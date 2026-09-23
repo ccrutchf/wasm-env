@@ -1,0 +1,250 @@
+# wasm-env
+
+A Linux environment whose native architecture is WebAssembly. Software is compiled to it directly; existing x86-64 and arm64 binaries and OCI images are translated to it ahead of time. It runs on any machine, whatever its OS or CPU architecture.
+
+## Problem
+
+In a BYOD environment people use different operating systems (macOS, Windows, Linux) on different architectures (Apple Silicon arm64, x86_64).
+
+Docker solves the OS half of this but not the architecture half. A container image is still native machine code: every binary must be built once per architecture, and multi-arch images just bundle those builds together. A team with Apple Silicon Macs and x86 Windows machines has to build, test and publish everything twice. Emulating the other architecture is slow and fragile.
+
+## Idea
+
+**WASM is our native format.** We define a Linux ABI for WASM: a module that makes Linux syscalls through an import. Software built for wasm-env is compiled to that ABI from source. A native runtime on each host implements the syscalls, hiding the host OS and CPU.
+
+Existing software reaches the same ABI through ahead-of-time translation. A converter pulls an OCI image, uses recompiled packages where they exist, translates the remaining x86-64 or arm64 binaries to WASM, and produces a `wasi/wasm` image. This is the Rosetta 2 model: translate once, cache, run everywhere.
+
+Both paths produce the same kind of module and run on the same runtime, so there is one system.
+
+## Goals
+
+- Existing OCI images convert to a single `wasi/wasm` image that runs identically on macOS arm64, Windows x86_64 and Linux x86_64.
+- Linux-compatible environment: shell, processes, pipes, filesystem, env vars, exit codes.
+- Runs on a native runtime on each host (not in a browser).
+- Research environment first; grows workload by workload.
+- Learning project first, then possibly a product.
+
+## Non-goals (for now)
+
+- GUI, GPU.
+- JIT-based runtimes (Node/V8, JVM). They generate machine code at runtime, which ahead-of-time translation can't see; revisit later.
+- Multithreaded binaries (see the memory-ordering risk below).
+
+## Approach: hybrid
+
+For each binary, use the first path that works:
+
+1. **Recompile to WASM (ideal — our native format).** Build from source against the wasm-env Linux ABI. Most images are Alpine or Debian underneath, so the converter swaps in recompiled packages (for example `bash`, `python3`) where they exist. Fastest and most faithful result.
+2. **Ahead-of-time translation from another ISA (backup).** Translate the ELF binary to WASM at conversion time and cache it. A runtime fallback handles only code that can't be found ahead of time. Two source ISAs, each with a different strength:
+   - **x86-64 — best compatibility.** Nearly every image and binary exists for x86-64, and many exist only for it.
+   - **arm64 — easiest to translate.** Fixed-width instructions make finding code far easier, and its weaker memory ordering maps onto WASM without extra fences.
+
+   Start with arm64 to prove the translator, then add x86-64 for coverage. Both frontends lift to the same LLVM IR, so everything after lifting is shared.
+3. **CPU emulation (last resort).** Emulate the CPU inside WASM (as container2wasm does). Slow (5–50×), but it keeps things working. Avoid where possible.
+
+## Architecture
+
+```
+ OCI image (arm64)                                   wasi/wasm OCI image
+ ┌──────────────┐    ┌────────────────────────┐     ┌──────────────┐
+ │ layers       │───▶│ converter              │────▶│ layers       │
+ │  ELF, .so    │    │  - unpack, classify    │     │  .wasm       │
+ │  scripts     │    │  - package substitution│     │  scripts     │
+ │  data        │    │  - translator          │     │  data        │
+ └──────────────┘    │  - translation cache   │     └──────┬───────┘
+                     └────────────────────────┘            │
+                                                           ▼
+                                  ┌────────────────────────────────────┐
+                                  │ runtime (wasmtime embedding)       │
+                                  │  - Linux syscall layer             │
+                                  │  - process model: fork/exec/wait   │
+                                  │  - virtual filesystem + host mounts│
+                                  └────────────────────────────────────┘
+                                      macOS arm64 · Windows x86_64 · Linux
+```
+
+### Converter
+
+1. **Pull** the image. Prefer the arm64 variant when one exists (easier to translate); use x86-64 when it's the only one.
+2. **Unpack** the layers and classify each file: ELF executables and shared libraries go to translation; scripts, configs and data are copied unchanged.
+3. **Substitute** recompiled WASM packages where available, using the image's package database (apk, dpkg).
+4. **Translate** the remaining ELF files.
+5. **Output** an OCI image with platform `wasi/wasm`, preserving the layer structure.
+
+### Native ABI and toolchain
+
+- A memory64 WASM module that exports `_start` and imports a single Linux syscall function, roughly `linux.syscall(nr, a0..a5) -> i64`, using Linux syscall numbers and the 64-bit (LP64) struct layouts. One ABI for recompiled and translated software; no 4 GB per-process limit.
+- A musl libc port whose syscall wrapper calls that import, plus a clang/LLVM toolchain targeting it (`wasm64-linux-musl`). Porting software means cross-compiling it with this toolchain.
+- The translator emits modules with the same imports, so recompiled and translated binaries are indistinguishable to the runtime.
+
+### Translator
+
+- Lift machine code to LLVM IR (remill/McSema or rev.ng style), then compile to WASM with LLVM's WASM backend.
+- Find code by recursive disassembly from entry points and symbols. Indirect jumps go through a dispatch table of known targets. Unknown targets trap to a runtime translation fallback.
+- Link each executable with its shared libraries at conversion time, since the whole image is known. This avoids WASM's immature dynamic linking.
+- Use memory64 (standardized in Wasm 3.0) so translated 64-bit pointers work unchanged.
+- **Cache by file hash.** Layers are shared across images, so a given musl libc or python binary is translated once.
+
+### Runtime
+
+- Translated binaries carry their own libc, which makes raw Linux syscalls. The runtime therefore implements the **Linux syscall interface**, like WSL1 and gVisor, not a POSIX library layer. Recompiled packages target the same interface, so there is one system underneath both.
+- Built as a **wasmtime** embedding, with the syscall layer as host functions. We're writing the syscall layer ourselves, so we don't need WASIX's POSIX layer. wasmtime is standards-track and has memory64 support. We'll still study WASIX for how it implements fork and signals.
+- Emulates fork, execve, pipes, signals and `mmap` on top of WASM.
+- Mounts the image filesystem, with explicit host directory mounts.
+- Runs each environment in its own OS process, and compiles 64-bit memories with masked addressing instead of bounds checks (see M-1).
+
+## Implementation
+
+- **Rust** for all components: converter, translator driver and runtime. wasmtime is a Rust library, so the runtime embeds it directly.
+- Toolchain pieces that already live in LLVM (the WASM backend, the musl port's build) stay C/C++ and are driven from Rust.
+- Useful crates: `wasmtime` (runtime), `oci-client` (registry pull/push), `object` or `goblin` (ELF parsing), `inkwell` (LLVM bindings, if the lifter is ours).
+
+## Distribution
+
+**The runtime** is the only per-architecture artifact in the whole system: one Rust binary (`wasm-env`) with wasmtime embedded. It ships as a prebuilt, self-contained binary per host (macOS arm64/x86-64, Windows x86-64/arm64, Linux x86-64/arm64). Channels: GitHub releases with an install script, Homebrew, winget/Scoop, and a Nix package. Nix can't be a requirement: BYOD users on macOS and Windows won't have it.
+
+**The Nix flake** is our development environment and a reproducible build of the release binaries. It is not how end users install wasm-env.
+
+**Environments** (converted or natively built images) are OCI images with a single `wasi/wasm` platform. We reuse existing registries, tags and signing, with no Docker required at runtime. One image serves every host.
+
+## Performance targets (draft)
+
+- Translated binaries within ~2–3× of native; recompiled packages within ~1.5×.
+- Environment startup < 100ms, with cached compiled modules.
+- Converting an image is a one-time cost; minutes is acceptable at first.
+
+## Milestones
+
+- **M-1 — wasm32 vs memory64 benchmarks (done on Linux x86-64).** Decided the native ABI's memory model: memory64 with masked addressing, ~1.2× native (~1.12× excluding interpreters), on wasmtime. See [Benchmarks](#m-1-benchmarks) below.
+- **M0 — Native ABI.** Define the syscall import, port musl, and compile BusyBox from source to WASM. Run `busybox ls` and `busybox echo` on wasmtime with a minimal syscall layer (read, write, openat, close, fstat, getdents64, brk, mmap, exit_group, ioctl stubs). Verify on the Mac and on a Windows x86 machine.
+- **M1 — Shell.** `busybox sh -c` with pipes and subshells: fork, execve, wait4, pipe, dup2. A non-trivial script gives identical output on all hosts.
+- **M2 — Native userland.** Recompile a small Alpine-based set (bash, coreutils, python3) and package it as a `wasi/wasm` OCI image; `wasm-env run` opens a shell in it.
+- **M3 — arm64 translation.** Translate the static arm64 BusyBox from `alpine` to the same ABI. Compare its output and performance against the recompiled BusyBox from M0 — a built-in correctness and performance baseline.
+- **M4 — Image conversion.** `wasm-env convert alpine:latest`: substitute recompiled packages, translate the rest (including dynamically linked binaries and `.so` files, linked at conversion time), output a `wasi/wasm` image. Translation cache in place.
+- **M5 — x86-64 translation.** Add the x86-64 frontend, starting with single-threaded binaries, then x86-only images.
+- **M6 — Breadth.** glibc/Debian-based images, networking (sockets, exposed ports), host mounts.
+- **Later.** Runtime translation fallback for unknown jump targets, CPU emulation fallback, threads, JIT workloads.
+
+## M-1 benchmarks
+
+**Question:** how much slower is memory64 than wasm32, and is it worth having one ABI for recompiled and translated code?
+
+**Why it might be slower.** For wasm32, runtimes reserve 4 GB of virtual memory plus guard pages, so out-of-bounds accesses fault in hardware and most bounds checks disappear. memory64 can't use that trick, so every load and store gets an explicit bounds check. 64-bit pointers also use more cache.
+
+**Setup**
+
+- The same C sources compiled three ways: native (x86-64 / arm64), `wasm32` and `wasm64`, all `-O2`.
+- Freestanding (no libc) with a tiny bump allocator, so libc support for wasm64 isn't a variable.
+- A Rust harness embeds wasmtime, instantiates each module, and times only the exported `run()` call. It reports the median of N runs, compiled code size and compile time.
+
+**Workloads**
+
+| Benchmark | What it stresses |
+|---|---|
+| Linked-list / binary-tree walk | Pointer size, cache footprint |
+| Array sum / memcpy | Streaming loads and stores (bounds checks) |
+| Sort (quicksort) | Mixed compute and memory |
+| Hash table insert/lookup | Random access |
+| Bytecode interpreter loop | Dispatch-heavy code, like bash and Python |
+| SHA-256 | Pure compute (control; should be equal) |
+
+**Configurations:** native; wasm32 with guard pages (default); wasm32 with explicit bounds checks (isolates the bounds-check cost); memory64.
+
+**Hosts:** Linux x86-64, macOS arm64, Windows x86-64.
+
+**Decision rule:** the original draft compared memory64 against wasm32 (≤ 15% overhead). That was the wrong baseline: what users feel is the cost versus native. The rule is now that recompiled software stays within the 1.5× of native performance target.
+
+### Results: Linux x86-64 (2026-09-23)
+
+Intel i7-11800H, wasmtime 49 (with our patch for `wasm64-masked`), clang 21, wabt 1.0.41, `-O2`. The harness pins itself to one core and interleaves configurations; 9 runs each. Load average was ~2 during the run. Spread (interquartile range) was under 5% for most results, but 8–20% for `list` and `tree`, which are dominated by memory latency. Raw data: `bench/results/linux-x86_64.json`.
+
+Times relative to native (lower is faster):
+
+| Benchmark | wasm32 | wasm64 | wasm64-nospectre | **wasm64-masked** | w2c-wasm32 | w2c-wasm64 | w2c-wasm64-masked |
+|---|---|---|---|---|---|---|---|
+| list | 0.47× | 1.03× | 1.04× | **1.10×** | 0.46× | 0.98× | 1.10× |
+| tree | 0.66× | 1.19× | 1.02× | **1.06×** | 0.67× | 1.10× | 1.12× |
+| stream | 0.99× | 1.08× | 1.04× | **1.02×** | 1.04× | 1.00× | 1.05× |
+| sort | 1.06× | 1.48× | 1.33× | **1.27×** | 1.15× | 1.41× | 1.16× |
+| hash | 1.00× | 1.16× | 1.03× | **1.08×** | 1.05× | 1.02× | 1.07× |
+| interp | 2.29× | 2.84× | 2.19× | **1.96×** | 2.25× | 2.93× | 2.10× |
+| sha256 | 1.13× | 1.44× | 1.24× | **1.21×** | 1.23× | 1.45× | 1.22× |
+| **geomean** | **0.98×** | **1.38×** | **1.22×** | **1.21×** | **1.01×** | **1.31×** | **1.22×** |
+
+`wasm*` columns are wasmtime (Cranelift). `w2c-*` columns are the same `.wasm` files translated to C by wasm2c and compiled by clang (LLVM), with the same memory strategies.
+
+**Findings**
+
+1. **Masked memory64 is ~1.21× native, and ~1.12× excluding the interpreter.** Bounds checks are no longer a meaningful cost.
+2. **The compiler backend doesn't matter.** LLVM (via wasm2c) is no faster than Cranelift in any memory mode (masked: 1.22× vs 1.21×). We stay on wasmtime.
+3. **What's left is WASM's structure, not memory64:**
+   - **Interpreter dispatch (~2×).** Native clang builds "threaded" dispatch: the indirect jump is copied into every opcode handler (10 dispatch points) with no range check, so the CPU predicts each handler's next opcode separately. In WASM, a C `switch` in a loop becomes one `br_table`. Structured control flow sends every handler back to that single dispatch point, and `br_table` always needs a default branch, so the range check stays. Neither Cranelift nor clang rebuilds the threaded form.
+   - **Local arrays live in linear memory (`sha256`, `sort`, ~1.2×).** Locals that need an address, like `sha256`'s `w[64]`, go on a shadow stack inside WASM memory, so each access takes the memory path instead of a direct stack access.
+   - wasm2c also reloads the memory base address before every access, because clang can't prove stores to WASM memory don't overwrite it. wasm2c's "Segue" mode (base kept in the `gs` register) fixes that, but since LLVM isn't helping, it isn't worth pursuing now.
+4. **Pointer size (list, tree).** wasm32's 32-bit pointers make it 1.5–2× *faster* than native on pointer-heavy code (like Linux's x32 ABI). memory64 and native both pay for 64-bit pointers.
+
+**Decision: memory64 everywhere, with masked addressing, on wasmtime.** Real workloads regularly need more than 4 GB in a single process, which rules out wasm32 as the default. With masking, memory64 is ~1.2× native, inside the 1.5× target, and one ABI keeps the syscall layer simple. wasm32 remains a possible opt-in "compact" build for small tools if a real workload justifies it. Still to do: confirm on macOS arm64 and Windows x86-64, and rerun on an idle machine.
+
+**Closing the remaining gap (research, later):**
+- **Interpreters:** teach Cranelift to duplicate `br_table` dispatch into loop predecessors, rebuilding threaded dispatch. Or build interpreters with WASM tail calls (`return_call_indirect`) so each handler jumps directly to the next, the way CPython 3.14's tail-calling interpreter works natively.
+- **Shadow stack:** investigate keeping more locals out of linear memory, in both LLVM's WASM backend and Cranelift.
+
+### Masked addressing
+
+Our runtime patches wasmtime's compiler (`vendor/wasmtime-internal-cranelift`, search for "wasm-env") so that 64-bit memories are masked instead of bounds-checked:
+
+```
+addr = base + (index & (2^38 - 1)) + offset
+```
+
+- Each memory gets a fixed 2^38-byte (256 GB) virtual reservation that never moves, plus a guard region covering the largest static offset. That limits each process to 256 GB of memory.
+- Pages beyond the memory's current size are inaccessible, so **out-of-bounds accesses below 256 GB still trap**. Only indexes at or above 2^38 wrap around. This deviates from the WebAssembly spec, but not from safety: every access stays inside the process's own reservation, even speculatively, so no Spectre guard is needed.
+- This is the same technique Google's Native Client used on x86-64, and it mirrors native amd64, which also has a hardware-capped address space (48 bits).
+- A test in `bench/harness` checks all three behaviors: in-bounds loads, trapping below 2^38, and wrapping above.
+- Before production: turn the environment-variable switch into a proper wasmtime configuration option, get the patch reviewed (the file warns it is safety-critical), and consider proposing it upstream.
+
+### Security model: one OS process per environment
+
+Native code gets memory isolation for free from the CPU's memory hardware, but only between processes. WASM enforces its sandbox in software because the guest shares a process with the runtime. We put the trust boundary where the hardware enforces it:
+
+- **Each environment runs in its own OS process.** Another environment's data, and the host's, is never in the same address space.
+- **Bounds enforcement stays** (masking plus guard pages) to protect the runtime's own state inside the process. The runtime holds the environment's host privileges (file handles, the ability to make real syscalls), so guest code must not be able to overwrite it.
+- **Spectre guards aren't needed.** The process holds nothing the environment couldn't already reach, so speculative reads leak nothing new. Masked addresses can't leave the reservation even speculatively.
+- Separate processes also give crash isolation, and they let us use OS resource limits for each environment.
+
+
+## Risks
+
+- **Finding all the code.** Static disassembly is undecidable in general (indirect jumps, jump tables, data mixed with code), and worst on x86-64's variable-length instructions. Mitigated by arm64-first, dispatch tables and a runtime fallback.
+- **Porting effort.** Recompiling needs each package's build to cross-compile cleanly to the new target. Some will need patches (assembly, `fork`-heavy code, assumptions about the host).
+- **fork in WASM.** WASM can't clone a running instance natively. Options: snapshot and copy linear memory (WASIX's approach), or rewrite the control flow so execution can be paused and resumed (asyncify-style). Expect this to be slow at first.
+- **Memory ordering.** x86 guarantees a stronger memory ordering between threads (TSO) than WASM does. Rosetta 2 relies on a hardware mode for this that WASM doesn't have. arm64 sidesteps it; multithreaded x86-64 binaries need extra atomics or fences, which will cost performance.
+- **SIMD.** SSE, AVX and NEON instructions have to map onto WASM's 128-bit SIMD, or be split into scalar operations.
+- **Performance of lifted code.** Lifting loses types and structure, so the generated WASM may be well above the 2–3× target. Measure from M0.
+- **Maintaining a wasmtime patch.** Masked addressing lives in a safety-critical file we patch ourselves. Every wasmtime upgrade needs the patch re-applied and re-reviewed until it is upstream or a supported option.
+- **Interpreter performance.** The M-1 interpreter loop runs ~3× slower than native in WASM. bash and Python are interpreters, so this hits the first workloads directly. Investigate Cranelift's codegen for switch dispatch, and try a real interpreter (Lua or CPython) early.
+
+## Open questions
+
+- When a binary can't be translated, fall back to emulation automatically (with a warning) or only when asked?
+- Lifter: build on remill, rev.ng, or write a purpose-built arm64 → LLVM IR lifter?
+- Where do recompiled packages come from? Candidates:
+  - **nixpkgs cross-compilation (leading option).** Define `wasm64-linux-musl` as a nixpkgs cross platform and build packages with `pkgsCross`. nixpkgs already cross-builds to musl and to unusual targets, it's reproducible, and it can output OCI images directly (`dockerTools`, nix2container). Nix *builds* the environments; OCI *delivers* them; users never need Nix.
+  - Rebuilding Alpine's APKBUILDs with our toolchain (keeps package parity with Alpine images, which helps substitution in the converter).
+  - Existing WASM package efforts.
+- Should the translation cache be shareable, for example a registry of pre-translated layers?
+- Exact host list — is Windows on ARM in scope?
+- Docker interop depth, for example running converted images via runwasi/containerd.
+
+## Prior art to study
+
+- Rosetta 2 (Apple): x86_64 → arm64, ahead of time with a JIT fallback. The reference model
+- Box64, FEX-Emu (x86_64 Linux binaries on arm64), Microsoft Prism (Windows on ARM): binary translators
+- remill / McSema, rev.ng, RetDec: lifting machine code to LLVM IR
+- WSL1, gVisor: implementing the Linux syscall interface in user space
+- WASI, wasmtime: runtime and embedding API
+- Wasmer + WASIX: how fork, signals and sockets were done in WASM
+- container2wasm, v86, WebVM: emulation-based; candidates for the last-resort path
+- Linux kernel ported to WASM (experimental)
+- Google Native Client (NaCl): software fault isolation using x86-32 segments, and masking plus guard regions on x86-64. The model for our masked addressing
+- Docker + runwasi / containerd WASM shims

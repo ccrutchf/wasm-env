@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["bench/harness"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+debug = "line-tables-only"
+
+# M-1 experiment: masked bounds checks for 64-bit memories.
+# See vendor/wasmtime-internal-cranelift/src/bounds_checks.rs (search "wasm-env").
+[patch.crates-io]
+wasmtime-internal-cranelift = { path = "vendor/wasmtime-internal-cranelift" }
