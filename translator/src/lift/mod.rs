@@ -323,6 +323,8 @@ impl Block {
                 let v = imm_u64(imm);
                 Ok(match shift {
                     Some(Shift::LSL(s)) => v << s,
+                    // "Shifting ones" (movi/mvni): the vacated bits are set.
+                    Some(Shift::MSL(s)) => (v << s) | ((1u64 << s) - 1),
                     None => v,
                     Some(s) => bail!("immediate with shift {s:?}"),
                 })
@@ -776,7 +778,13 @@ fn intrinsics() -> String {
              declare {t} @llvm.fabs.{s}({t})\n\
              declare {t} @llvm.fma.{s}({t}, {t}, {t})\n\
              declare {t} @llvm.minnum.{s}({t}, {t})\n\
-             declare {t} @llvm.maxnum.{s}({t}, {t})"
+             declare {t} @llvm.maxnum.{s}({t}, {t})\n\
+             declare {t} @llvm.rint.{s}({t})\n\
+             declare {t} @llvm.roundeven.{s}({t})\n\
+             declare {t} @llvm.trunc.{s}({t})\n\
+             declare {t} @llvm.ceil.{s}({t})\n\
+             declare {t} @llvm.floor.{s}({t})\n\
+             declare {t} @llvm.copysign.{s}({t}, {t})"
         );
     }
     ir

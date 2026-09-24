@@ -24,6 +24,7 @@ fixtures=(
 	"hello:tests/c/hello.c:-static"
 	"fnptr:tests/arm64/fnptr.c:-static"
 	"arith:tests/arm64/arith.c:-static"
+	"fp:tests/arm64/fp.c:-static"
 	"control:tests/arm64/control.c:-static"
 	"memory:tests/arm64/memory.c:-static"
 	# Static PIE (loaded at a chosen base, relocations applied on translate).

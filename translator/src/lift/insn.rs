@@ -584,11 +584,11 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         {
             vector_binary(b, i, m)?
         }
-        "not" | "abs" | "cnt" if is_v(ops.first()) => vector_unary(b, i, m)?,
-        "addp" if is_v(ops.first()) => {
+        "not" | "abs" | "cnt" | "neg" | "rbit" if is_v(ops.first()) => vector_unary(b, i, m)?,
+        "addp" | "umaxp" | "uminp" | "smaxp" | "sminp" if is_v(ops.first()) => {
             let (d, elem, total) = vec_dst(&ops[0])?;
             if ops.len() == 3 {
-                // Vector pairwise add: concatenate vn:vm, add adjacent pairs.
+                // Vector pairwise: concatenate vn:vm, combine adjacent pairs.
                 let x = read_v128(b, &ops[1])?;
                 let y = read_v128(b, &ops[2])?;
                 let half = nlanes(total, elem) / 2;
@@ -597,7 +597,13 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                     for k in 0..half {
                         let a = vlane(b, src, elem, 2 * k);
                         let c = vlane(b, src, elem, 2 * k + 1);
-                        parts.push(b.val(format!("add i{elem} {a}, {c}")));
+                        parts.push(match m {
+                            "addp" => b.val(format!("add i{elem} {a}, {c}")),
+                            _ => {
+                                let f = &m[..4]; // umax, umin, smax, smin
+                                b.val(format!("call i{elem} @llvm.{f}.i{elem}(i{elem} {a}, i{elem} {c})"))
+                            }
+                        });
                     }
                 }
                 let r = vbuild(b, elem, &parts);
@@ -732,14 +738,184 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let r = b.val(format!("select i1 {cond}, {ty} {x}, {ty} {y}"));
             write_fp(b, d, r, bits)?;
         }
+        "scvtf" | "ucvtf" if has_arrspec(&ops[0]) => {
+            let op = if m == "scvtf" { "sitofp" } else { "uitofp" };
+            vector_map(b, i, |b, bits, lane| {
+                let ty = fp_ty(bits)?.0;
+                let f = b.val(format!("{op} i{bits} {lane} to {ty}"));
+                Ok(b.val(format!("bitcast {ty} {f} to i{bits}")))
+            })?
+        }
         "scvtf" | "ucvtf" => {
             let (d, dbits) = fp_reg(&ops[0])?;
             let (ty, _) = fp_ty(dbits)?;
-            let (s, sbits) = b.reg_op(i, 1)?;
-            let x = b.read(s, sbits)?;
+            // The integer comes from a general register or, for the scalar
+            // SIMD form (scvtf d0, d1), from a SIMD/FP register.
+            let (x, sbits) = if is_v(ops.get(1)) {
+                let (n, sbits) = fp_reg(&ops[1])?;
+                (b.read_v(n, sbits), sbits)
+            } else {
+                let (s, sbits) = b.reg_op(i, 1)?;
+                (b.read(s, sbits)?, sbits)
+            };
             let op = if m == "scvtf" { "sitofp" } else { "uitofp" };
-            let r = b.val(format!("{op} i{sbits} {x} to {ty}"));
+            let mut r = b.val(format!("{op} i{sbits} {x} to {ty}"));
+            // Fixed-point form (scvtf d0, x0, #fbits): scale by 2^-fbits,
+            // which is exact.
+            if ops.len() == 3 {
+                let fbits = b.imm_op(i, 2)?;
+                r = b.val(format!("fmul {ty} {r}, {}", pow2(-(fbits as i64))));
+            }
             write_fp(b, d, r, dbits)?;
+        }
+
+        // --- Rounding, and conversions with a rounding mode ----------------------------------
+        "frintx" | "frinti" | "frintz" | "frintp" | "frintm" | "frinta" | "frintn" => {
+            let mode = m.as_bytes()[5] as char;
+            if is_scalar_fp(ops) {
+                let (d, bits) = fp_reg(&ops[0])?;
+                let x = read_fp(b, &ops[1], bits)?;
+                let r = fround(b, mode, bits, &x)?;
+                write_fp(b, d, r, bits)?;
+            } else {
+                vector_fp_unary(b, i, |b, bits, x| fround(b, mode, bits, x))?;
+            }
+        }
+        "fcvtas" | "fcvtau" | "fcvtns" | "fcvtnu" | "fcvtms" | "fcvtmu" | "fcvtps" | "fcvtpu" if !is_v(ops.first()) => {
+            let (d, dbits) = b.reg_op(i, 0)?;
+            let (_, sbits) = fp_reg(&ops[1])?;
+            let (sty, s) = fp_ty(sbits)?;
+            let x = read_fp(b, &ops[1], sbits)?;
+            let rounded = fround(b, m.as_bytes()[4] as char, sbits, &x)?;
+            let op = if m.ends_with('s') { "fptosi.sat" } else { "fptoui.sat" };
+            let r = b.val(format!("call i{dbits} @llvm.{op}.i{dbits}.{s}({sty} {rounded})"));
+            b.write(d, r, dbits)?;
+        }
+
+        // --- SIMD floating point, per lane ---------------------------------------------------
+        "fneg" | "fabs" | "fsqrt" if has_arrspec(&ops[0]) => vector_fp_unary(b, i, |b, bits, x| {
+            let (ty, s) = fp_ty(bits)?;
+            Ok(match m {
+                "fneg" => b.val(format!("fneg {ty} {x}")),
+                "fabs" => b.val(format!("call {ty} @llvm.fabs.{s}({ty} {x})")),
+                _ => b.val(format!("call {ty} @llvm.sqrt.{s}({ty} {x})")),
+            })
+        })?,
+        "fadd" | "fsub" | "fmul" | "fdiv" | "fmax" | "fmin" | "fmaxnm" | "fminnm" if has_arrspec(&ops[0]) => {
+            let (d, elem, total) = vec_dst(&ops[0])?;
+            let ty = fp_ty(elem)?.0;
+            let x = read_v128(b, &ops[1])?;
+            let y = read_v128(b, &ops[2])?;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, elem) {
+                let xl = vlane(b, &x, elem, k);
+                let yl = vlane(b, &y, elem, k);
+                let xf = b.val(format!("bitcast i{elem} {xl} to {ty}"));
+                let yf = b.val(format!("bitcast i{elem} {yl} to {ty}"));
+                let r = match m {
+                    "fadd" | "fsub" | "fmul" | "fdiv" => b.val(format!("{m} {ty} {xf}, {yf}")),
+                    _ => {
+                        let pred = if m.starts_with("fmax") { "ogt" } else { "olt" };
+                        let c = b.val(format!("fcmp {pred} {ty} {xf}, {yf}"));
+                        b.val(format!("select i1 {c}, {ty} {xf}, {ty} {yf}"))
+                    }
+                };
+                parts.push(b.val(format!("bitcast {ty} {r} to i{elem}")));
+            }
+            let r = vbuild(b, elem, &parts);
+            b.write_v(d, r, 128);
+        }
+
+        // --- SIMD bitwise select, table lookup, reversal, widening -------------------------
+        "bsl" | "bit" | "bif" => {
+            let (d, _, total) = vec_dst(&ops[0])?;
+            let old = b.read_v(d, 128);
+            let n = read_v128(b, &ops[1])?;
+            let mm = read_v128(b, &ops[2])?;
+            // result = (t AND sel) OR (f AND NOT sel)
+            let (sel, t, f) = match m {
+                "bsl" => (old, n, mm),
+                "bit" => (mm, n, old),
+                _ => (mm, old, n),
+            };
+            let a = b.val(format!("and i128 {t}, {sel}"));
+            let ns = b.val(format!("xor i128 {sel}, -1"));
+            let c = b.val(format!("and i128 {f}, {ns}"));
+            let mut r = b.val(format!("or i128 {a}, {c}"));
+            if total < 128 {
+                r = b.val(format!("and i128 {r}, {}", konst128((1u128 << total) - 1)));
+            }
+            b.write_v(d, r, 128);
+        }
+        "tbl" | "tbx" => {
+            let (d, _, total) = vec_dst(&ops[0])?;
+            let (regs, _, _) = reg_list(&ops[1])?;
+            // Each table register as two 64-bit halves, so the per-byte
+            // selection is a native 64-bit shift.
+            let mut halves = Vec::new();
+            for &n in &regs {
+                let v = b.read_v(n, 128);
+                let lo = b.val(format!("trunc i128 {v} to i64"));
+                let h = b.val(format!("lshr i128 {v}, 64"));
+                let hi = b.val(format!("trunc i128 {h} to i64"));
+                halves.push((lo, hi));
+            }
+            let idxv = read_v128(b, &ops[2])?;
+            let old = if m == "tbx" { Some(b.read_v(d, 128)) } else { None };
+            let mut parts = Vec::new();
+            for k in 0..total / 8 {
+                let idx = vlane(b, &idxv, 8, k);
+                // Out-of-range indices give 0 (tbl) or keep the old byte (tbx).
+                let mut acc = match &old {
+                    Some(o) => vlane(b, o, 8, k),
+                    None => "0".into(),
+                };
+                let bit3 = b.val(format!("and i8 {idx}, 8"));
+                let upper = b.val(format!("icmp ne i8 {bit3}, 0"));
+                let low3 = b.val(format!("and i8 {idx}, 7"));
+                let low3w = b.val(format!("zext i8 {low3} to i64"));
+                let sh = b.val(format!("shl i64 {low3w}, 3"));
+                let which = b.val(format!("lshr i8 {idx}, 4"));
+                for (j, (lo, hi)) in halves.iter().enumerate() {
+                    let half = b.val(format!("select i1 {upper}, i64 {hi}, i64 {lo}"));
+                    let s = b.val(format!("lshr i64 {half}, {sh}"));
+                    let byte = b.val(format!("trunc i64 {s} to i8"));
+                    let hit = b.val(format!("icmp eq i8 {which}, {j}"));
+                    acc = b.val(format!("select i1 {hit}, i8 {byte}, i8 {acc}"));
+                }
+                parts.push(acc);
+            }
+            let r = vbuild(b, 8, &parts);
+            b.write_v(d, r, 128);
+        }
+        "rev16" | "rev32" | "rev64" if is_v(ops.first()) => {
+            // Reverse the elements within each 16/32/64-bit container.
+            let (d, elem, total) = vec_dst(&ops[0])?;
+            let per = m[3..].parse::<u32>()? / elem;
+            let x = read_v128(b, &ops[1])?;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, elem) {
+                parts.push(vlane(b, &x, elem, k / per * per + (per - 1 - k % per)));
+            }
+            let r = vbuild(b, elem, &parts);
+            b.write_v(d, r, 128);
+        }
+        "sxtl" | "uxtl" | "sxtl2" | "uxtl2" | "sshll" | "ushll" | "sshll2" | "ushll2" => {
+            // Widen the low (or, for the "2" forms, high) half's lanes.
+            let (d, e, _) = vec_dst(&ops[0])?;
+            let x = read_v128(b, &ops[1])?;
+            let n = 128 / e;
+            let first = if m.ends_with('2') { n } else { 0 };
+            let shift = if m.contains("shll") { b.imm_op(i, 2)? } else { 0 };
+            let ext = if m.starts_with('s') { "sext" } else { "zext" };
+            let mut parts = Vec::new();
+            for k in 0..n {
+                let lane = vlane(b, &x, e / 2, first + k);
+                let w = b.val(format!("{ext} i{} {lane} to i{e}", e / 2));
+                parts.push(if shift == 0 { w } else { b.val(format!("shl i{e} {w}, {shift}")) });
+            }
+            let r = vbuild(b, e, &parts);
+            b.write_v(d, r, 128);
         }
         "fcvtzs" | "fcvtzu" => {
             let (d, dbits) = b.reg_op(i, 0)?;
@@ -854,6 +1030,63 @@ fn read_fp(b: &mut Block, op: &Operand, bits: u32) -> Result<String> {
     let ty = fp_ty(bits)?.0;
     let iv = b.read_v(n, bits);
     Ok(b.val(format!("bitcast i{bits} {iv} to {ty}")))
+}
+
+/// Rounds a float/double as an arm64 FRINT<mode> or FCVT<mode> does:
+/// x/i the current mode (nearest, ties to even), n ties to even, z toward
+/// zero, p toward +infinity, m toward -infinity, a ties away from zero.
+fn fround(b: &mut Block, mode: char, bits: u32, x: &str) -> Result<String> {
+    let (ty, s) = fp_ty(bits)?;
+    Ok(match mode {
+        'x' | 'i' => b.val(format!("call {ty} @llvm.rint.{s}({ty} {x})")),
+        'n' => b.val(format!("call {ty} @llvm.roundeven.{s}({ty} {x})")),
+        'z' => b.val(format!("call {ty} @llvm.trunc.{s}({ty} {x})")),
+        'p' => b.val(format!("call {ty} @llvm.ceil.{s}({ty} {x})")),
+        'm' => b.val(format!("call {ty} @llvm.floor.{s}({ty} {x})")),
+        'a' => {
+            // No WebAssembly instruction does this (and llvm.round needs
+            // libm): truncate, then step away from zero if the dropped part
+            // is at least 1/2. x - trunc(x) is exact, so the result is too.
+            let t = b.val(format!("call {ty} @llvm.trunc.{s}({ty} {x})"));
+            let f = b.val(format!("fsub {ty} {x}, {t}"));
+            let af = b.val(format!("call {ty} @llvm.fabs.{s}({ty} {f})"));
+            let up = b.val(format!("fcmp oge {ty} {af}, 5.000000e-01"));
+            let one = b.val(format!("call {ty} @llvm.copysign.{s}({ty} 1.000000e+00, {ty} {x})"));
+            let stepped = b.val(format!("fadd {ty} {t}, {one}"));
+            b.val(format!("select i1 {up}, {ty} {stepped}, {ty} {t}"))
+        }
+        _ => bail!("rounding mode {mode}"),
+    })
+}
+
+/// 2^e as an LLVM floating-point constant (exact in float and double for
+/// the fixed-point scales arm64 allows).
+fn pow2(e: i64) -> String {
+    format!("0x{:016X}", ((1023 + e) as u64) << 52)
+}
+
+/// Applies `f` to each lane of a vector, as integers of the lane width.
+fn vector_map(b: &mut Block, i: &Instruction, f: impl Fn(&mut Block, u32, &str) -> Result<String>) -> Result<()> {
+    let (d, elem, total) = vec_dst(&i.operands()[0])?;
+    let x = read_v128(b, &i.operands()[1])?;
+    let mut parts = Vec::new();
+    for k in 0..nlanes(total, elem) {
+        let lane = vlane(b, &x, elem, k);
+        parts.push(f(b, elem, &lane)?);
+    }
+    let r = vbuild(b, elem, &parts);
+    b.write_v(d, r, 128);
+    Ok(())
+}
+
+/// Applies a floating-point function to each lane of a vector.
+fn vector_fp_unary(b: &mut Block, i: &Instruction, f: impl Fn(&mut Block, u32, &str) -> Result<String>) -> Result<()> {
+    vector_map(b, i, |b, bits, lane| {
+        let ty = fp_ty(bits)?.0;
+        let x = b.val(format!("bitcast i{bits} {lane} to {ty}"));
+        let r = f(b, bits, &x)?;
+        Ok(b.val(format!("bitcast {ty} {r} to i{bits}")))
+    })
 }
 
 fn write_fp(b: &mut Block, idx: u8, val: String, bits: u32) -> Result<()> {

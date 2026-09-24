@@ -33,7 +33,7 @@ check "dynamic output (cross-object call + data)" "$(cat "$out/exp")" "$(cat "$o
 # Real dynamically-linked musl programs (main + libc.so). musl's dynamic
 # linker is libc.so itself; it's translated too and runs first, setting up
 # TLS and constructors exactly as under qemu.
-for f in hello:tests/c/hello.c control:tests/arm64/control.c memory:tests/arm64/memory.c arith:tests/arm64/arith.c; do
+for f in hello:tests/c/hello.c control:tests/arm64/control.c memory:tests/arm64/memory.c arith:tests/arm64/arith.c fp:tests/arm64/fp.c; do
 	name=${f%%:*} src=${f#*:}
 	$cc -O2 -o "$out/$name-dyn" "$src"
 	env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin TERM=xterm \
