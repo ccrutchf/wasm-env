@@ -19,12 +19,17 @@ wasm_env=$root/target/release/wasm-env
 
 # name:source:flags
 fixtures=(
-	"min:tests/arm64/min.c:-nostdlib -fno-stack-protector"
-	"hello:tests/c/hello.c:"
-	"fnptr:tests/arm64/fnptr.c:"
-	"arith:tests/arm64/arith.c:"
-	"control:tests/arm64/control.c:"
-	"memory:tests/arm64/memory.c:"
+	# Statically linked (fixed load address).
+	"min:tests/arm64/min.c:-static -nostdlib -fno-stack-protector"
+	"hello:tests/c/hello.c:-static"
+	"fnptr:tests/arm64/fnptr.c:-static"
+	"arith:tests/arm64/arith.c:-static"
+	"control:tests/arm64/control.c:-static"
+	"memory:tests/arm64/memory.c:-static"
+	# Static PIE (loaded at a chosen base, relocations applied on translate).
+	"hello-pie:tests/c/hello.c:-static-pie"
+	"control-pie:tests/arm64/control.c:-static-pie"
+	"memory-pie:tests/arm64/memory.c:-static-pie"
 )
 
 out=$root/build/m2
@@ -35,7 +40,7 @@ for f in "${fixtures[@]}"; do
 	IFS=: read -r name src flags <<<"$f"
 	if [ $# -gt 0 ] && [[ " $* " != *" $name "* ]]; then continue; fi
 	# shellcheck disable=SC2086
-	$cc -O2 -static $flags -o "$out/$name" "$src"
+	$cc -O2 $flags -o "$out/$name" "$src"
 
 	set +e
 	# Give qemu the same environment wasm-env supplies by default, so only

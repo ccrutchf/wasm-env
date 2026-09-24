@@ -3,7 +3,8 @@
 use anyhow::{Context, Result, bail};
 use object::elf;
 use object::read::elf::{ElfFile64, FileHeader, ProgramHeader};
-use object::{Endianness, Object, ObjectSection, ObjectSymbol, SectionFlags, SymbolKind};
+use object::read::ObjectSymbolTable;
+use object::{Endianness, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionFlags, SymbolKind};
 
 pub struct Segment {
     pub vaddr: u64,
@@ -36,6 +37,66 @@ pub struct Image {
     pub code: Vec<std::ops::Range<u64>>,
 }
 
+/// Applies dynamic relocations into the loaded segments (prelinking). For
+/// a PIE/shared object loaded at `base`, this resolves relative and
+/// defined-symbol relocations to final values, so the translated code needs
+/// no runtime relocation. Undefined symbols (from other objects) and
+/// unsupported relocation types are errors for this slice.
+fn apply_relocations(
+    file: &ElfFile64<Endianness>,
+    _endian: Endianness,
+    base: u64,
+    segments: &mut [Segment],
+) -> Result<()> {
+    // arm64 dynamic relocation types.
+    const RELATIVE: u32 = 1027;
+    const GLOB_DAT: u32 = 1025;
+    const JUMP_SLOT: u32 = 1026;
+    const ABS64: u32 = 257;
+
+    let write = |segments: &mut [Segment], addr: u64, value: u64| -> Result<()> {
+        let seg = segments
+            .iter_mut()
+            .find(|s| addr >= s.vaddr && addr + 8 <= s.vaddr + s.memsz)
+            .ok_or_else(|| anyhow::anyhow!("relocation at {addr:#x} outside any segment"))?;
+        let off = (addr - seg.vaddr) as usize;
+        if off + 8 > seg.data.len() {
+            // Relocation into .bss: grow the file data to cover it.
+            seg.data.resize(off + 8, 0);
+        }
+        seg.data[off..off + 8].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    };
+
+    let Some(relocs) = file.dynamic_relocations() else { return Ok(()) };
+    for (offset, r) in relocs {
+        let RelocationFlags::Elf { r_type } = r.flags() else { continue };
+        let addend = r.addend();
+        let value = match r_type {
+            RELATIVE => base.wrapping_add(addend as u64),
+            GLOB_DAT | JUMP_SLOT | ABS64 => {
+                let RelocationTarget::Symbol(idx) = r.target() else {
+                    bail!("relocation type {r_type} without a symbol");
+                };
+                let syms = file.dynamic_symbol_table().ok_or_else(|| anyhow::anyhow!("no dynamic symbols"))?;
+                let sym = syms.symbol_by_index(idx).map_err(|_| anyhow::anyhow!("bad symbol index"))?;
+                if sym.is_undefined() {
+                    bail!("undefined symbol `{}` needs an external library (later M3 slice)", sym.name().unwrap_or("?"));
+                }
+                base + sym.address() + addend as u64
+            }
+            other => bail!("unsupported relocation type {other}"),
+        };
+        write(segments, base + offset, value)?;
+    }
+    Ok(())
+}
+
+/// Where a position-independent executable (ET_DYN) is loaded. Fixed at
+/// translation time, so the 1:1 guest-address model still holds: a shared
+/// object gets a base assigned once and everything is prelinked to it.
+pub const PIE_BASE: u64 = 0x40_0000;
+
 impl Image {
     pub fn load(bytes: &[u8]) -> Result<Image> {
         let file = ElfFile64::<Endianness>::parse(bytes).context("not a 64-bit ELF file")?;
@@ -44,10 +105,11 @@ impl Image {
         if header.e_machine(endian) != elf::EM_AARCH64 {
             bail!("not an arm64 binary (e_machine {})", header.e_machine(endian));
         }
-        if header.e_type(endian) != elf::ET_EXEC {
-            // Static PIE and dynamically linked binaries come later (M3).
-            bail!("only statically linked, non-PIE executables are supported so far");
-        }
+        let base = match header.e_type(endian) {
+            elf::ET_EXEC => 0,
+            elf::ET_DYN => PIE_BASE,
+            other => bail!("unsupported ELF type {other}"),
+        };
         let phoff = header.e_phoff(endian);
         let mut segments = Vec::new();
         let mut interp = false;
@@ -58,7 +120,7 @@ impl Image {
                 elf::PT_LOAD => {
                     let offset = ph.p_offset(endian);
                     let filesz = ph.p_filesz(endian);
-                    let vaddr = ph.p_vaddr(endian);
+                    let vaddr = base + ph.p_vaddr(endian);
                     if phoff >= offset && phoff < offset + filesz {
                         phdr = Some(vaddr + (phoff - offset));
                     }
@@ -75,12 +137,15 @@ impl Image {
             }
         }
         if interp {
-            bail!("dynamically linked binaries aren't supported yet (M3)");
+            // A PT_INTERP means ld.so loads shared libraries at runtime; that
+            // needs the multi-object loader (a later M3 slice).
+            bail!("dynamically linked binaries (with an interpreter) aren't supported yet");
         }
+        apply_relocations(&file, endian, base, &mut segments)?;
         let mut functions: Vec<(u64, String)> = file
             .symbols()
             .filter(|s| s.kind() == SymbolKind::Text && s.address() != 0)
-            .map(|s| (s.address(), s.name().unwrap_or("?").to_string()))
+            .map(|s| (base + s.address(), s.name().unwrap_or("?").to_string()))
             .collect();
         functions.sort();
         functions.dedup_by_key(|f| f.0);
@@ -88,13 +153,13 @@ impl Image {
             .sections()
             .filter(|s| matches!(s.flags(), SectionFlags::Elf { sh_flags } if sh_flags & elf::SHF_EXECINSTR as u64 != 0))
             .filter(|s| s.size() > 0)
-            .map(|s| s.address()..s.address() + s.size())
+            .map(|s| base + s.address()..base + s.address() + s.size())
             .collect();
         if code.is_empty() {
             code = segments.iter().filter(|s| s.exec).map(|s| s.vaddr..s.vaddr + s.data.len() as u64).collect();
         }
         code.sort_by_key(|r| r.start);
-        Ok(Image { entry: header.e_entry(endian), segments, phdr, phnum: header.e_phnum(endian), functions, code })
+        Ok(Image { entry: base + header.e_entry(endian), segments, phdr, phnum: header.e_phnum(endian), functions, code })
     }
 
     /// Decodes every 4-byte-aligned word of code (see `code`). arm64
@@ -207,5 +272,44 @@ mod tests {
         assert!(decoded.windows(2).all(|w| w[1].0 == w[0].0 + 4), "consecutive addresses");
         let (_, word, insn) = decoded.iter().find(|d| d.0 == image.entry).unwrap();
         assert_eq!(insn.as_ref().unwrap().opcode(), *word);
+    }
+}
+
+#[cfg(test)]
+mod pie_tests {
+    use super::*;
+    use crate::testutil;
+
+    #[test]
+    fn static_pie_is_loaded_at_the_pie_base_and_relocated() {
+        let Some(bytes) = testutil::fixture("c/hello.c", &["-O2", "-static-pie"]) else { return };
+        let image = Image::load(&bytes).unwrap();
+        // Segments and entry are placed at the PIE base.
+        assert!(image.entry >= PIE_BASE, "entry {:#x} below the PIE base", image.entry);
+        assert!(image.segments.iter().all(|s| s.vaddr >= PIE_BASE));
+        assert!(image.functions.iter().any(|f| f.1 == "main" && f.0 >= PIE_BASE));
+
+        // A RELATIVE relocation stores an absolute pointer; after prelinking
+        // every such stored code/data pointer must land inside the loaded
+        // image (base applied), not near zero (the un-relocated value).
+        let top = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap();
+        let mut relocated = 0;
+        for seg in image.segments.iter().filter(|s| s.write) {
+            for w in seg.data.chunks_exact(8) {
+                let v = u64::from_le_bytes(w.try_into().unwrap());
+                if (PIE_BASE..top).contains(&v) {
+                    relocated += 1;
+                }
+            }
+        }
+        assert!(relocated > 0, "expected some relocated pointers into the image");
+    }
+
+    #[test]
+    fn dynamically_linked_binaries_are_rejected_for_now() {
+        let Some(bytes) = testutil::fixture("c/hello.c", &["-O2"]) else { return };
+        // Default musl link is dynamic (has a PT_INTERP).
+        let err = Image::load(&bytes).map(|_| ()).unwrap_err().to_string();
+        assert!(err.contains("interpreter") || err.contains("dynamically"), "got: {err}");
     }
 }
