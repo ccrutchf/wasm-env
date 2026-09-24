@@ -18,7 +18,17 @@ struct seg { uint64_t vaddr, filesz, memsz; const uint8_t *data; };
 extern const struct seg guest_segments[];
 extern const uint64_t guest_segment_count, guest_entry, guest_phdr, guest_phnum;
 
-void dispatch(uint64_t pc);
+// The block table, defined by the lifted data module: sorted guest block
+// addresses and their translated functions. `dispatch` maps a guest address
+// to its function; the lifted code routes every branch, call and return
+// through it, so blocks never reference each other directly (which lets them
+// be split across compilation units).
+extern const uint64_t dispatch_addrs[];
+extern void *const dispatch_fns[];
+extern const uint64_t dispatch_count;
+typedef void (*block_fn)(long);
+
+void dispatch(long pc);
 
 enum { SYS_write = 64, SYS_exit_group = 94, SYS_clone = 220, ENOSYS = 38 };
 
@@ -60,6 +70,28 @@ void __wasm_env_fatal(const char *why, uint64_t pc)
 void __wasm_env_bad_target(uint64_t pc)
 {
 	die("jump to an address that wasn't translated", pc);
+}
+
+// Binary search the block table for `pc` and tail-call its function (a
+// WebAssembly return_call, so the host stack doesn't grow). An address with
+// no block was never translated.
+void dispatch(long pc)
+{
+	uint64_t target = (uint64_t)pc;
+	uint64_t lo = 0, hi = dispatch_count;
+	while (lo < hi) {
+		uint64_t mid = lo + (hi - lo) / 2;
+		uint64_t a = dispatch_addrs[mid];
+		if (a == target) {
+			block_fn f = (block_fn)dispatch_fns[mid];
+			__attribute__((musttail)) return f(0);
+		}
+		if (a < target)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	__wasm_env_bad_target(target);
 }
 
 // svc #0: the syscall number is in x8, arguments in x0–x5, the result goes

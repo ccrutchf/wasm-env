@@ -68,10 +68,10 @@ fn translate(input: &str, output: &str, libs: &[String]) -> Result<()> {
     let tc = link::Toolchain::from_env().context("$WASM_CC isn't set (run inside `nix develop`)")?;
     let image_end = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(0);
     let work = std::env::temp_dir().join(format!("wasm-env-translate-{}", std::process::id()));
-    let wasm = link::link(&tc, &lifted.ir, image_end, &work);
+    let wasm = link::link_chunked(&tc, &lifted.data, &lifted.chunks, image_end, &work);
     let _ = std::fs::remove_dir_all(&work);
     std::fs::write(output, wasm?).with_context(|| format!("writing {output}"))?;
-    eprintln!("{input}: {} blocks → {output}", lifted.blocks);
+    eprintln!("{input}: {} blocks in {} module(s) → {output}", lifted.blocks, lifted.chunks.len());
     Ok(())
 }
 
@@ -113,7 +113,7 @@ fn main() -> Result<()> {
             let bytes = std::fs::read(input)?;
             let image = elf::Image::load(&bytes)?;
             let prog = discover::discover(&image);
-            print!("{}", lift::lift(&image, &prog).ir);
+            print!("{}", lift::lift(&image, &prog).ir());
             Ok(())
         }
         _ => bail!("usage: wasm-env-translate census|blocks BINARY | translate BINARY OUT.wasm"),

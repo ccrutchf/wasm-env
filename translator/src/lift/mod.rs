@@ -111,8 +111,9 @@ pub const C: usize = 2;
 pub const V: usize = 3;
 
 /// Builds the body of one block function.
-pub struct Block<'a> {
+pub struct Block {
     pub body: String,
+    addr: u64,
     next_tmp: usize,
     gpr: [Option<String>; 32],
     gpr_dirty: [bool; 32],
@@ -120,14 +121,16 @@ pub struct Block<'a> {
     flags_dirty: [bool; 4],
     vec: [Option<String>; 32],
     vec_dirty: [bool; 32],
-    pub prog: &'a Program,
-    strings: &'a mut Vec<String>,
+    /// Private string constants this block needs (for fatal messages),
+    /// emitted in the same module as the block: (name, LLVM constant text).
+    pub strings: Vec<(String, String)>,
 }
 
-impl<'a> Block<'a> {
-    fn new(prog: &'a Program, strings: &'a mut Vec<String>) -> Self {
+impl Block {
+    fn new(addr: u64) -> Self {
         Block {
             body: String::new(),
+            addr,
             next_tmp: 0,
             gpr: Default::default(),
             gpr_dirty: [false; 32],
@@ -135,8 +138,7 @@ impl<'a> Block<'a> {
             flags_dirty: [false; 4],
             vec: Default::default(),
             vec_dirty: [false; 32],
-            prog,
-            strings,
+            strings: Vec::new(),
         }
     }
 
@@ -544,14 +546,12 @@ impl<'a> Block<'a> {
 
     // --- Control flow ------------------------------------------------------------
 
-    /// Ends the block by jumping to a known address.
+    /// Ends the block by jumping to a known address. All control flow goes
+    /// through `@dispatch` (a binary search over the block table), so blocks
+    /// never reference each other directly and can be split across modules.
     pub fn jump(&mut self, target: u64) {
         self.flush();
-        if self.prog.leaders.contains(&target) {
-            self.line(format!("musttail call void @B_{target:x}(i64 0)"));
-        } else {
-            self.line(format!("musttail call void @dispatch(i64 {})", target as i64));
-        }
+        self.line(format!("musttail call void @dispatch(i64 {})", target as i64));
         self.line("ret void");
     }
 
@@ -572,12 +572,13 @@ impl<'a> Block<'a> {
         self.jump(not_taken);
     }
 
-    /// Stops the program at an instruction that can't be translated.
+    /// Stops the program at an instruction that can't be translated. The
+    /// message is a private constant in the block's own module.
     pub fn fail(&mut self, pc: u64, why: &str) {
-        let k = self.strings.len();
-        self.strings.push(why.to_string());
+        let name = format!("@S_{:x}_{}", self.addr, self.strings.len());
+        self.strings.push((name.clone(), cstring(why.as_bytes())));
         self.flush();
-        self.line(format!("call void @__wasm_env_fatal(ptr @S{k}, i64 {})", pc as i64));
+        self.line(format!("call void @__wasm_env_fatal(ptr {name}, i64 {})", pc as i64));
         self.line("unreachable");
     }
 
@@ -589,21 +590,47 @@ impl<'a> Block<'a> {
     }
 }
 
+/// Roughly how many block functions go in one compilation module. Bounds
+/// clang's memory: a whole translated library can be hundreds of thousands
+/// of blocks, which is infeasible as a single module.
+const BLOCKS_PER_CHUNK: usize = 2000;
+
+/// A lifted block: its guest address, LLVM function body, and the private
+/// string constants (fatal messages) it references.
+type LiftedBlock = (u64, String, Vec<(String, String)>);
+
 pub struct Lifted {
-    pub ir: String,
+    /// The data module: guest state, the guest image, block-function
+    /// declarations, and the dispatch table (block address -> function).
+    pub data: String,
+    /// Code modules, each defining a subset of the block functions.
+    pub chunks: Vec<String>,
     /// Instructions that couldn't be translated, by mnemonic.
     pub unsupported: BTreeMap<String, (usize, String)>,
     pub blocks: usize,
 }
 
-/// Lifts every block and packages the guest image as LLVM IR.
+impl Lifted {
+    /// All modules joined, for `emit`/debugging (not separately compilable).
+    pub fn ir(&self) -> String {
+        let mut s = self.data.clone();
+        for c in &self.chunks {
+            s.push_str("\n; ---- chunk ----\n");
+            s.push_str(c);
+        }
+        s
+    }
+}
+
+/// Lifts every block. Control flow goes through `@dispatch` (defined in the
+/// support code as a binary search over the block table), so block
+/// functions are independent and split across modules for compilation.
 pub fn lift(image: &Image, prog: &Program) -> Lifted {
-    let mut ir = String::new();
-    let mut strings = Vec::new();
     let mut unsupported = BTreeMap::new();
+    let mut blocks: Vec<LiftedBlock> = Vec::new();
 
     for &start in &prog.leaders {
-        let mut b = Block::new(prog, &mut strings);
+        let mut b = Block::new(start);
         let mut pc = start;
         loop {
             let Some(i) = prog.insns.get(&pc) else {
@@ -614,7 +641,6 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(e) => {
-                    // Keep one example error per mnemonic for diagnostics.
                     unsupported.entry(i.op().mnem().to_string()).or_insert_with(|| (0, format!("`{i}`: {e}"))).0 += 1;
                     b.fail(pc, &format!("unsupported instruction `{i}`: {e}"));
                     break;
@@ -626,31 +652,56 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
                 break;
             }
         }
-        let _ = writeln!(ir, "define internal void @B_{start:x}(i64 %_) {{\n{}}}\n", b.body);
+        blocks.push((start, std::mem::take(&mut b.body), std::mem::take(&mut b.strings)));
     }
 
-    // Dispatch: a switch over every block start.
-    ir.push_str("define void @dispatch(i64 %pc) {\n  switch i64 %pc, label %bad [\n");
-    for &a in &prog.leaders {
-        let _ = writeln!(ir, "    i64 {}, label %b_{a:x}", a as i64);
-    }
-    ir.push_str("  ]\n");
-    for &a in &prog.leaders {
-        let _ = writeln!(ir, "b_{a:x}:\n  musttail call void @B_{a:x}(i64 0)\n  ret void");
-    }
-    ir.push_str("bad:\n  call void @__wasm_env_bad_target(i64 %pc)\n  unreachable\n}\n\n");
+    let chunks = build_chunks(&blocks);
+    let data = build_data(image, prog);
+    Lifted { data, chunks, unsupported, blocks: prog.leaders.len() }
+}
 
-    // Guest state, strings, and the guest image for the support code.
+/// Assembles the code modules: block definitions grouped into chunks, each
+/// with the declarations it needs.
+fn build_chunks(blocks: &[LiftedBlock]) -> Vec<String> {
+    let preamble = format!(
+        "target triple = \"wasm64-unknown-unknown\"\n\
+         @R = external global [32 x i64]\n\
+         @F = external global [4 x i8]\n\
+         @V = external global [32 x i128]\n\
+         @TP = external global i64\n\
+         declare void @dispatch(i64)\n\
+         declare void @__wasm_env_svc()\n\
+         declare void @__wasm_env_fatal(ptr, i64)\n\
+         declare void @__wasm_env_bad_target(i64)\n{}",
+        intrinsics()
+    );
+    blocks
+        .chunks(BLOCKS_PER_CHUNK)
+        .map(|group| {
+            let mut m = preamble.clone();
+            for (addr, body, strings) in group {
+                for (name, text) in strings {
+                    let _ = writeln!(m, "{name} = private constant {text}");
+                }
+                let _ = writeln!(m, "define void @B_{addr:x}(i64 %_) {{\n{body}}}\n");
+            }
+            m
+        })
+        .collect()
+}
+
+/// Builds the data module: guest state, the guest image, and the dispatch
+/// table mapping each block address to its function.
+fn build_data(image: &Image, prog: &Program) -> String {
+    let mut ir = String::from("target triple = \"wasm64-unknown-unknown\"\n");
     ir.push_str("@R = global [32 x i64] zeroinitializer, align 8\n");
     ir.push_str("@F = global [4 x i8] zeroinitializer\n");
     ir.push_str("@V = global [32 x i128] zeroinitializer, align 16\n");
     ir.push_str("@TP = global i64 0\n\n");
-    for (k, s) in strings.iter().enumerate() {
-        let _ = writeln!(ir, "@S{k} = private constant [{} x i8] {}", s.len() + 1, cstring(s.as_bytes()));
-    }
-    ir.push_str("\n%seg = type { i64, i64, i64, ptr }\n");
+
+    ir.push_str("%seg = type { i64, i64, i64, ptr }\n");
     for (k, s) in image.segments.iter().enumerate() {
-        let _ = writeln!(ir, "@seg{k} = private constant [{} x i8] {}", s.data.len() + 1, cstring(&s.data));
+        let _ = writeln!(ir, "@seg{k} = private constant [{} x i8] {}", s.data.len(), cstring_raw(&s.data));
     }
     let _ = write!(ir, "@guest_segments = constant [{} x %seg] [", image.segments.len());
     for (k, s) in image.segments.iter().enumerate() {
@@ -668,11 +719,30 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
     let _ = writeln!(ir, "@guest_phdr = constant i64 {}", image.phdr.unwrap_or(0) as i64);
     let _ = writeln!(ir, "@guest_phnum = constant i64 {}\n", image.phnum);
 
-    ir.push_str(
-        "declare void @__wasm_env_fatal(ptr, i64)\n\
-         declare void @__wasm_env_bad_target(i64)\n\
-         declare void @__wasm_env_svc()\n",
-    );
+    // Declare every block function, then build the dispatch table: parallel
+    // arrays of sorted addresses and their function pointers, searched by
+    // the support code's `dispatch`.
+    for &a in &prog.leaders {
+        let _ = writeln!(ir, "declare void @B_{a:x}(i64)");
+    }
+    let n = prog.leaders.len();
+    let _ = write!(ir, "@dispatch_addrs = constant [{n} x i64] [");
+    for (i, &a) in prog.leaders.iter().enumerate() {
+        let _ = write!(ir, "{}i64 {}", if i == 0 { "" } else { ", " }, a as i64);
+    }
+    ir.push_str("]\n");
+    let _ = write!(ir, "@dispatch_fns = constant [{n} x ptr] [");
+    for (i, &a) in prog.leaders.iter().enumerate() {
+        let _ = write!(ir, "{}ptr @B_{a:x}", if i == 0 { "" } else { ", " });
+    }
+    ir.push_str("]\n");
+    let _ = writeln!(ir, "@dispatch_count = constant i64 {n}");
+    ir
+}
+
+/// The LLVM intrinsic declarations the lifted code may call.
+fn intrinsics() -> String {
+    let mut ir = String::new();
     for t in ["i32", "i64"] {
         let _ = writeln!(
             ir,
@@ -686,7 +756,6 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
         );
     }
     ir.push_str("declare i16 @llvm.bswap.i16(i16)\n");
-    // Integer min/max and per-lane intrinsics, at every vector element width.
     for t in ["i8", "i16", "i32", "i64"] {
         let _ = writeln!(
             ir,
@@ -708,15 +777,14 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
              declare {t} @llvm.maxnum.{s}({t}, {t})"
         );
     }
-
-    Lifted { ir, unsupported, blocks: prog.leaders.len() }
+    ir
 }
 
-/// An LLVM `c"..."` constant with a trailing NUL.
-fn cstring(bytes: &[u8]) -> String {
+/// An LLVM array constant `[N x i8] c"..."` (no added NUL).
+fn cstring_raw(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2 + 4);
     s.push_str("c\"");
-    for &b in bytes.iter().chain([&0]) {
+    for &b in bytes {
         if (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\' {
             s.push(b as char);
         } else {
@@ -725,4 +793,9 @@ fn cstring(bytes: &[u8]) -> String {
     }
     s.push('"');
     s
+}
+
+/// An LLVM `[N x i8] c"..."` constant with a trailing NUL (for C strings).
+fn cstring(bytes: &[u8]) -> String {
+    format!("[{} x i8] {}", bytes.len() + 1, cstring_raw(&[bytes, &[0]].concat()))
 }

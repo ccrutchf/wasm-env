@@ -638,7 +638,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         // --- Scalar floating point ---------------------------------------------------------
         "fadd" | "fsub" | "fmul" | "fdiv" | "fnmul" | "fmin" | "fmax" | "fminnm" | "fmaxnm" if is_scalar_fp(ops) => {
             let (d, bits) = fp_reg(&ops[0])?;
-            let (ty, s) = fp_ty(bits)?;
+            let ty = fp_ty(bits)?.0;
             let x = read_fp(b, &ops[1], bits)?;
             let y = read_fp(b, &ops[2], bits)?;
             let r = match m {
@@ -650,8 +650,16 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                     let p = b.val(format!("fmul {ty} {x}, {y}"));
                     b.val(format!("fneg {ty} {p}"))
                 }
-                "fmin" | "fminnm" => b.val(format!("call {ty} @llvm.minnum.{s}({ty} {x}, {ty} {y})")),
-                _ => b.val(format!("call {ty} @llvm.maxnum.{s}({ty} {x}, {ty} {y})")),
+                // Compare + select (no wasm fmin/fmax, and llvm.minnum needs
+                // libm). Differs from arm64 only on NaN and signed zero.
+                "fmin" | "fminnm" => {
+                    let c = b.val(format!("fcmp olt {ty} {x}, {y}"));
+                    b.val(format!("select i1 {c}, {ty} {x}, {ty} {y}"))
+                }
+                _ => {
+                    let c = b.val(format!("fcmp ogt {ty} {x}, {y}"));
+                    b.val(format!("select i1 {c}, {ty} {x}, {ty} {y}"))
+                }
             };
             write_fp(b, d, r, bits)?;
         }
@@ -667,14 +675,24 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             write_fp(b, d, r, bits)?;
         }
         "fmadd" | "fmsub" | "fnmadd" | "fnmsub" => {
+            // WebAssembly has no fused multiply-add, and lowering @llvm.fma
+            // needs a libm `fma`. Use a separate multiply and add: two
+            // roundings instead of one, a last-bit difference from true FMA.
             let (d, bits) = fp_reg(&ops[0])?;
-            let (ty, s) = fp_ty(bits)?;
+            let ty = fp_ty(bits)?.0;
             let x = read_fp(b, &ops[1], bits)?;
             let y = read_fp(b, &ops[2], bits)?;
             let a = read_fp(b, &ops[3], bits)?;
-            let x = if matches!(m, "fnmadd" | "fnmsub") { b.val(format!("fneg {ty} {x}")) } else { x };
-            let a = if matches!(m, "fmsub" | "fnmadd") { b.val(format!("fneg {ty} {a}")) } else { a };
-            let r = b.val(format!("call {ty} @llvm.fma.{s}({ty} {x}, {ty} {y}, {ty} {a})"));
+            let p = b.val(format!("fmul {ty} {x}, {y}"));
+            let r = match m {
+                "fmadd" => b.val(format!("fadd {ty} {a}, {p}")),
+                "fmsub" => b.val(format!("fsub {ty} {a}, {p}")),
+                "fnmsub" => b.val(format!("fsub {ty} {p}, {a}")),
+                _ => {
+                    let s = b.val(format!("fadd {ty} {a}, {p}"));
+                    b.val(format!("fneg {ty} {s}")) // fnmadd = -(a + x*y)
+                }
+            };
             write_fp(b, d, r, bits)?;
         }
         "fcmp" | "fcmpe" => {

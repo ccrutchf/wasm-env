@@ -62,6 +62,7 @@ fn run(cmd: &mut Command) -> Result<()> {
 
 /// Compiles and links `ir` with the support code into a WebAssembly
 /// module, using `work` for intermediate files.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn link(tc: &Toolchain, ir: &str, image_end: u64, work: &Path) -> Result<Vec<u8>> {
     std::fs::create_dir_all(work)?;
     let (ll, lifted_o) = (work.join("lifted.ll"), work.join("lifted.o"));
@@ -86,6 +87,73 @@ pub fn link(tc: &Toolchain, ir: &str, image_end: u64, work: &Path) -> Result<Vec
     Ok(std::fs::read(&wasm)?)
 }
 
+/// Compiles a chunked program (a data module plus several code modules) and
+/// the support code into one WebAssembly module. Each module compiles
+/// separately, in parallel, so memory stays bounded no matter how large the
+/// translated program is.
+pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u64, work: &Path) -> Result<Vec<u8>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    std::fs::create_dir_all(work)?;
+
+    // The data module and support code compile like any other unit; the data
+    // module is only declarations and tables, so it needs no optimization.
+    let support_c = work.join("support.c");
+    std::fs::write(&support_c, SUPPORT_C)?;
+    let data_ll = work.join("data.ll");
+    std::fs::write(&data_ll, data)?;
+
+    // (source path, output object, opt level) for every unit.
+    let mut units: Vec<(PathBuf, PathBuf, String)> = vec![
+        (data_ll, work.join("data.o"), "-O0".into()),
+        (support_c.clone(), work.join("support.o"), "-O2".into()),
+    ];
+    for (i, chunk) in chunks.iter().enumerate() {
+        let ll = work.join(format!("chunk{i}.ll"));
+        std::fs::write(&ll, chunk)?;
+        units.push((ll, work.join(format!("chunk{i}.o")), lift_opt()));
+    }
+
+    // Compile in parallel across the available cores.
+    let next = AtomicUsize::new(0);
+    let errors = std::sync::Mutex::new(Vec::<String>::new());
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                while let Some((src, obj, opt)) = units.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let is_c = src.extension().is_some_and(|e| e == "c");
+                    let mut cmd = Command::new(&tc.cc);
+                    cmd.args(WASM_FLAGS).arg(opt);
+                    if is_c {
+                        cmd.args(["-ffreestanding", "-nostdlib"]);
+                    }
+                    cmd.arg("-c").arg(src).arg("-o").arg(obj);
+                    if let Err(e) = run(&mut cmd) {
+                        errors.lock().unwrap().push(e.to_string());
+                    }
+                }
+            });
+        }
+    });
+    let errors = errors.into_inner().unwrap();
+    if !errors.is_empty() {
+        bail!("compiling modules failed:\n{}", errors.join("\n"));
+    }
+
+    let wasm = work.join("program.wasm");
+    let mut ld = Command::new(&tc.wasm_ld);
+    ld.args(["-m", "wasm64", "--no-entry", "-z", "stack-size=1048576"])
+        .arg(format!("--global-base={}", global_base(image_end)))
+        .args(["--export=__stack_pointer", "--export=__heap_base"])
+        .args(["--export=R", "--export=F", "--export=V", "--export=TP"]);
+    for (_, obj, _) in &units {
+        ld.arg(obj);
+    }
+    ld.args(tc.builtins.iter()).arg("-o").arg(&wasm);
+    run(&mut ld)?;
+    Ok(std::fs::read(&wasm)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +170,7 @@ target triple = "wasm64-unknown-unknown"
 declare void @__wasm_env_svc()
 declare void @__wasm_env_fatal(ptr, i64)
 declare void @__wasm_env_bad_target(i64)
+declare void @dispatch(i64)
 "#;
 
     /// A one-segment guest image at 0x400000: 16 bytes of data, 64 KB total.
@@ -121,18 +190,21 @@ declare void @__wasm_env_bad_target(i64)
         format!("  %p{n}_{v} = getelementptr [32 x i64], ptr @R, i64 0, i64 {n}\n  store i64 {v}, ptr %p{n}_{v}\n")
     }
 
+    /// The dispatch table for a program whose only block is at guest_entry
+    /// (0x400000). `dispatch` (in the support code) routes to it.
+    const TABLE: &str = r#"
+@dispatch_addrs = constant [1 x i64] [i64 4194304]
+@dispatch_fns = constant [1 x ptr] [ptr @B_400000]
+@dispatch_count = constant i64 1
+"#;
+
     /// A program whose single block at the entry runs `body`, then exits
     /// with status 0 through svc.
     fn program(body: &str) -> String {
         format!(
-            "{PRELUDE}{IMAGE}
-define void @dispatch(i64 %pc) {{
-  switch i64 %pc, label %bad [ i64 4194304, label %entry ]
-entry:
+            "{PRELUDE}{IMAGE}{TABLE}
+define void @B_400000(i64 %_) {{
 {body}{}  call void @__wasm_env_svc()
-  unreachable
-bad:
-  call void @__wasm_env_bad_target(i64 %pc)
   unreachable
 }}
 ",
@@ -302,9 +374,9 @@ bad:
     #[test]
     fn fatal_errors_name_the_guest_address() {
         let ir = format!(
-            "{PRELUDE}{IMAGE}
+            "{PRELUDE}{IMAGE}{TABLE}
 @msg = private constant [22 x i8] c\"unsupported `foo x0`\\00\\00\"
-define void @dispatch(i64 %pc) {{
+define void @B_400000(i64 %_) {{
   call void @__wasm_env_fatal(ptr @msg, i64 4194308)
   unreachable
 }}
@@ -319,15 +391,10 @@ define void @dispatch(i64 %pc) {{
     #[test]
     fn jumps_to_untranslated_addresses_are_reported() {
         let ir = format!(
-            "{PRELUDE}{IMAGE}
-define void @dispatch(i64 %pc) {{
-  switch i64 %pc, label %bad [ i64 4194304, label %entry ]
-entry:
+            "{PRELUDE}{IMAGE}{TABLE}
+define void @B_400000(i64 %_) {{
   musttail call void @dispatch(i64 12345)
   ret void
-bad:
-  call void @__wasm_env_bad_target(i64 %pc)
-  unreachable
 }}
 "
         );
