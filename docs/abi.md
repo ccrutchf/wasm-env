@@ -101,6 +101,11 @@ M1 must pick a `fork` strategy. The ABI above doesn't rule any of them out:
 - `long double` is 128-bit IEEE quad, as on arm64 Linux, emulated in software (compiler-rt builtins).
 - Linking is static: `crt1.o`, the program, `libc.a` and compiler-rt builtins, linked by `wasm-ld`. Dynamic linking is out of scope.
 
+## Planned versions
+
+- **Version 1: dynamic linking** (PLAN.md, M3). Several modules in one process, sharing one memory and one function table, loaded and linked by the runtime at run time, including `dlopen`. Needed so translated programs can load shared libraries such as Python extension modules. Translated modules use glibc's symbol versions.
+- **Version 2: threads** (PLAN.md, M6). Shared memory, atomics and `clone(CLONE_THREAD)`, with real thread-local storage. Needed for PyTorch.
+
 ## Versioning
 
 The module declares the ABI version it was built for in a custom section named `wasm-env.abi`, containing the version number as a LEB128 integer. Version 0 is this document. The runtime refuses versions it doesn't know.

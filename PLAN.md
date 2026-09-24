@@ -18,6 +18,7 @@ Both paths produce the same kind of module and run on the same runtime, so there
 
 ## Goals
 
+- **Primary workload: Ubuntu images running existing Python wheels.** Unmodified manylinux wheels from PyPI, including C extensions like numpy and pandas, and eventually PyTorch (CPU). Ubuntu 24.04 LTS, arm64 images first.
 - Existing OCI images convert to a single `wasi/wasm` image that runs identically on macOS arm64, Windows x86_64 and Linux x86_64.
 - Linux-compatible environment: shell, processes, pipes, filesystem, env vars, exit codes.
 - Runs on a native runtime on each host (not in a browser).
@@ -26,9 +27,10 @@ Both paths produce the same kind of module and run on the same runtime, so there
 
 ## Non-goals (for now)
 
-- GUI, GPU.
-- JIT-based runtimes (Node/V8, JVM). They generate machine code at runtime, which ahead-of-time translation can't see; revisit later.
-- Multithreaded binaries (see the memory-ordering risk below).
+- GUI.
+- GPU. Research for much later: running CUDA kernels through wgpu (see "GPU research" below).
+- JIT-based runtimes (Node/V8, JVM). They generate machine code at runtime, which ahead-of-time translation can't see; revisit later. Libraries with an internal JIT (oneDNN in PyTorch) must run with it disabled.
+- Multithreading, until the PyTorch milestone (see Milestones). numpy and pandas run single-threaded (`OPENBLAS_NUM_THREADS=1`).
 
 ## Approach: hybrid
 
@@ -41,6 +43,14 @@ For each binary, use the first path that works:
 
    Start with arm64 to prove the translator, then add x86-64 for coverage. Both frontends lift to the same LLVM IR, so everything after lifting is shared.
 3. **CPU emulation (last resort).** Emulate the CPU inside WASM (as container2wasm does). Slow (5–50×), but it keeps things working. Avoid where possible.
+
+### One world per process
+
+Code inside a process shares a libc, `malloc`, data structures and calling conventions, so **each process is either entirely native (recompiled, musl) or entirely translated (from the image, usually glibc).** Processes only talk through syscalls, so mixing across process boundaries is fine: a native shell can start a translated `python3`.
+
+This is why we don't port glibc. A Python that loads manylinux wheels must be a translated process: Ubuntu's own `python3`, its glibc and `libstdc++`, and the wheels' `.so` files, all translated from arm64. glibc arrives with it as ordinary translated code. musl remains the libc for recompiled software.
+
+Recompiled wheels (built for our platform, like Pyodide does for its WebAssembly Python) are a later speed-up for the hottest packages. They would need a native Python and a wheel build farm.
 
 ## Architecture
 
@@ -83,9 +93,11 @@ The full specification is [docs/abi.md](docs/abi.md) (version 0). Summary:
 
 - Lift machine code to LLVM IR (remill/McSema or rev.ng style), then compile to WASM with LLVM's WASM backend.
 - Find code by recursive disassembly from entry points and symbols. Indirect jumps go through a dispatch table of known targets. Unknown targets trap to a runtime translation fallback.
-- Link each executable with its shared libraries at conversion time, since the whole image is known. This avoids WASM's immature dynamic linking.
 - Use memory64 (standardized in Wasm 3.0) so translated 64-bit pointers work unchanged.
-- **Cache by file hash.** Layers are shared across images, so a given musl libc or python binary is translated once.
+- **Dynamic linking, not just link-time merging.** Python loads wheels with `dlopen`, and `pip install` adds new `.so` files after the image was converted. So each shared object translates to its own WASM module, and the runtime loads and links them at run time: all modules share one memory and one function table, and the runtime's loader resolves symbols (including glibc's symbol versions). This needs ABI version 1 (docs/abi.md is static-only today).
+- **Translate at first load, cache by file hash** (the Rosetta 2 model). Image conversion pre-translates what's in the image; anything added later translates the first time it's loaded. Layers are shared across images, so a given glibc or `libpython` is translated once.
+- **SIMD and CPU features.** arm64's NEON is 128-bit, the same width as WASM SIMD, so numpy's and OpenBLAS's NEON kernels translate closely. Libraries choose kernels by reading `AT_HWCAP` (arm64) or `cpuid` (x86-64); the runtime advertises exactly what translates well (NEON yes, SVE no; on x86-64, SSE up to 4.2, not AVX).
+- **C++ exceptions.** Translated C++ unwinds with DWARF `.eh_frame` data through `libgcc_s`. Throwing through translated frames needs either a translated unwinder that understands translated frames, or a mapping onto WASM exceptions. PyTorch needs this; numpy and pandas mostly don't.
 
 ### Runtime
 
@@ -119,13 +131,13 @@ The full specification is [docs/abi.md](docs/abi.md) (version 0). Summary:
 
 - **M-1 — wasm32 vs memory64 benchmarks (done on Linux x86-64).** Decided the native ABI's memory model: memory64 with masked addressing, ~1.2× native (~1.12× excluding interpreters), on wasmtime. See [Benchmarks](#m-1-benchmarks) below.
 - **M0 — Native ABI (done on Linux x86-64).** Specified in [docs/abi.md](docs/abi.md). musl 1.2.6 ported to `wasm64` (`toolchain/musl-overlay`), compiler-rt builtins, a `wasm64-linux-musl-cc` wrapper, and the `wasm-env` runtime (`runtime/`, about 50 syscalls). A C test program and BusyBox 1.37 (44 applets, 294 KB) pass `tests/m0.sh` (20 checks). Still to do: run it on the Mac and on Windows. See [M0 notes](#m0-notes).
-- **M1 — Shell.** `busybox sh -c` with pipes and subshells: fork, execve, wait4, pipe, dup2. A non-trivial script gives identical output on all hosts.
-- **M2 — Native userland.** Recompile a small Alpine-based set (bash, coreutils, python3) and package it as a `wasi/wasm` OCI image; `wasm-env run` opens a shell in it.
-- **M3 — arm64 translation.** Translate the static arm64 BusyBox from `alpine` to the same ABI. Compare its output and performance against the recompiled BusyBox from M0 — a built-in correctness and performance baseline.
-- **M4 — Image conversion.** `wasm-env convert alpine:latest`: substitute recompiled packages, translate the rest (including dynamically linked binaries and `.so` files, linked at conversion time), output a `wasi/wasm` image. Translation cache in place.
-- **M5 — x86-64 translation.** Add the x86-64 frontend, starting with single-threaded binaries, then x86-only images.
-- **M6 — Breadth.** glibc/Debian-based images, networking (sockets, exposed ports), host mounts.
-- **Later.** Runtime translation fallback for unknown jump targets, CPU emulation fallback, threads, JIT workloads.
+- **M1 — Processes and a shell.** `posix_spawn`/`vfork`+`execve`, `wait4`, pipes, `dup2`, basic signals; BusyBox `sh` with pipes and subshells. Needed by every path. A non-trivial script gives identical output on all hosts.
+- **M2 — arm64 translation, static.** Lift a static arm64 binary to WASM against the same ABI. Start with arm64 BusyBox and compare it to the recompiled BusyBox from M0: a built-in correctness and performance baseline.
+- **M3 — Translated dynamic linking.** ABI version 1 (shared memory and function table across modules), the runtime's loader, and translate-on-first-load with caching. Goal: Ubuntu 24.04 arm64's own `python3 -c 'print(1)'`, with its glibc, running translated.
+- **M4 — Python wheels.** `pip install` into the translated Python and import binary wheels: first a small C extension (`markupsafe`), then **numpy** (with bundled OpenBLAS, single-threaded), then **pandas**. Measure against native arm64.
+- **M5 — Ubuntu images.** `wasm-env convert ubuntu:24.04` (arm64): pre-translate the image, keep dpkg metadata, and `wasm-env run` gives a shell in it. Networking (sockets, DNS) so `pip` can reach PyPI.
+- **M6 — PyTorch (CPU).** Threads (ABI version 2: shared memory, atomics, `clone`), C++ exceptions through translated code, and oneDNN's JIT disabled. Goal: `import torch` and a small model's forward pass.
+- **Later.** Native recompiled userland and recompiled wheels for hot packages (nixpkgs cross-compilation; Pyodide recipes); x86-64 translation for x86-only images; runtime translation fallback; CPU emulation fallback; GPU (below).
 
 ## M-1 benchmarks
 
@@ -246,6 +258,15 @@ Native code gets memory isolation for free from the CPU's memory hardware, but o
 - Paths must be valid UTF-8; file-backed `mmap` is read-only.
 - Not yet run on macOS or Windows. The Windows-specific code (symlinks, permissions, `stat`) has never been compiled.
 
+## GPU research (much later)
+
+The eventual wish: run CUDA kernels from existing PyTorch wheels on any host's GPU through wgpu (Vulkan, Metal, DirectX 12). Two possible shapes:
+
+- **A CUDA driver inside the runtime.** Implement `libcuda`/`libcudart` as runtime services: memory management, streams and kernel launches. Translate each kernel's PTX to WGSL or SPIR-V and run it with wgpu. ZLUDA and chipStar show that translating PTX works. The hard part is cuBLAS and cuDNN: they are closed binaries, often without PTX, so their APIs would need our own implementations on top of wgpu. WGSL's limits (no 64-bit pointers, limited atomics, little fp64) are a further constraint.
+- **A PyTorch device backend on wgpu** (PyTorch's `PrivateUse1` extension point), bypassing CUDA entirely. Less general, but more achievable.
+
+Either way the runtime would expose the GPU to the process through host functions, the way FEX-Emu's "thunks" hand some library calls to native host implementations.
+
 ## Risks
 
 - **Finding all the code.** Static disassembly is undecidable in general (indirect jumps, jump tables, data mixed with code), and worst on x86-64's variable-length instructions. Mitigated by arm64-first, dispatch tables and a runtime fallback.
@@ -256,6 +277,10 @@ Native code gets memory isolation for free from the CPU's memory hardware, but o
 - **Performance of lifted code.** Lifting loses types and structure, so the generated WASM may be well above the 2–3× target. Measure from M0.
 - **Maintaining a wasmtime patch.** Masked addressing lives in a safety-critical file we patch ourselves. Every wasmtime upgrade needs the patch re-applied and re-reviewed until it is upstream or a supported option.
 - **Interpreter performance.** The M-1 interpreter loop runs ~3× slower than native in WASM. bash and Python are interpreters, so this hits the first workloads directly. Investigate Cranelift's codegen for switch dispatch, and try a real interpreter (Lua or CPython) early.
+- **Numerical performance of translated code.** numpy, pandas and PyTorch spend their time in SIMD kernels and BLAS. NEON maps well onto WASM SIMD, but anything wider (SVE, AVX2/AVX-512 on x86-64) doesn't, and lifted code loses some optimization. Expect numerical code to be the slowest workload; recompiled wheels are the fallback for hot packages.
+- **Runtime dynamic linking.** WebAssembly has no standard dynamic linking. Our loader must place modules in one shared memory and function table, apply relocations and resolve versioned glibc symbols, and translate new `.so` files on first load without long pauses.
+- **Size of PyTorch.** `libtorch_cpu.so` is hundreds of MB of machine code. Translation time, cache size and Cranelift compile time all scale with it.
+- **Code generated inside libraries.** oneDNN (PyTorch) and some BLAS builds generate machine code at runtime. They must be configured to use their non-JIT paths until a runtime translation fallback exists.
 
 ## Open questions
 
@@ -267,6 +292,9 @@ Native code gets memory isolation for free from the CPU's memory hardware, but o
   - Existing WASM package efforts.
 - Should the translation cache be shareable, for example a registry of pre-translated layers?
 - Exact host list — is Windows on ARM in scope?
+- Ubuntu version and architecture: assumed 24.04 LTS, arm64 first. Is x86-64 Ubuntu needed early (for x86-only wheels)?
+- Performance bar for translated numerical code: assumed "works, possibly 2–5× slower" at first, with recompiled wheels as the later speed-up.
+- When do we need PyTorch's threads badly enough to pull M6 forward?
 - Docker interop depth, for example running converted images via runwasi/containerd.
 
 ## Prior art to study
@@ -281,3 +309,6 @@ Native code gets memory isolation for free from the CPU's memory hardware, but o
 - Linux kernel ported to WASM (experimental)
 - Google Native Client (NaCl): software fault isolation using x86-32 segments, and masking plus guard regions on x86-64. The model for our masked addressing
 - Docker + runwasi / containerd WASM shims
+- Pyodide: CPython and scientific packages (numpy, pandas, scipy) recompiled for WebAssembly, with build recipes and a wheel platform tag. The model for recompiled wheels
+- ZLUDA (CUDA on non-NVIDIA GPUs via PTX translation), chipStar (CUDA/HIP on SPIR-V): GPU research
+- FEX-Emu thunks: forwarding selected library calls from translated code to native host libraries
