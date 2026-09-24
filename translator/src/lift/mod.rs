@@ -521,6 +521,14 @@ impl Block {
                 self.write(reg(*r)?.0, next, 64)?;
                 b
             }
+            // Post-index by a register: [xn], xm.
+            Operand::MemPostIdxReg([r, step]) => {
+                let b = base(self, r)?;
+                let s = base(self, step)?;
+                let next = self.val(format!("add i64 {b}, {s}"));
+                self.write(reg(*r)?.0, next, 64)?;
+                b
+            }
             Operand::MemExt { regs, shift, .. } => {
                 let b = base(self, &regs[0])?;
                 let (ir, ibits) = reg(regs[1])?;
@@ -674,7 +682,8 @@ fn build_chunks(blocks: &[LiftedBlock]) -> Vec<String> {
          declare void @dispatch(i64)\n\
          declare void @__wasm_env_svc()\n\
          declare void @__wasm_env_fatal(ptr, i64)\n\
-         declare void @__wasm_env_bad_target(i64)\n{}",
+         declare void @__wasm_env_bad_target(i64)\n\
+         declare i32 @__wasm_env_crc32(i32, i64, i32, i32)\n{}",
         intrinsics()
     );
     blocks
@@ -737,6 +746,20 @@ fn build_data(image: &Image, prog: &Program) -> String {
     let table = if entries.is_empty() { "zeroinitializer".to_string() } else { format!("[{}]", entries.join(", ")) };
     let _ = writeln!(ir, "@guest_libs = constant [{} x %lib] {table}", image.libs.len());
     let _ = writeln!(ir, "@guest_lib_count = constant i64 {}", image.libs.len());
+
+    // Every object, for error messages.
+    for (k, (name, _, _)) in image.objects.iter().enumerate() {
+        let _ = writeln!(ir, "@objname{k} = private constant {}", cstring(name.as_bytes()));
+    }
+    let objects: Vec<String> = image
+        .objects
+        .iter()
+        .enumerate()
+        .map(|(k, (_, base, end))| format!("%lib {{ ptr @objname{k}, i64 {}, i64 {} }}", *base as i64, *end as i64))
+        .collect();
+    let table = if objects.is_empty() { "zeroinitializer".to_string() } else { format!("[{}]", objects.join(", ")) };
+    let _ = writeln!(ir, "@guest_objects = constant [{} x %lib] {table}", image.objects.len());
+    let _ = writeln!(ir, "@guest_object_count = constant i64 {}", image.objects.len());
     let _ = writeln!(ir, "@guest_phnum = constant i64 {}\n", image.phnum);
 
     // Declare every block function, then build the dispatch table: parallel

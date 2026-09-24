@@ -47,6 +47,9 @@ pub struct Image {
     /// Libraries the dynamic linker will map at run time: (the path it will
     /// open, prelinked base, end). The support code places them here.
     pub libs: Vec<(String, u64, u64)>,
+    /// Every object in the image (name, base, end), for naming addresses in
+    /// error messages.
+    pub objects: Vec<(String, u64, u64)>,
 }
 
 /// Where a position-independent executable (ET_DYN) is loaded. Bases are
@@ -266,7 +269,8 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
 /// The first object is the executable (its program headers win). With
 /// `interp`, the last object is the dynamic linker: the image starts there,
 /// and relocations we don't model are left for it to apply at run time.
-fn link(objects: Vec<Parsed>, interp: bool, libs: Vec<(String, u64, u64)>) -> Result<Image> {
+fn link(objects: Vec<Parsed>, interp: bool, libs: Vec<(String, u64, u64)>, names: Vec<String>) -> Result<Image> {
+    let placed: Vec<(String, u64, u64)> = names.into_iter().zip(&objects).map(|(n, o)| (n, o.base, o.top)).collect();
     // arm64 dynamic relocation types.
     const RELATIVE: u32 = 1027;
     const GLOB_DAT: u32 = 1025;
@@ -326,7 +330,7 @@ fn link(objects: Vec<Parsed>, interp: bool, libs: Vec<(String, u64, u64)>) -> Re
     code.sort_by_key(|r| r.start);
     functions.sort();
     functions.dedup_by_key(|f| f.0);
-    Ok(Image { entry, segments, phdr, phnum, functions, code, app_entry, interp_base, roots, libs })
+    Ok(Image { entry, segments, phdr, phnum, functions, code, app_entry, interp_base, roots, libs, objects: placed })
 }
 
 /// Writes an 8-byte little-endian value at a guest address, growing the
@@ -348,7 +352,7 @@ impl Image {
     /// Loads a single statically-linked or position-independent executable.
     pub fn load(bytes: &[u8]) -> Result<Image> {
         let base = elf_base(bytes)?;
-        link(vec![parse_object(bytes, base)?], false, Vec::new())
+        link(vec![parse_object(bytes, base)?], false, Vec::new(), vec!["program".into()])
     }
 
     /// Loads a dynamically-linked executable together with the shared
@@ -373,7 +377,8 @@ impl Image {
             }
             objects.push(obj);
         }
-        link(objects, interp.is_some(), placed)
+        let names = std::iter::once("program".to_string()).chain(libs.iter().chain(interp).map(|(n, _)| n.clone())).collect();
+        link(objects, interp.is_some(), placed, names)
     }
 
     /// Decodes every 4-byte-aligned word of code (see `code`). arm64

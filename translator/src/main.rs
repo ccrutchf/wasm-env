@@ -97,11 +97,12 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     for l in &inputs.libs {
         libs.push(read(l, l.as_ref())?);
     }
-    let image = if libs.is_empty() && interp.is_none() {
+    let mut image = if libs.is_empty() && interp.is_none() {
         elf::Image::load(&bytes)?
     } else {
         elf::Image::load_dynamic(&bytes, &libs, interp.as_ref())?
     };
+    image.objects[0].0 = input.to_string();
     if let Some(path) = &inputs.deps_out {
         let list: String = read_files.borrow().iter().map(|p| format!("{}\n", p.display())).collect();
         std::fs::write(path, list).with_context(|| format!("writing {path}"))?;
@@ -115,7 +116,15 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     let image_end = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(0);
     let work = std::env::temp_dir().join(format!("wasm-env-translate-{}", std::process::id()));
     let wasm = link::link_chunked(&tc, &lifted.data, &lifted.chunks, image_end, &work);
-    let _ = std::fs::remove_dir_all(&work);
+    // WASM_ENV_KEEP_WORK=1 keeps the generated IR and objects for debugging.
+    if std::env::var_os("WASM_ENV_KEEP_WORK").is_some() {
+        eprintln!("kept {}", work.display());
+        for (name, base, end) in &image.libs {
+            eprintln!("  {base:#x}..{end:#x} {name}");
+        }
+    } else {
+        let _ = std::fs::remove_dir_all(&work);
+    }
     std::fs::write(output, wasm?).with_context(|| format!("writing {output}"))?;
     eprintln!("{input}: {} blocks in {} module(s) → {output}", lifted.blocks, lifted.chunks.len());
     Ok(())

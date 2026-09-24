@@ -186,6 +186,8 @@ declare void @dispatch(i64)
 %lib = type { ptr, i64, i64 }
 @guest_libs = constant [0 x %lib] zeroinitializer
 @guest_lib_count = constant i64 0
+@guest_objects = constant [0 x %lib] zeroinitializer
+@guest_object_count = constant i64 0
 "#;
 
     const IMAGE_END: u64 = 0x410000;

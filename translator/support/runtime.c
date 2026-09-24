@@ -55,12 +55,29 @@ static void put_hex(uint64_t v)
 	put(buf, 18);
 }
 
+struct lib { const char *path; uint64_t base, end; };
+
+// Every object in the image (program, libraries, dynamic linker), for naming
+// addresses in error messages.
+extern const struct lib guest_objects[];
+extern const uint64_t guest_object_count;
+
 _Noreturn static void die(const char *what, uint64_t pc)
 {
 	put("wasm-env: translated program: ", 30);
 	put(what, len(what));
 	put(" at ", 4);
 	put_hex(pc);
+	for (uint64_t k = 0; k < guest_object_count; k++) {
+		const struct lib *o = &guest_objects[k];
+		if (pc >= o->base && pc < o->end) {
+			put(" (", 2);
+			put(o->path, len(o->path));
+			put(" + ", 3);
+			put_hex(pc - o->base);
+			put(")", 1);
+		}
+	}
 	put("\n", 1);
 	__builtin_trap();
 }
@@ -73,6 +90,18 @@ void __wasm_env_fatal(const char *why, uint64_t pc)
 void __wasm_env_bad_target(uint64_t pc)
 {
 	die("jump to an address that wasn't translated", pc);
+}
+
+// The CRC32* instructions: CRC-32 (or CRC-32C, by polynomial) of the low
+// `bytes` bytes of `data`, least significant first.
+uint32_t __wasm_env_crc32(uint32_t crc, uint64_t data, uint32_t bytes, uint32_t poly)
+{
+	for (uint32_t i = 0; i < bytes; i++) {
+		crc ^= (uint8_t)(data >> (8 * i));
+		for (int k = 0; k < 8; k++)
+			crc = (crc >> 1) ^ (poly & -(crc & 1));
+	}
+	return crc;
 }
 
 // Binary search the block table for `pc` and tail-call its function (a
@@ -102,7 +131,6 @@ void dispatch(long pc)
 // exists as translated blocks there. When the dynamic linker opens one and
 // maps it, place the mapping at that base; it then relocates the library as
 // usual, and every address it computes matches the translation.
-struct lib { const char *path; uint64_t base, end; };
 extern const struct lib guest_libs[];
 extern const uint64_t guest_lib_count;
 

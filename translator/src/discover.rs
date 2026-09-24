@@ -133,7 +133,23 @@ pub fn discover(image: &Image) -> Program {
                 // A `br` with no writeback is usually a switch: read the
                 // jump table (case targets aren't stored as pointers).
                 if i.op().mnem() == "br" {
-                    for t in jump_table(image, &insns, &block) {
+                    // The idiom is straight-line code ending at the br, but other
+                    // leaders may split it into blocks, so look at the preceding
+                    // instructions directly, back to one that doesn't fall through.
+                    let mut window = vec![(pc, i)];
+                    while window.len() < 32 {
+                        let Some(prev) = window[0].0.checked_sub(4).and_then(|a| insns.get(&a).map(|p| (a, p))) else { break };
+                        if is_terminal(prev.1) {
+                            break;
+                        }
+                        window.insert(0, prev);
+                    }
+                    let targets = jump_table(image, &insns, &window);
+                    // WASM_ENV_DEBUG_BR=ADDR (hex) reports what was found for that br.
+                    if std::env::var("WASM_ENV_DEBUG_BR").ok().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()) == Some(pc) {
+                        eprintln!("br at {pc:#x}: window from {:#x} ({} insns), {} targets: {:x?}", window[0].0, window.len(), targets.len(), targets);
+                    }
+                    for t in targets {
                         add(t);
                     }
                 }
@@ -190,7 +206,7 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
     // (label, table base, entry width, load signed, the add's extension, index register)
     let mut table: Option<(u64, u64, u32, bool, Shift, Option<u32>)> = None;
 
-    for (_, i) in block {
+    for &(addr, i) in block {
         let ops = i.operands();
         let d = ops.first().and_then(gpr_id);
         match i.op().mnem() {
@@ -248,7 +264,7 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
                     _ => None,
                 };
                 match (d, slot) {
-                    (Some(d), Some((b @ (29 | 31), off))) => match stack_slot_value(insns, block[0].0, b, off) {
+                    (Some(d), Some((b @ (29 | 31), off))) => match stack_slot_value(insns, addr, b, off) {
                         Some(v) => {
                             val.insert(d, v);
                         }
@@ -282,22 +298,12 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
     let sx = |v: u64, bits: u32| ((v << (64 - bits)) as i64) >> (64 - bits);
     // The table's length, from the bounds check before it (`cmp wI, #max;
     // b.hi default`), when it's just before this block.
-    let count = index.and_then(|idx| {
-        let start = block[0].0;
-        for k in 1..=16u64 {
-            let i = insns.get(&start.checked_sub(4 * k)?)?;
-            let ops = i.operands();
-            let writes_idx = ops.first().and_then(gpr_id) == Some(idx);
-            match (i.op().mnem(), ops.get(1)) {
-                ("cmp", Some(Imm32 { imm, .. } | Imm64 { imm, .. })) if writes_idx => return Some(imm_u64(imm) + 1),
-                (m, _) if writes_idx && !m.starts_with("b.") && m != "cmp" => return None,
-                _ => {}
-            }
-        }
-        None
-    });
+    let count = index.and_then(|idx| table_length(insns, block, idx));
     let mut targets = Vec::new();
-    for i in 0..count.unwrap_or(4096).min(4096) {
+    // Without a bound, read at most 256 entries (and stop at the first that
+    // isn't code, below): data past the table can look like offsets, and every
+    // false target splits a block.
+    for i in 0..count.unwrap_or(256).min(4096) {
         let Some(raw) = image.read_uint(base + i * width as u64, width) else { break };
         let v = if signed { sx(raw, width * 8) as u64 } else { raw };
         // The add's extension decides how the entry is interpreted (sxth: a
@@ -322,6 +328,42 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
         targets.push(target);
     }
     targets
+}
+
+/// A jump table's length from its bounds check: `cmp wI, #max` on the index
+/// register just before a conditional branch that either falls into the
+/// dispatch sequence (`b.hi default`) or jumps to it (`b.ls dispatch`).
+fn table_length(insns: &BTreeMap<u64, Instruction>, window: &[(u64, &Instruction)], idx: u32) -> Option<u64> {
+    use bad64::Operand::*;
+    let cmp_before = |branch: u64| -> Option<u64> {
+        let i = insns.get(&branch.checked_sub(4)?)?;
+        let ops = i.operands();
+        match (i.op().mnem(), ops.first().and_then(gpr_id), ops.get(1)) {
+            ("cmp", Some(r), Some(Imm32 { imm, .. } | Imm64 { imm, .. })) if r == idx => Some(imm_u64(imm) + 1),
+            _ => None,
+        }
+    };
+    let (start, end) = (window[0].0, window[window.len() - 1].0);
+    // A guard on the straight-line path, or just before it: the one nearest
+    // the dispatch (earlier compares of the same register guard other code).
+    let first = start.saturating_sub(4);
+    for (&a, i) in insns.range(first..=end).rev() {
+        if i.op().mnem().starts_with("b.")
+            && let Some(n) = cmp_before(a)
+        {
+            return Some(n);
+        }
+    }
+    // A guard elsewhere that branches into the sequence.
+    for (&a, i) in insns.range(start.saturating_sub(0x10000)..end + 0x10000) {
+        if i.op().mnem().starts_with("b.")
+            && direct_target(i).is_some_and(|t| (start..=end).contains(&t))
+            && let Some(n) = cmp_before(a)
+        {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// The value last stored to a frame slot (`[sp|fp, #off]`) before `from`:

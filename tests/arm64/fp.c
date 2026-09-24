@@ -155,9 +155,64 @@ int main(void)
 	print_v("neg.16b", vreinterpretq_u8_s8(vnegq_s8(n8)));
 	print_v("rbit", vrbitq_u8(a));
 
-	// Pairwise add/min/max across the concatenation of two vectors.
+	// A 64-bit whole-register move clears the destination's upper half.
+	uint8x16_t mv8 = vdupq_n_u8(0x5a);
+	OPAQUE(mv8);
+	__asm__("mov %0.8b, %1.8b" : "+w"(mv8) : "w"(a));
+	print_v("mov.8b", mv8);
+
 	uint8x16_t p = vaddq_u8(a, vdupq_n_u8(0x7b));
 	OPAQUE(p);
+
+	// Widening and pairwise-long arithmetic.
+	int64x2_t w64 = vreinterpretq_s64_u8(mask);
+	int32x4_t n32 = vreinterpretq_s32_u8(p);
+	print_v("ssubw", vreinterpretq_u8_s64(vsubw_s32(w64, vget_low_s32(n32))));
+	print_v("ssubw2", vreinterpretq_u8_s64(vsubw_high_s32(w64, n32)));
+	print_v("uaddw2", vreinterpretq_u8_u16(vaddw_high_u8(vreinterpretq_u16_u8(a), p)));
+	print_v("saddl", vreinterpretq_u8_s32(vaddl_s16(vget_low_s16(vreinterpretq_s16_u8(p)), vget_low_s16(vreinterpretq_s16_u8(mask)))));
+	print_v("uaddlp", vreinterpretq_u8_u16(vpaddlq_u8(p)));
+	print_v("sadalp", vreinterpretq_u8_s32(vpadalq_s16(vreinterpretq_s32_u8(a), vreinterpretq_s16_u8(p))));
+
+	// Scalar forms on SIMD registers.
+	uint64_t sd;
+	__asm__("add %d0, %d1, %d2" : "=w"(sd) : "w"(0x7fffffffffffffffull), "w"(3ull));
+	printf("add d: %016llx\n", (unsigned long long)sd);
+	double dv = -1234.75;
+	int64_t cz;
+	__asm__("fcvtzs %d0, %d1" : "=w"(cz) : "w"(dv));
+	printf("fcvtzs d,d: %lld\n", (long long)cz);
+	__asm__("fcvtzu %d0, %d1" : "=w"(cz) : "w"(dv));
+	printf("fcvtzu d,d: %lld\n", (long long)cz);
+	__asm__("fcvtzs %0, %d1, #4" : "=r"(cz) : "w"(dv));
+	printf("fcvtzs fixed: %lld\n", (long long)cz);
+	double fa;
+	__asm__("fabd %d0, %d1, %d2" : "=w"(fa) : "w"(1.5), "w"(4.25));
+	printf("fabd: %g\n", fa);
+	print_v("fabd.4s", vreinterpretq_u8_f32(vabdq_f32(fs, vdupq_n_f32(2.0f))));
+	float lane3;
+	__asm__("mov %s0, %1.s[3]" : "=w"(lane3) : "w"(fs));
+	printf("mov s, v.s[3]: %g\n", (double)lane3);
+	print_v("fcvtzs.4s", vreinterpretq_u8_s32(vcvtq_s32_f32(fs)));
+
+	// Interleaved and multi-register loads and stores.
+	uint8_t buf[64], out[64];
+	for (int i = 0; i < 64; i++) buf[i] = (uint8_t)(i * 7 + 3);
+	OPAQUE(a);
+	uint8x16x4_t q4 = vld4q_u8(buf);
+	print_v("ld4.0", q4.val[0]);
+	print_v("ld4.3", q4.val[3]);
+	uint16x8x3_t q3 = vld3q_u16((const uint16_t *)buf);
+	print_v("ld3.1", vreinterpretq_u8_u16(q3.val[1]));
+	uint32x4x2_t q2 = vld2q_u32((const uint32_t *)buf);
+	print_v("ld2.1", vreinterpretq_u8_u32(q2.val[1]));
+	vst4q_u8(out, q4);
+	printf("st4 roundtrip: %d\n", __builtin_memcmp(out, buf, 64) == 0);
+	uint8x16x2_t two = vld1q_u8_x2(buf + 8);
+	vst1q_u8_x2(out, two);
+	printf("ld1/st1 x2: %d %02x\n", __builtin_memcmp(out, buf + 8, 32) == 0, vgetq_lane_u8(two.val[1], 15));
+
+	// Pairwise add/min/max across the concatenation of two vectors.
 	print_v("umaxp.4s", vreinterpretq_u8_u32(vpmaxq_u32(vreinterpretq_u32_u8(a), vreinterpretq_u32_u8(p))));
 	print_v("uminp.8h", vreinterpretq_u8_u16(vpminq_u16(vreinterpretq_u16_u8(p), vreinterpretq_u16_u8(a))));
 	print_v("smaxp.16b", vreinterpretq_u8_s8(vpmaxq_s8(vreinterpretq_s8_u8(p), vreinterpretq_s8_u8(mask))));
