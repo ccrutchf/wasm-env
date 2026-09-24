@@ -58,3 +58,38 @@ pub fn min() -> Option<Vec<u8>> {
 pub fn static_c(source: &str) -> Option<Vec<u8>> {
     fixture(source, &["-O2", "-static"])
 }
+
+/// Builds `source` as an arm64 executable linked against shared libraries
+/// built from `lib_sources`, and returns the executable's bytes. Used to
+/// test multi-object (dynamic) loading. None if the cross compiler is
+/// unavailable.
+pub fn fixture_linked(source: &str, flags: &[&str], lib_sources: &[&str]) -> Option<Vec<u8>> {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let out_dir = repo.join("target/arm64-fixtures");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut libs = Vec::new();
+    for lib in lib_sources {
+        let so = out_dir.join(format!("{}.so", lib.replace('/', "_")));
+        let status = std::process::Command::new(CROSS_CC)
+            .args(["-O2", "-shared", "-nostdlib", "-fno-stack-protector", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(repo.join("tests").join(lib))
+            .status();
+        match status {
+            Ok(s) if s.success() => libs.push(so),
+            Ok(s) => panic!("{CROSS_CC} failed on {lib}: {s}"),
+            Err(_) => return None,
+        }
+    }
+    let out = out_dir.join(format!("{}-linked", source.replace('/', "_")));
+    let mut cmd = std::process::Command::new(CROSS_CC);
+    cmd.args(flags).arg("-o").arg(&out).arg(repo.join("tests").join(source)).arg("-L").arg(&out_dir);
+    for so in &libs {
+        cmd.arg(so);
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => Some(std::fs::read(&out).unwrap()),
+        Ok(s) => panic!("{CROSS_CC} link failed on {source}: {s}"),
+        Err(_) => None,
+    }
+}

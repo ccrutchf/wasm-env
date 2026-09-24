@@ -3,7 +3,7 @@
 //!
 //!   wasm-env-translate census BINARY   count instructions by operation
 //!   wasm-env-translate blocks BINARY   list the basic blocks discovery finds
-//!   wasm-env-translate translate BINARY OUT.wasm   (needs the `lift` feature)
+//!   wasm-env-translate translate BINARY OUT.wasm [--lib SO]...   (needs `lift`)
 
 mod discover;
 mod elf;
@@ -46,11 +46,20 @@ fn census(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Translates an arm64 executable into a wasm-env program.
+/// Translates an arm64 executable (with any shared libraries) into a
+/// wasm-env program.
 #[cfg(feature = "lift")]
-fn translate(input: &str, output: &str) -> Result<()> {
+fn translate(input: &str, output: &str, libs: &[String]) -> Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("reading {input}"))?;
-    let image = elf::Image::load(&bytes)?;
+    let image = if libs.is_empty() {
+        elf::Image::load(&bytes)?
+    } else {
+        let libs: Result<Vec<(String, Vec<u8>)>> = libs
+            .iter()
+            .map(|l| Ok((l.clone(), std::fs::read(l).with_context(|| format!("reading {l}"))?)))
+            .collect();
+        elf::Image::load_dynamic(&bytes, &libs?)?
+    };
     let prog = discover::discover(&image);
     let lifted = lift::lift(&image, &prog);
     for (op, (n, example)) in &lifted.unsupported {
@@ -87,7 +96,18 @@ fn main() -> Result<()> {
         ["census", path] => census(path),
         ["blocks", path] => blocks(path),
         #[cfg(feature = "lift")]
-        ["translate", input, output] => translate(input, output),
+        ["translate", input, output, libs @ ..] => {
+            // translate INPUT OUT [--lib SO]...
+            let mut so = Vec::new();
+            let mut it = libs.iter();
+            while let Some(a) = it.next() {
+                match *a {
+                    "--lib" => so.push(it.next().context("--lib needs a path")?.to_string()),
+                    other => bail!("unexpected argument {other}"),
+                }
+            }
+            translate(input, output, &so)
+        }
         #[cfg(feature = "lift")]
         ["emit", input] => {
             let bytes = std::fs::read(input)?;

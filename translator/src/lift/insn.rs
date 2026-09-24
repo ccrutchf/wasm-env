@@ -585,6 +585,33 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             vector_binary(b, i, m)?
         }
         "not" | "abs" | "cnt" if is_v(ops.first()) => vector_unary(b, i, m)?,
+        "addp" if is_v(ops.first()) => {
+            let (d, elem, total) = vec_dst(&ops[0])?;
+            if ops.len() == 3 {
+                // Vector pairwise add: concatenate vn:vm, add adjacent pairs.
+                let x = read_v128(b, &ops[1])?;
+                let y = read_v128(b, &ops[2])?;
+                let half = nlanes(total, elem) / 2;
+                let mut parts = Vec::new();
+                for src in [&x, &y] {
+                    for k in 0..half {
+                        let a = vlane(b, src, elem, 2 * k);
+                        let c = vlane(b, src, elem, 2 * k + 1);
+                        parts.push(b.val(format!("add i{elem} {a}, {c}")));
+                    }
+                }
+                let r = vbuild(b, elem, &parts);
+                b.write_v(d, r, 128);
+            } else {
+                // Scalar pairwise (addp d, vn.2d): add the two lanes.
+                let (_, e, _) = vec_dst(&ops[1])?;
+                let x = read_v128(b, &ops[1])?;
+                let a = vlane(b, &x, e, 0);
+                let c = vlane(b, &x, e, 1);
+                let r = b.val(format!("add i{e} {a}, {c}"));
+                b.write_v(d, r, e);
+            }
+        }
         "shl" | "sshr" | "ushr" | "sshl" | "ushl" if is_v(ops.first()) => vector_shift(b, i, m)?,
         "addv" | "uaddlv" | "saddlv" | "umaxv" | "uminv" | "smaxv" | "sminv" => vector_reduce(b, i, m)?,
         "uzp1" | "uzp2" | "zip1" | "zip2" | "trn1" | "trn2" => vector_permute(b, i, m)?,

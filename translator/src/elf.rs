@@ -37,129 +37,242 @@ pub struct Image {
     pub code: Vec<std::ops::Range<u64>>,
 }
 
-/// Applies dynamic relocations into the loaded segments (prelinking). For
-/// a PIE/shared object loaded at `base`, this resolves relative and
-/// defined-symbol relocations to final values, so the translated code needs
-/// no runtime relocation. Undefined symbols (from other objects) and
-/// unsupported relocation types are errors for this slice.
-fn apply_relocations(
-    file: &ElfFile64<Endianness>,
-    _endian: Endianness,
+/// Where a position-independent executable (ET_DYN) is loaded. Bases are
+/// fixed at translation time, so the 1:1 guest-address model still holds:
+/// each shared object gets a base assigned once and everything is prelinked.
+pub const PIE_BASE: u64 = 0x40_0000;
+
+/// One relocation, with its site and symbol resolved to absolute addresses
+/// once, then applied against the whole-image symbol table.
+struct Reloc {
+    at: u64,
+    r_type: u32,
+    /// The referenced symbol's name (for symbol-based relocations).
+    sym: Option<String>,
+    addend: i64,
+}
+
+/// A single ELF object loaded at a base, before cross-object relocation.
+struct Parsed {
     base: u64,
-    segments: &mut [Segment],
-) -> Result<()> {
+    segments: Vec<Segment>,
+    entry: u64,
+    phdr: Option<u64>,
+    phnum: u16,
+    functions: Vec<(u64, String)>,
+    code: Vec<std::ops::Range<u64>>,
+    relocs: Vec<Reloc>,
+    /// Global/weak symbols this object defines: (name, absolute address).
+    defined: Vec<(String, u64)>,
+    /// End of the object in memory (for placing the next one).
+    top: u64,
+}
+
+/// The load base for a lone object: fixed for ET_EXEC, the PIE base for
+/// ET_DYN (a PIE or shared object).
+fn elf_base(bytes: &[u8]) -> Result<u64> {
+    let file = ElfFile64::<Endianness>::parse(bytes).context("not a 64-bit ELF file")?;
+    match file.elf_header().e_type(file.endian()) {
+        elf::ET_EXEC => Ok(0),
+        elf::ET_DYN => Ok(PIE_BASE),
+        other => bail!("unsupported ELF type {other}"),
+    }
+}
+
+/// Parses one ELF object and places its segments at `base`. Relocations and
+/// exported symbols are recorded but not yet applied (that needs the whole
+/// image's symbol table).
+fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
+    let file = ElfFile64::<Endianness>::parse(bytes).context("not a 64-bit ELF file")?;
+    let header = file.elf_header();
+    let endian = file.endian();
+    if header.e_machine(endian) != elf::EM_AARCH64 {
+        bail!("not an arm64 binary (e_machine {})", header.e_machine(endian));
+    }
+    match header.e_type(endian) {
+        elf::ET_EXEC | elf::ET_DYN => {}
+        other => bail!("unsupported ELF type {other}"),
+    }
+    let phoff = header.e_phoff(endian);
+    let mut segments = Vec::new();
+    let mut phdr = None;
+    for ph in file.elf_program_headers() {
+        if ph.p_type(endian) == elf::PT_LOAD {
+            let offset = ph.p_offset(endian);
+            let filesz = ph.p_filesz(endian);
+            let vaddr = base + ph.p_vaddr(endian);
+            if phoff >= offset && phoff < offset + filesz {
+                phdr = Some(vaddr + (phoff - offset));
+            }
+            let flags = ph.p_flags(endian);
+            segments.push(Segment {
+                vaddr,
+                data: ph.data(endian, bytes).map_err(|_| anyhow::anyhow!("bad segment"))?.to_vec(),
+                memsz: ph.p_memsz(endian),
+                exec: flags & elf::PF_X != 0,
+                write: flags & elf::PF_W != 0,
+            });
+        }
+    }
+    // PT_INTERP (a dynamic executable) is fine: we do the loading ourselves,
+    // given the libraries, so we ignore the requested interpreter.
+
+    let mut relocs = Vec::new();
+    if let Some(dyn_relocs) = file.dynamic_relocations() {
+        let syms = file.dynamic_symbol_table();
+        for (offset, r) in dyn_relocs {
+            let RelocationFlags::Elf { r_type } = r.flags() else { continue };
+            let sym = match r.target() {
+                RelocationTarget::Symbol(idx) => {
+                    let table = syms.ok_or_else(|| anyhow::anyhow!("relocation symbol without a symbol table"))?;
+                    let s = table.symbol_by_index(idx).map_err(|_| anyhow::anyhow!("bad symbol index"))?;
+                    // A defined local symbol resolves within this object; an
+                    // undefined one is looked up image-wide by name.
+                    if s.is_undefined() { Some(s.name().unwrap_or("").to_string()) } else { None }
+                }
+                _ => None,
+            };
+            // For a defined-symbol relocation, fold the symbol's own address
+            // into the addend now (base applied at apply time).
+            let addend = match r.target() {
+                RelocationTarget::Symbol(idx) if sym.is_none() => {
+                    let table = syms.unwrap();
+                    let s = table.symbol_by_index(idx).unwrap();
+                    r.addend() + s.address() as i64
+                }
+                _ => r.addend(),
+            };
+            relocs.push(Reloc { at: base + offset, r_type, sym, addend });
+        }
+    }
+
+    let defined = file
+        .dynamic_symbols()
+        .filter(|s| !s.is_undefined() && s.name().is_ok_and(|n| !n.is_empty()))
+        .map(|s| (s.name().unwrap().to_string(), base + s.address()))
+        .collect();
+
+    let mut functions: Vec<(u64, String)> = file
+        .symbols()
+        .filter(|s| s.kind() == SymbolKind::Text && s.address() != 0)
+        .map(|s| (base + s.address(), s.name().unwrap_or("?").to_string()))
+        .collect();
+    functions.sort();
+    functions.dedup_by_key(|f| f.0);
+
+    let mut code: Vec<_> = file
+        .sections()
+        .filter(|s| matches!(s.flags(), SectionFlags::Elf { sh_flags } if sh_flags & elf::SHF_EXECINSTR as u64 != 0))
+        .filter(|s| s.size() > 0)
+        .map(|s| base + s.address()..base + s.address() + s.size())
+        .collect();
+    if code.is_empty() {
+        code = segments.iter().filter(|s| s.exec).map(|s| s.vaddr..s.vaddr + s.data.len() as u64).collect();
+    }
+    code.sort_by_key(|r| r.start);
+
+    let top = segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(base);
+    Ok(Parsed {
+        base,
+        segments,
+        entry: base + header.e_entry(endian),
+        phdr,
+        phnum: header.e_phnum(endian),
+        functions,
+        code,
+        relocs,
+        defined,
+        top,
+    })
+}
+
+/// Prelinks parsed objects into one image: builds the image-wide symbol
+/// table, applies every relocation to final values, and merges segments.
+/// The first object is the executable (its entry and program headers win).
+fn link(objects: Vec<Parsed>) -> Result<Image> {
     // arm64 dynamic relocation types.
     const RELATIVE: u32 = 1027;
     const GLOB_DAT: u32 = 1025;
     const JUMP_SLOT: u32 = 1026;
     const ABS64: u32 = 257;
 
-    let write = |segments: &mut [Segment], addr: u64, value: u64| -> Result<()> {
-        let seg = segments
-            .iter_mut()
-            .find(|s| addr >= s.vaddr && addr + 8 <= s.vaddr + s.memsz)
-            .ok_or_else(|| anyhow::anyhow!("relocation at {addr:#x} outside any segment"))?;
-        let off = (addr - seg.vaddr) as usize;
-        if off + 8 > seg.data.len() {
-            // Relocation into .bss: grow the file data to cover it.
-            seg.data.resize(off + 8, 0);
+    let mut global = std::collections::HashMap::new();
+    for obj in &objects {
+        for (name, addr) in &obj.defined {
+            global.entry(name.clone()).or_insert(*addr);
         }
-        seg.data[off..off + 8].copy_from_slice(&value.to_le_bytes());
-        Ok(())
-    };
-
-    let Some(relocs) = file.dynamic_relocations() else { return Ok(()) };
-    for (offset, r) in relocs {
-        let RelocationFlags::Elf { r_type } = r.flags() else { continue };
-        let addend = r.addend();
-        let value = match r_type {
-            RELATIVE => base.wrapping_add(addend as u64),
-            GLOB_DAT | JUMP_SLOT | ABS64 => {
-                let RelocationTarget::Symbol(idx) = r.target() else {
-                    bail!("relocation type {r_type} without a symbol");
-                };
-                let syms = file.dynamic_symbol_table().ok_or_else(|| anyhow::anyhow!("no dynamic symbols"))?;
-                let sym = syms.symbol_by_index(idx).map_err(|_| anyhow::anyhow!("bad symbol index"))?;
-                if sym.is_undefined() {
-                    bail!("undefined symbol `{}` needs an external library (later M3 slice)", sym.name().unwrap_or("?"));
-                }
-                base + sym.address() + addend as u64
-            }
-            other => bail!("unsupported relocation type {other}"),
-        };
-        write(segments, base + offset, value)?;
     }
+
+    let exe = &objects[0];
+    let (entry, phdr, phnum) = (exe.entry, exe.phdr, exe.phnum);
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut functions = Vec::new();
+    let mut code = Vec::new();
+
+    for mut obj in objects {
+        for r in &obj.relocs {
+            let value = match r.r_type {
+                RELATIVE => obj.base.wrapping_add(r.addend as u64),
+                GLOB_DAT | JUMP_SLOT | ABS64 => match &r.sym {
+                    // A local defined symbol was folded into the addend.
+                    None => obj.base.wrapping_add(r.addend as u64),
+                    Some(name) => {
+                        let addr = global
+                            .get(name)
+                            .copied()
+                            .ok_or_else(|| anyhow::anyhow!("undefined symbol `{name}` (provide the library with --lib)"))?;
+                        addr.wrapping_add(r.addend as u64)
+                    }
+                },
+                other => bail!("unsupported relocation type {other}"),
+            };
+            write_word(&mut obj.segments, r.at, value)?;
+        }
+        segments.append(&mut obj.segments);
+        functions.append(&mut obj.functions);
+        code.append(&mut obj.code);
+    }
+    code.sort_by_key(|r| r.start);
+    functions.sort();
+    functions.dedup_by_key(|f| f.0);
+    Ok(Image { entry, segments, phdr, phnum, functions, code })
+}
+
+/// Writes an 8-byte little-endian value at a guest address, growing the
+/// owning segment's file data into .bss if needed.
+fn write_word(segments: &mut [Segment], addr: u64, value: u64) -> Result<()> {
+    let seg = segments
+        .iter_mut()
+        .find(|s| addr >= s.vaddr && addr + 8 <= s.vaddr + s.memsz)
+        .ok_or_else(|| anyhow::anyhow!("relocation at {addr:#x} outside any segment"))?;
+    let off = (addr - seg.vaddr) as usize;
+    if off + 8 > seg.data.len() {
+        seg.data.resize(off + 8, 0);
+    }
+    seg.data[off..off + 8].copy_from_slice(&value.to_le_bytes());
     Ok(())
 }
 
-/// Where a position-independent executable (ET_DYN) is loaded. Fixed at
-/// translation time, so the 1:1 guest-address model still holds: a shared
-/// object gets a base assigned once and everything is prelinked to it.
-pub const PIE_BASE: u64 = 0x40_0000;
-
 impl Image {
+    /// Loads a single statically-linked or position-independent executable.
     pub fn load(bytes: &[u8]) -> Result<Image> {
-        let file = ElfFile64::<Endianness>::parse(bytes).context("not a 64-bit ELF file")?;
-        let header = file.elf_header();
-        let endian = file.endian();
-        if header.e_machine(endian) != elf::EM_AARCH64 {
-            bail!("not an arm64 binary (e_machine {})", header.e_machine(endian));
+        let base = elf_base(bytes)?;
+        link(vec![parse_object(bytes, base)?])
+    }
+
+    /// Loads a dynamically-linked executable together with the shared
+    /// objects it needs, prelinking them into one image. `libs` are
+    /// (name, bytes) pairs; symbols are resolved across all of them.
+    pub fn load_dynamic(exe: &[u8], libs: &[(String, Vec<u8>)]) -> Result<Image> {
+        let mut objects = vec![parse_object(exe, elf_base(exe)?)?];
+        // Place each library above the previous object, page-aligned.
+        let mut next = objects[0].top.next_multiple_of(0x10000).max(PIE_BASE);
+        for (name, bytes) in libs {
+            let obj = parse_object(bytes, next).with_context(|| format!("loading {name}"))?;
+            next = obj.top.next_multiple_of(0x10000);
+            objects.push(obj);
         }
-        let base = match header.e_type(endian) {
-            elf::ET_EXEC => 0,
-            elf::ET_DYN => PIE_BASE,
-            other => bail!("unsupported ELF type {other}"),
-        };
-        let phoff = header.e_phoff(endian);
-        let mut segments = Vec::new();
-        let mut interp = false;
-        let mut phdr = None;
-        for ph in file.elf_program_headers() {
-            match ph.p_type(endian) {
-                elf::PT_INTERP => interp = true,
-                elf::PT_LOAD => {
-                    let offset = ph.p_offset(endian);
-                    let filesz = ph.p_filesz(endian);
-                    let vaddr = base + ph.p_vaddr(endian);
-                    if phoff >= offset && phoff < offset + filesz {
-                        phdr = Some(vaddr + (phoff - offset));
-                    }
-                    let flags = ph.p_flags(endian);
-                    segments.push(Segment {
-                        vaddr,
-                        data: ph.data(endian, bytes).map_err(|_| anyhow::anyhow!("bad segment"))?.to_vec(),
-                        memsz: ph.p_memsz(endian),
-                        exec: flags & elf::PF_X != 0,
-                        write: flags & elf::PF_W != 0,
-                    });
-                }
-                _ => {}
-            }
-        }
-        if interp {
-            // A PT_INTERP means ld.so loads shared libraries at runtime; that
-            // needs the multi-object loader (a later M3 slice).
-            bail!("dynamically linked binaries (with an interpreter) aren't supported yet");
-        }
-        apply_relocations(&file, endian, base, &mut segments)?;
-        let mut functions: Vec<(u64, String)> = file
-            .symbols()
-            .filter(|s| s.kind() == SymbolKind::Text && s.address() != 0)
-            .map(|s| (base + s.address(), s.name().unwrap_or("?").to_string()))
-            .collect();
-        functions.sort();
-        functions.dedup_by_key(|f| f.0);
-        let mut code: Vec<_> = file
-            .sections()
-            .filter(|s| matches!(s.flags(), SectionFlags::Elf { sh_flags } if sh_flags & elf::SHF_EXECINSTR as u64 != 0))
-            .filter(|s| s.size() > 0)
-            .map(|s| base + s.address()..base + s.address() + s.size())
-            .collect();
-        if code.is_empty() {
-            code = segments.iter().filter(|s| s.exec).map(|s| s.vaddr..s.vaddr + s.data.len() as u64).collect();
-        }
-        code.sort_by_key(|r| r.start);
-        Ok(Image { entry: base + header.e_entry(endian), segments, phdr, phnum: header.e_phnum(endian), functions, code })
+        link(objects)
     }
 
     /// Decodes every 4-byte-aligned word of code (see `code`). arm64
@@ -248,7 +361,7 @@ mod tests {
         assert!(err(&host).contains("not an arm64 binary"), "got: {}", err(&host));
         if let Some(dynamic) = testutil::fixture("c/hello.c", &["-O2", "-no-pie"]) {
             let e = err(&dynamic);
-            assert!(e.contains("dynamically linked") || e.contains("statically linked"), "got: {e}");
+            assert!(e.contains("undefined symbol") || e.contains("dynamically") || e.contains("statically"), "got: {e}");
         }
     }
 
@@ -310,6 +423,46 @@ mod pie_tests {
         let Some(bytes) = testutil::fixture("c/hello.c", &["-O2"]) else { return };
         // Default musl link is dynamic (has a PT_INTERP).
         let err = Image::load(&bytes).map(|_| ()).unwrap_err().to_string();
-        assert!(err.contains("interpreter") || err.contains("dynamically"), "got: {err}");
+        assert!(err.contains("undefined symbol") || err.contains("interpreter"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod dynamic_tests {
+    use super::*;
+    use crate::testutil;
+
+    #[test]
+    fn cross_object_symbols_are_prelinked() {
+        // A main dynamically linked against a custom shared library.
+        let Some(lib) = testutil::fixture("arm64/dynlib.c", &["-O2", "-shared", "-nostdlib", "-fno-stack-protector", "-fPIC"])
+        else {
+            return;
+        };
+        let Some(main) = testutil::fixture_linked(
+            "arm64/dynmain.c",
+            &["-O2", "-fPIE", "-pie", "-nostdlib", "-fno-stack-protector"],
+            &["arm64/dynlib.c"],
+        ) else {
+            return;
+        };
+        // Loading main alone leaves lib_add/lib_sum/lib_value undefined.
+        let err = Image::load(&main).map(|_| ()).unwrap_err().to_string();
+        assert!(err.contains("undefined symbol"), "got: {err}");
+
+        // With the library, everything resolves and the two objects occupy
+        // distinct, non-overlapping address ranges.
+        let image = Image::load_dynamic(&main, &[("dynlib.so".into(), lib)]).unwrap();
+        let ranges: Vec<_> = image.segments.iter().map(|s| (s.vaddr, s.vaddr + s.memsz)).collect();
+        for (i, a) in ranges.iter().enumerate() {
+            for b in &ranges[i + 1..] {
+                assert!(a.1 <= b.0 || b.1 <= a.0, "segments {a:?} and {b:?} overlap");
+            }
+        }
+        // main's entry is the executable's, at the PIE base.
+        assert!(image.entry >= PIE_BASE);
+        // The library's exported functions are present as blocks to lift.
+        assert!(image.functions.iter().any(|f| f.1 == "lib_add"));
+        assert!(image.functions.iter().any(|f| f.1 == "lib_sum"));
     }
 }

@@ -41,6 +41,8 @@
             COMPILER_RT_SRC = "${llvm.compiler-rt.src}";
             # Packages built with the toolchain (packages/*/build.sh).
             BUSYBOX_SRC = "${pkgs.busybox.src}";
+            # arm64 musl runtime (libc.so, ld-musl) for dynamic-linking tests.
+            AARCH64_MUSL = "${pkgs.pkgsCross.aarch64-multiplatform-musl.musl}";
             # bindgen (used by the bad64 arm64 decoder crate) needs libclang.
             LIBCLANG_PATH = "${llvm.libclang.lib}/lib";
           };
