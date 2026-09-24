@@ -162,6 +162,11 @@ pub fn ensure_translated(elf: &Path, root: &Path, program: &str, trace: bool) ->
     for lib in &dlopen {
         cmd.arg("--dlopen").arg(lib);
     }
+    // Addresses earlier runs found missing (see record_missed_target).
+    let roots = out.with_extension("roots");
+    if roots.exists() {
+        cmd.arg("--roots").arg(&roots);
+    }
     if !trace {
         // Keep the translator's diagnostics out of the program's output.
         cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -258,5 +263,26 @@ mod dlopen_tests {
         assert!(dlopen_list(&root, "ls").is_empty());
         assert!(dlopen_list(&root.join("nope"), "greet").is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Records that a translated program jumped to code the translation missed
+/// (an address computed at run time that static discovery didn't find),
+/// as "object<TAB>offset" in the module's `.roots` file. For a cached
+/// translation, the module is dropped, so the next exec retranslates with
+/// these addresses as block roots: each run can only add real code, so the
+/// translation converges.
+pub fn record_missed_target(module: &Path, object: &str, offset: u64) {
+    use std::io::Write;
+    let roots = module.with_extension("roots");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&roots) {
+        let _ = writeln!(f, "{object}\t{offset:#x}");
+    }
+    let cached = cache_dir().is_some_and(|d| module.parent() == Some(d.as_path()));
+    if cached {
+        let _ = std::fs::remove_file(module);
+        eprintln!("wasm-env: recorded the missed address; the next run translates it");
+    } else {
+        eprintln!("wasm-env: recorded the missed address in {} (translate with --roots)", roots.display());
     }
 }

@@ -95,7 +95,7 @@ Processes are created with **`vfork` + `execve`**, which covers `posix_spawn`, `
 
 `vfork` returns twice, so libc defines it as a macro around `setjmp` (see `toolchain/musl-overlay/src/process/wasm64/vfork.c`); the child must not return from the function that called `vfork`, the usual vfork rule. `clone` with any other flags returns `-ENOSYS`.
 
-**execve** accepts WebAssembly programs and `#!` scripts (up to four levels of interpreter). Other files, including ELF binaries until the translator exists, fail with `-ENOEXEC`. Outside a vfork child, a successful `execve` replaces the running program; the pid, descriptors (minus close-on-exec ones), working directory, umask and ignored signals carry over.
+**execve** accepts WebAssembly programs, `#!` scripts (up to four levels of interpreter) and arm64 ELF binaries, which the runtime translates on first use (with their dynamic linker and libraries from the environment) and caches. Other files fail with `-ENOEXEC`. Outside a vfork child, a successful `execve` replaces the running program; the pid, descriptors (minus close-on-exec ones), working directory, umask and ignored signals carry over.
 
 **Process model.** Each process runs on its own host thread, all inside the environment's one host process. `wait4` supports the usual targets (-1, a pid, 0, -pgid) and `WNOHANG`, and reports standard Linux wait statuses. Pipes are in-runtime buffers of 64 KB; writing to a pipe without readers raises `SIGPIPE`.
 
@@ -121,6 +121,14 @@ Processes are created with **`vfork` + `execve`**, which covers `posix_spawn`, `
 
 - **Version 1: dynamic linking** (PLAN.md, M3). Several modules in one process, sharing one memory and one function table, loaded and linked by the runtime at run time, including `dlopen`. Needed so translated programs can load shared libraries such as Python extension modules. Translated modules use glibc's symbol versions.
 - **Version 2: threads** (PLAN.md, M6). Shared memory, atomics and `clone(CLONE_THREAD)`, with real thread-local storage. Needed for PyTorch.
+
+## wasm-env's own calls
+
+Syscall numbers from 2^32 up are wasm-env's, not Linux's; unknown ones return `-ENOSYS` like any other.
+
+| Number | Call | Arguments |
+|---|---|---|
+| 2^32 | `missed_target` | (address, object name, offset in the object). Made by a translated program's support code when it jumps to code the translation missed. The runtime records the address, and the next translation of that program includes it. |
 
 ## Versioning
 

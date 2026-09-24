@@ -600,10 +600,13 @@ impl Block {
     }
 }
 
-/// Roughly how many block functions go in one compilation module. Bounds
-/// clang's memory: a whole translated library can be hundreds of thousands
-/// of blocks, which is infeasible as a single module.
-const BLOCKS_PER_CHUNK: usize = 2000;
+/// The guest address range whose blocks go in one compilation module. Bounds
+/// clang's memory (a whole translated library can be hundreds of thousands
+/// of blocks, infeasible as one module). Grouping by address rather than by
+/// count keeps chunk boundaries stable: translating again with a few more
+/// blocks changes only the chunks containing them, so the object cache
+/// (link.rs) reuses the rest.
+const CHUNK_SPAN: u64 = 0x8000;
 
 /// A lifted block: its guest address, LLVM function body, and the private
 /// string constants (fatal messages) it references.
@@ -686,8 +689,12 @@ fn build_chunks(blocks: &[LiftedBlock]) -> Vec<String> {
          declare i32 @__wasm_env_crc32(i32, i64, i32, i32)\n{}",
         intrinsics()
     );
-    blocks
-        .chunks(BLOCKS_PER_CHUNK)
+    let mut groups: BTreeMap<u64, Vec<&LiftedBlock>> = BTreeMap::new();
+    for block in blocks {
+        groups.entry(block.0 / CHUNK_SPAN).or_default().push(block);
+    }
+    groups
+        .into_values()
         .map(|group| {
             let mut m = preamble.clone();
             for (addr, body, strings) in group {

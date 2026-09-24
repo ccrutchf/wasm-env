@@ -233,7 +233,8 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
                     (ops.get(1).and_then(gpr_id), ops.get(2))
                 {
                     let scaled = matches!(shift, Shift::SXTH(2) | Shift::SXTB(2) | Shift::SXTW(2) | Shift::UXTH(2) | Shift::UXTW(2) | Shift::UXTB(2) | Shift::LSL(2));
-                    if let (Some(&label), Some(idx), true) = (val.get(&base_reg), gpr_id(&Reg { reg: *idx, arrspec: None }), scaled)
+                    let label = val.get(&base_reg).copied().or_else(|| register_value_before(insns, addr, base_reg, 0));
+                    if let (Some(label), Some(idx), true) = (label, gpr_id(&Reg { reg: *idx, arrspec: None }), scaled)
                         && let Some(&(base, width, signed, index)) = load.get(&idx)
                     {
                         table = Some((label, base, width, signed, *shift, index));
@@ -248,7 +249,10 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
                     Some(MemOffset { reg: r, .. }) => (gpr_id(&Reg { reg: *r, arrspec: None }), None),
                     _ => (None, None),
                 };
-                if let (Some(d), Some(base)) = (d, tab.and_then(|t| val.get(&t).copied())) {
+                // The table base, from this window or, if it was set up earlier
+                // (before a loop, say), the nearest preceding definition.
+                let base = tab.and_then(|t| val.get(&t).copied().or_else(|| register_value_before(insns, addr, t, 0)));
+                if let (Some(d), Some(base)) = (d, base) {
                     let width = if i.op().mnem().contains('h') { 2 } else if i.op().mnem().ends_with('w') { 4 } else { 1 };
                     let signed = i.op().mnem().contains('s');
                     load.insert(d, (base, width, signed, index));
@@ -396,9 +400,20 @@ fn register_value_before(insns: &BTreeMap<u64, Instruction>, at: u64, r: u32, de
         return None;
     }
     let mut pc = at;
-    for _ in 0..64 {
-        pc = pc.checked_sub(4)?;
-        let i = insns.get(&pc)?;
+    for _ in 0..1024 {
+        let prev = pc.checked_sub(4)?;
+        let i = insns.get(&prev)?;
+        if is_terminal(i) {
+            // Code at pc is only entered by branches (the instruction before
+            // doesn't fall through): continue from each branch that targets
+            // it, rather than from unrelated code that happens to precede it.
+            let start = pc;
+            return insns
+                .range(start.saturating_sub(0x10000)..start + 0x10000)
+                .filter(|(_, b)| direct_target(b) == Some(start))
+                .find_map(|(&a, _)| register_value_before(insns, a, r, depth + 1));
+        }
+        pc = prev;
         let ops = i.operands();
         let m = i.op().mnem();
         if ops.first().and_then(gpr_id) != Some(r) || m.starts_with("st") || matches!(m, "cmp" | "cmn" | "tst" | "cbz" | "cbnz" | "tbz" | "tbnz") {

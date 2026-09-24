@@ -82,6 +82,8 @@ pub struct Process {
     pub pending: Option<Pending>,
     pub trace: bool,
     pub start: Instant,
+    /// The WebAssembly module this process runs (for translation feedback).
+    pub module: PathBuf,
 }
 
 impl Process {
@@ -254,6 +256,7 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
         pending: None,
         trace: kernel.trace,
         start: Instant::now(),
+        module: image.host.clone(),
     };
     let mut store = Store::new(&kernel.engine, process);
     match start(&mut store, &module, &image) {

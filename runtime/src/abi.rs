@@ -40,6 +40,10 @@ pub mod nr {
     pub const UTIMENSAT: i64 = 88;
     pub const EXIT: i64 = 93;
     pub const EXIT_GROUP: i64 = 94;
+    /// wasm-env's own calls start at 2^32, far from Linux's. This one is made
+    /// by translated programs' support code when they jump to an address that
+    /// wasn't translated: (pc, object name, offset in the object).
+    pub const WASM_ENV_MISSED_TARGET: i64 = 1 << 32;
     pub const SET_TID_ADDRESS: i64 = 96;
     pub const SET_ROBUST_LIST: i64 = 99;
     pub const NANOSLEEP: i64 = 101;

@@ -330,6 +330,10 @@ impl Process {
             nr::GETPPID => Ok(self.kernel.ppid(self.pid) as i64),
             nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
             nr::EXIT | nr::EXIT_GROUP => Ok(self.exit(a as i32 & 0xff)),
+            nr::WASM_ENV_MISSED_TARGET => {
+                crate::translate::record_missed_target(&self.module, &mem::cstr(data, ub)?, uc);
+                Ok(0)
+            }
             nr::KILL => self.kernel.kill(self.pid, a as i32, b as i32).map(|_| 0),
             nr::TGKILL => self.kernel.kill(self.pid, a as i32, c as i32).map(|_| 0),
             nr::CLONE => self.clone_vfork(a, b),

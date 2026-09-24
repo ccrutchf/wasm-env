@@ -26,6 +26,8 @@ fixtures=(
 	"arith:tests/arm64/arith.c:-static"
 	"fp:tests/arm64/fp.c:-static"
 	"jumptable:tests/arm64/jumptable.S:-static -nostdlib"
+	"jumptable2:tests/arm64/jumptable2.S:-static -nostdlib"
+	"jumptable3:tests/arm64/jumptable3.S:-static -nostdlib"
 	"atomics:tests/arm64/atomics.c:-static -march=armv8.1-a"
 	"simd3:tests/arm64/simd3.c:-static -march=armv8.2-a+crc+sha3"
 	"control:tests/arm64/control.c:-static"

@@ -87,8 +87,17 @@ void __wasm_env_fatal(const char *why, uint64_t pc)
 	die(why, pc);
 }
 
+// wasm-env's private call for reporting a missed jump target (see the runtime's
+// translate.rs): the next translation adds it as a block root.
+#define WASM_ENV_MISSED_TARGET (1L << 32)
+
 void __wasm_env_bad_target(uint64_t pc)
 {
+	for (uint64_t k = 0; k < guest_object_count; k++) {
+		const struct lib *o = &guest_objects[k];
+		if (pc >= o->base && pc < o->end)
+			__wasm_env_host_syscall(WASM_ENV_MISSED_TARGET, (long)pc, (long)o->path, (long)(pc - o->base), 0, 0, 0);
+	}
 	die("jump to an address that wasn't translated", pc);
 }
 

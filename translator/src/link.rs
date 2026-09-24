@@ -87,6 +87,36 @@ pub fn link(tc: &Toolchain, ir: &str, image_end: u64, work: &Path) -> Result<Vec
     Ok(std::fs::read(&wasm)?)
 }
 
+/// Where compiled objects are cached: `$WASM_ENV_OBJECT_CACHE` (empty or "0"
+/// disables it), else `~/.cache/wasm-env/objects`. Entries are named by content,
+/// so they never go stale; nothing evicts them yet.
+fn object_cache() -> Option<PathBuf> {
+    match std::env::var_os("WASM_ENV_OBJECT_CACHE") {
+        Some(d) if d.is_empty() || d == "0" => None,
+        Some(d) => Some(PathBuf::from(d)),
+        None => std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .map(|d| d.join("wasm-env/objects")),
+    }
+}
+
+/// A 128-bit content hash (two independent FNV-1a variants) of `parts`, in
+/// hex. Parts are length-prefixed, so their boundaries count.
+fn content_key(parts: &[&[u8]]) -> String {
+    let (mut a, mut b) = (0xcbf2_9ce4_8422_2325u64, 0x6c62_272e_07bb_0142u64);
+    let mut feed = |byte: u8| {
+        a = (a ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        b = (b ^ byte as u64).wrapping_mul(0x0000_0001_0000_01b3).rotate_left(5);
+    };
+    for p in parts {
+        for byte in (p.len() as u64).to_le_bytes().iter().chain(p.iter()) {
+            feed(*byte);
+        }
+    }
+    format!("{a:016x}{b:016x}")
+}
+
 /// Compiles a chunked program (a data module plus several code modules) and
 /// the support code into one WebAssembly module. Each module compiles
 /// separately, in parallel, so memory stays bounded no matter how large the
@@ -102,34 +132,58 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
     let data_ll = work.join("data.ll");
     std::fs::write(&data_ll, data)?;
 
-    // (source path, output object, opt level) for every unit.
-    let mut units: Vec<(PathBuf, PathBuf, String)> = vec![
-        (data_ll, work.join("data.o"), "-O0".into()),
-        (support_c.clone(), work.join("support.o"), "-O2".into()),
-    ];
+    // (source path, output object, opt level) for every unit. With an object
+    // cache, the object's name is a hash of everything that determines it,
+    // so an unchanged unit (most chunks, when retranslating) isn't rebuilt.
+    let cache = object_cache();
+    let mut units: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+    let mut unit = |name: &str, source: &[u8], opt: String| -> Result<()> {
+        let src = work.join(name);
+        std::fs::write(&src, source)?;
+        let obj = match &cache {
+            Some(dir) => dir.join(format!(
+                "{}.o",
+                content_key(&[source, opt.as_bytes(), WASM_FLAGS.join(" ").as_bytes(), tc.cc.as_os_str().as_encoded_bytes()])
+            )),
+            None => src.with_extension("o"),
+        };
+        units.push((src, obj, opt));
+        Ok(())
+    };
+    unit("data.ll", data.as_bytes(), "-O0".into())?;
+    unit("support.c", SUPPORT_C.as_bytes(), "-O2".into())?;
     for (i, chunk) in chunks.iter().enumerate() {
-        let ll = work.join(format!("chunk{i}.ll"));
-        std::fs::write(&ll, chunk)?;
-        units.push((ll, work.join(format!("chunk{i}.o")), lift_opt()));
+        unit(&format!("chunk{i}.ll"), chunk.as_bytes(), lift_opt())?;
+    }
+    if let Some(dir) = &cache {
+        std::fs::create_dir_all(dir)?;
     }
 
-    // Compile in parallel across the available cores.
+    // Compile what isn't cached, in parallel across the available cores.
+    let todo: Vec<&(PathBuf, PathBuf, String)> = units.iter().filter(|u| !u.1.exists()).collect();
     let next = AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
-                while let Some((src, obj, opt)) = units.get(next.fetch_add(1, Ordering::Relaxed)) {
+                while let Some((src, obj, opt)) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let is_c = src.extension().is_some_and(|e| e == "c");
+                    let tmp = obj.with_extension(format!("{}.tmp", std::process::id()));
                     let mut cmd = Command::new(&tc.cc);
                     cmd.args(WASM_FLAGS).arg(opt);
                     if is_c {
                         cmd.args(["-ffreestanding", "-nostdlib"]);
                     }
-                    cmd.arg("-c").arg(src).arg("-o").arg(obj);
-                    if let Err(e) = run(&mut cmd) {
-                        errors.lock().unwrap().push(e.to_string());
+                    cmd.arg("-c").arg(src).arg("-o").arg(&tmp);
+                    // Compile to a temporary name, then rename: concurrent
+                    // translations never see a partial object.
+                    match run(&mut cmd).and_then(|()| Ok(std::fs::rename(&tmp, obj)?)) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&tmp);
+                            errors.lock().unwrap().push(e.to_string());
+                        }
                     }
                 }
             });
@@ -315,6 +369,14 @@ define void @B_400000(i64 %_) {{
         let start = instance.get_typed_func::<i64, ()>(&mut store, "_start").unwrap();
         let _ = start.call(&mut store, block as i64);
         Some(Run { store, instance, memory })
+    }
+
+    #[test]
+    fn content_keys_distinguish_contents_and_boundaries() {
+        assert_eq!(content_key(&[b"ab", b"c"]), content_key(&[b"ab", b"c"]));
+        assert_ne!(content_key(&[b"ab", b"c"]), content_key(&[b"a", b"bc"]), "boundaries count");
+        assert_ne!(content_key(&[b"abc"]), content_key(&[b"abd"]));
+        assert_eq!(content_key(&[b""]).len(), 32);
     }
 
     #[test]

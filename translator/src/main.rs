@@ -4,7 +4,7 @@
 //!   wasm-env-translate census BINARY   count instructions by operation
 //!   wasm-env-translate blocks BINARY   list the basic blocks discovery finds
 //!   wasm-env-translate translate BINARY OUT.wasm [--root DIR] [--dlopen PATH]...
-//!                                 [--lib SO]... [--interp LD_SO] [--deps-out FILE]   (needs `lift`)
+//!                                 [--lib SO]... [--interp LD_SO] [--deps-out FILE] [--roots FILE]   (needs `lift`)
 //!
 //! With `--root`, the dynamic linker and libraries are found inside DIR the
 //! way the dynamic linker will find them; `--dlopen` adds libraries the
@@ -57,6 +57,9 @@ fn census(path: &str) -> Result<()> {
 #[cfg(feature = "lift")]
 #[derive(Default)]
 struct Inputs {
+    /// Extra block roots (`--roots FILE`): "object<TAB>offset" lines, as the
+    /// runtime records addresses a previous run found untranslated.
+    roots: Option<String>,
     /// Where to list the host files the translation read (`--deps-out`), so a
     /// cache can tell when it goes stale.
     deps_out: Option<String>,
@@ -103,6 +106,16 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         elf::Image::load_dynamic(&bytes, &libs, interp.as_ref())?
     };
     image.objects[0].0 = input.to_string();
+    if let Some(path) = &inputs.roots {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+        for line in text.lines() {
+            let Some((object, offset)) = line.split_once('\t') else { continue };
+            let Ok(offset) = u64::from_str_radix(offset.trim().trim_start_matches("0x"), 16) else { continue };
+            if let Some((_, base, _)) = image.objects.iter().find(|o| o.0 == object) {
+                image.roots.push(base + offset);
+            }
+        }
+    }
     if let Some(path) = &inputs.deps_out {
         let list: String = read_files.borrow().iter().map(|p| format!("{}\n", p.display())).collect();
         std::fs::write(path, list).with_context(|| format!("writing {path}"))?;
@@ -163,6 +176,7 @@ fn main() -> Result<()> {
                     "--root" => inputs.root = Some(value()?),
                     "--dlopen" => inputs.dlopen.push(value()?),
                     "--deps-out" => inputs.deps_out = Some(value()?),
+                    "--roots" => inputs.roots = Some(value()?),
                     other => bail!("unexpected argument {other}"),
                 }
             }

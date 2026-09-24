@@ -66,5 +66,15 @@ $cc -O2 -shared -fPIC -o "$rootfs/usr/lib/libgreet.so" "$root/build/libgreet-v2.
 out=$("$wasm_env" run --root "$rootfs" /bin/greet again 2>&1 | sed -n 2p)
 check "cache retranslates after a library changes" "HELLO, world (call 1)" "$out"
 
+# 6. Learning from runs: a jump target computed at run time is missed and
+# recorded by the first run; the next exec retranslates and succeeds.
+$cc -static -nostdlib -o "$rootfs/bin/hidden" tests/arm64/hidden.S
+"$wasm_env" run --root "$rootfs" /bin/hidden a b >"$root/build/hidden.1" 2>&1
+first=$?
+check "missed target: first run stops" "134" "$first"
+check "missed target: recorded" "1" "$(grep -c "recorded the missed address" "$root/build/hidden.1")"
+"$wasm_env" run --root "$rootfs" /bin/hidden a b >/dev/null 2>&1
+check "missed target: next run translates it" "42" "$?"
+
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]
