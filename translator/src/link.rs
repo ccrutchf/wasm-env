@@ -14,9 +14,18 @@ use anyhow::{Context, Result, bail};
 
 pub const SUPPORT_C: &str = include_str!("../support/runtime.c");
 
-/// Compiler flags shared by the lifted code and the support code.
-const CFLAGS: &[&str] =
-    &["--target=wasm64-unknown-unknown", "-O2", "-mtail-call", "-mbulk-memory", "-mexception-handling"];
+/// WebAssembly target and features, shared by the lifted code and the
+/// support code.
+const WASM_FLAGS: &[&str] =
+    &["--target=wasm64-unknown-unknown", "-mtail-call", "-mbulk-memory", "-mexception-handling"];
+
+/// Optimization level for the lifted IR. It is already low-level, and one
+/// module can hold a whole translated library, so `-O2` makes clang use
+/// enormous memory on a whole-library module (see PLAN.md, M3). Small and
+/// medium programs compile fine at -O2; override with WASM_ENV_LIFT_OPT.
+fn lift_opt() -> String {
+    std::env::var("WASM_ENV_LIFT_OPT").unwrap_or_else(|_| "-O2".into())
+}
 
 pub struct Toolchain {
     pub cc: PathBuf,
@@ -60,8 +69,8 @@ pub fn link(tc: &Toolchain, ir: &str, image_end: u64, work: &Path) -> Result<Vec
     let wasm = work.join("program.wasm");
     std::fs::write(&ll, ir)?;
     std::fs::write(&support_c, SUPPORT_C)?;
-    run(Command::new(&tc.cc).args(CFLAGS).arg("-c").arg(&ll).arg("-o").arg(&lifted_o))?;
-    run(Command::new(&tc.cc).args(CFLAGS).args(["-ffreestanding", "-nostdlib", "-c"]).arg(&support_c).arg("-o").arg(&support_o))?;
+    run(Command::new(&tc.cc).args(WASM_FLAGS).arg(lift_opt()).arg("-c").arg(&ll).arg("-o").arg(&lifted_o))?;
+    run(Command::new(&tc.cc).args(WASM_FLAGS).args(["-O2", "-ffreestanding", "-nostdlib", "-c"]).arg(&support_c).arg("-o").arg(&support_o))?;
     run(Command::new(&tc.wasm_ld)
         .args(["-m", "wasm64", "--no-entry", "-z", "stack-size=1048576"])
         .arg(format!("--global-base={}", global_base(image_end)))

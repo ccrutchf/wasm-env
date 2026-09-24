@@ -47,8 +47,8 @@ pub const PIE_BASE: u64 = 0x40_0000;
 struct Reloc {
     at: u64,
     r_type: u32,
-    /// The referenced symbol's name (for symbol-based relocations).
-    sym: Option<String>,
+    /// The referenced symbol (name, is_weak) for symbol-based relocations.
+    sym: Option<(String, bool)>,
     addend: i64,
 }
 
@@ -128,7 +128,7 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
                     let s = table.symbol_by_index(idx).map_err(|_| anyhow::anyhow!("bad symbol index"))?;
                     // A defined local symbol resolves within this object; an
                     // undefined one is looked up image-wide by name.
-                    if s.is_undefined() { Some(s.name().unwrap_or("").to_string()) } else { None }
+                    if s.is_undefined() { Some((s.name().unwrap_or("").to_string(), s.is_weak())) } else { None }
                 }
                 _ => None,
             };
@@ -216,13 +216,12 @@ fn link(objects: Vec<Parsed>) -> Result<Image> {
                 GLOB_DAT | JUMP_SLOT | ABS64 => match &r.sym {
                     // A local defined symbol was folded into the addend.
                     None => obj.base.wrapping_add(r.addend as u64),
-                    Some(name) => {
-                        let addr = global
-                            .get(name)
-                            .copied()
-                            .ok_or_else(|| anyhow::anyhow!("undefined symbol `{name}` (provide the library with --lib)"))?;
-                        addr.wrapping_add(r.addend as u64)
-                    }
+                    Some((name, weak)) => match global.get(name) {
+                        Some(addr) => addr.wrapping_add(r.addend as u64),
+                        // A weak undefined symbol resolves to 0 (the code guards it).
+                        None if *weak => r.addend as u64,
+                        None => bail!("undefined symbol `{name}` (provide the library with --lib)"),
+                    },
                 },
                 other => bail!("unsupported relocation type {other}"),
             };
