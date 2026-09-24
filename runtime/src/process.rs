@@ -167,8 +167,9 @@ pub fn check_shape(module: &Module) -> Result<()> {
     Ok(())
 }
 
-/// Resolves execve(path, argv, env) to a program, following `#!` lines.
-pub fn resolve_exec(fs: &Fs, path: &str, mut argv: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> SysResult<ExecImage> {
+/// Resolves execve(path, argv, env) to a program, following `#!` lines and
+/// translating arm64 ELF binaries on first use (`trace` logs translation).
+pub fn resolve_exec(fs: &Fs, path: &str, mut argv: Vec<Vec<u8>>, env: Vec<Vec<u8>>, trace: bool) -> SysResult<ExecImage> {
     let mut path = path.to_string();
     for _ in 0..4 {
         let guest = fs.resolve(&fs.cwd, &path, true)?;
@@ -184,8 +185,15 @@ pub fn resolve_exec(fs: &Fs, path: &str, mut argv: Vec<Vec<u8>>, env: Vec<Vec<u8
         if head.starts_with(b"\0asm") {
             return Ok(ExecImage { host, path: guest, argv, env });
         }
+        if crate::translate::is_arm64_elf(head) {
+            // Translate the arm64 binary to WebAssembly; it targets the same
+            // ABI, so it runs like any other program. argv[0] stays the
+            // guest path.
+            let wasm = crate::translate::ensure_translated(&host, trace)?;
+            return Ok(ExecImage { host: wasm, path: guest, argv, env });
+        }
         let Some(line) = head.strip_prefix(b"#!") else {
-            // Not WebAssembly: an ELF binary needs the translator (M2).
+            // Not WebAssembly, not a shebang, not an arm64 ELF.
             return Err(ENOEXEC);
         };
         // "#!interpreter [one argument]", as Linux parses it.
@@ -413,7 +421,7 @@ mod tests {
     fn exec_resolves_a_wasm_program() {
         let root = Root::new("wasm");
         root.file("/bin/prog", b"\0asm\x01\0\0\0");
-        let image = resolve_exec(&root.fs(), "/bin/prog", args(&["prog", "x"]), args(&["A=1"])).unwrap();
+        let image = resolve_exec(&root.fs(), "/bin/prog", args(&["prog", "x"]), args(&["A=1"]), false).unwrap();
         assert_eq!(image.path, "/bin/prog");
         assert_eq!(image.host, root.0.join("bin/prog"));
         assert_eq!(image.argv, args(&["prog", "x"]));
@@ -425,7 +433,7 @@ mod tests {
         let root = Root::new("shebang");
         root.file("/bin/sh", b"\0asm");
         root.file("/bin/script", b"#!/bin/sh -e\necho hi\n");
-        let image = resolve_exec(&root.fs(), "/bin/script", args(&["script", "a", "b"]), vec![]).unwrap();
+        let image = resolve_exec(&root.fs(), "/bin/script", args(&["script", "a", "b"]), vec![], false).unwrap();
         assert_eq!(image.path, "/bin/sh");
         assert_eq!(image.argv, args(&["/bin/sh", "-e", "/bin/script", "a", "b"]), "Linux shebang argv");
     }
@@ -436,7 +444,7 @@ mod tests {
         root.file("/bin/sh", b"\0asm");
         root.file("/bin/interp", b"#!/bin/sh\n");
         root.file("/bin/script", b"#!/bin/interp\n");
-        let image = resolve_exec(&root.fs(), "/bin/script", args(&["script"]), vec![]).unwrap();
+        let image = resolve_exec(&root.fs(), "/bin/script", args(&["script"]), vec![], false).unwrap();
         assert_eq!(image.argv, args(&["/bin/sh", "/bin/interp", "/bin/script"]));
     }
 
@@ -446,7 +454,7 @@ mod tests {
         root.file("/bin/elf", b"\x7fELF\x02\x01\x01");
         root.file("/bin/loop", b"#!/bin/loop\n");
         let fs = root.fs();
-        let exec = |p: &str| resolve_exec(&fs, p, args(&["x"]), vec![]).map(|_| ());
+        let exec = |p: &str| resolve_exec(&fs, p, args(&["x"]), vec![], false).map(|_| ());
         assert_eq!(exec("/bin/missing"), Err(ENOENT));
         assert_eq!(exec("/bin"), Err(EACCES), "directories aren't executable");
         assert_eq!(exec("/bin/elf"), Err(ENOEXEC), "native binaries need the translator");

@@ -18,6 +18,7 @@ mod memory;
 mod pipe;
 mod process;
 mod syscall;
+mod translate;
 
 use std::path::PathBuf;
 
@@ -62,11 +63,17 @@ fn main() -> Result<()> {
         && fs.resolve("/", &program, true).is_ok_and(|g| fs.host(&g).is_file());
     let image = if in_root {
         let argv = std::iter::once(program.clone()).chain(rest).map(String::into_bytes).collect();
-        process::resolve_exec(&fs, &program, argv, env)
+        process::resolve_exec(&fs, &program, argv, env, trace)
             .map_err(|e| anyhow::anyhow!("{program}: can't execute (errno {e})"))?
     } else {
-        let host = PathBuf::from(&program);
-        let name = host.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        // A host file: a .wasm module, or an arm64 ELF to translate.
+        let mut host = PathBuf::from(&program);
+        let head = std::fs::read(&host).map(|b| b.into_iter().take(256).collect::<Vec<_>>()).unwrap_or_default();
+        if translate::is_arm64_elf(&head) {
+            host = translate::ensure_translated(&host, trace)
+                .map_err(|e| anyhow::anyhow!("{program}: can't translate (errno {e})"))?;
+        }
+        let name = PathBuf::from(&program).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let argv = std::iter::once(name).chain(rest).map(String::into_bytes).collect();
         ExecImage { host, path: program, argv, env }
     };

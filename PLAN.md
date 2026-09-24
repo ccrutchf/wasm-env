@@ -324,7 +324,7 @@ Either way the runtime would expose the GPU to the process through host function
 
 - **No runtime fallback yet:** an indirect branch to an address discovery missed, or an unimplemented instruction, traps. A runtime translator (or CPU-emulation fallback) is future work.
 - **Threads and atomics:** exclusives assume a single thread (`stxr` always succeeds).
-- **Not wired into the runtime's `execve`:** the runtime rejects ELF binaries with `ENOEXEC` (M0/M1). Converting an image (translate every ELF, cache by hash) and running translated binaries as processes is M4.
+- **Wired into the runtime.** `wasm-env run` and the shell's `execve` translate arm64 ELF binaries on first use (`runtime/src/translate.rs`), caching by content hash, and run them as ordinary processes. A recompiled (wasm-native) shell can exec a translated binary; both make the same syscalls. `tests/m2-exec.sh` covers it. Converting whole images is still M4.
 - **Not yet run on macOS or Windows.**
 
 ## Risks

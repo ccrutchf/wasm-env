@@ -337,7 +337,7 @@ impl Process {
                 let path = mem::cstr(data, ua)?;
                 let argv = string_array(data, ub)?;
                 let env = string_array(data, uc)?;
-                let image = process::resolve_exec(&self.fs, &path, argv, env)?;
+                let image = process::resolve_exec(&self.fs, &path, argv, env, self.trace)?;
                 if self.vfork.is_empty() {
                     // Unwind out of this program; the process loop starts the next.
                     self.pending = Some(Pending::Exec(image));
