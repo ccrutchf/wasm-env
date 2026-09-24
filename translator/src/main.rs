@@ -3,7 +3,7 @@
 //!
 //!   wasm-env-translate census BINARY   count instructions by operation
 //!   wasm-env-translate blocks BINARY   list the basic blocks discovery finds
-//!   wasm-env-translate translate BINARY OUT.wasm [--lib SO]...   (needs `lift`)
+//!   wasm-env-translate translate BINARY OUT.wasm [--lib SO]... [--interp LD_SO]   (needs `lift`)
 
 mod discover;
 mod elf;
@@ -49,16 +49,15 @@ fn census(path: &str) -> Result<()> {
 /// Translates an arm64 executable (with any shared libraries) into a
 /// wasm-env program.
 #[cfg(feature = "lift")]
-fn translate(input: &str, output: &str, libs: &[String]) -> Result<()> {
+fn translate(input: &str, output: &str, libs: &[String], interp: Option<&str>) -> Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("reading {input}"))?;
-    let image = if libs.is_empty() {
+    let read = |p: &str| -> Result<(String, Vec<u8>)> { Ok((p.to_string(), std::fs::read(p).with_context(|| format!("reading {p}"))?)) };
+    let image = if libs.is_empty() && interp.is_none() {
         elf::Image::load(&bytes)?
     } else {
-        let libs: Result<Vec<(String, Vec<u8>)>> = libs
-            .iter()
-            .map(|l| Ok((l.clone(), std::fs::read(l).with_context(|| format!("reading {l}"))?)))
-            .collect();
-        elf::Image::load_dynamic(&bytes, &libs?)?
+        let libs = libs.iter().map(|l| read(l)).collect::<Result<Vec<_>>>()?;
+        let interp = interp.map(read).transpose()?;
+        elf::Image::load_dynamic(&bytes, &libs, interp.as_ref())?
     };
     let prog = discover::discover(&image);
     let lifted = lift::lift(&image, &prog);
@@ -97,16 +96,18 @@ fn main() -> Result<()> {
         ["blocks", path] => blocks(path),
         #[cfg(feature = "lift")]
         ["translate", input, output, libs @ ..] => {
-            // translate INPUT OUT [--lib SO]...
+            // translate INPUT OUT [--lib SO]... [--interp LD_SO]
             let mut so = Vec::new();
+            let mut interp = None;
             let mut it = libs.iter();
             while let Some(a) = it.next() {
                 match *a {
                     "--lib" => so.push(it.next().context("--lib needs a path")?.to_string()),
+                    "--interp" => interp = Some(*it.next().context("--interp needs a path")?),
                     other => bail!("unexpected argument {other}"),
                 }
             }
-            translate(input, output, &so)
+            translate(input, output, &so, interp)
         }
         #[cfg(feature = "lift")]
         ["emit", input] => {

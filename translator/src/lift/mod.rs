@@ -717,6 +717,8 @@ fn build_data(image: &Image, prog: &Program) -> String {
     let _ = writeln!(ir, "]\n@guest_segment_count = constant i64 {}", image.segments.len());
     let _ = writeln!(ir, "@guest_entry = constant i64 {}", image.entry as i64);
     let _ = writeln!(ir, "@guest_phdr = constant i64 {}", image.phdr.unwrap_or(0) as i64);
+    let _ = writeln!(ir, "@guest_app_entry = constant i64 {}", image.app_entry as i64);
+    let _ = writeln!(ir, "@guest_interp_base = constant i64 {}", image.interp_base as i64);
     let _ = writeln!(ir, "@guest_phnum = constant i64 {}\n", image.phnum);
 
     // Declare every block function, then build the dispatch table: parallel

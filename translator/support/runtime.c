@@ -17,6 +17,9 @@ extern uint64_t TP;    // TPIDR_EL0
 struct seg { uint64_t vaddr, filesz, memsz; const uint8_t *data; };
 extern const struct seg guest_segments[];
 extern const uint64_t guest_segment_count, guest_entry, guest_phdr, guest_phnum;
+// The program's own entry (AT_ENTRY) and, when a translated dynamic linker
+// runs first (guest_entry is then its entry), its load address (AT_BASE).
+extern const uint64_t guest_app_entry, guest_interp_base;
 
 // The block table, defined by the lifted data module: sorted guest block
 // addresses and their translated functions. `dispatch` maps a guest address
@@ -116,11 +119,12 @@ void __wasm_env_svc(void)
 #define GUEST_STACK (8u << 20)
 static uint8_t guest_stack[GUEST_STACK] __attribute__((aligned(16)));
 
-enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_ENTRY = 9 };
+enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_BASE = 7, AT_ENTRY = 9 };
 
 // Copies argc, argv, envp and auxv from the runtime's initial stack to the
-// guest stack, adding the ELF entries a static binary's libc expects
-// (AT_PHDR for TLS setup, AT_ENTRY). The strings stay where they are.
+// guest stack, adding the ELF entries the kernel would (AT_PHDR for TLS
+// setup and the dynamic linker, AT_ENTRY, and AT_BASE when a dynamic linker
+// runs). The strings stay where they are.
 static uint64_t guest_initial_stack(const uint64_t *sp)
 {
 	uint64_t argc = sp[0];
@@ -130,7 +134,7 @@ static uint64_t guest_initial_stack(const uint64_t *sp)
 	const uint64_t *q = auxv;
 	while (q[0] != AT_NULL) q += 2;
 	uint64_t words = (uint64_t)(q - sp);  // argc through the last aux pair
-	uint64_t total = words + 4 * 2 + 2;   // plus four new pairs and AT_NULL
+	uint64_t total = words + 5 * 2 + 2;   // plus up to five new pairs and AT_NULL
 
 	uint64_t *out = (uint64_t *)(guest_stack + GUEST_STACK) - total;
 	out = (uint64_t *)((uintptr_t)out & ~(uintptr_t)15);
@@ -140,7 +144,10 @@ static uint64_t guest_initial_stack(const uint64_t *sp)
 	*a++ = AT_PHDR;  *a++ = guest_phdr;
 	*a++ = AT_PHENT; *a++ = 56;
 	*a++ = AT_PHNUM; *a++ = guest_phnum;
-	*a++ = AT_ENTRY; *a++ = guest_entry;
+	*a++ = AT_ENTRY; *a++ = guest_app_entry;
+	if (guest_interp_base) {
+		*a++ = AT_BASE; *a++ = guest_interp_base;
+	}
 	*a++ = AT_NULL;  *a++ = 0;
 	return (uint64_t)out;
 }

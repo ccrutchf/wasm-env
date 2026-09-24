@@ -75,6 +75,7 @@ pub fn discover(image: &Image) -> Program {
     let mut roots = BTreeSet::new();
     roots.insert(image.entry);
     roots.extend(image.functions.iter().map(|f| f.0));
+    roots.extend(&image.roots);
 
     // Code addresses built in registers: ADR, or ADRP followed by ADD.
     let mut prev_adrp: BTreeMap<u32, u64> = BTreeMap::new();

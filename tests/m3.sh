@@ -30,5 +30,26 @@ act=$?
 check "dynamic exit status" "$exp" "$act"
 check "dynamic output (cross-object call + data)" "$(cat "$out/exp")" "$(cat "$out/act")"
 
+# Real dynamically-linked musl programs (main + libc.so). musl's dynamic
+# linker is libc.so itself; it's translated too and runs first, setting up
+# TLS and constructors exactly as under qemu.
+for f in hello:tests/c/hello.c control:tests/arm64/control.c memory:tests/arm64/memory.c arith:tests/arm64/arith.c; do
+	name=${f%%:*} src=${f#*:}
+	$cc -O2 -o "$out/$name-dyn" "$src"
+	env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin TERM=xterm \
+		qemu-aarch64 -L "$AARCH64_MUSL" "$out/$name-dyn" a "b c" >"$out/$name.exp" 2>&1
+	exp=$?
+	if ! "$root/target/release/wasm-env-translate" translate "$out/$name-dyn" "$out/$name-dyn.wasm" \
+		--interp "$AARCH64_MUSL/lib/libc.so" >"$out/$name.tlog" 2>&1; then
+		check "$name (libc.so): translation" "ok" "failed"
+		continue
+	fi
+	"$root/target/release/wasm-env" run "$out/$name-dyn.wasm" a "b c" >"$out/$name.act" 2>&1
+	act=$?
+	sed -i "s|argv\[0\] = .*|argv[0] = PROG|" "$out/$name.exp" "$out/$name.act"
+	check "$name (libc.so): exit status" "$exp" "$act"
+	check "$name (libc.so): output" "$(cat "$out/$name.exp")" "$(cat "$out/$name.act")"
+done
+
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]

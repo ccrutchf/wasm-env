@@ -181,6 +181,8 @@ declare void @dispatch(i64)
 @guest_entry = constant i64 4194304
 @guest_phdr = constant i64 4194560
 @guest_phnum = constant i64 7
+@guest_app_entry = constant i64 4194304
+@guest_interp_base = constant i64 0
 "#;
 
     const IMAGE_END: u64 = 0x410000;

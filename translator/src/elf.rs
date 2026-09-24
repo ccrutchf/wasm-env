@@ -35,6 +35,15 @@ pub struct Image {
     /// section headers (so read-only data sharing an executable segment is
     /// excluded), otherwise whole executable segments.
     pub code: Vec<std::ops::Range<u64>>,
+    /// The executable's entry point (AT_ENTRY). Differs from `entry` when a
+    /// dynamic linker runs first.
+    pub app_entry: u64,
+    /// Where the dynamic linker is loaded (AT_BASE), or 0 if none runs.
+    pub interp_base: u64,
+    /// Extra block entry points: the app entry and every object's
+    /// DT_INIT/DT_FINI, which the dynamic linker calls through addresses it
+    /// computes at run time (so no stored pointer reveals them).
+    pub roots: Vec<u64>,
 }
 
 /// Where a position-independent executable (ET_DYN) is loaded. Bases are
@@ -66,6 +75,8 @@ struct Parsed {
     defined: Vec<(String, u64)>,
     /// End of the object in memory (for placing the next one).
     top: u64,
+    /// DT_INIT and DT_FINI, as absolute addresses.
+    roots: Vec<u64>,
 }
 
 /// The load base for a lone object: fixed for ET_EXEC, the PIE base for
@@ -114,8 +125,25 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
             });
         }
     }
-    // PT_INTERP (a dynamic executable) is fine: we do the loading ourselves,
-    // given the libraries, so we ignore the requested interpreter.
+    // DT_INIT and DT_FINI from the dynamic section.
+    let mut roots = Vec::new();
+    for ph in file.elf_program_headers() {
+        if ph.p_type(endian) != elf::PT_DYNAMIC {
+            continue;
+        }
+        let data = ph.data(endian, bytes).map_err(|_| anyhow::anyhow!("bad dynamic segment"))?;
+        for entry in data.as_chunks::<16>().0 {
+            let tag = u64::from_le_bytes(entry[..8].try_into().unwrap());
+            let val = u64::from_le_bytes(entry[8..].try_into().unwrap());
+            match tag as u32 {
+                elf::DT_NULL => break,
+                elf::DT_INIT | elf::DT_FINI if val != 0 => roots.push(base + val),
+                _ => {}
+            }
+        }
+    }
+    // PT_INTERP (a dynamic executable) is fine: the caller supplies the
+    // libraries and, optionally, the interpreter (see Image::load_dynamic).
 
     let mut relocs = Vec::new();
     if let Some(dyn_relocs) = file.dynamic_relocations() {
@@ -152,8 +180,10 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
         .map(|s| (s.name().unwrap().to_string(), base + s.address()))
         .collect();
 
+    // Function symbols from .symtab, and .dynsym for stripped libraries.
     let mut functions: Vec<(u64, String)> = file
         .symbols()
+        .chain(file.dynamic_symbols())
         .filter(|s| s.kind() == SymbolKind::Text && s.address() != 0)
         .map(|s| (base + s.address(), s.name().unwrap_or("?").to_string()))
         .collect();
@@ -183,13 +213,16 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
         relocs,
         defined,
         top,
+        roots,
     })
 }
 
 /// Prelinks parsed objects into one image: builds the image-wide symbol
 /// table, applies every relocation to final values, and merges segments.
-/// The first object is the executable (its entry and program headers win).
-fn link(objects: Vec<Parsed>) -> Result<Image> {
+/// The first object is the executable (its program headers win). With
+/// `interp`, the last object is the dynamic linker: the image starts there,
+/// and relocations we don't model are left for it to apply at run time.
+fn link(objects: Vec<Parsed>, interp: bool) -> Result<Image> {
     // arm64 dynamic relocation types.
     const RELATIVE: u32 = 1027;
     const GLOB_DAT: u32 = 1025;
@@ -204,7 +237,12 @@ fn link(objects: Vec<Parsed>) -> Result<Image> {
     }
 
     let exe = &objects[0];
-    let (entry, phdr, phnum) = (exe.entry, exe.phdr, exe.phnum);
+    let (app_entry, phdr, phnum) = (exe.entry, exe.phdr, exe.phnum);
+    let (entry, interp_base) = match objects.last() {
+        Some(ld) if interp => (ld.entry, ld.base),
+        _ => (app_entry, 0),
+    };
+    let mut roots = vec![app_entry];
     let mut segments: Vec<Segment> = Vec::new();
     let mut functions = Vec::new();
     let mut code = Vec::new();
@@ -223,10 +261,13 @@ fn link(objects: Vec<Parsed>) -> Result<Image> {
                         None => bail!("undefined symbol `{name}` (provide the library with --lib)"),
                     },
                 },
+                // TLS and other relocations: the dynamic linker applies them.
+                _ if interp => continue,
                 other => bail!("unsupported relocation type {other}"),
             };
             write_word(&mut obj.segments, r.at, value)?;
         }
+        roots.append(&mut obj.roots);
         segments.append(&mut obj.segments);
         functions.append(&mut obj.functions);
         code.append(&mut obj.code);
@@ -234,7 +275,7 @@ fn link(objects: Vec<Parsed>) -> Result<Image> {
     code.sort_by_key(|r| r.start);
     functions.sort();
     functions.dedup_by_key(|f| f.0);
-    Ok(Image { entry, segments, phdr, phnum, functions, code })
+    Ok(Image { entry, segments, phdr, phnum, functions, code, app_entry, interp_base, roots })
 }
 
 /// Writes an 8-byte little-endian value at a guest address, growing the
@@ -256,22 +297,28 @@ impl Image {
     /// Loads a single statically-linked or position-independent executable.
     pub fn load(bytes: &[u8]) -> Result<Image> {
         let base = elf_base(bytes)?;
-        link(vec![parse_object(bytes, base)?])
+        link(vec![parse_object(bytes, base)?], false)
     }
 
     /// Loads a dynamically-linked executable together with the shared
     /// objects it needs, prelinking them into one image. `libs` are
     /// (name, bytes) pairs; symbols are resolved across all of them.
-    pub fn load_dynamic(exe: &[u8], libs: &[(String, Vec<u8>)]) -> Result<Image> {
+    ///
+    /// With `interp` (the program's PT_INTERP, e.g. musl's libc.so), the
+    /// dynamic linker is translated too and runs first, as the kernel would
+    /// start it: it sets up TLS, runs constructors and jumps to the program.
+    /// Its own relocation pass over the prelinked image is idempotent (RELA
+    /// relocations store absolute values).
+    pub fn load_dynamic(exe: &[u8], libs: &[(String, Vec<u8>)], interp: Option<&(String, Vec<u8>)>) -> Result<Image> {
         let mut objects = vec![parse_object(exe, elf_base(exe)?)?];
         // Place each library above the previous object, page-aligned.
         let mut next = objects[0].top.next_multiple_of(0x10000).max(PIE_BASE);
-        for (name, bytes) in libs {
+        for (name, bytes) in libs.iter().chain(interp) {
             let obj = parse_object(bytes, next).with_context(|| format!("loading {name}"))?;
             next = obj.top.next_multiple_of(0x10000);
             objects.push(obj);
         }
-        link(objects)
+        link(objects, interp.is_some())
     }
 
     /// Decodes every 4-byte-aligned word of code (see `code`). arm64
@@ -451,7 +498,7 @@ mod dynamic_tests {
 
         // With the library, everything resolves and the two objects occupy
         // distinct, non-overlapping address ranges.
-        let image = Image::load_dynamic(&main, &[("dynlib.so".into(), lib)]).unwrap();
+        let image = Image::load_dynamic(&main, &[("dynlib.so".into(), lib)], None).unwrap();
         let ranges: Vec<_> = image.segments.iter().map(|s| (s.vaddr, s.vaddr + s.memsz)).collect();
         for (i, a) in ranges.iter().enumerate() {
             for b in &ranges[i + 1..] {
