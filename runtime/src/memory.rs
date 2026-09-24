@@ -39,6 +39,16 @@ pub fn cstr(data: &[u8], addr: u64) -> SysResult<String> {
     String::from_utf8(rest[..len].to_vec()).map_err(|_| EINVAL)
 }
 
+/// Reads a NUL-terminated byte string (argv and envp entries, up to
+/// 128 KB). These are raw bytes on Linux, not necessarily UTF-8: BusyBox,
+/// for one, flags re-executed processes by setting the high bit of
+/// argv[0][0].
+pub fn cstr_bytes(data: &[u8], addr: u64) -> SysResult<Vec<u8>> {
+    let rest = data.get(addr as usize..).ok_or(EFAULT)?;
+    let len = rest.iter().take(128 << 10).position(|&b| b == 0).ok_or(E2BIG)?;
+    Ok(rest[..len].to_vec())
+}
+
 /// An iovec array: (base, len) pairs.
 pub fn iovecs(data: &[u8], addr: u64, count: u64) -> SysResult<Vec<(u64, u64)>> {
     if count > 1024 {

@@ -23,6 +23,7 @@ pub mod nr {
     pub const FCHDIR: i64 = 50;
     pub const OPENAT: i64 = 56;
     pub const CLOSE: i64 = 57;
+    pub const PIPE2: i64 = 59;
     pub const GETDENTS64: i64 = 61;
     pub const LSEEK: i64 = 62;
     pub const READ: i64 = 63;
@@ -42,6 +43,7 @@ pub mod nr {
     pub const SET_TID_ADDRESS: i64 = 96;
     pub const SET_ROBUST_LIST: i64 = 99;
     pub const NANOSLEEP: i64 = 101;
+    pub const CLOCK_NANOSLEEP: i64 = 115;
     pub const CLOCK_GETTIME: i64 = 113;
     pub const SCHED_GETAFFINITY: i64 = 123;
     pub const KILL: i64 = 129;
@@ -49,6 +51,10 @@ pub mod nr {
     pub const SIGALTSTACK: i64 = 132;
     pub const RT_SIGACTION: i64 = 134;
     pub const RT_SIGPROCMASK: i64 = 135;
+    pub const SETPGID: i64 = 154;
+    pub const GETPGID: i64 = 155;
+    pub const GETSID: i64 = 156;
+    pub const SETSID: i64 = 157;
     pub const UNAME: i64 = 160;
     pub const UMASK: i64 = 166;
     pub const GETTIMEOFDAY: i64 = 169;
@@ -62,9 +68,12 @@ pub mod nr {
     pub const BRK: i64 = 214;
     pub const MUNMAP: i64 = 215;
     pub const MREMAP: i64 = 216;
+    pub const CLONE: i64 = 220;
+    pub const EXECVE: i64 = 221;
     pub const MMAP: i64 = 222;
     pub const MPROTECT: i64 = 226;
     pub const MADVISE: i64 = 233;
+    pub const WAIT4: i64 = 260;
     pub const PRLIMIT64: i64 = 261;
     pub const RENAMEAT2: i64 = 276;
     pub const GETRANDOM: i64 = 278;
@@ -84,7 +93,7 @@ pub fn name(n: i64) -> &'static str {
         READV => "readv", WRITEV => "writev", PREAD64 => "pread64", PWRITE64 => "pwrite64",
         READLINKAT => "readlinkat", NEWFSTATAT => "newfstatat", FSTAT => "fstat", UTIMENSAT => "utimensat",
         EXIT => "exit", EXIT_GROUP => "exit_group", SET_TID_ADDRESS => "set_tid_address",
-        SET_ROBUST_LIST => "set_robust_list", NANOSLEEP => "nanosleep",
+        SET_ROBUST_LIST => "set_robust_list", NANOSLEEP => "nanosleep", CLOCK_NANOSLEEP => "clock_nanosleep",
         CLOCK_GETTIME => "clock_gettime", SCHED_GETAFFINITY => "sched_getaffinity",
         KILL => "kill", TGKILL => "tgkill", SIGALTSTACK => "sigaltstack",
         RT_SIGACTION => "rt_sigaction", RT_SIGPROCMASK => "rt_sigprocmask", UNAME => "uname",
@@ -92,7 +101,9 @@ pub fn name(n: i64) -> &'static str {
         GETPPID => "getppid", GETUID => "getuid", GETEUID => "geteuid", GETGID => "getgid",
         GETEGID => "getegid", GETTID => "gettid", BRK => "brk", MUNMAP => "munmap",
         MREMAP => "mremap", MMAP => "mmap", MPROTECT => "mprotect", MADVISE => "madvise",
-        PRLIMIT64 => "prlimit64", GETRANDOM => "getrandom",
+        PRLIMIT64 => "prlimit64", GETRANDOM => "getrandom", PIPE2 => "pipe2", CLONE => "clone",
+        EXECVE => "execve", WAIT4 => "wait4", SETPGID => "setpgid", GETPGID => "getpgid",
+        GETSID => "getsid", SETSID => "setsid",
         _ => "?",
     }
 }
@@ -100,8 +111,14 @@ pub fn name(n: i64) -> &'static str {
 /// errno values (include/uapi/asm-generic/errno-base.h and errno.h).
 pub mod errno {
     pub const ENOENT: i64 = 2;
+    pub const ESRCH: i64 = 3;
+    pub const EINTR: i64 = 4;
     pub const EIO: i64 = 5;
+    pub const E2BIG: i64 = 7;
+    pub const ENOEXEC: i64 = 8;
     pub const EBADF: i64 = 9;
+    pub const ECHILD: i64 = 10;
+    pub const EAGAIN: i64 = 11;
     pub const ENOMEM: i64 = 12;
     pub const EACCES: i64 = 13;
     pub const EFAULT: i64 = 14;
@@ -114,6 +131,7 @@ pub mod errno {
     pub const ENOTTY: i64 = 25;
     pub const ESPIPE: i64 = 29;
     pub const EROFS: i64 = 30;
+    pub const EPIPE: i64 = 32;
     pub const ERANGE: i64 = 34;
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
@@ -129,6 +147,7 @@ pub mod o {
     pub const EXCL: i64 = 0o200;
     pub const TRUNC: i64 = 0o1000;
     pub const APPEND: i64 = 0o2000;
+    pub const NONBLOCK: i64 = 0o4000;
     pub const DIRECTORY: i64 = 0o40000;
     pub const NOFOLLOW: i64 = 0o100000;
     pub const CLOEXEC: i64 = 0o2000000;

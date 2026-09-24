@@ -131,7 +131,7 @@ The full specification is [docs/abi.md](docs/abi.md) (version 0). Summary:
 
 - **M-1 — wasm32 vs memory64 benchmarks (done on Linux x86-64).** Decided the native ABI's memory model: memory64 with masked addressing, ~1.2× native (~1.12× excluding interpreters), on wasmtime. See [Benchmarks](#m-1-benchmarks) below.
 - **M0 — Native ABI (done on Linux x86-64).** Specified in [docs/abi.md](docs/abi.md). musl 1.2.6 ported to `wasm64` (`toolchain/musl-overlay`), compiler-rt builtins, a `wasm64-linux-musl-cc` wrapper, and the `wasm-env` runtime (`runtime/`, about 50 syscalls). A C test program and BusyBox 1.37 (44 applets, 294 KB) pass `tests/m0.sh` (20 checks). Still to do: run it on the Mac and on Windows. See [M0 notes](#m0-notes).
-- **M1 — Processes and a shell.** `posix_spawn`/`vfork`+`execve`, `wait4`, pipes, `dup2`, basic signals; BusyBox `sh` with pipes and subshells. Needed by every path. A non-trivial script gives identical output on all hosts.
+- **M1 — Processes and a shell (done on Linux x86-64).** `vfork` (built on setjmp and WebAssembly exceptions) + `execve`, `posix_spawn`, `system`/`popen`, `wait4`, pipes, `kill` with default signal actions, `#!` scripts and virtual `/dev` devices. BusyBox in its no-MMU mode with the `hush` shell. `tests/m1.sh` passes 27 checks. See [M1 notes](#m1-notes).
 - **M2 — arm64 translation, static.** Lift a static arm64 binary to WASM against the same ABI. Start with arm64 BusyBox and compare it to the recompiled BusyBox from M0: a built-in correctness and performance baseline.
 - **M3 — Translated dynamic linking.** ABI version 1 (shared memory and function table across modules), the runtime's loader, and translate-on-first-load with caching. Goal: Ubuntu 24.04 arm64's own `python3 -c 'print(1)'`, with its glibc, running translated.
 - **M4 — Python wheels.** `pip install` into the translated Python and import binary wheels: first a small C extension (`markupsafe`), then **numpy** (with bundled OpenBLAS, single-threaded), then **pandas**. Measure against native arm64.
@@ -257,6 +257,28 @@ Native code gets memory isolation for free from the CPU's memory hardware, but o
 - Terminal size is fixed at 80×24; there's no terminal mode control (`TCGETS`/`TCSETS`).
 - Paths must be valid UTF-8; file-backed `mmap` is read-only.
 - Not yet run on macOS or Windows. The Windows-specific code (symlinks, permissions, `stat`) has never been compiled.
+
+## M1 notes
+
+**How processes work**
+
+- **Each guest process is a host thread** with its own wasmtime instance, all in the environment's one host process (the security model). Pipes, `wait4` and signals are in-runtime data structures, so they work the same on every host, and starting a process is cheap: the compiled program is shared, and instantiation takes microseconds.
+- **vfork is built on setjmp.** The child runs in the parent's memory until it calls `execve` or `_exit`; the runtime then starts the new program (or records the exit) and returns the child's pid, and libc `longjmp`s back to the `vfork` call site. This is real vfork semantics, and it's cheap because it reuses the WebAssembly-exception setjmp from M0. Details in docs/abi.md, "Processes".
+- **BusyBox runs in its no-MMU mode**, built for hardware without `fork`: it uses only `vfork`+`exec`, and re-executes itself where it would otherwise fork. Its `hush` shell supports that mode fully.
+
+**Findings**
+
+- **Deadlock in the first version of `wait4`**: it held the process-table lock while checking for signals, which takes the same lock. Rust's `Mutex` isn't re-entrant. Found by reading thread states from `/proc` (ptrace is blocked on this machine).
+- **argv is bytes, not text.** BusyBox marks a re-executed process by setting the high bit of `argv[0][0]`, which isn't valid UTF-8. The runtime now carries argv and envp as raw bytes.
+- **Variadic `int` arguments arrive with garbage in the high 32 bits** on wasm64 (musl reads `fcntl`'s argument as a `long`). The runtime truncates them to 32 bits, as the Linux kernel does.
+- **BusyBox bug in no-MMU `timeout`**: it re-executes itself with `-p PID` after the duration, where getopt never sees it. We carry a small patch (`packages/busybox/patches/`); worth sending upstream.
+
+**Known gaps**
+
+- **No `fork`.** Programs that fork without exec fail with `ENOSYS`. The options are in docs/abi.md.
+- **Signal handlers never run**: they're recorded, and a signal with a handler is ignored. Needs a way to interrupt a running instance and call into it (for example with wasmtime's epoch interruption).
+- **A process in a CPU loop can't be killed** until its next syscall. The same interruption mechanism would fix it.
+- **No terminal control** (`TCGETS`/`TCSETS`, process-group job control), so no interactive line editing yet.
 
 ## GPU research (much later)
 

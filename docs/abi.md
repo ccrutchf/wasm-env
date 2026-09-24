@@ -1,6 +1,6 @@
 # wasm-env native ABI (`wasm64-linux-musl`), version 0
 
-This document defines what a wasm-env program is: the contract between a WebAssembly module and the wasm-env runtime. Recompiled software targets it through our toolchain. Translated binaries (see PLAN.md) will target it too. Status: draft for M0; everything may change until M2.
+This document defines what a wasm-env program is: the contract between a WebAssembly module and the wasm-env runtime. Recompiled software targets it through our toolchain. Translated binaries (see PLAN.md) will target it too. Status: draft (M0, extended in M1 with processes); everything may change until M3.
 
 The guiding rule: **be Linux**. Where Linux already defines something (syscall numbers, struct layouts, errno values, the initial process stack), we use the Linux definition, specifically the one for **arm64**, which uses the modern generic syscall table and 64-bit struct layouts. A port of existing software should see nothing unusual except the CPU.
 
@@ -74,7 +74,7 @@ The program exits by calling `exit_group`. If `_start` returns, the runtime trea
 
 ## Threads and thread-local storage
 
-Version 0 is single-threaded. `clone` with `CLONE_THREAD` returns `-ENOSYS`, so `pthread_create` fails cleanly.
+Version 0 is single-threaded. `clone` with `CLONE_THREAD` returns `-ENOSYS`, so `pthread_create` fails cleanly. (Separate processes do run concurrently; see "Processes".)
 
 musl's thread pointer, which it uses for `errno` and its own bookkeeping, is an ordinary global variable in libc, set by `__set_thread_area`. There is no ELF TLS segment. C `_Thread_local` variables compile to ordinary globals, which is correct with one thread.
 
@@ -82,18 +82,34 @@ musl's thread pointer, which it uses for `errno` and its own bookkeeping, is an 
 
 The compiler rewrites `setjmp`/`longjmp` using WebAssembly exception handling (`-mllvm -wasm-enable-sjlj`): `longjmp` throws the C tag `__c_longjmp`, and functions that call `setjmp` catch it and check whether it's theirs. libc supplies the three helpers the compiler calls (`__wasm_setjmp`, `__wasm_setjmp_test`, `__wasm_longjmp`). Everything linked into a program must be compiled with the same flags.
 
-## Processes: `fork` and `exec` (decided in M1)
+## Processes
 
-Version 0 has no `fork`; `clone` without `CLONE_THREAD` (and `vfork`) returns `-ENOSYS`. `execve` is implemented by the runtime replacing the current module with a new one.
+Processes are created with **`vfork` + `execve`**, which covers `posix_spawn`, `system`, `popen` and shells. There is no `fork` yet (see the end of this section).
 
-M1 must pick a `fork` strategy. The ABI above doesn't rule any of them out:
+**vfork.** `clone(CLONE_VM | CLONE_VFORK | SIGCHLD, 0)` (no new stack) enters a *vfork child*:
+
+1. The runtime allocates the child's pid and saves the parent's process state (descriptor table, working directory, umask, signal dispositions). The child continues **in the parent's memory, on the parent's call stack**, with its own copy of that state, exactly as a real vfork child shares its parent's memory.
+2. When the child calls `execve` and it succeeds, the runtime starts the new program as the child's pid, restores the parent's state, and **returns the child's pid** (instead of not returning).
+3. When the child calls `exit_group`, the runtime records the child's exit status, restores the parent's state, and **returns the child's pid**.
+4. In both cases libc then `longjmp`s back to the `vfork` call site, where `vfork()` returns the pid to the parent.
+
+`vfork` returns twice, so libc defines it as a macro around `setjmp` (see `toolchain/musl-overlay/src/process/wasm64/vfork.c`); the child must not return from the function that called `vfork`, the usual vfork rule. `clone` with any other flags returns `-ENOSYS`.
+
+**execve** accepts WebAssembly programs and `#!` scripts (up to four levels of interpreter). Other files, including ELF binaries until the translator exists, fail with `-ENOEXEC`. Outside a vfork child, a successful `execve` replaces the running program; the pid, descriptors (minus close-on-exec ones), working directory, umask and ignored signals carry over.
+
+**Process model.** Each process runs on its own host thread, all inside the environment's one host process. `wait4` supports the usual targets (-1, a pid, 0, -pgid) and `WNOHANG`, and reports standard Linux wait statuses. Pipes are in-runtime buffers of 64 KB; writing to a pipe without readers raises `SIGPIPE`.
+
+**Signals (version 0).** `kill` and `tgkill` queue a signal; it's acted on at the target's next syscall, and blocking calls (`read` on a pipe, `wait4`, `nanosleep`) wake up with `-EINTR`. Default actions apply (terminate, or ignore for SIGCHLD, SIGCONT, SIGURG and SIGWINCH), and `SIG_IGN` is honored. **Signal handlers are recorded by `rt_sigaction` but never run**: a signal with a handler is ignored. Running handlers is future work.
+
+**Devices.** The runtime provides `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd/N`, whatever the root directory contains.
+
+**fork**, for programs that fork without exec, remains open. The options:
 
 | Option | How it works | Trade-off |
 |---|---|---|
 | Asyncify-style unwinding | The compiler instruments code so the call stack can be saved to memory and rebuilt in a copy of the process | Works on any runtime; code grows and slows (roughly 10–50%) |
 | Stack switching | Use the WebAssembly stack-switching proposal to capture the running stack | Cheap, but the proposal isn't finished and wasmtime support is experimental |
 | Runtime-level snapshot | wasmtime copies the instance, including its native stack | No compiler changes; needs deep wasmtime changes |
-| `posix_spawn`-first | Implement `vfork`+`exec` and `posix_spawn` without real `fork` | Covers shells and most tools; programs that fork without exec still fail |
 
 ## Toolchain
 

@@ -1,0 +1,28 @@
+--- a/coreutils/timeout.c
++++ b/coreutils/timeout.c
+@@ -123,11 +123,22 @@
+ 		/* Child: spawn grandchild and exit */
+ 		parent = getppid();
+ #if !BB_MMU
+-		argv[optind] = xasprintf("-p%u", parent);
+-		argv[optind + 1] = NULL;
+-#endif
++		{
++			/* Re-exec as "timeout [OPTS] -pPID DURATION PROG": getopt
++			 * stops at the first non-option, so -p must come before
++			 * the duration. PROG is only there to pass the usage check. */
++			char **rexec_argv = xzalloc((optind + 3) * sizeof(rexec_argv[0]));
++			memcpy(rexec_argv, argv, (optind - 1) * sizeof(rexec_argv[0]));
++			rexec_argv[optind - 1] = xasprintf("-p%u", parent);
++			rexec_argv[optind] = argv[optind - 1];
++			rexec_argv[optind + 1] = argv[optind];
++			/* NB: exits with nonzero on error: */
++			bb_daemonize_or_rexec(0, rexec_argv);
++		}
++#else
+ 		/* NB: exits with nonzero on error: */
+ 		bb_daemonize_or_rexec(0, argv);
++#endif
+ 		/* Here we are grandchild. Sleep, then kill grandparent */
+  grandchild:
+ 		if (timeout_wait(timeout, parent) == EXIT_SUCCESS)

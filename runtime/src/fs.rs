@@ -5,14 +5,14 @@
 //! absolute link like /bin/sh -> /bin/busybox resolves inside the root and
 //! `..` can't climb out of it.
 
-use std::cell::RefCell;
 use std::fs::{File, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::abi::errno::*;
 use crate::memory::SysResult;
+use crate::pipe::PipeEnd;
 
 /// Maps a host I/O error to a Linux errno.
 pub fn errno(e: &io::Error) -> i64 {
@@ -105,6 +105,68 @@ impl Fs {
     }
 }
 
+/// Devices the runtime provides under /dev, whatever the root contains.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Device {
+    Null,
+    Zero,
+    Random,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DevPath {
+    Device(Device),
+    /// /dev/stdin, /dev/stdout, /dev/stderr and /dev/fd/N: another descriptor.
+    Fd(i64),
+}
+
+impl Fs {
+    /// Recognizes the virtual /dev paths (resolved lexically; /dev itself
+    /// is not looked up in the root).
+    pub fn device(&self, dir: &str, path: &str) -> Option<DevPath> {
+        let mut parts = if path.starts_with('/') { vec![] } else { split(dir) };
+        for c in path.split('/') {
+            match c {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                _ => parts.push(c.to_string()),
+            }
+        }
+        let [dev, rest @ ..] = parts.as_slice() else { return None };
+        if dev != "dev" {
+            return None;
+        }
+        let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+        match rest.as_slice() {
+            ["null"] => Some(DevPath::Device(Device::Null)),
+            ["zero"] => Some(DevPath::Device(Device::Zero)),
+            ["random"] | ["urandom"] => Some(DevPath::Device(Device::Random)),
+            ["stdin"] => Some(DevPath::Fd(0)),
+            ["stdout"] => Some(DevPath::Fd(1)),
+            ["stderr"] => Some(DevPath::Fd(2)),
+            ["fd", n] => n.parse().ok().map(DevPath::Fd),
+            _ => None,
+        }
+    }
+}
+
+/// `struct stat` for a /dev device (Linux's major 1 memory devices).
+pub fn device_stat_bytes(d: Device) -> [u8; 128] {
+    let minor: u64 = match d {
+        Device::Null => 3,
+        Device::Zero => 5,
+        Device::Random => 9,
+    };
+    let mut b = [0u8; 128];
+    b[16..20].copy_from_slice(&(S_IFCHR | 0o666).to_le_bytes());
+    b[20..24].copy_from_slice(&1u32.to_le_bytes());
+    b[32..40].copy_from_slice(&(1 << 8 | minor).to_le_bytes());
+    b[56..60].copy_from_slice(&4096u32.to_le_bytes());
+    b
+}
+
 /// Pushes path components onto a stack so they pop in order.
 fn push_components(todo: &mut Vec<String>, path: &str) {
     for c in path.split('/').rev() {
@@ -189,6 +251,16 @@ pub fn stdio_stat_bytes() -> [u8; 128] {
     b
 }
 
+/// `struct stat` for a pipe.
+pub fn fifo_stat_bytes() -> [u8; 128] {
+    const S_IFIFO: u32 = 0o010000;
+    let mut b = [0u8; 128];
+    b[16..20].copy_from_slice(&(S_IFIFO | 0o600).to_le_bytes());
+    b[20..24].copy_from_slice(&1u32.to_le_bytes());
+    b[56..60].copy_from_slice(&4096u32.to_le_bytes());
+    b
+}
+
 pub struct DirEntry {
     pub ino: u64,
     pub dtype: u8,
@@ -201,24 +273,30 @@ pub enum Open {
     Stderr,
     File { file: File, path: String, append: bool },
     Dir { path: String, entries: Option<Vec<DirEntry>>, pos: usize },
+    Pipe(PipeEnd),
+    Device(Device),
 }
 
-/// A descriptor: the open file (shared by dup) plus per-descriptor flags.
+/// A descriptor: the open file description (shared by dup, vfork and
+/// exec, possibly across processes) plus per-descriptor flags.
 #[derive(Clone)]
 pub struct Fd {
-    pub open: Rc<RefCell<Open>>,
+    pub open: Arc<Mutex<Open>>,
     pub cloexec: bool,
     /// File status flags (O_APPEND etc.) as the guest set them.
     pub flags: i64,
 }
 
+/// A process's descriptor table. Cloning it (for a vfork child or a new
+/// process) shares the open file descriptions, as fork does on Linux.
+#[derive(Clone)]
 pub struct FdTable {
     fds: Vec<Option<Fd>>,
 }
 
 impl FdTable {
     pub fn with_stdio() -> Self {
-        let fd = |o| Some(Fd { open: Rc::new(RefCell::new(o)), cloexec: false, flags: 0 });
+        let fd = |o| Some(Fd { open: Arc::new(Mutex::new(o)), cloexec: false, flags: 0 });
         FdTable { fds: vec![fd(Open::Stdin), fd(Open::Stdout), fd(Open::Stderr)] }
     }
 
@@ -253,6 +331,15 @@ impl FdTable {
     pub fn close(&mut self, fd: i64) -> SysResult<()> {
         let slot = usize::try_from(fd).ok().and_then(|i| self.fds.get_mut(i)).ok_or(EBADF)?;
         slot.take().map(|_| ()).ok_or(EBADF)
+    }
+
+    /// Closes descriptors marked close-on-exec (at execve).
+    pub fn close_on_exec(&mut self) {
+        for slot in &mut self.fds {
+            if slot.as_ref().is_some_and(|f| f.cloexec) {
+                *slot = None;
+            }
+        }
     }
 }
 
@@ -307,6 +394,10 @@ mod tests {
         assert_eq!(fs.resolve("/", "/missing", true).unwrap(), "/missing");
         assert_eq!(fs.resolve("/", "/missing/x", true), Err(ENOENT));
         assert_eq!(fs.resolve("/", "/bin/new/", false).unwrap(), "/bin/new");
+        assert_eq!(fs.device("/", "/dev/null"), Some(DevPath::Device(Device::Null)));
+        assert_eq!(fs.device("/dev", "fd/3"), Some(DevPath::Fd(3)));
+        assert_eq!(fs.device("/tmp", "../dev/../dev/zero"), Some(DevPath::Device(Device::Zero)));
+        assert_eq!(fs.device("/", "/dev/sda"), None);
         #[cfg(unix)]
         {
             assert_eq!(fs.resolve("/", "/bin/sh", true).unwrap(), "/bin/busybox");

@@ -1,17 +1,17 @@
 //! The `linux.syscall` import: Linux syscalls (generic/arm64 numbering) on
 //! top of the host. See docs/abi.md.
 
-use std::cell::RefCell;
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wasmtime::Caller;
 
 use crate::abi::{self, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, errno::*, nr, o};
-use crate::fs::{self, Fd, Open};
+use crate::fs::{self, DevPath, Device, Fd, Open};
+use crate::kernel::Termination;
 use crate::memory::{self as mem, SysResult, page_align};
-use crate::process::{Exit, Process};
+use crate::process::{self, NSIG, Pending, Process, Unwind, VforkFrame};
 
 /// Entry point for every syscall the program makes.
 #[allow(clippy::too_many_arguments)]
@@ -26,43 +26,37 @@ pub fn syscall(
     f: i64,
 ) -> wasmtime::Result<i64> {
     let args = [a, b, c, d, e, f];
+    deliver_signal(caller.data_mut())?;
     let result = match n {
-        nr::EXIT | nr::EXIT_GROUP => Err(Exit(a as i32 & 0xff)),
-        // A signal sent to ourselves (abort() raises SIGABRT) terminates
-        // the process with the shell's 128+signal status.
-        nr::KILL | nr::TGKILL => match signal_self(n, &args) {
-            Some(sig) => Err(Exit(128 + sig)),
-            None => Ok(Ok(0)),
-        },
-        nr::MMAP => Ok(mmap(&mut caller, &args)),
-        nr::MREMAP => Ok(mremap(&mut caller, &args)),
+        nr::MMAP => mmap(&mut caller, &args),
+        nr::MREMAP => mremap(&mut caller, &args),
         _ => {
             let memory = caller.data().memory.expect("memory is set before _start");
             let (data, process) = memory.data_and_store_mut(&mut caller);
-            Ok(process.call(data, n, &args))
+            process.call(data, n, &args)
         }
     };
-    match result {
-        Ok(r) => {
-            let ret = r.unwrap_or_else(|e| -e);
-            if caller.data().trace {
-                eprintln!("[wasm-env] {}({a:#x}, {b:#x}, {c:#x}) = {ret}", abi::name(n));
-            }
-            Ok(ret)
-        }
-        Err(exit) => {
-            if caller.data().trace {
-                eprintln!("[wasm-env] {}({a}) -> exit {}", abi::name(n), exit.0);
-            }
-            Err(wasmtime::Error::new(exit))
-        }
+    let ret = result.unwrap_or_else(|e| -e);
+    let process = caller.data_mut();
+    if process.trace {
+        eprintln!("[wasm-env] pid {}: {}({a:#x}, {b:#x}, {c:#x}) = {ret}", process.pid, abi::name(n));
     }
+    if process.pending.is_some() {
+        return Err(wasmtime::Error::new(Unwind));
+    }
+    deliver_signal(process)?;
+    Ok(ret)
 }
 
-/// The signal number if this kill/tgkill targets our own process.
-fn signal_self(n: i64, args: &[i64; 6]) -> Option<i32> {
-    let (pid, sig) = if n == nr::KILL { (args[0], args[1]) } else { (args[0], args[2]) };
-    (sig != 0 && (pid == 1 || pid == 0 || pid == -1)).then_some(sig as i32)
+/// Acts on a signal sent to this process: its default action ends the
+/// process (unless the signal is ignored).
+fn deliver_signal(p: &mut Process) -> wasmtime::Result<()> {
+    if let Some(sig) = p.kernel.take_signal(p.pid)
+        && let Some(how) = p.signal_effect(sig) {
+            p.pending = Some(Pending::Terminate(how));
+            return Err(wasmtime::Error::new(Unwind));
+        }
+    Ok(())
 }
 
 const MAP_FIXED: i64 = 0x10;
@@ -106,7 +100,7 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
     if flags & MAP_ANONYMOUS == 0 {
         // File mapping: copy the contents in (docs/abi.md; read-only for now).
         let open = process.fds.get(fd)?.open.clone();
-        let mut open = open.borrow_mut();
+        let mut open = open.lock().unwrap();
         let Open::File { file, .. } = &mut *open else { return Err(EACCES) };
         let pos = file.stream_position().map_err(|e| fs::errno(&e))?;
         file.seek(SeekFrom::Start(off as u64)).map_err(|e| fs::errno(&e))?;
@@ -203,6 +197,9 @@ impl Process {
             nr::FACCESSAT => {
                 let path = mem::cstr(data, ub)?;
                 let dir = self.dir_of(a)?;
+                if self.fs.device(&dir, &path).is_some() {
+                    return Ok(0);
+                }
                 let guest = self.fs.resolve(&dir, &path, true)?;
                 std::fs::metadata(self.fs.host(&guest)).map(|_| 0).map_err(|e| fs::errno(&e))
             }
@@ -226,7 +223,7 @@ impl Process {
             }
             nr::FCHDIR => {
                 let fd = self.fds.get(a)?;
-                let Open::Dir { path, .. } = &*fd.open.borrow() else { return Err(ENOTDIR) };
+                let Open::Dir { path, .. } = &*fd.open.lock().unwrap() else { return Err(ENOTDIR) };
                 self.fs.cwd = path.clone();
                 Ok(0)
             }
@@ -284,7 +281,7 @@ impl Process {
             }
             nr::FCHMOD => {
                 let open = self.fds.get(a)?.open.clone();
-                let path = match &*open.borrow() {
+                let path = match &*open.lock().unwrap() {
                     Open::File { path, .. } | Open::Dir { path, .. } => self.fs.host(path),
                     _ => return Err(EINVAL),
                 };
@@ -329,13 +326,80 @@ impl Process {
                 let file = std::fs::File::open(self.fs.host(&guest)).map_err(|e| fs::errno(&e))?;
                 apply(&file)
             }
-            nr::SET_TID_ADDRESS | nr::GETPID | nr::GETTID => Ok(1),
-            nr::GETPPID | nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
+            nr::SET_TID_ADDRESS | nr::GETPID | nr::GETTID => Ok(self.pid as i64),
+            nr::GETPPID => Ok(self.kernel.ppid(self.pid) as i64),
+            nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
+            nr::EXIT | nr::EXIT_GROUP => Ok(self.exit(a as i32 & 0xff)),
+            nr::KILL => self.kernel.kill(self.pid, a as i32, b as i32).map(|_| 0),
+            nr::TGKILL => self.kernel.kill(self.pid, a as i32, c as i32).map(|_| 0),
+            nr::CLONE => self.clone_vfork(a, b),
+            nr::EXECVE => {
+                let path = mem::cstr(data, ua)?;
+                let argv = string_array(data, ub)?;
+                let env = string_array(data, uc)?;
+                let image = process::resolve_exec(&self.fs, &path, argv, env)?;
+                if self.vfork.is_empty() {
+                    // Unwind out of this program; the process loop starts the next.
+                    self.pending = Some(Pending::Exec(image));
+                    return Ok(0);
+                }
+                // A vfork child: start the new program as the child and hand
+                // the parent back its state. libc then jumps back to vfork.
+                let inherit = self.inherit();
+                let child = self.vfork_return();
+                self.kernel.spawn(child, image, inherit);
+                Ok(child as i64)
+            }
+            nr::WAIT4 => {
+                const WNOHANG: i64 = 1;
+                match self.kernel.wait(self.pid, a as i32, c & WNOHANG != 0)? {
+                    None => Ok(0),
+                    Some((child, how)) => {
+                        if b != 0 {
+                            mem::write(data, ub, &how.wait_status().to_le_bytes())?;
+                        }
+                        if d != 0 {
+                            mem::slice_mut(data, d as u64, 144)?.fill(0); // struct rusage
+                        }
+                        Ok(child as i64)
+                    }
+                }
+            }
+            nr::PIPE2 => {
+                let (r, w) = crate::pipe::new();
+                let fd = |end| Fd {
+                    open: Arc::new(Mutex::new(Open::Pipe(end))),
+                    cloexec: b & o::CLOEXEC != 0,
+                    flags: b & o::NONBLOCK,
+                };
+                let r = self.fds.insert(fd(r), 0)?;
+                let w = self.fds.insert(fd(w), 0)?;
+                let mut pair = [0u8; 8];
+                pair[..4].copy_from_slice(&(r as i32).to_le_bytes());
+                pair[4..].copy_from_slice(&(w as i32).to_le_bytes());
+                mem::write(data, ua, &pair).map(|_| 0)
+            }
+            nr::SETPGID => {
+                let pid = if a == 0 { self.pid } else { a as i32 };
+                let pgid = if b == 0 { pid } else { b as i32 };
+                self.kernel.setpgid(pid, pgid).map(|_| 0)
+            }
+            nr::GETPGID => self.kernel.pgid(if a == 0 { self.pid } else { a as i32 }).map(i64::from),
+            nr::SETSID => self.kernel.setsid(self.pid).map(i64::from),
+            nr::GETSID => self.kernel.sid(if a == 0 { self.pid } else { a as i32 }).map(i64::from),
             nr::SET_ROBUST_LIST | nr::SIGALTSTACK | nr::MPROTECT | nr::MADVISE => Ok(0),
             nr::RT_SIGACTION => {
-                // No signal delivery yet: report every action as default.
+                // Handlers are recorded and reported back, but not yet run;
+                // SIG_IGN takes effect (see Process::signal_effect).
+                let sig = usize::try_from(a).ok().filter(|s| (1..NSIG).contains(s)).ok_or(EINVAL)?;
                 if c != 0 {
-                    mem::slice_mut(data, uc, 32)?.fill(0);
+                    mem::write(data, uc, &self.sigactions[sig])?;
+                }
+                if b != 0 {
+                    if sig == 9 || sig == 19 {
+                        return Err(EINVAL); // SIGKILL and SIGSTOP can't be changed
+                    }
+                    self.sigactions[sig].copy_from_slice(mem::slice(data, ub, 32)?);
                 }
                 Ok(0)
             }
@@ -366,15 +430,17 @@ impl Process {
                 }
                 Ok(0)
             }
-            nr::NANOSLEEP => {
-                let ts = mem::slice(data, ua, 16)?;
-                let secs = i64::from_le_bytes(ts[..8].try_into().unwrap());
-                let nanos = i64::from_le_bytes(ts[8..].try_into().unwrap());
-                if secs < 0 || !(0..1_000_000_000).contains(&nanos) {
-                    return Err(EINVAL);
+            nr::NANOSLEEP => self.sleep(data, ua, ub),
+            nr::CLOCK_NANOSLEEP => {
+                const TIMER_ABSTIME: i64 = 1;
+                if b & TIMER_ABSTIME != 0 {
+                    // Sleep until an absolute time on clock `a`.
+                    let until = read_timespec(data, uc)?;
+                    let now = self.clock(a)?;
+                    let left = until.saturating_sub(now);
+                    return self.sleep_for(left).map(|_| 0).map_err(|(e, _)| e);
                 }
-                std::thread::sleep(Duration::new(secs as u64, nanos as u32));
-                Ok(0)
+                self.sleep(data, uc, d as u64)
             }
             nr::SCHED_GETAFFINITY => {
                 // One CPU: the environment is single-threaded.
@@ -425,26 +491,144 @@ impl Process {
             return Ok(self.fs.cwd.clone());
         }
         let fd = self.fds.get(dirfd)?;
-        match &*fd.open.borrow() {
+        match &*fd.open.lock().unwrap() {
             Open::Dir { path, .. } => Ok(path.clone()),
             _ => Err(ENOTDIR),
         }
     }
 
+    /// exit/exit_group. In a vfork child this records the child's exit and
+    /// returns its pid to libc, which jumps back to the parent.
+    fn exit(&mut self, code: i32) -> i64 {
+        if self.vfork.is_empty() {
+            self.pending = Some(Pending::Terminate(Termination::Exit(code)));
+            return 0;
+        }
+        let child = self.pid;
+        self.kernel.exit(child, Termination::Exit(code));
+        self.vfork_return();
+        child as i64
+    }
+
+    /// clone. Only vfork (CLONE_VM | CLONE_VFORK, no new stack) is
+    /// supported: the child gets its own pid and a copy of the process
+    /// state, and keeps running in the parent's memory until it execs or
+    /// exits (docs/abi.md, "Processes").
+    fn clone_vfork(&mut self, flags: i64, stack: i64) -> SysResult<i64> {
+        const CLONE_VM: i64 = 0x100;
+        const CLONE_VFORK: i64 = 0x4000;
+        if flags & (CLONE_VM | CLONE_VFORK) != CLONE_VM | CLONE_VFORK || stack != 0 {
+            return Err(ENOSYS);
+        }
+        let child = self.kernel.create(self.pid);
+        self.vfork.push(VforkFrame {
+            parent_pid: self.pid,
+            fds: self.fds.clone(),
+            cwd: self.fs.cwd.clone(),
+            umask: self.umask,
+            sigactions: self.sigactions.clone(),
+        });
+        self.pid = child;
+        Ok(0)
+    }
+
+    /// Ends the current vfork child: restores the parent's state and
+    /// returns the child's pid.
+    fn vfork_return(&mut self) -> i32 {
+        let frame = self.vfork.pop().expect("in a vfork child");
+        let child = std::mem::replace(&mut self.pid, frame.parent_pid);
+        self.fds = frame.fds;
+        self.fs.cwd = frame.cwd;
+        self.umask = frame.umask;
+        self.sigactions = frame.sigactions;
+        child
+    }
+
+    /// nanosleep(req, rem): sleeps, but wakes early (EINTR, with the time
+    /// left in `rem`) if a signal arrives.
+    fn sleep(&self, data: &mut [u8], req: u64, rem: u64) -> SysResult<i64> {
+        let duration = read_timespec(data, req)?;
+        match self.sleep_for(duration) {
+            Ok(()) => Ok(0),
+            Err((e, left)) => {
+                if rem != 0 {
+                    mem::write(data, rem, &timespec(left))?;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn sleep_for(&self, duration: Duration) -> Result<(), (i64, Duration)> {
+        const SLICE: Duration = Duration::from_millis(20);
+        let deadline = std::time::Instant::now() + duration;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            if self.kernel.peek_signal(self.pid).is_some() {
+                return Err((EINTR, deadline - now));
+            }
+            std::thread::sleep((deadline - now).min(SLICE));
+        }
+    }
+
+    /// The pipe behind `fd`, if it is one, and whether it's non-blocking.
+    /// Pipe I/O blocks, so it happens without holding the descriptor lock.
+    fn pipe_of(&self, fd: i64, want_write: bool) -> SysResult<Option<(Arc<crate::pipe::Pipe>, bool)>> {
+        let fd = self.fds.get(fd)?;
+        let nonblock = fd.flags & o::NONBLOCK != 0;
+        match &*fd.open.lock().unwrap() {
+            Open::Pipe(end) if end.write == want_write => Ok(Some((end.pipe.clone(), nonblock))),
+            Open::Pipe(_) => Err(EBADF),
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether a blocking call should give up with EINTR.
+    fn interrupted(&self) -> impl Fn() -> bool + use<> {
+        let (kernel, pid) = (self.kernel.clone(), self.pid);
+        move || kernel.peek_signal(pid).is_some()
+    }
+
     fn read(&mut self, fd: i64, buf: &mut [u8]) -> SysResult<i64> {
+        if let Some((pipe, nonblock)) = self.pipe_of(fd, false)? {
+            return pipe.read(buf, nonblock, &self.interrupted()).map(|n| n as i64);
+        }
         let open = self.fds.get(fd)?.open.clone();
-        let r = match &mut *open.borrow_mut() {
+        let r = match &mut *open.lock().unwrap() {
             Open::Stdin => std::io::stdin().read(buf),
             Open::File { file, .. } => file.read(buf),
             Open::Dir { .. } => return Err(EISDIR),
-            Open::Stdout | Open::Stderr => return Err(EBADF),
+            Open::Device(Device::Null) => Ok(0),
+            Open::Device(Device::Zero) => {
+                buf.fill(0);
+                Ok(buf.len())
+            }
+            Open::Device(Device::Random) => {
+                getrandom::fill(buf).map_err(|_| EIO)?;
+                Ok(buf.len())
+            }
+            Open::Stdout | Open::Stderr | Open::Pipe(_) => return Err(EBADF),
         };
         r.map(|n| n as i64).map_err(|e| fs::errno(&e))
     }
 
     fn write(&mut self, fd: i64, buf: &[u8]) -> SysResult<i64> {
+        if let Some((pipe, nonblock)) = self.pipe_of(fd, true)? {
+            let r = pipe.write(buf, nonblock, &self.interrupted());
+            if r == Err(EPIPE) {
+                // Writing to a pipe nobody reads raises SIGPIPE.
+                const SIGPIPE: i32 = 13;
+                if let Some(how) = self.signal_effect(SIGPIPE) {
+                    self.pending = Some(Pending::Terminate(how));
+                }
+            }
+            return r.map(|n| n as i64);
+        }
         let open = self.fds.get(fd)?.open.clone();
-        let r = match &mut *open.borrow_mut() {
+        let r = match &mut *open.lock().unwrap() {
             Open::Stdout => {
                 let mut out = std::io::stdout().lock();
                 out.write_all(buf).and_then(|_| out.flush())
@@ -457,14 +641,15 @@ impl Process {
                 file.write_all(buf)
             }
             Open::Dir { .. } => return Err(EISDIR),
-            Open::Stdin => return Err(EBADF),
+            Open::Device(_) => Ok(()), // writes to /dev devices are discarded
+            Open::Stdin | Open::Pipe(_) => return Err(EBADF),
         };
         r.map(|_| buf.len() as i64).map_err(|e| fs::errno(&e))
     }
 
     fn with_file<T>(&self, fd: i64, f: impl FnOnce(&mut std::fs::File) -> std::io::Result<T>) -> SysResult<T> {
         let open = self.fds.get(fd)?.open.clone();
-        let mut open = open.borrow_mut();
+        let mut open = open.lock().unwrap();
         match &mut *open {
             Open::File { file, .. } => f(file).map_err(|e| fs::errno(&e)),
             Open::Dir { .. } => Err(EISDIR),
@@ -496,6 +681,17 @@ impl Process {
 
     fn openat(&mut self, dirfd: i64, path: &str, flags: i64) -> SysResult<i64> {
         let dir = self.dir_of(dirfd)?;
+        match self.fs.device(&dir, path) {
+            Some(DevPath::Device(d)) => {
+                let open = Arc::new(Mutex::new(Open::Device(d)));
+                return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
+            }
+            Some(DevPath::Fd(n)) => {
+                let fd = Fd { cloexec: flags & o::CLOEXEC != 0, ..self.fds.get(n)?.clone() };
+                return self.fds.insert(fd, 0);
+            }
+            None => {}
+        }
         let guest = self.fs.resolve(&dir, path, flags & o::NOFOLLOW == 0)?;
         let host = self.fs.host(&guest);
         let access = flags & o::ACCMODE;
@@ -535,13 +731,13 @@ impl Process {
             let file = opts.open(&host).map_err(|e| fs::errno(&e))?;
             Open::File { file, path: guest, append: flags & o::APPEND != 0 }
         };
-        let fd = Fd { open: Rc::new(RefCell::new(open)), cloexec: flags & o::CLOEXEC != 0, flags };
+        let fd = Fd { open: Arc::new(Mutex::new(open)), cloexec: flags & o::CLOEXEC != 0, flags };
         self.fds.insert(fd, 0)
     }
 
     fn lseek(&mut self, fd: i64, off: i64, whence: i64) -> SysResult<i64> {
         let open = self.fds.get(fd)?.open.clone();
-        let mut open = open.borrow_mut();
+        let mut open = open.lock().unwrap();
         match &mut *open {
             Open::File { file, .. } => {
                 let to = match whence {
@@ -562,13 +758,14 @@ impl Process {
                 *pos = off as usize;
                 Ok(off)
             }
+            Open::Device(_) => Ok(0),
             _ => Err(ESPIPE),
         }
     }
 
     fn getdents64(&mut self, fd: i64, buf: &mut [u8]) -> SysResult<i64> {
         let open = self.fds.get(fd)?.open.clone();
-        let mut open = open.borrow_mut();
+        let mut open = open.lock().unwrap();
         let Open::Dir { path, entries, pos } = &mut *open else { return Err(ENOTDIR) };
         if entries.is_none() {
             *entries = Some(fs::read_dir(&self.fs, path)?);
@@ -599,12 +796,14 @@ impl Process {
 
     fn fstat(&mut self, fd: i64) -> SysResult<[u8; 128]> {
         let open = self.fds.get(fd)?.open.clone();
-        let open = open.borrow();
+        let open = open.lock().unwrap();
         match &*open {
             Open::File { file, .. } => file.metadata().map(|m| fs::stat_bytes(&m)).map_err(|e| fs::errno(&e)),
             Open::Dir { path, .. } => {
                 std::fs::metadata(self.fs.host(path)).map(|m| fs::stat_bytes(&m)).map_err(|e| fs::errno(&e))
             }
+            Open::Pipe(_) => Ok(fs::fifo_stat_bytes()),
+            Open::Device(d) => Ok(fs::device_stat_bytes(*d)),
             _ => Ok(fs::stdio_stat_bytes()),
         }
     }
@@ -614,12 +813,20 @@ impl Process {
             return self.fstat(dirfd);
         }
         let dir = self.dir_of(dirfd)?;
+        match self.fs.device(&dir, path) {
+            Some(DevPath::Device(d)) => return Ok(fs::device_stat_bytes(d)),
+            Some(DevPath::Fd(n)) => return self.fstat(n),
+            None => {}
+        }
         let guest = self.fs.resolve(&dir, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
         let meta = std::fs::symlink_metadata(self.fs.host(&guest)).map_err(|e| fs::errno(&e))?;
         Ok(fs::stat_bytes(&meta))
     }
 
     fn fcntl(&mut self, fd: i64, cmd: i64, arg: i64) -> SysResult<i64> {
+        // fcntl is variadic; its argument is an int, so the high 32 bits
+        // of the register are undefined. Linux ignores them too.
+        let arg = arg as i32 as i64;
         const F_DUPFD: i64 = 0;
         const F_GETFD: i64 = 1;
         const F_SETFD: i64 = 2;
@@ -647,8 +854,15 @@ impl Process {
     }
 
     fn ioctl(&mut self, data: &mut [u8], fd: i64, req: i64, arg: u64) -> SysResult<i64> {
+        // The request is an unsigned int (see fcntl).
+        let req = req as u32 as i64;
         const TIOCGWINSZ: i64 = 0x5413;
-        let tty = match &*self.fds.get(fd)?.open.borrow() {
+        const FIONREAD: i64 = 0x541b;
+        if req == FIONREAD
+            && let Some((pipe, _)) = self.pipe_of(fd, false)? {
+                return mem::write(data, arg, &(pipe.available() as i32).to_le_bytes()).map(|_| 0);
+            }
+        let tty = match &*self.fds.get(fd)?.open.lock().unwrap() {
             Open::Stdin => std::io::stdin().is_terminal(),
             Open::Stdout => std::io::stdout().is_terminal(),
             Open::Stderr => std::io::stderr().is_terminal(),
@@ -707,4 +921,34 @@ fn chmod(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_readonly(mode & 0o222 == 0);
     std::fs::set_permissions(path, perms)
+}
+
+/// Reads a NULL-terminated array of string pointers (argv, envp).
+fn string_array(data: &[u8], mut addr: u64) -> SysResult<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    if addr == 0 {
+        return Ok(out);
+    }
+    loop {
+        let p = mem::read_u64(data, addr)?;
+        if p == 0 {
+            return Ok(out);
+        }
+        if out.len() > 100_000 {
+            return Err(abi::errno::E2BIG);
+        }
+        out.push(mem::cstr_bytes(data, p)?);
+        addr += 8;
+    }
+}
+
+/// Reads a struct timespec, rejecting invalid values like the kernel does.
+fn read_timespec(data: &[u8], addr: u64) -> SysResult<Duration> {
+    let ts = mem::slice(data, addr, 16)?;
+    let secs = i64::from_le_bytes(ts[..8].try_into().unwrap());
+    let nanos = i64::from_le_bytes(ts[8..].try_into().unwrap());
+    if secs < 0 || !(0..1_000_000_000).contains(&nanos) {
+        return Err(EINVAL);
+    }
+    Ok(Duration::new(secs as u64, nanos as u32))
 }

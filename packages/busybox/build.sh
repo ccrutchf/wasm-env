@@ -15,6 +15,9 @@ out=$root/build/packages/busybox
 src=$out/src
 rm -rf "$src" && mkdir -p "$src"
 tar -xjf "$BUSYBOX_SRC" -C "$src" --strip-components=1
+for p in "$here"/patches/*.patch; do
+	patch -s -d "$src" -p1 < "$p"
+done
 
 cc=$root/toolchain/bin/wasm64-linux-musl-cc
 make_args=(-C "$src" CC="$cc" HOSTCC=cc AR=llvm-ar STRIP=true)

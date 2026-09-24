@@ -32,6 +32,17 @@ for f in bits/fcntl.h bits/float.h bits/signal.h bits/syscall.h.in bits/user.h k
 done
 cp -r "$root/toolchain/musl-overlay/." "$musl/"
 
+# vfork returns twice, so on wasm64 it's a macro around setjmp, defined
+# right after its declaration (see src/process/wasm64/vfork.c).
+sed -i 's|^pid_t vfork(void);$|&\
+#ifdef __wasm__\
+#include <setjmp.h>\
+jmp_buf *__wasm_env_vfork_prepare(void);\
+pid_t __wasm_env_vfork_finish(int);\
+#define vfork() __wasm_env_vfork_finish(setjmp(*__wasm_env_vfork_prepare()))\
+#endif|' "$musl/include/unistd.h"
+grep -q __wasm_env_vfork_finish "$musl/include/unistd.h"
+
 cat > "$musl/config.mak" <<EOF
 ARCH = wasm64
 srcdir = .

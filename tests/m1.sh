@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# M1 acceptance test: processes and a shell. Runs BusyBox hush scripts and a
+# C program (tests/c/spawn.c) under wasm-env.
+#
+#   nix develop -c tests/m1.sh
+#
+# SKIP_BUILD=1 reuses existing builds (see tests/m0.sh).
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+cc=toolchain/bin/wasm64-linux-musl-cc
+
+if [ "${SKIP_BUILD:-0}" != 1 ]; then
+	toolchain/build.sh >/dev/null
+	cargo build -q --release -p wasm-env
+	packages/busybox/build.sh >/dev/null 2>&1
+fi
+
+wasm_env=$root/target/release/wasm-env
+rootfs=$root/build/test-rootfs-m1
+rm -rf "$rootfs"
+mkdir -p "$rootfs"/{bin,etc,root,tmp,data}
+cp build/packages/busybox/busybox.wasm "$rootfs/bin/busybox"
+for applet in $("$wasm_env" run --root "$rootfs" /bin/busybox --list); do
+	ln -sf busybox "$rootfs/bin/$applet"
+done
+$cc -O2 tests/c/spawn.c -o "$rootfs/bin/spawn-test"
+echo 'root:x:0:0:root:/root:/bin/sh' > "$rootfs/etc/passwd"
+printf 'b\na\nc\n' > "$rootfs/data/letters"
+cat > "$rootfs/bin/greet" <<'EOF'
+#!/bin/sh
+echo "hello, $1"
+exit 4
+EOF
+chmod +x "$rootfs/bin/greet"
+
+sh_() { timeout 30 "$wasm_env" run --root "$rootfs" /bin/sh -c "$1" 2>&1; }
+
+passed=0
+failed=0
+check() {
+	local name=$1 expected=$2 actual=$3
+	if [ "$expected" = "$actual" ]; then
+		passed=$((passed + 1))
+	else
+		failed=$((failed + 1))
+		printf 'FAIL %s\n  expected: %q\n  actual:   %q\n' "$name" "$expected" "$actual"
+	fi
+}
+
+# Pipelines and substitution.
+check "pipe" "PIPED" "$(sh_ 'echo piped | tr a-z A-Z')"
+check "three-stage pipe" "c b a" "$(sh_ 'sort -r /data/letters | tr "\n" " " | sed "s/ $//"')"
+check "command substitution" "n=3" "$(sh_ 'n=$(wc -l < /data/letters); echo "n=$n"')"
+check "nested substitution" "x-y" "$(sh_ 'echo $(echo x)-$(echo $(echo y))')"
+check "pipeline status" "1" "$(sh_ 'echo x | false; echo $?')"
+
+# Control flow and builtins in pipelines (re-executed in NOMMU mode).
+check "loop into pipe" "3 2 1" "$(sh_ 'for i in 1 2 3; do echo $i; done | sort -r | tr "\n" " " | sed "s/ $//"')"
+check "function in pipe" "HI" "$(sh_ 'f() { echo hi; }; f | tr a-z A-Z')"
+check "subshell cd" "/tmp /" "$(sh_ '(cd /tmp && pwd); pwd' | tr '\n' ' ' | sed 's/ $//')"
+check "exported env" "value" "$(sh_ 'export V=value; sh -c "echo \$V"')"
+check "exit status" "7" "$(sh_ 'sh -c "exit 7"; echo $?')"
+
+# Redirections.
+check "redirect to file" "a b c" "$(sh_ 'sort /data/letters > /tmp/out; cat /tmp/out | tr "\n" " " | sed "s/ $//"')"
+check "append and stderr" "one two err" "$(sh_ 'echo one > /tmp/o; echo two >> /tmp/o; ls /missing 2>/dev/null || echo err >> /tmp/o; cat /tmp/o' | tr '\n' ' ' | sed 's/ $//')"
+check "here document" "line1 line2" "$(sh_ 'cat <<EOF
+line1
+line2
+EOF' | tr '\n' ' ' | sed 's/ $//')"
+
+# Programs and scripts.
+check "#! script" "hello, world 4" "$(sh_ 'greet world; echo $?' | tr '\n' ' ' | sed 's/ $//')"
+check "xargs" "3" "$(sh_ 'printf "a\nb\nc\n" | xargs -n1 echo | wc -l')"
+check "find -exec" "/data/letters" "$(sh_ 'find /data -type f -exec echo {} \;')"
+check "awk" "6" "$(sh_ 'printf "1 2\n3\n" | awk "{ for (i = 1; i <= NF; i++) s += \$i } END { print s }"')"
+check "SIGPIPE ends yes" "y y y" "$(sh_ 'yes | head -n 3' | tr '\n' ' ' | sed 's/ $//')"
+
+# Background jobs and signals.
+check "background + wait" "bg done" "$(sh_ 'sleep 0.2 & wait; echo bg done')"
+check "kill background" "143" "$(sh_ 'sleep 10 & kill $!; wait $!; echo $?')"
+# BusyBox timeout execs the command, so a timeout shows as SIGTERM (143).
+check "timeout" "143" "$(sh_ 'timeout 1 sleep 10; echo $?')"
+
+# C: posix_spawn, vfork, system, popen, kill.
+out=$(timeout 30 "$wasm_env" run --root "$rootfs" /bin/spawn-test 2>&1)
+check "C posix_spawn" "posix_spawn: err=0 output=spawned" "$(sed -n 1p <<<"$out")"
+check "C posix_spawnp ENOENT" "posix_spawnp missing: ENOENT" "$(sed -n 3p <<<"$out")"
+check "C vfork" "vfork: child exit 42" "$(sed -n 4p <<<"$out")"
+check "C system" "system: 5" "$(sed -n 5p <<<"$out")"
+check "C popen" "popen: FROM POPEN" "$(sed -n 6p <<<"$out")"
+check "C kill" "kill: signaled=1 sig=15" "$(sed -n 8p <<<"$out")"
+
+echo "$passed passed, $failed failed"
+[ "$failed" = 0 ]
