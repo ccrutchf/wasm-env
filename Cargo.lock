@@ -1572,6 +1572,7 @@ dependencies = [
  "anyhow",
  "bad64",
  "object 0.37.3",
+ "wasmtime",
 ]
 
 [[package]]

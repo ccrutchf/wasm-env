@@ -139,6 +139,19 @@ The full specification is [docs/abi.md](docs/abi.md) (version 0). Summary:
 - **M6 — PyTorch (CPU).** Threads (ABI version 2: shared memory, atomics, `clone`), C++ exceptions through translated code, and oneDNN's JIT disabled. Goal: `import torch` and a small model's forward pass.
 - **Later.** Native recompiled userland and recompiled wheels for hot packages (nixpkgs cross-compilation; Pyodide recipes); x86-64 translation for x86-only images; runtime translation fallback; CPU emulation fallback; GPU (below).
 
+## Testing
+
+Test-first from M2 on. `nix develop -c tests/all.sh` runs everything:
+
+| Suite | What it covers |
+|---|---|
+| `cargo test -p wasm-env` (35 tests) | Runtime units: process table (wait, kill, orphans, groups), exec resolution and `#!` scripts, the initial stack layout, signal dispositions, descriptor tables, path resolution, stat layouts, memory helpers, pipes |
+| `cargo test -p wasm-env-translate` (20 tests) | ELF loading, block discovery (branch targets, return addresses, pointer-only functions, data in the code segment), and the support code and link step, run in wasmtime with a fake syscall import |
+| `tests/m0.sh`, `tests/m1.sh` | End to end: the toolchain, BusyBox, the shell, processes and pipes |
+| `tests/m2.sh` | **Differential testing of the translator**: C fixtures in `tests/arm64/` built for arm64, run under qemu-aarch64 as the reference and translated under wasm-env; output and exit status must match exactly |
+
+The arm64 fixtures are plain C, not assembly: gcc at `-O2` produces the instruction patterns real binaries contain, and each fixture prints its results. `tests/m2.sh` fails until `translator/src/lift/insn.rs` is complete.
+
 ## M-1 benchmarks
 
 **Question:** how much slower is memory64 than wasm32, and is it worth having one ABI for recompiled and translated code?

@@ -70,7 +70,7 @@ pub fn discover(image: &Image) -> Program {
             insns.insert(addr, i);
         }
     }
-    let in_code = |a: u64| a % 4 == 0 && insns.contains_key(&a);
+    let in_code = |a: u64| a.is_multiple_of(4) && insns.contains_key(&a);
 
     let mut roots = BTreeSet::new();
     roots.insert(image.entry);
@@ -97,9 +97,9 @@ pub fn discover(image: &Image) -> Program {
 
     // Code pointers stored in data (function pointer tables, init arrays).
     for seg in &image.segments {
-        for (k, w) in seg.data.chunks_exact(8).enumerate() {
-            if (seg.vaddr + k as u64 * 8) % 8 == 0 {
-                roots.insert(u64::from_le_bytes(w.try_into().unwrap()));
+        for (k, w) in seg.data.as_chunks::<8>().0.iter().enumerate() {
+            if (seg.vaddr + k as u64 * 8).is_multiple_of(8) {
+                roots.insert(u64::from_le_bytes(*w));
             }
         }
     }
@@ -140,4 +140,144 @@ pub fn discover(image: &Image) -> Program {
         }
     }
     Program { insns, leaders }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+
+    fn program(bytes: &[u8]) -> (Image, Program) {
+        let image = Image::load(bytes).unwrap();
+        let prog = discover(&image);
+        (image, prog)
+    }
+
+    fn symbol(image: &Image, name: &str) -> u64 {
+        image.functions.iter().find(|f| f.1 == name).unwrap_or_else(|| panic!("no symbol {name}")).0
+    }
+
+    #[test]
+    fn leaders_are_decoded_instructions() {
+        let Some(bytes) = testutil::static_c("c/hello.c") else { return };
+        let (image, prog) = program(&bytes);
+        assert!(prog.leaders.contains(&image.entry));
+        for a in &prog.leaders {
+            assert!(prog.insns.contains_key(a), "leader {a:#x} isn't an instruction");
+        }
+    }
+
+    #[test]
+    fn control_flow_edges_start_blocks() {
+        let Some(bytes) = testutil::static_c("c/hello.c") else { return };
+        let (_, prog) = program(&bytes);
+        // Every control instruction inside a reached block contributes its
+        // direct target and (unless it never falls through) the next address.
+        let mut checked = 0;
+        for &start in &prog.leaders {
+            let mut pc = start;
+            while let Some(i) = prog.insns.get(&pc) {
+                if is_control(i) {
+                    if let Some(t) = direct_target(i).filter(|t| prog.insns.contains_key(t)) {
+                        assert!(prog.leaders.contains(&t), "branch at {pc:#x} to {t:#x}");
+                    }
+                    if !is_terminal(i) && prog.insns.contains_key(&(pc + 4)) {
+                        assert!(prog.leaders.contains(&(pc + 4)), "fall-through after {pc:#x}");
+                    }
+                    checked += 1;
+                    break;
+                }
+                pc += 4;
+                if prog.leaders.contains(&pc) {
+                    break;
+                }
+            }
+        }
+        assert!(checked > 100, "checked {checked} blocks");
+    }
+
+    /// Addresses of instructions inside reached blocks.
+    fn reached(prog: &Program) -> BTreeSet<u64> {
+        let mut out = BTreeSet::new();
+        for &start in &prog.leaders {
+            let mut pc = start;
+            while let Some(i) = prog.insns.get(&pc) {
+                out.insert(pc);
+                pc += 4;
+                if is_control(i) || prog.leaders.contains(&pc) {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn calls_have_return_address_blocks() {
+        let Some(bytes) = testutil::min() else { return };
+        let (_, prog) = program(&bytes);
+        let reached = reached(&prog);
+        let calls: Vec<u64> = reached.iter().copied().filter(|a| prog.insns[a].op().mnem() == "bl").collect();
+        assert!(!calls.is_empty());
+        for pc in calls {
+            assert!(prog.leaders.contains(&(pc + 4)), "return address after bl at {pc:#x}");
+        }
+    }
+
+    #[test]
+    fn data_in_the_code_segment_is_not_reached() {
+        // min.c's strings sit after _start in the executable segment, and
+        // some of those bytes decode as instructions (even calls).
+        use object::{Object, ObjectSection};
+        let Some(bytes) = testutil::min() else { return };
+        let (image, prog) = program(&bytes);
+        let file = object::File::parse(&*bytes).unwrap();
+        let rodata = file.section_by_name(".rodata").expect(".rodata");
+        let data = rodata.address()..rodata.address() + rodata.size();
+        let exec = image.segments.iter().find(|s| s.exec).unwrap();
+        assert!(exec.contains(data.start), "the fixture's strings share the executable segment");
+        // _start builds the string's address with ADRP+ADD, which looks like a
+        // code pointer; section information keeps it out.
+        for a in reached(&prog) {
+            assert!(!data.contains(&a), "data at {a:#x} was treated as code");
+        }
+    }
+
+    #[test]
+    fn finds_functions_reached_only_through_pointers() {
+        let Some(bytes) = testutil::static_c("arm64/fnptr.c") else { return };
+        let mut image = Image::load(&bytes).unwrap();
+        let wanted: Vec<u64> =
+            ["via_table_a", "via_table_b", "via_adrp"].iter().map(|n| symbol(&image, n)).collect();
+        // Forget the symbols, as in a stripped binary: only pointers remain.
+        image.functions.clear();
+        let prog = discover(&image);
+        for (a, name) in wanted.iter().zip(["via_table_a", "via_table_b", "via_adrp"]) {
+            assert!(prog.leaders.contains(a), "{name} at {a:#x} not found");
+        }
+    }
+
+    #[test]
+    fn stripped_binaries_still_reach_main() {
+        let Some(bytes) = testutil::static_c("c/hello.c") else { return };
+        let mut image = Image::load(&bytes).unwrap();
+        let main = symbol(&image, "main");
+        image.functions.clear();
+        let prog = discover(&image);
+        assert!(prog.leaders.contains(&main), "main is passed to __libc_start_main by address");
+    }
+
+    #[test]
+    fn unreachable_words_are_not_blocks() {
+        let Some(bytes) = testutil::static_c("c/hello.c") else { return };
+        let (_, prog) = program(&bytes);
+        assert!(prog.leaders.len() < prog.insns.len() / 2, "blocks are a minority of instructions");
+        // Words after an unconditional branch that nothing targets stay out.
+        for (&pc, i) in &prog.insns {
+            if is_terminal(i) && !prog.leaders.contains(&(pc + 4)) {
+                return;
+            }
+        }
+        panic!("expected some unreached fall-through after a terminal instruction");
+    }
 }

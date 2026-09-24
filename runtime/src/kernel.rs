@@ -261,3 +261,130 @@ impl Kernel {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kernel() -> Arc<Kernel> {
+        Kernel::new(Engine::default(), std::env::temp_dir(), false)
+    }
+
+    #[test]
+    fn statuses() {
+        assert_eq!(Termination::Exit(3).wait_status(), 3 << 8);
+        assert_eq!(Termination::Exit(256 + 3).wait_status(), 3 << 8, "exit codes are 8 bits");
+        assert_eq!(Termination::Signal(15).wait_status(), 15);
+        assert_eq!(Termination::Exit(3).shell_status(), 3);
+        assert_eq!(Termination::Signal(15).shell_status(), 143);
+    }
+
+    #[test]
+    fn pids_are_sequential_and_inherit_groups() {
+        let k = kernel();
+        let parent = k.create(0);
+        let child = k.create(parent);
+        assert_eq!((parent, child), (1, 2));
+        assert_eq!(k.ppid(child), parent);
+        assert_eq!(k.pgid(child), Ok(parent), "a child joins its parent's process group");
+        assert_eq!(k.sid(child), Ok(parent));
+    }
+
+    #[test]
+    fn wait_reaps_an_exited_child_once() {
+        let k = kernel();
+        let parent = k.create(0);
+        let child = k.create(parent);
+        assert_eq!(k.wait(parent, -1, true), Ok(None), "WNOHANG while the child runs");
+        k.exit(child, Termination::Exit(7));
+        assert_eq!(k.wait(parent, -1, false), Ok(Some((child, Termination::Exit(7)))));
+        assert_eq!(k.wait(parent, -1, true), Err(ECHILD), "reaped: no children left");
+    }
+
+    #[test]
+    fn wait_without_children_is_echild() {
+        let k = kernel();
+        let pid = k.create(0);
+        assert_eq!(k.wait(pid, -1, false), Err(ECHILD));
+    }
+
+    #[test]
+    fn wait_matches_pid_and_group_targets() {
+        let k = kernel();
+        let parent = k.create(0);
+        let a = k.create(parent);
+        let b = k.create(parent);
+        k.setpgid(b, b).unwrap();
+        k.exit(a, Termination::Exit(1));
+        k.exit(b, Termination::Exit(2));
+        assert_eq!(k.wait(parent, b, false), Ok(Some((b, Termination::Exit(2)))), "specific pid");
+        assert_eq!(k.wait(parent, -b, true), Err(ECHILD), "group of b is now empty");
+        assert_eq!(k.wait(parent, 0, false), Ok(Some((a, Termination::Exit(1)))), "own group");
+    }
+
+    #[test]
+    fn wait_blocks_until_a_child_exits() {
+        let k = kernel();
+        let parent = k.create(0);
+        let child = k.create(parent);
+        let k2 = k.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            k2.exit(child, Termination::Signal(9));
+        });
+        assert_eq!(k.wait(parent, child, false), Ok(Some((child, Termination::Signal(9)))));
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn a_signal_interrupts_wait() {
+        let k = kernel();
+        let parent = k.create(0);
+        let _child = k.create(parent);
+        k.kill(parent, parent, 15).unwrap();
+        assert_eq!(k.wait(parent, -1, false), Err(EINTR));
+        assert_eq!(k.take_signal(parent), Some(15), "wait leaves the signal pending");
+    }
+
+    #[test]
+    fn orphans_are_not_left_as_zombies() {
+        let k = kernel();
+        let parent = k.create(0);
+        let exited = k.create(parent);
+        let running = k.create(parent);
+        k.exit(exited, Termination::Exit(0));
+        k.exit(parent, Termination::Exit(0));
+        assert_eq!(k.ppid(running), 0, "reparented to nobody");
+        assert_eq!(k.pgid(exited), Err(ESRCH), "exited orphan forgotten");
+        k.exit(running, Termination::Exit(0));
+        assert_eq!(k.pgid(running), Err(ESRCH), "running orphan cleans up when it exits");
+    }
+
+    #[test]
+    fn kill_targets() {
+        let k = kernel();
+        let a = k.create(0);
+        let b = k.create(a);
+        let c = k.create(a);
+        k.setpgid(c, c).unwrap();
+        assert_eq!(k.kill(a, 99, 15), Err(ESRCH), "no such pid");
+        assert_eq!(k.kill(a, b, 0), Ok(()), "signal 0 checks existence only");
+        assert_eq!(k.peek_signal(b), None);
+        k.kill(a, 0, 1).unwrap(); // a's group: a and b
+        assert_eq!((k.peek_signal(a), k.peek_signal(b), k.peek_signal(c)), (Some(1), Some(1), None));
+        k.kill(a, -c, 2).unwrap(); // group c
+        assert_eq!(k.take_signal(c), Some(2));
+        assert_eq!(k.take_signal(c), None, "taking consumes it");
+        k.exit(b, Termination::Exit(0));
+        assert_eq!(k.kill(a, b, 0), Err(ESRCH), "exited processes can't be signalled");
+    }
+
+    #[test]
+    fn setsid_makes_a_new_session_and_group() {
+        let k = kernel();
+        let a = k.create(0);
+        let b = k.create(a);
+        assert_eq!(k.setsid(b), Ok(b));
+        assert_eq!((k.pgid(b), k.sid(b)), (Ok(b), Ok(b)));
+    }
+}

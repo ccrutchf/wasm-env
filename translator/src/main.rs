@@ -1,18 +1,26 @@
 //! wasm-env-translate: translates arm64 Linux ELF executables into
 //! WebAssembly programs for the wasm-env runtime (docs/abi.md).
 //!
-//!   wasm-env-translate census BINARY          count instructions by operation
-//!   wasm-env-translate translate BINARY OUT   translate to OUT.wasm
+//!   wasm-env-translate census BINARY   count instructions by operation
+//!   wasm-env-translate blocks BINARY   list the basic blocks discovery finds
+//!   wasm-env-translate translate BINARY OUT.wasm   (needs the `lift` feature)
 
+mod discover;
 mod elf;
+#[cfg(feature = "lift")]
+mod lift;
+#[cfg_attr(not(feature = "lift"), allow(dead_code))]
+mod link;
+#[cfg(test)]
+mod testutil;
 
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 
-fn census(path: &str) -> Result<()> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
-    let image = elf::Image::load(&bytes)?;
+/// Counts instructions by operation, most frequent first, plus the number
+/// of words that don't decode.
+fn census_of(image: &elf::Image) -> (Vec<(String, usize)>, usize) {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut undecodable = 0;
     for (_, _, insn) in image.decode_all() {
@@ -21,12 +29,54 @@ fn census(path: &str) -> Result<()> {
             None => undecodable += 1,
         }
     }
-    let total: usize = counts.values().sum();
     let mut by_count: Vec<_> = counts.into_iter().collect();
-    by_count.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("{total} instructions, {} distinct operations, {undecodable} undecodable words", by_count.len());
-    for (op, n) in by_count {
+    by_count.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    (by_count, undecodable)
+}
+
+fn census(path: &str) -> Result<()> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+    let image = elf::Image::load(&bytes)?;
+    let (ops, undecodable) = census_of(&image);
+    let total: usize = ops.iter().map(|o| o.1).sum();
+    println!("{total} instructions, {} distinct operations, {undecodable} undecodable words", ops.len());
+    for (op, n) in ops {
         println!("{n:8} {op}");
+    }
+    Ok(())
+}
+
+/// Translates an arm64 executable into a wasm-env program.
+#[cfg(feature = "lift")]
+fn translate(input: &str, output: &str) -> Result<()> {
+    let bytes = std::fs::read(input).with_context(|| format!("reading {input}"))?;
+    let image = elf::Image::load(&bytes)?;
+    let prog = discover::discover(&image);
+    let lifted = lift::lift(&image, &prog);
+    for (op, n) in &lifted.unsupported {
+        eprintln!("warning: {n} × `{op}` not supported yet (traps if executed)");
+    }
+    let tc = link::Toolchain::from_env().context("$WASM_CC isn't set (run inside `nix develop`)")?;
+    let image_end = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("wasm-env-translate-{}", std::process::id()));
+    let wasm = link::link(&tc, &lifted.ir, image_end, &work);
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::write(output, wasm?).with_context(|| format!("writing {output}"))?;
+    eprintln!("{input}: {} blocks → {output}", lifted.blocks);
+    Ok(())
+}
+
+/// Reports the blocks discovery found.
+fn blocks(path: &str) -> Result<()> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+    let image = elf::Image::load(&bytes)?;
+    let prog = discover::discover(&image);
+    println!("{} instructions decoded, {} blocks", prog.insns.len(), prog.leaders.len());
+    for a in &prog.leaders {
+        match image.function_at(*a) {
+            Some(f) => println!("{a:#x} {f}"),
+            None => println!("{a:#x}"),
+        }
     }
     Ok(())
 }
@@ -35,6 +85,9 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["census", path] => census(path),
-        _ => bail!("usage: wasm-env-translate census BINARY | translate BINARY OUT.wasm"),
+        ["blocks", path] => blocks(path),
+        #[cfg(feature = "lift")]
+        ["translate", input, output] => translate(input, output),
+        _ => bail!("usage: wasm-env-translate census|blocks BINARY | translate BINARY OUT.wasm"),
     }
 }

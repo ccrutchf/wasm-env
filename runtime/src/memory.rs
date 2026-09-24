@@ -149,6 +149,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounds_are_checked() {
+        let mut data = vec![0u8; 16];
+        assert_eq!(slice(&data, 8, 8).map(<[u8]>::len), Ok(8));
+        assert_eq!(slice(&data, 9, 8).err(), Some(EFAULT), "past the end");
+        assert_eq!(slice(&data, u64::MAX, 2).err(), Some(EFAULT), "overflowing range");
+        assert_eq!(write(&mut data, 15, b"xy"), Err(EFAULT));
+        write_u64(&mut data, 0, 0x1122334455667788).unwrap();
+        assert_eq!(read_u64(&data, 0), Ok(0x1122334455667788));
+        assert_eq!(data[0], 0x88, "little-endian");
+    }
+
+    #[test]
+    fn strings() {
+        let data = b"abc\0\xff\xfe\0no terminator".to_vec();
+        assert_eq!(cstr(&data, 0).as_deref(), Ok("abc"));
+        assert_eq!(cstr(&data, 4), Err(EINVAL), "paths must be UTF-8 for now");
+        assert_eq!(cstr_bytes(&data, 4), Ok(vec![0xff, 0xfe]), "argv is bytes");
+        assert_eq!(cstr(&data, 7), Err(ENAMETOOLONG), "no NUL before the end");
+        assert_eq!(cstr(&data, 100), Err(EFAULT));
+    }
+
+    #[test]
+    fn iovec_arrays() {
+        let mut data = vec![0u8; 64];
+        for (i, v) in [100u64, 5, 200, 7].iter().enumerate() {
+            write_u64(&mut data, i as u64 * 8, *v).unwrap();
+        }
+        assert_eq!(iovecs(&data, 0, 2), Ok(vec![(100, 5), (200, 7)]));
+        assert_eq!(iovecs(&data, 0, 5), Err(EFAULT), "array runs past memory");
+        assert_eq!(iovecs(&data, 0, 2000), Err(EINVAL), "IOV_MAX");
+    }
+
+    #[test]
+    fn page_alignment_and_contains() {
+        assert_eq!((page_align(0), page_align(1), page_align(4096), page_align(4097)), (0, 4096, 4096, 8192));
+        let mut s = AddressSpace::new(0x10000);
+        let a = s.alloc(8192);
+        assert!(s.contains(a, 8192));
+        assert!(!s.contains(a, 8193), "past top");
+        assert!(!s.contains(0x1000, 16), "below the mmap region");
+        assert!(!s.contains(a, u64::MAX), "overflow");
+    }
+
+    #[test]
     fn alloc_release_reuse() {
         let mut s = AddressSpace::new(100);
         assert_eq!(s.start, 4096);

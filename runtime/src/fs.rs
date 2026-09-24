@@ -377,6 +377,107 @@ pub fn read_dir(fs: &Fs, guest: &str) -> SysResult<Vec<DirEntry>> {
 mod tests {
     use super::*;
 
+    fn null_fd() -> Fd {
+        Fd { open: Arc::new(Mutex::new(Open::Device(Device::Null))), cloexec: false, flags: 0 }
+    }
+
+    #[test]
+    fn fd_table_allocates_the_lowest_free_number() {
+        let mut t = FdTable::with_stdio();
+        assert_eq!(t.insert(null_fd(), 0), Ok(3));
+        assert_eq!(t.insert(null_fd(), 0), Ok(4));
+        t.close(3).unwrap();
+        assert_eq!(t.insert(null_fd(), 0), Ok(3), "reuses the hole");
+        assert_eq!(t.insert(null_fd(), 10), Ok(10), "F_DUPFD minimum");
+        assert_eq!(t.insert(null_fd(), 5), Ok(5));
+        assert_eq!(t.insert(null_fd(), 1024).map_err(|e| e == EMFILE), Err(true), "limit is 1024");
+    }
+
+    #[test]
+    fn fd_table_errors() {
+        let mut t = FdTable::with_stdio();
+        assert_eq!(t.get(7).err(), Some(EBADF));
+        assert_eq!(t.get(-1).err(), Some(EBADF));
+        assert_eq!(t.close(7), Err(EBADF));
+        t.close(1).unwrap();
+        assert_eq!(t.close(1), Err(EBADF), "double close");
+    }
+
+    #[test]
+    fn fd_table_close_on_exec() {
+        let mut t = FdTable::with_stdio();
+        let kept = t.insert(null_fd(), 0).unwrap();
+        let closed = t.insert(Fd { cloexec: true, ..null_fd() }, 0).unwrap();
+        t.close_on_exec();
+        assert!(t.get(kept).is_ok());
+        assert!(t.get(closed).is_err());
+    }
+
+    #[test]
+    fn fd_table_clones_share_open_descriptions() {
+        let mut parent = FdTable::with_stdio();
+        let fd = parent.insert(null_fd(), 0).unwrap();
+        let mut child = parent.clone();
+        assert!(Arc::ptr_eq(&parent.get(fd).unwrap().open, &child.get(fd).unwrap().open));
+        child.close(fd).unwrap();
+        assert!(parent.get(fd).is_ok(), "closing in the child doesn't affect the parent");
+    }
+
+    #[test]
+    fn stat_layout() {
+        let path = std::env::temp_dir().join(format!("wasm-env-stat-{}", std::process::id()));
+        std::fs::write(&path, b"hello").unwrap();
+        let st = stat_bytes(&std::fs::metadata(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        let u32_at = |o: usize| u32::from_le_bytes(st[o..o + 4].try_into().unwrap());
+        let i64_at = |o: usize| i64::from_le_bytes(st[o..o + 8].try_into().unwrap());
+        assert_eq!(u32_at(16) & 0o170000, 0o100000, "st_mode: regular file");
+        assert_eq!((u32_at(24), u32_at(28)), (0, 0), "owned by root");
+        assert_eq!(i64_at(48), 5, "st_size");
+        assert!(i64_at(88) > 1_600_000_000, "st_mtime");
+        let dev = device_stat_bytes(Device::Null);
+        assert_eq!(u32::from_le_bytes(dev[16..20].try_into().unwrap()) & 0o170000, 0o020000, "character device");
+        assert_eq!(u64::from_le_bytes(dev[32..40].try_into().unwrap()), 1 << 8 | 3, "rdev 1:3");
+    }
+
+    #[test]
+    fn resolve_edge_cases() {
+        let root = std::env::temp_dir().join(format!("wasm-env-fs-edge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("file"), b"").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("a", root.join("b")).unwrap();
+            std::os::unix::fs::symlink("b", root.join("a")).unwrap();
+            std::os::unix::fs::symlink("../../../file", root.join("dir/up")).unwrap();
+            std::os::unix::fs::symlink("dir", root.join("rel")).unwrap();
+        }
+        let fs = Fs::new(root.clone());
+        assert_eq!(fs.resolve("/", "file/x", true), Err(ENOTDIR), "a file isn't a directory");
+        assert_eq!(fs.resolve("/", "", true), Err(ENOENT));
+        #[cfg(unix)]
+        {
+            assert_eq!(fs.resolve("/", "/a", true), Err(ELOOP), "symlink cycle");
+            assert_eq!(fs.resolve("/", "/dir/up", true).unwrap(), "/file", "relative link can't climb out");
+            assert_eq!(fs.resolve("/", "/rel/../file", true).unwrap(), "/file");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_dir_lists_dot_entries() {
+        let root = std::env::temp_dir().join(format!("wasm-env-fs-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/f"), b"").unwrap();
+        let fs = Fs::new(root.clone());
+        let mut names: Vec<_> = read_dir(&fs, "/d").unwrap().into_iter().map(|e| (e.name, e.dtype)).collect();
+        names.sort();
+        assert_eq!(names, [(".".into(), 4), ("..".into(), 4), ("f".into(), 8)]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn resolve_stays_inside_root() {
         let root = std::env::temp_dir().join(format!("wasm-env-fs-test-{}", std::process::id()));

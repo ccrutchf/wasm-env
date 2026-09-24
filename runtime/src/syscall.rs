@@ -952,3 +952,36 @@ fn read_timespec(data: &[u8], addr: u64) -> SysResult<Duration> {
     }
     Ok(Duration::new(secs as u64, nanos as u32))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timespecs() {
+        let mut data = vec![0u8; 32];
+        mem::write(&mut data, 0, &timespec(Duration::new(3, 500))).unwrap();
+        assert_eq!(read_timespec(&data, 0), Ok(Duration::new(3, 500)), "round trip");
+        mem::write(&mut data, 16, &(-1i64).to_le_bytes()).unwrap();
+        assert_eq!(read_timespec(&data, 16), Err(EINVAL), "negative seconds");
+        mem::write(&mut data, 16, &0i64.to_le_bytes()).unwrap();
+        mem::write(&mut data, 24, &1_000_000_000i64.to_le_bytes()).unwrap();
+        assert_eq!(read_timespec(&data, 16), Err(EINVAL), "nanoseconds out of range");
+        assert_eq!(read_timespec(&data, 24), Err(EFAULT));
+    }
+
+    #[test]
+    fn argv_arrays() {
+        let mut data = vec![0u8; 128];
+        data[64..70].copy_from_slice(b"hello\0");
+        data[70..73].copy_from_slice(&[0x80, 0x81, 0]);
+        // The array lives at address 8 (address 0 is NULL).
+        for (i, p) in [64u64, 70, 0].iter().enumerate() {
+            mem::write_u64(&mut data, 8 + i as u64 * 8, *p).unwrap();
+        }
+        assert_eq!(string_array(&data, 8), Ok(vec![b"hello".to_vec(), vec![0x80, 0x81]]));
+        assert_eq!(string_array(&data, 24), Ok(vec![]), "empty array");
+        assert_eq!(string_array(&data, 0), Ok(vec![]), "NULL array pointer");
+        assert_eq!(string_array(&data, 124), Err(EFAULT), "array runs past memory");
+    }
+}
