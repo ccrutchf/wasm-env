@@ -1,0 +1,12 @@
+[package]
+name = "wasm-env-translate"
+version = "0.1.0"
+description = "Translates arm64 Linux ELF binaries to wasm-env WebAssembly programs"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+bad64 = "0.12"
+object = { version = "0.37", default-features = false, features = ["read", "elf", "std"] }

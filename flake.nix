@@ -25,6 +25,9 @@
               pkgs.wabt # wasm2c, wasm-objdump, wasm2wat
               pkgs.simde # SIMD headers used by wasm2c output
               pkgs.wasmtime
+              # M2: arm64 reference toolchain and emulator for translator tests.
+              pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
+              pkgs.qemu-user
               pkgs.gnumake
             ];
             # The wrapped clang injects host flags that break wasm targets,
@@ -38,6 +41,8 @@
             COMPILER_RT_SRC = "${llvm.compiler-rt.src}";
             # Packages built with the toolchain (packages/*/build.sh).
             BUSYBOX_SRC = "${pkgs.busybox.src}";
+            # bindgen (used by the bad64 arm64 decoder crate) needs libclang.
+            LIBCLANG_PATH = "${llvm.libclang.lib}/lib";
           };
         });
     };
