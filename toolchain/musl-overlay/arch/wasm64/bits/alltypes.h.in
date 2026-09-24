@@ -1,0 +1,22 @@
+// wasm-env: based on arch/aarch64/bits/alltypes.h.in. LP64, little-endian.
+// wchar_t is signed int, matching clang's WebAssembly targets.
+#define _Addr long
+#define _Int64 long
+#define _Reg long
+
+#define __BYTE_ORDER 1234
+
+#define __LONG_MAX 0x7fffffffffffffffL
+
+#ifndef __cplusplus
+TYPEDEF int wchar_t;
+#endif
+TYPEDEF unsigned wint_t;
+
+TYPEDEF int blksize_t;
+TYPEDEF unsigned int nlink_t;
+
+TYPEDEF float float_t;
+TYPEDEF double double_t;
+
+TYPEDEF struct { long long __ll; long double __ld; } max_align_t;

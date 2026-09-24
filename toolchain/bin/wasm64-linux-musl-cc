@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# C compiler for the wasm-env ABI (docs/abi.md): clang for wasm64 with our
+# musl sysroot. Use like any cross compiler:
+#
+#   wasm64-linux-musl-cc -O2 hello.c -o hello.wasm
+#
+# Needs WASM_CC (from nix develop) and the sysroot from toolchain/build.sh.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd "$here/../.." && pwd)
+sysroot=${WASM_ENV_SYSROOT:-$root/build/sysroot}
+: "${WASM_CC:?run inside nix develop}"
+source "$root/toolchain/flags.sh"
+
+resource=$("$WASM_CC" -print-resource-dir)
+compile_flags=(
+	"${WASM_ENV_CFLAGS[@]}"
+	-nostdinc -isystem "$sysroot/include" -isystem "$resource/include"
+)
+
+# Do a full link unless asked only to preprocess, compile or assemble, or
+# to do a partial (relocatable) link, which build systems use to combine
+# objects.
+link=1
+for arg in "$@"; do
+	case $arg in -c | -S | -E | -M | -MM | -r | -Wl,-r | -Wl,--relocatable) link=0 ;; esac
+done
+
+if [ $link = 0 ]; then
+	exec "$WASM_CC" "${compile_flags[@]}" "$@"
+fi
+
+# wasm-ld resolves archives in any order and rejects some GNU ld flags
+# (grouping, common-symbol warnings), which build systems commonly pass.
+args=()
+for arg in "$@"; do
+	case $arg in
+	-Wl,--start-group | -Wl,--end-group | -Wl,-\( | -Wl,-\) | -Wl,--warn-common | -Wl,--sort-common | -Wl,--sort-section,*) ;;
+	*) args+=("$arg") ;;
+	esac
+done
+
+exec "$WASM_CC" "${compile_flags[@]}" -nostdlib -fuse-ld=lld \
+	"$sysroot/lib/crt1.o" "${args[@]}" \
+	"${WASM_ENV_LDFLAGS[@]}" \
+	-L"$sysroot/lib" -lc "$sysroot/lib/libclang_rt.builtins.a"

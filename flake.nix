@@ -33,6 +33,11 @@
             # wasm2c's runtime sources and headers.
             WASM2C_RT = "${pkgs.wabt}/share/wabt/wasm2c";
             WASM2C_INCLUDE = "${pkgs.wabt}/include";
+            # Sources for the wasm64-linux-musl toolchain (toolchain/build.sh).
+            MUSL_SRC = "${pkgs.musl.src}";
+            COMPILER_RT_SRC = "${llvm.compiler-rt.src}";
+            # Packages built with the toolchain (packages/*/build.sh).
+            BUSYBOX_SRC = "${pkgs.busybox.src}";
           };
         });
     };

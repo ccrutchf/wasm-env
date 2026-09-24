@@ -73,6 +73,8 @@ For each binary, use the first path that works:
 
 ### Native ABI and toolchain
 
+The full specification is [docs/abi.md](docs/abi.md) (version 0). Summary:
+
 - A memory64 WASM module that exports `_start` and imports a single Linux syscall function, roughly `linux.syscall(nr, a0..a5) -> i64`, using Linux syscall numbers and the 64-bit (LP64) struct layouts. One ABI for recompiled and translated software; no 4 GB per-process limit.
 - A musl libc port whose syscall wrapper calls that import, plus a clang/LLVM toolchain targeting it (`wasm64-linux-musl`). Porting software means cross-compiling it with this toolchain.
 - The translator emits modules with the same imports, so recompiled and translated binaries are indistinguishable to the runtime.
@@ -116,7 +118,7 @@ For each binary, use the first path that works:
 ## Milestones
 
 - **M-1 — wasm32 vs memory64 benchmarks (done on Linux x86-64).** Decided the native ABI's memory model: memory64 with masked addressing, ~1.2× native (~1.12× excluding interpreters), on wasmtime. See [Benchmarks](#m-1-benchmarks) below.
-- **M0 — Native ABI.** Define the syscall import, port musl, and compile BusyBox from source to WASM. Run `busybox ls` and `busybox echo` on wasmtime with a minimal syscall layer (read, write, openat, close, fstat, getdents64, brk, mmap, exit_group, ioctl stubs). Verify on the Mac and on a Windows x86 machine.
+- **M0 — Native ABI (done on Linux x86-64).** Specified in [docs/abi.md](docs/abi.md). musl 1.2.6 ported to `wasm64` (`toolchain/musl-overlay`), compiler-rt builtins, a `wasm64-linux-musl-cc` wrapper, and the `wasm-env` runtime (`runtime/`, about 50 syscalls). A C test program and BusyBox 1.37 (44 applets, 294 KB) pass `tests/m0.sh` (20 checks). Still to do: run it on the Mac and on Windows. See [M0 notes](#m0-notes).
 - **M1 — Shell.** `busybox sh -c` with pipes and subshells: fork, execve, wait4, pipe, dup2. A non-trivial script gives identical output on all hosts.
 - **M2 — Native userland.** Recompile a small Alpine-based set (bash, coreutils, python3) and package it as a `wasi/wasm` OCI image; `wasm-env run` opens a shell in it.
 - **M3 — arm64 translation.** Translate the static arm64 BusyBox from `alpine` to the same ABI. Compare its output and performance against the recompiled BusyBox from M0 — a built-in correctness and performance baseline.
@@ -212,6 +214,37 @@ Native code gets memory isolation for free from the CPU's memory hardware, but o
 - **Spectre guards aren't needed.** The process holds nothing the environment couldn't already reach, so speculative reads leak nothing new. Masked addresses can't leave the reservation even speculatively.
 - Separate processes also give crash isolation, and they let us use OS resource limits for each environment.
 
+
+## M0 notes
+
+**Layout**
+
+| Path | What |
+|---|---|
+| `docs/abi.md` | The ABI specification (version 0) |
+| `toolchain/musl-overlay/` | Our musl port: `arch/wasm64` plus a few `src/*/wasm64` files. Upstream musl stays pristine; `toolchain/build.sh` copies the overlay onto it |
+| `toolchain/build.sh` | Builds `build/sysroot`: musl and compiler-rt builtins |
+| `toolchain/bin/wasm64-linux-musl-cc` | The cross compiler: clang plus our flags, sysroot and link line |
+| `runtime/` | The `wasm-env` runtime: wasmtime with our masking patch, startup, the mmap allocator, filesystem and syscalls |
+| `packages/busybox/` | BusyBox build script and applet list |
+| `tests/m0.sh` | End-to-end acceptance test |
+
+**Findings**
+
+- **The musl port is small.** About 150 lines: syscall, thread-pointer, atomics and startup headers, plus setjmp/longjmp, `__set_thread_area` and `__unmapself`. Everything else builds from musl's generic C code.
+- **setjmp/longjmp work through WebAssembly exception handling** (`-mllvm -wasm-enable-sjlj`, exnref form), with three small helper functions in libc. wasmtime 49 supports it.
+- **clang renames `main` on WebAssembly** (`__main_argc_argv` or `__main_void`), and an indirect call with the wrong signature traps. `crt1` adapts, using strong references so `main` is found even inside a static library (BusyBox keeps it in `libbb/lib.a`).
+- **compiler-rt bug:** its soft-float comparison functions return `long` on every 64-bit target except arm64, but LLVM's WebAssembly backend expects `int`. We patch it at build time; worth reporting upstream.
+- **Build-system friction is small.** The wrapper passes partial links (`-r`) through and drops GNU ld flags that `wasm-ld` rejects (`--start-group`, `--warn-common`). BusyBox then built unmodified.
+- **Compiled programs are cached.** Without a cache, Cranelift recompiled BusyBox on every run (0.8 s of CPU for `true`). With wasmtime's cache in our own directory, `true` takes 7 ms.
+- **Paths are resolved by the runtime, not the host.** Symlinks, including absolute ones, resolve inside the environment's root, and `..` can't climb out.
+
+**Known gaps (for M1 and later)**
+
+- No `fork`, `execve`, pipes or signals, so no shell yet. This is M1.
+- Terminal size is fixed at 80×24; there's no terminal mode control (`TCGETS`/`TCSETS`).
+- Paths must be valid UTF-8; file-backed `mmap` is read-only.
+- Not yet run on macOS or Windows. The Windows-specific code (symlinks, permissions, `stat`) has never been compiled.
 
 ## Risks
 

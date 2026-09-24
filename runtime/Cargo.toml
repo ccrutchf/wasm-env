@@ -1,0 +1,12 @@
+[package]
+name = "wasm-env"
+version = "0.1.0"
+description = "Runs wasm-env programs: WebAssembly modules that use the Linux syscall ABI in docs/abi.md"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+getrandom = "0.3"
+wasmtime = "49"
