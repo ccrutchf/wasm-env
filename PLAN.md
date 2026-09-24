@@ -132,7 +132,7 @@ The full specification is [docs/abi.md](docs/abi.md) (version 0). Summary:
 - **M-1 — wasm32 vs memory64 benchmarks (done on Linux x86-64).** Decided the native ABI's memory model: memory64 with masked addressing, ~1.2× native (~1.12× excluding interpreters), on wasmtime. See [Benchmarks](#m-1-benchmarks) below.
 - **M0 — Native ABI (done on Linux x86-64).** Specified in [docs/abi.md](docs/abi.md). musl 1.2.6 ported to `wasm64` (`toolchain/musl-overlay`), compiler-rt builtins, a `wasm64-linux-musl-cc` wrapper, and the `wasm-env` runtime (`runtime/`, about 50 syscalls). A C test program and BusyBox 1.37 (44 applets, 294 KB) pass `tests/m0.sh` (20 checks). Still to do: run it on the Mac and on Windows. See [M0 notes](#m0-notes).
 - **M1 — Processes and a shell (done on Linux x86-64).** `vfork` (built on setjmp and WebAssembly exceptions) + `execve`, `posix_spawn`, `system`/`popen`, `wait4`, pipes, `kill` with default signal actions, `#!` scripts and virtual `/dev` devices. BusyBox in its no-MMU mode with the `hush` shell. `tests/m1.sh` passes 27 checks. See [M1 notes](#m1-notes).
-- **M2 — arm64 translation, static.** Lift a static arm64 binary to WASM against the same ABI. Start with arm64 BusyBox and compare it to the recompiled BusyBox from M0: a built-in correctness and performance baseline.
+- **M2 — arm64 translation, static (done on Linux x86-64).** A Rust translator (`translator/`): ELF loading, block discovery (branch/pointer targets plus GCC/LLVM jump-table recognition), an arm64→LLVM-IR lifter (`lift/`, integer + scalar FP + a NEON subset, blocks chained by `musttail`, indirect branches through a dispatch switch), and a link step producing a wasm-env program. Six C fixtures (from a libc-free program up to printf/malloc/setjmp and SIMD string code) run **byte-identical to qemu-aarch64** via `tests/m2.sh`. See [M2 notes](#m2-notes).
 - **M3 — Translated dynamic linking.** ABI version 1 (shared memory and function table across modules), the runtime's loader, and translate-on-first-load with caching. Goal: Ubuntu 24.04 arm64's own `python3 -c 'print(1)'`, with its glibc, running translated.
 - **M4 — Python wheels.** `pip install` into the translated Python and import binary wheels: first a small C extension (`markupsafe`), then **numpy** (with bundled OpenBLAS, single-threaded), then **pandas**. Measure against native arm64.
 - **M5 — Ubuntu images.** `wasm-env convert ubuntu:24.04` (arm64): pre-translate the image, keep dpkg metadata, and `wasm-env run` gives a shell in it. Networking (sockets, DNS) so `pip` can reach PyPI.
@@ -301,6 +301,31 @@ The eventual wish: run CUDA kernels from existing PyTorch wheels on any host's G
 - **A PyTorch device backend on wgpu** (PyTorch's `PrivateUse1` extension point), bypassing CUDA entirely. Less general, but more achievable.
 
 Either way the runtime would expose the GPU to the process through host functions, the way FEX-Emu's "thunks" hand some library calls to native host implementations.
+
+## M2 notes
+
+**How translation works** (see also `docs/abi.md` and the module docs)
+
+- **Discovery** (`translator/src/discover.rs`) decodes every 4-byte word in the executable sections, then finds basic blocks by following control flow from roots: the entry point, function symbols, and addresses formed as code pointers (ADR/ADRP+ADD, or stored in data). It recognizes the GCC/LLVM **jump-table** idiom (`adrp`+`add` table base, `ldr{b,h,sw}` index, `adr` label, `add …, ext #2`, `br`) and reads the offset table, so `switch` targets are found without executing anything.
+- **Lifting** (`translator/src/lift/`) turns each block into an LLVM function. Guest registers live in globals (`@R`, `@F` flags, `@V`, `@TP`), cached as SSA values within a block and flushed at its end. Guest memory *is* the WebAssembly memory: guest address A is WebAssembly address A, so the masked-memory64 runtime bounds it for free. Blocks pass control by **guaranteed tail call** (`musttail` → `return_call`), so the host stack never grows however the guest branches, calls or returns; indirect branches (BR/BLR/RET) go through a `@dispatch` switch over every block start.
+- **Linking** (`translator/src/link.rs`) compiles the IR and the support code (`translator/support/runtime.c`) for wasm64 with clang, and links them with wasm-ld plus the compiler-rt builtins (`__multi3` etc., which LLVM emits for 128-bit arithmetic and divide-by-constant). The support code maps the guest image at its original addresses, builds the Linux initial stack (adding `AT_PHDR`/`AT_ENTRY`), and forwards `svc` to the `linux.syscall` import — so translated and recompiled programs make identical syscalls.
+
+**Coverage.** Integer arithmetic/logic/shifts/bitfields/conditionals, all load/store forms (including pairs, exclusives as single-threaded, and `ld1`/`st1`), scalar floating point (arithmetic, compare, convert, fma, select), and a NEON integer subset (element-wise arithmetic and compares, `dup`/`movi`, `cnt`, reductions, shifts, permutes, narrowing, element moves). Cache-maintenance ops are no-ops. Anything unimplemented lifts to a trap that names the instruction and address, so gaps surface at runtime rather than as wrong answers.
+
+**Findings**
+
+- **bad64 names x29/x30 `fp`/`lr`**; the register decoder handles those aliases.
+- **Divide-by-constant introduces 128-bit multiply.** LLVM strength-reduces `x / 10` to a 64×64→128 multiply, so translated programs need compiler-rt's `__multi3`; the sysroot's builtins archive is linked in.
+- **Vector results are always full i128.** `vbuild` zero-fills unused high lanes (the arm64 rule that writing a 64-bit vector result clears the upper half), so results are written back as 128 bits.
+- **Jump tables reuse the base register.** `ldrh w1, [x1, …]` overwrites the very register holding the table base, so the base address is resolved at load time, not deferred.
+- **The only environment-level difference from qemu was `$HOME`**: qemu inherits the host's, so the test gives qemu wasm-env's default environment.
+
+**Known gaps**
+
+- **No runtime fallback yet:** an indirect branch to an address discovery missed, or an unimplemented instruction, traps. A runtime translator (or CPU-emulation fallback) is future work.
+- **Threads and atomics:** exclusives assume a single thread (`stxr` always succeeds).
+- **Not wired into the runtime's `execve`:** the runtime rejects ELF binaries with `ENOEXEC` (M0/M1). Converting an image (translate every ELF, cache by hash) and running translated binaries as processes is M4.
+- **Not yet run on macOS or Windows.**
 
 ## Risks
 

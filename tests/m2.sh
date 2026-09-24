@@ -38,7 +38,10 @@ for f in "${fixtures[@]}"; do
 	$cc -O2 -static $flags -o "$out/$name" "$src"
 
 	set +e
-	qemu-aarch64 "$out/$name" a "b c" >"$out/$name.expected" 2>&1
+	# Give qemu the same environment wasm-env supplies by default, so only
+	# translation differences show up (not inherited host variables).
+	env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin TERM=xterm \
+		"$(command -v qemu-aarch64)" "$out/$name" a "b c" >"$out/$name.expected" 2>&1
 	expected_status=$?
 	"$translate" translate "$out/$name" "$out/$name.wasm" 2>"$out/$name.translate.log"
 	translate_status=$?

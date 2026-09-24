@@ -11,6 +11,7 @@ pub struct Segment {
     pub data: Vec<u8>,
     pub memsz: u64,
     pub exec: bool,
+    #[allow(dead_code)]
     pub write: bool,
 }
 
@@ -113,6 +114,24 @@ impl Image {
             }
         }
         out
+    }
+
+    /// Reads a little-endian unsigned integer of `width` bytes at a guest
+    /// virtual address, if it lies within a loaded segment.
+    pub fn read_uint(&self, vaddr: u64, width: u32) -> Option<u64> {
+        let seg = self.segments.iter().find(|s| s.contains(vaddr) && s.contains(vaddr + width as u64 - 1))?;
+        let off = (vaddr - seg.vaddr) as usize;
+        let bytes = seg.data.get(off..off + width as usize)?;
+        let mut v = 0u64;
+        for (k, b) in bytes.iter().enumerate() {
+            v |= (*b as u64) << (8 * k);
+        }
+        Some(v)
+    }
+
+    /// Whether `addr` is a 4-byte-aligned address inside executable code.
+    pub fn is_code(&self, addr: u64) -> bool {
+        addr.is_multiple_of(4) && self.code.iter().any(|r| r.contains(&addr))
     }
 
     pub fn function_at(&self, addr: u64) -> Option<&str> {

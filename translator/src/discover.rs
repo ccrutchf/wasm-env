@@ -114,7 +114,9 @@ pub fn discover(image: &Image) -> Program {
             continue;
         }
         let mut pc = start;
+        let mut block: Vec<(u64, &Instruction)> = Vec::new();
         while let Some(i) = insns.get(&pc) {
+            block.push((pc, i));
             if is_control(i) {
                 let mut add = |a: u64| {
                     if in_code(a) && leaders.insert(a) {
@@ -126,6 +128,13 @@ pub fn discover(image: &Image) -> Program {
                 }
                 if !is_terminal(i) {
                     add(pc + 4);
+                }
+                // A `br` with no writeback is usually a switch: read the
+                // jump table (case targets aren't stored as pointers).
+                if i.op().mnem() == "br" {
+                    for t in jump_table(image, &block) {
+                        add(t);
+                    }
                 }
                 break;
             }
@@ -140,6 +149,126 @@ pub fn discover(image: &Image) -> Program {
         }
     }
     Program { insns, leaders }
+}
+
+/// A canonical general-register id (x and w of the same number share one),
+/// with sp=31, fp=29, lr=30.
+fn gpr_id(op: &Operand) -> Option<u32> {
+    let Operand::Reg { reg: r, .. } = op else { return None };
+    let n = r.name();
+    match n {
+        "sp" | "wsp" => Some(31),
+        "fp" => Some(29),
+        "lr" => Some(30),
+        "xzr" | "wzr" => None,
+        _ => n.strip_prefix('x').or_else(|| n.strip_prefix('w')).and_then(|s| s.parse().ok()),
+    }
+}
+
+/// Recognizes the GCC/LLVM arm64 switch idiom ending in `br` and returns
+/// the case target addresses by reading the offset table:
+///
+///     adrp xT, PAGE ; add xT, xT, #OFF     ; table base
+///     ldr{b,h,sw} wI, [xT, wIdx, ext #s]   ; entry = table[index]
+///     adr  xB, LABEL                        ; base label
+///     add  xD, xB, wI, ext #2               ; target = LABEL + entry*4
+///     br   xD
+///
+/// Register absolute values (from adr/adrp/add-imm/mov) are tracked across
+/// the block. Table entries are read until one points outside the code.
+fn jump_table(image: &Image, block: &[(u64, &Instruction)]) -> Vec<u64> {
+    use bad64::{Operand::*, Shift};
+    let br = block.last().unwrap().1;
+    let Some(target_reg) = br.operands().first().and_then(gpr_id) else { return vec![] };
+
+    // Track absolute register values built by adr/adrp/add-imm/mov.
+    let mut val: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    // The last load into each register: (resolved table base, width, signed).
+    let mut load: std::collections::HashMap<u32, (u64, u32, bool)> = std::collections::HashMap::new();
+    let mut table: Option<(u64, u64, u32, bool)> = None; // (label, table_base, width, signed)
+
+    for (_, i) in block {
+        let ops = i.operands();
+        let d = ops.first().and_then(gpr_id);
+        match i.op().mnem() {
+            "adr" | "adrp" => {
+                if let (Some(d), Some(Label(imm))) = (d, ops.get(1)) {
+                    val.insert(d, imm_u64(imm));
+                }
+            }
+            "add" if matches!(ops.get(2), Some(Imm64 { .. } | Imm32 { .. })) => {
+                if let (Some(d), Some(s), Some(off)) = (d, ops.get(1).and_then(gpr_id), ops.get(2)) {
+                    match (val.get(&s).copied(), off) {
+                        (Some(base), Imm64 { imm, .. } | Imm32 { imm, .. }) => {
+                            val.insert(d, base.wrapping_add(imm_u64(imm)));
+                        }
+                        _ => {
+                            val.remove(&d);
+                        }
+                    }
+                }
+            }
+            // add xD, xB, wI, <ext> #2  -> the switch target computation.
+            "add" if d == Some(target_reg) => {
+                if let (Some(base_reg), Some(ShiftReg { reg: idx, shift })) =
+                    (ops.get(1).and_then(gpr_id), ops.get(2))
+                {
+                    let scaled = matches!(shift, Shift::SXTH(2) | Shift::SXTB(2) | Shift::SXTW(2) | Shift::UXTH(2) | Shift::UXTW(2) | Shift::UXTB(2) | Shift::LSL(2));
+                    if let (Some(&label), Some(idx), true) = (val.get(&base_reg), gpr_id(&Reg { reg: *idx, arrspec: None }), scaled)
+                        && let Some(&(base, width, signed)) = load.get(&idx)
+                    {
+                        table = Some((label, base, width, signed));
+                    }
+                }
+            }
+            "ldrb" | "ldrsb" | "ldrh" | "ldrsh" | "ldrsw" => {
+                let tab = match ops.get(1) {
+                    Some(MemExt { regs, .. }) => gpr_id(&Reg { reg: regs[0], arrspec: None }),
+                    Some(MemOffset { reg: r, .. }) => gpr_id(&Reg { reg: *r, arrspec: None }),
+                    _ => None,
+                };
+                if let (Some(d), Some(base)) = (d, tab.and_then(|t| val.get(&t).copied())) {
+                    let width = if i.op().mnem().contains('h') { 2 } else if i.op().mnem().ends_with('w') { 4 } else { 1 };
+                    let signed = i.op().mnem().contains('s');
+                    load.insert(d, (base, width, signed));
+                }
+                if let Some(d) = d {
+                    val.remove(&d);
+                }
+            }
+            "movz" | "mov" | "movn" | "movk" => {
+                if let (Some(d), Some(Imm64 { imm, .. } | Imm32 { imm, .. })) = (d, ops.get(1)) {
+                    val.insert(d, imm_u64(imm));
+                } else if let Some(d) = d {
+                    val.remove(&d);
+                }
+            }
+            _ => {
+                if let Some(d) = d {
+                    val.remove(&d);
+                    load.remove(&d);
+                }
+            }
+        }
+    }
+
+    let Some((label, base, width, signed)) = table else { return vec![] };
+    let mut targets = Vec::new();
+    for i in 0..4096u64 {
+        let Some(raw) = image.read_uint(base + i * width as u64, width) else { break };
+        let entry = if signed {
+            let bits = width * 8;
+            (raw << (64 - bits)) as i64 >> (64 - bits)
+        } else {
+            raw as i64
+        };
+        let target = label.wrapping_add((entry * 4) as u64);
+        if !image.is_code(target) {
+            break;
+        }
+        targets.push(target);
+    }
+    targets
 }
 
 #[cfg(test)]

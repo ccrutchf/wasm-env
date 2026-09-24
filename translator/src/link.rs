@@ -21,13 +21,19 @@ const CFLAGS: &[&str] =
 pub struct Toolchain {
     pub cc: PathBuf,
     pub wasm_ld: PathBuf,
+    /// compiler-rt builtins for wasm64 (`__multi3` and friends, which
+    /// LLVM emits for 128-bit arithmetic and divide-by-constant). Built
+    /// into the sysroot by toolchain/build.sh.
+    pub builtins: Option<PathBuf>,
 }
 
 impl Toolchain {
     /// clang from $WASM_CC and wasm-ld from PATH (both in `nix develop`).
     pub fn from_env() -> Option<Toolchain> {
         let cc = PathBuf::from(std::env::var_os("WASM_CC")?);
-        Some(Toolchain { cc, wasm_ld: PathBuf::from("wasm-ld") })
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let builtins = repo.join("build/sysroot/lib/libclang_rt.builtins.a");
+        Some(Toolchain { cc, wasm_ld: PathBuf::from("wasm-ld"), builtins: builtins.exists().then_some(builtins) })
     }
 }
 
@@ -65,6 +71,7 @@ pub fn link(tc: &Toolchain, ir: &str, image_end: u64, work: &Path) -> Result<Vec
         .args(["--export=R", "--export=F", "--export=V", "--export=TP"])
         .arg(&lifted_o)
         .arg(&support_o)
+        .args(tc.builtins.iter())
         .arg("-o")
         .arg(&wasm))?;
     Ok(std::fs::read(&wasm)?)

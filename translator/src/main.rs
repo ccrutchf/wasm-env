@@ -53,8 +53,8 @@ fn translate(input: &str, output: &str) -> Result<()> {
     let image = elf::Image::load(&bytes)?;
     let prog = discover::discover(&image);
     let lifted = lift::lift(&image, &prog);
-    for (op, n) in &lifted.unsupported {
-        eprintln!("warning: {n} × `{op}` not supported yet (traps if executed)");
+    for (op, (n, example)) in &lifted.unsupported {
+        eprintln!("warning: {n} × `{op}` not supported yet (traps if executed): {example}");
     }
     let tc = link::Toolchain::from_env().context("$WASM_CC isn't set (run inside `nix develop`)")?;
     let image_end = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(0);
@@ -88,6 +88,14 @@ fn main() -> Result<()> {
         ["blocks", path] => blocks(path),
         #[cfg(feature = "lift")]
         ["translate", input, output] => translate(input, output),
+        #[cfg(feature = "lift")]
+        ["emit", input] => {
+            let bytes = std::fs::read(input)?;
+            let image = elf::Image::load(&bytes)?;
+            let prog = discover::discover(&image);
+            print!("{}", lift::lift(&image, &prog).ir);
+            Ok(())
+        }
         _ => bail!("usage: wasm-env-translate census|blocks BINARY | translate BINARY OUT.wasm"),
     }
 }

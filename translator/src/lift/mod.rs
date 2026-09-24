@@ -46,6 +46,8 @@ pub fn reg(r: Reg) -> Result<(R, u32)> {
         "wzr" => (R::Zr, 32),
         "sp" => (R::X(31), 64),
         "wsp" => (R::X(31), 32),
+        "fp" => (R::X(29), 64), // bad64's names for x29/x30
+        "lr" => (R::X(30), 64),
         _ => {
             let (kind, rest) = name.split_at(1);
             let n: u8 = rest.parse().map_err(|_| anyhow::anyhow!("register {name}"))?;
@@ -293,6 +295,7 @@ impl<'a> Block<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn write_any(&mut self, (r, bits): (R, u32), v: String) -> Result<()> {
         match r {
             R::V(i) => {
@@ -589,7 +592,7 @@ impl<'a> Block<'a> {
 pub struct Lifted {
     pub ir: String,
     /// Instructions that couldn't be translated, by mnemonic.
-    pub unsupported: BTreeMap<String, usize>,
+    pub unsupported: BTreeMap<String, (usize, String)>,
     pub blocks: usize,
 }
 
@@ -611,7 +614,8 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(e) => {
-                    *unsupported.entry(i.op().mnem().to_string()).or_default() += 1;
+                    // Keep one example error per mnemonic for diagnostics.
+                    unsupported.entry(i.op().mnem().to_string()).or_insert_with(|| (0, format!("`{i}`: {e}"))).0 += 1;
                     b.fail(pc, &format!("unsupported instruction `{i}`: {e}"));
                     break;
                 }
@@ -674,7 +678,6 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
             ir,
             "declare {t} @llvm.fshr.{t}({t}, {t}, {t})\n\
              declare {t} @llvm.ctlz.{t}({t}, i1)\n\
-             declare {t} @llvm.bitreverse.{t}({t})\n\
              declare {t} @llvm.bswap.{t}({t})\n\
              declare {t} @llvm.fptosi.sat.{t}.f64(double)\n\
              declare {t} @llvm.fptoui.sat.{t}.f64(double)\n\
@@ -683,6 +686,18 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
         );
     }
     ir.push_str("declare i16 @llvm.bswap.i16(i16)\n");
+    // Integer min/max and per-lane intrinsics, at every vector element width.
+    for t in ["i8", "i16", "i32", "i64"] {
+        let _ = writeln!(
+            ir,
+            "declare {t} @llvm.umin.{t}({t}, {t})\n\
+             declare {t} @llvm.umax.{t}({t}, {t})\n\
+             declare {t} @llvm.smin.{t}({t}, {t})\n\
+             declare {t} @llvm.smax.{t}({t}, {t})\n\
+             declare {t} @llvm.ctpop.{t}({t})\n\
+             declare {t} @llvm.bitreverse.{t}({t})"
+        );
+    }
     for (t, s) in [("double", "f64"), ("float", "f32")] {
         let _ = writeln!(
             ir,
