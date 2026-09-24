@@ -133,7 +133,7 @@ pub fn discover(image: &Image) -> Program {
                 // A `br` with no writeback is usually a switch: read the
                 // jump table (case targets aren't stored as pointers).
                 if i.op().mnem() == "br" {
-                    for t in jump_table(image, &block) {
+                    for t in jump_table(image, &insns, &block) {
                         add(t);
                     }
                 }
@@ -177,16 +177,18 @@ fn gpr_id(op: &Operand) -> Option<u32> {
 ///
 /// Register absolute values (from adr/adrp/add-imm/mov) are tracked across
 /// the block. Table entries are read until one points outside the code.
-fn jump_table(image: &Image, block: &[(u64, &Instruction)]) -> Vec<u64> {
+fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, &Instruction)]) -> Vec<u64> {
     use bad64::{Operand::*, Shift};
     let br = block.last().unwrap().1;
     let Some(target_reg) = br.operands().first().and_then(gpr_id) else { return vec![] };
 
     // Track absolute register values built by adr/adrp/add-imm/mov.
     let mut val: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-    // The last load into each register: (resolved table base, width, signed).
-    let mut load: std::collections::HashMap<u32, (u64, u32, bool)> = std::collections::HashMap::new();
-    let mut table: Option<(u64, u64, u32, bool)> = None; // (label, table_base, width, signed)
+    // The last load into each register: (resolved table base, width, signed,
+    // index register).
+    let mut load: std::collections::HashMap<u32, (u64, u32, bool, Option<u32>)> = std::collections::HashMap::new();
+    // (label, table base, entry width, load signed, the add's extension, index register)
+    let mut table: Option<(u64, u64, u32, bool, Shift, Option<u32>)> = None;
 
     for (_, i) in block {
         let ops = i.operands();
@@ -216,25 +218,48 @@ fn jump_table(image: &Image, block: &[(u64, &Instruction)]) -> Vec<u64> {
                 {
                     let scaled = matches!(shift, Shift::SXTH(2) | Shift::SXTB(2) | Shift::SXTW(2) | Shift::UXTH(2) | Shift::UXTW(2) | Shift::UXTB(2) | Shift::LSL(2));
                     if let (Some(&label), Some(idx), true) = (val.get(&base_reg), gpr_id(&Reg { reg: *idx, arrspec: None }), scaled)
-                        && let Some(&(base, width, signed)) = load.get(&idx)
+                        && let Some(&(base, width, signed, index)) = load.get(&idx)
                     {
-                        table = Some((label, base, width, signed));
+                        table = Some((label, base, width, signed, *shift, index));
                     }
                 }
             }
             "ldrb" | "ldrsb" | "ldrh" | "ldrsh" | "ldrsw" => {
-                let tab = match ops.get(1) {
-                    Some(MemExt { regs, .. }) => gpr_id(&Reg { reg: regs[0], arrspec: None }),
-                    Some(MemOffset { reg: r, .. }) => gpr_id(&Reg { reg: *r, arrspec: None }),
-                    _ => None,
+                let (tab, index) = match ops.get(1) {
+                    Some(MemExt { regs, .. }) => {
+                        (gpr_id(&Reg { reg: regs[0], arrspec: None }), gpr_id(&Reg { reg: regs[1], arrspec: None }))
+                    }
+                    Some(MemOffset { reg: r, .. }) => (gpr_id(&Reg { reg: *r, arrspec: None }), None),
+                    _ => (None, None),
                 };
                 if let (Some(d), Some(base)) = (d, tab.and_then(|t| val.get(&t).copied())) {
                     let width = if i.op().mnem().contains('h') { 2 } else if i.op().mnem().ends_with('w') { 4 } else { 1 };
                     let signed = i.op().mnem().contains('s');
-                    load.insert(d, (base, width, signed));
+                    load.insert(d, (base, width, signed, index));
                 }
                 if let Some(d) = d {
                     val.remove(&d);
+                }
+            }
+            // A table address the compiler spilled to the stack earlier.
+            "ldr" if matches!(ops.get(1), Some(MemOffset { .. })) => {
+                let slot = match ops.get(1) {
+                    Some(MemOffset { reg: r, offset, .. }) => gpr_id(&Reg { reg: *r, arrspec: None }).map(|b| (b, imm_u64(offset) as i64)),
+                    _ => None,
+                };
+                match (d, slot) {
+                    (Some(d), Some((b @ (29 | 31), off))) => match stack_slot_value(insns, block[0].0, b, off) {
+                        Some(v) => {
+                            val.insert(d, v);
+                        }
+                        None => {
+                            val.remove(&d);
+                        }
+                    },
+                    (Some(d), _) => {
+                        val.remove(&d);
+                    }
+                    _ => {}
                 }
             }
             "movz" | "mov" | "movn" | "movk" => {
@@ -253,23 +278,99 @@ fn jump_table(image: &Image, block: &[(u64, &Instruction)]) -> Vec<u64> {
         }
     }
 
-    let Some((label, base, width, signed)) = table else { return vec![] };
+    let Some((label, base, width, signed, ext, index)) = table else { return vec![] };
+    let sx = |v: u64, bits: u32| ((v << (64 - bits)) as i64) >> (64 - bits);
+    // The table's length, from the bounds check before it (`cmp wI, #max;
+    // b.hi default`), when it's just before this block.
+    let count = index.and_then(|idx| {
+        let start = block[0].0;
+        for k in 1..=16u64 {
+            let i = insns.get(&start.checked_sub(4 * k)?)?;
+            let ops = i.operands();
+            let writes_idx = ops.first().and_then(gpr_id) == Some(idx);
+            match (i.op().mnem(), ops.get(1)) {
+                ("cmp", Some(Imm32 { imm, .. } | Imm64 { imm, .. })) if writes_idx => return Some(imm_u64(imm) + 1),
+                (m, _) if writes_idx && !m.starts_with("b.") && m != "cmp" => return None,
+                _ => {}
+            }
+        }
+        None
+    });
     let mut targets = Vec::new();
-    for i in 0..4096u64 {
+    for i in 0..count.unwrap_or(4096).min(4096) {
         let Some(raw) = image.read_uint(base + i * width as u64, width) else { break };
-        let entry = if signed {
-            let bits = width * 8;
-            (raw << (64 - bits)) as i64 >> (64 - bits)
-        } else {
-            raw as i64
+        let v = if signed { sx(raw, width * 8) as u64 } else { raw };
+        // The add's extension decides how the entry is interpreted (sxth: a
+        // signed halfword, so cases may lie before the base label).
+        let entry = match ext {
+            Shift::SXTB(_) => sx(v, 8),
+            Shift::SXTH(_) => sx(v, 16),
+            Shift::SXTW(_) => sx(v, 32),
+            Shift::UXTB(_) => (v & 0xff) as i64,
+            Shift::UXTH(_) => (v & 0xffff) as i64,
+            Shift::UXTW(_) => (v & 0xffff_ffff) as i64,
+            _ => v as i64,
         };
         let target = label.wrapping_add((entry * 4) as u64);
         if !image.is_code(target) {
-            break;
+            // Without a known length, the first non-code entry ends the table.
+            if count.is_none() {
+                break;
+            }
+            continue;
         }
         targets.push(target);
     }
     targets
+}
+
+/// The value last stored to a frame slot (`[sp|fp, #off]`) before `from`:
+/// finds the nearest preceding `str xS, [base, #off]` and resolves xS. A
+/// linear, bounded look back: enough for the table addresses compilers hoist
+/// out of loops and spill.
+fn stack_slot_value(insns: &BTreeMap<u64, Instruction>, from: u64, base: u32, off: i64) -> Option<u64> {
+    use bad64::Operand::*;
+    let mut pc = from;
+    for _ in 0..4096 {
+        pc = pc.checked_sub(4)?;
+        let Some(i) = insns.get(&pc) else { continue };
+        let ops = i.operands();
+        if i.op().mnem() == "str"
+            && let Some(MemOffset { reg: r, offset, .. }) = ops.get(1)
+            && gpr_id(&Reg { reg: *r, arrspec: None }) == Some(base)
+            && imm_u64(offset) as i64 == off
+        {
+            return register_value_before(insns, pc, gpr_id(&ops[0])?, 0);
+        }
+    }
+    None
+}
+
+/// The constant address register `r` holds just before `at`, if it was built
+/// by adr, adrp, or adrp + add in the preceding instructions.
+fn register_value_before(insns: &BTreeMap<u64, Instruction>, at: u64, r: u32, depth: u32) -> Option<u64> {
+    use bad64::Operand::*;
+    if depth > 4 {
+        return None;
+    }
+    let mut pc = at;
+    for _ in 0..64 {
+        pc = pc.checked_sub(4)?;
+        let i = insns.get(&pc)?;
+        let ops = i.operands();
+        let m = i.op().mnem();
+        if ops.first().and_then(gpr_id) != Some(r) || m.starts_with("st") || matches!(m, "cmp" | "cmn" | "tst" | "cbz" | "cbnz" | "tbz" | "tbnz") {
+            continue; // doesn't write r
+        }
+        return match (m, ops.get(1), ops.get(2)) {
+            ("adr" | "adrp", Some(Label(imm)), _) => Some(imm_u64(imm)),
+            ("add", Some(src), Some(Imm32 { imm, .. } | Imm64 { imm, .. })) => {
+                Some(register_value_before(insns, pc, gpr_id(src)?, depth + 1)?.wrapping_add(imm_u64(imm)))
+            }
+            _ => None,
+        };
+    }
+    None
 }
 
 #[cfg(test)]

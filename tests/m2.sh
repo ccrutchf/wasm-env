@@ -25,12 +25,17 @@ fixtures=(
 	"fnptr:tests/arm64/fnptr.c:-static"
 	"arith:tests/arm64/arith.c:-static"
 	"fp:tests/arm64/fp.c:-static"
+	"jumptable:tests/arm64/jumptable.S:-static -nostdlib"
 	"control:tests/arm64/control.c:-static"
 	"memory:tests/arm64/memory.c:-static"
 	# Static PIE (loaded at a chosen base, relocations applied on translate).
 	"hello-pie:tests/c/hello.c:-static-pie"
 	"control-pie:tests/arm64/control.c:-static-pie"
 	"memory-pie:tests/arm64/memory.c:-static-pie"
+	# Static PIE with RELR (packed relative relocations), which the program's
+	# own startup code applies as *p += base: must not be applied twice.
+	"hello-relr:tests/c/hello.c:-static-pie -Wl,-z,pack-relative-relocs"
+	"control-relr:tests/arm64/control.c:-static-pie -Wl,-z,pack-relative-relocs"
 )
 
 out=$root/build/m2

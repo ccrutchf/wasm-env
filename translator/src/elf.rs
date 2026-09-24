@@ -62,6 +62,11 @@ struct Reloc {
     /// The referenced symbol (name, is_weak) for symbol-based relocations.
     sym: Option<(String, bool)>,
     addend: i64,
+    /// A RELR relocation: used only to find code pointers. The dynamic
+    /// linker (or a static PIE's own startup code) applies RELR as
+    /// `*p += base`, which isn't idempotent, so the image keeps the file's
+    /// value for it to relocate at run time.
+    discovery_only: bool,
 }
 
 /// A single ELF object loaded at a base, before cross-object relocation.
@@ -110,8 +115,11 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
     let phoff = header.e_phoff(endian);
     let mut segments = Vec::new();
     let mut phdr = None;
+    // (vaddr, file offset, file size) of each PT_LOAD, to find tables by address.
+    let mut loads = Vec::new();
     for ph in file.elf_program_headers() {
         if ph.p_type(endian) == elf::PT_LOAD {
+            loads.push((ph.p_vaddr(endian), ph.p_offset(endian), ph.p_filesz(endian)));
             let offset = ph.p_offset(endian);
             let filesz = ph.p_filesz(endian);
             let vaddr = base + ph.p_vaddr(endian);
@@ -128,8 +136,9 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
             });
         }
     }
-    // DT_INIT and DT_FINI from the dynamic section.
+    // DT_INIT and DT_FINI from the dynamic section, and the RELR table.
     let mut roots = Vec::new();
+    let (mut relr, mut relr_size) = (0u64, 0u64);
     for ph in file.elf_program_headers() {
         if ph.p_type(endian) != elf::PT_DYNAMIC {
             continue;
@@ -141,6 +150,8 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
             match tag as u32 {
                 elf::DT_NULL => break,
                 elf::DT_INIT | elf::DT_FINI if val != 0 => roots.push(base + val),
+                36 => relr = val,      // DT_RELR
+                35 => relr_size = val, // DT_RELRSZ
                 _ => {}
             }
         }
@@ -173,7 +184,37 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
                 }
                 _ => r.addend(),
             };
-            relocs.push(Reloc { at: base + offset, r_type, sym, addend });
+            relocs.push(Reloc { at: base + offset, r_type, sym, addend, discovery_only: false });
+        }
+    }
+    // RELR: a compact list of relative relocations (entries are an address,
+    // or a bitmap of the 63 words after the last one), where the stored word
+    // is the link-time value and gets the base added.
+    let at_file = |vaddr: u64| {
+        loads.iter().find(|&&(va, _, sz)| vaddr >= va && vaddr + 8 <= va + sz).map(|&(va, off, _)| (off + vaddr - va) as usize)
+    };
+    let word = |off: usize| bytes.get(off..off + 8).map(|w| u64::from_le_bytes(w.try_into().unwrap()));
+    if relr_size > 0 {
+        let table = at_file(relr).context("RELR table outside the file")?;
+        let mut next = 0u64;
+        let mut relative = |addr: u64| {
+            if let Some(v) = at_file(addr).and_then(word) {
+                relocs.push(Reloc { at: base + addr, r_type: 1027, sym: None, addend: v as i64, discovery_only: true });
+            }
+        };
+        for k in 0..relr_size as usize / 8 {
+            let entry = word(table + 8 * k).context("truncated RELR table")?;
+            if entry & 1 == 0 {
+                relative(entry);
+                next = entry + 8;
+            } else {
+                for bit in 0..63 {
+                    if entry >> (bit + 1) & 1 != 0 {
+                        relative(next + 8 * bit);
+                    }
+                }
+                next += 8 * 63;
+            }
         }
     }
 
@@ -252,6 +293,10 @@ fn link(objects: Vec<Parsed>, interp: bool, libs: Vec<(String, u64, u64)>) -> Re
 
     for mut obj in objects {
         for r in &obj.relocs {
+            if r.discovery_only {
+                roots.push(obj.base.wrapping_add(r.addend as u64));
+                continue;
+            }
             let value = match r.r_type {
                 RELATIVE => obj.base.wrapping_add(r.addend as u64),
                 GLOB_DAT | JUMP_SLOT | ABS64 => match &r.sym {
