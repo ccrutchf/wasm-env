@@ -51,5 +51,27 @@ for f in hello:tests/c/hello.c control:tests/arm64/control.c memory:tests/arm64/
 	check "$name (libc.so): output" "$(cat "$out/$name.exp")" "$(cat "$out/$name.act")"
 done
 
+# Libraries loaded at run time by the translated dynamic linker: a DT_NEEDED
+# library (with a constructor and TLS) and a dlopen'd plugin, found in a root
+# filesystem laid out like a distribution's.
+R=$out/root
+rm -rf "$R"
+mkdir -p "$R/lib" "$R/usr/lib" "$R/bin"
+cp "$AARCH64_MUSL/lib/libc.so" "$R/lib/ld-musl-aarch64.so.1"
+$cc -O2 -shared -fPIC -o "$R/usr/lib/libgreet.so" tests/arm64/libgreet.c
+$cc -O2 -shared -fPIC -o "$R/usr/lib/libplugin.so" tests/arm64/plugin.c -L"$R/usr/lib" -lgreet
+$cc -O2 -o "$R/bin/greet" tests/arm64/greet.c -L"$R/usr/lib" -lgreet -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1
+env -i HOME=/root PATH=/bin qemu-aarch64 -L "$R" "$R/bin/greet" you >"$out/greet.exp" 2>&1
+exp=$?
+if "$root/target/release/wasm-env-translate" translate "$R/bin/greet" "$out/greet.wasm" --root "$R" \
+	--dlopen /usr/lib/libplugin.so >"$out/greet.tlog" 2>&1; then
+	"$root/target/release/wasm-env" run --root "$R" "$out/greet.wasm" you >"$out/greet.act" 2>&1
+	act=$?
+	check "libraries + dlopen: exit status" "$exp" "$act"
+	check "libraries + dlopen: output" "$(cat "$out/greet.exp")" "$(cat "$out/greet.act")"
+else
+	check "libraries + dlopen: translation" "ok" "failed"
+fi
+
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]

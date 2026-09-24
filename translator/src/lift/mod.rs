@@ -721,6 +721,22 @@ fn build_data(image: &Image, prog: &Program) -> String {
     let _ = writeln!(ir, "@guest_phdr = constant i64 {}", image.phdr.unwrap_or(0) as i64);
     let _ = writeln!(ir, "@guest_app_entry = constant i64 {}", image.app_entry as i64);
     let _ = writeln!(ir, "@guest_interp_base = constant i64 {}", image.interp_base as i64);
+
+    // Libraries the dynamic linker will map: the support code places each
+    // at its prelinked base (see __wasm_env_svc in support/runtime.c).
+    ir.push_str("%lib = type { ptr, i64, i64 }\n");
+    for (k, (path, _, _)) in image.libs.iter().enumerate() {
+        let _ = writeln!(ir, "@libpath{k} = private constant {}", cstring(path.as_bytes()));
+    }
+    let entries: Vec<String> = image
+        .libs
+        .iter()
+        .enumerate()
+        .map(|(k, (_, base, end))| format!("%lib {{ ptr @libpath{k}, i64 {}, i64 {} }}", *base as i64, *end as i64))
+        .collect();
+    let table = if entries.is_empty() { "zeroinitializer".to_string() } else { format!("[{}]", entries.join(", ")) };
+    let _ = writeln!(ir, "@guest_libs = constant [{} x %lib] {table}", image.libs.len());
+    let _ = writeln!(ir, "@guest_lib_count = constant i64 {}", image.libs.len());
     let _ = writeln!(ir, "@guest_phnum = constant i64 {}\n", image.phnum);
 
     // Declare every block function, then build the dispatch table: parallel

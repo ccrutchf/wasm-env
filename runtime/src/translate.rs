@@ -7,6 +7,15 @@
 //! runs it unchanged. Results are cached by content hash, so each binary is
 //! translated once.
 //!
+//! A dynamically-linked binary is translated together with its dynamic linker
+//! and libraries, which the translator finds inside the environment's root
+//! (`--root`). Libraries a program only `dlopen`s can't be found from the
+//! binary, so the environment may list them in `/etc/wasm-env/dlopen`: lines of
+//! `PROGRAM LIBRARY-OR-DIRECTORY...`, where PROGRAM is a file name pattern
+//! (`*` matches anything) such as `python3*`. A cache entry records every file
+//! the translation read, with its size and modification time, and is redone
+//! if any of them changes.
+//!
 //! Translation needs the toolchain (clang, wasm-ld) and the translator
 //! binary, which are present in the dev shell. When they aren't, execution
 //! of an ELF binary fails with ENOEXEC, exactly as before.
@@ -57,6 +66,32 @@ fn cache_dir() -> Option<PathBuf> {
     Some(base.join("translated"))
 }
 
+/// Whether `name` matches a pattern where `*` matches any run of characters.
+fn glob(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == name,
+        Some((head, rest)) => {
+            let Some(tail) = name.strip_prefix(head) else { return false };
+            (0..=tail.len()).filter(|&i| tail.is_char_boundary(i)).any(|i| glob(rest, &tail[i..]))
+        }
+    }
+}
+
+/// The libraries `/etc/wasm-env/dlopen` in `root` lists for a program named
+/// `program` (a file name).
+fn dlopen_list(root: &Path, program: &str) -> Vec<String> {
+    let Ok(conf) = std::fs::read_to_string(root.join("etc/wasm-env/dlopen")) else { return Vec::new() };
+    conf.lines()
+        .map(|l| l.split('#').next().unwrap_or_default())
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            let pattern = words.next()?;
+            glob(pattern, program).then(|| words.map(String::from).collect::<Vec<_>>())
+        })
+        .flatten()
+        .collect()
+}
+
 /// The first bytes of a little-endian arm64 (EM_AARCH64 = 183) ELF.
 pub fn is_arm64_elf(head: &[u8]) -> bool {
     head.len() >= 20
@@ -66,9 +101,35 @@ pub fn is_arm64_elf(head: &[u8]) -> bool {
         && u16::from_le_bytes([head[18], head[19]]) == 183
 }
 
+/// A fingerprint of the files a translation read: one "size<TAB>mtime<TAB>path"
+/// line each. A missing file fingerprints as "absent", so deleting a library
+/// invalidates the entry too.
+fn fingerprint(paths: &str) -> String {
+    paths
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|p| match std::fs::metadata(p) {
+            Ok(m) => {
+                let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+                format!("{}\t{}\t{p}\n", m.len(), t.map_or(0, |d| d.as_nanos()))
+            }
+            Err(_) => format!("absent\t\t{p}\n"),
+        })
+        .collect()
+}
+
+/// Whether a cache entry's recorded inputs are all unchanged.
+fn still_valid(deps: &Path) -> bool {
+    let Ok(recorded) = std::fs::read_to_string(deps) else { return false };
+    let paths: String = recorded.lines().filter_map(|l| l.splitn(3, '\t').nth(2)).map(|p| format!("{p}\n")).collect();
+    fingerprint(&paths) == recorded
+}
+
 /// Returns the cached translated module for `elf`, translating it on the
-/// first call. `trace` logs a line when translation actually runs.
-pub fn ensure_translated(elf: &Path, trace: bool) -> SysResult<PathBuf> {
+/// first call. Its dynamic linker and libraries come from `root`; `program`
+/// is its file name, for `/etc/wasm-env/dlopen`. `trace` logs a line when
+/// translation actually runs.
+pub fn ensure_translated(elf: &Path, root: &Path, program: &str, trace: bool) -> SysResult<PathBuf> {
     let bytes = std::fs::read(elf).map_err(|e| crate::fs::errno(&e))?;
     // The cache key covers the binary and the translator's build, so a
     // rebuilt translator retranslates.
@@ -77,12 +138,15 @@ pub fn ensure_translated(elf: &Path, trace: bool) -> SysResult<PathBuf> {
     let tool_hash = tool_stamp
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos() as u64);
-    let key = hash(&bytes) ^ hash(&tool_hash.to_le_bytes()) ^ bytes.len() as u64;
+    let dlopen = dlopen_list(root, program);
+    let root_hash = hash(root.as_os_str().as_encoded_bytes()) ^ hash(dlopen.join("\n").as_bytes()).rotate_left(3);
+    let key = hash(&bytes) ^ hash(&tool_hash.to_le_bytes()).rotate_left(1) ^ root_hash.rotate_left(2) ^ bytes.len() as u64;
 
     let dir = cache_dir().ok_or(ENOENT)?;
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
     let out = dir.join(format!("{key:016x}.wasm"));
-    if out.exists() {
+    let deps = dir.join(format!("{key:016x}.deps"));
+    if out.exists() && still_valid(&deps) {
         return Ok(out);
     }
 
@@ -92,8 +156,12 @@ pub fn ensure_translated(elf: &Path, trace: bool) -> SysResult<PathBuf> {
     // Translate to a unique temp file, then rename, so a concurrent run
     // never sees a half-written module.
     let tmp = dir.join(format!("{key:016x}.{}.tmp", std::process::id()));
+    let tmp_deps = dir.join(format!("{key:016x}.{}.deps.tmp", std::process::id()));
     let mut cmd = Command::new(&translator);
-    cmd.arg("translate").arg(elf).arg(&tmp);
+    cmd.arg("translate").arg(elf).arg(&tmp).arg("--root").arg(root).arg("--deps-out").arg(&tmp_deps);
+    for lib in &dlopen {
+        cmd.arg("--dlopen").arg(lib);
+    }
     if !trace {
         // Keep the translator's diagnostics out of the program's output.
         cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -101,8 +169,14 @@ pub fn ensure_translated(elf: &Path, trace: bool) -> SysResult<PathBuf> {
     let status = cmd.status().map_err(|_| ENOEXEC)?;
     if !status.success() {
         let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&tmp_deps);
         return Err(ENOEXEC);
     }
+    // Record the inputs: the binary itself and whatever the translator read.
+    let mut inputs = format!("{}\n{}\n", elf.display(), root.join("etc/wasm-env/dlopen").display());
+    inputs.push_str(&std::fs::read_to_string(&tmp_deps).unwrap_or_default());
+    let _ = std::fs::remove_file(&tmp_deps);
+    std::fs::write(&deps, fingerprint(&inputs)).map_err(|e| crate::fs::errno(&e))?;
     std::fs::rename(&tmp, &out).map_err(|e| crate::fs::errno(&e))?;
     Ok(out)
 }
@@ -129,5 +203,60 @@ mod tests {
     fn hash_depends_on_contents() {
         assert_ne!(hash(b"abc"), hash(b"abd"));
         assert_eq!(hash(b"abc"), hash(b"abc"));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn fingerprints_notice_changed_and_deleted_inputs() {
+        let dir = std::env::temp_dir().join(format!("wasm-env-fp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (lib, deps) = (dir.join("lib with space.so"), dir.join("entry.deps"));
+        std::fs::write(&lib, b"v1").unwrap();
+        std::fs::write(&deps, fingerprint(&format!("{}\n", lib.display()))).unwrap();
+        assert!(still_valid(&deps), "unchanged inputs");
+        std::fs::write(&lib, b"version 2").unwrap();
+        assert!(!still_valid(&deps), "a changed library");
+        std::fs::write(&deps, fingerprint(&format!("{}\n", lib.display()))).unwrap();
+        std::fs::remove_file(&lib).unwrap();
+        assert!(!still_valid(&deps), "a deleted library");
+        assert!(!still_valid(&dir.join("missing.deps")), "no record");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod dlopen_tests {
+    use super::*;
+
+    #[test]
+    fn globs() {
+        assert!(glob("python3*", "python3.12"));
+        assert!(glob("python3*", "python3"));
+        assert!(glob("*", "anything"));
+        assert!(glob("a*c*e", "abcde"));
+        assert!(!glob("python3*", "python"));
+        assert!(!glob("greet", "greeter"));
+    }
+
+    #[test]
+    fn reads_the_dlopen_list_for_a_program() {
+        let root = std::env::temp_dir().join(format!("wasm-env-dlopen-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("etc/wasm-env")).unwrap();
+        std::fs::write(
+            root.join("etc/wasm-env/dlopen"),
+            "# comment\npython3* /usr/lib/python3.12/lib-dynload\ngreet /usr/lib/libplugin.so /usr/lib/b.so # two\n",
+        )
+        .unwrap();
+        assert_eq!(dlopen_list(&root, "python3.12"), ["/usr/lib/python3.12/lib-dynload"]);
+        assert_eq!(dlopen_list(&root, "greet"), ["/usr/lib/libplugin.so", "/usr/lib/b.so"]);
+        assert!(dlopen_list(&root, "ls").is_empty());
+        assert!(dlopen_list(&root.join("nope"), "greet").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

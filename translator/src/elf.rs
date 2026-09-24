@@ -44,6 +44,9 @@ pub struct Image {
     /// DT_INIT/DT_FINI, which the dynamic linker calls through addresses it
     /// computes at run time (so no stored pointer reveals them).
     pub roots: Vec<u64>,
+    /// Libraries the dynamic linker will map at run time: (the path it will
+    /// open, prelinked base, end). The support code places them here.
+    pub libs: Vec<(String, u64, u64)>,
 }
 
 /// Where a position-independent executable (ET_DYN) is loaded. Bases are
@@ -222,7 +225,7 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
 /// The first object is the executable (its program headers win). With
 /// `interp`, the last object is the dynamic linker: the image starts there,
 /// and relocations we don't model are left for it to apply at run time.
-fn link(objects: Vec<Parsed>, interp: bool) -> Result<Image> {
+fn link(objects: Vec<Parsed>, interp: bool, libs: Vec<(String, u64, u64)>) -> Result<Image> {
     // arm64 dynamic relocation types.
     const RELATIVE: u32 = 1027;
     const GLOB_DAT: u32 = 1025;
@@ -257,7 +260,10 @@ fn link(objects: Vec<Parsed>, interp: bool) -> Result<Image> {
                     Some((name, weak)) => match global.get(name) {
                         Some(addr) => addr.wrapping_add(r.addend as u64),
                         // A weak undefined symbol resolves to 0 (the code guards it).
-                        None if *weak => r.addend as u64,
+                        // With a dynamic linker, prelinked values only guide code
+                        // discovery (it relinks everything), so a missing symbol is
+                        // its error to report, at run time, as on Linux.
+                        None if *weak || interp => r.addend as u64,
                         None => bail!("undefined symbol `{name}` (provide the library with --lib)"),
                     },
                 },
@@ -275,7 +281,7 @@ fn link(objects: Vec<Parsed>, interp: bool) -> Result<Image> {
     code.sort_by_key(|r| r.start);
     functions.sort();
     functions.dedup_by_key(|f| f.0);
-    Ok(Image { entry, segments, phdr, phnum, functions, code, app_entry, interp_base, roots })
+    Ok(Image { entry, segments, phdr, phnum, functions, code, app_entry, interp_base, roots, libs })
 }
 
 /// Writes an 8-byte little-endian value at a guest address, growing the
@@ -297,7 +303,7 @@ impl Image {
     /// Loads a single statically-linked or position-independent executable.
     pub fn load(bytes: &[u8]) -> Result<Image> {
         let base = elf_base(bytes)?;
-        link(vec![parse_object(bytes, base)?], false)
+        link(vec![parse_object(bytes, base)?], false, Vec::new())
     }
 
     /// Loads a dynamically-linked executable together with the shared
@@ -313,12 +319,16 @@ impl Image {
         let mut objects = vec![parse_object(exe, elf_base(exe)?)?];
         // Place each library above the previous object, page-aligned.
         let mut next = objects[0].top.next_multiple_of(0x10000).max(PIE_BASE);
-        for (name, bytes) in libs.iter().chain(interp) {
+        let mut placed = Vec::new();
+        for (k, (name, bytes)) in libs.iter().chain(interp).enumerate() {
             let obj = parse_object(bytes, next).with_context(|| format!("loading {name}"))?;
             next = obj.top.next_multiple_of(0x10000);
+            if k < libs.len() {
+                placed.push((name.clone(), obj.base, obj.top));
+            }
             objects.push(obj);
         }
-        link(objects, interp.is_some())
+        link(objects, interp.is_some(), placed)
     }
 
     /// Decodes every 4-byte-aligned word of code (see `code`). arm64

@@ -97,6 +97,111 @@ void dispatch(long pc)
 	__wasm_env_bad_target(target);
 }
 
+// Shared libraries the translated dynamic linker loads at run time. Each
+// was translated with the program at a fixed base, so its code already
+// exists as translated blocks there. When the dynamic linker opens one and
+// maps it, place the mapping at that base; it then relocates the library as
+// usual, and every address it computes matches the translation.
+struct lib { const char *path; uint64_t base, end; };
+extern const struct lib guest_libs[];
+extern const uint64_t guest_lib_count;
+
+enum { SYS_openat = 56, SYS_close = 57, SYS_pread64 = 67, SYS_munmap = 215, SYS_mmap = 222 };
+enum { MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20 };
+
+// For each file descriptor, 1 + the library it has open (0: none).
+#define LIB_FDS 1024
+static uint16_t fd_lib[LIB_FDS];
+
+static int same(const char *a, const char *b)
+{
+	while (*a && *a == *b) a++, b++;
+	return *a == *b;
+}
+
+static const char *base_name(const char *p)
+{
+	const char *b = p;
+	for (; *p; p++)
+		if (*p == '/') b = p + 1;
+	return b;
+}
+
+// The library a path names: the exact path the translator found, or else
+// the same file name (the dynamic linker may reach it through another
+// directory, such as one from LD_LIBRARY_PATH).
+static long lib_for_path(const char *path)
+{
+	for (uint64_t k = 0; k < guest_lib_count; k++)
+		if (same(path, guest_libs[k].path)) return (long)k;
+	for (uint64_t k = 0; k < guest_lib_count; k++)
+		if (same(base_name(path), base_name(guest_libs[k].path))) return (long)k;
+	return -1;
+}
+
+static int in_a_lib(uint64_t addr)
+{
+	for (uint64_t k = 0; k < guest_lib_count; k++)
+		if (addr >= guest_libs[k].base && addr < ((guest_libs[k].end + 4095) & ~(uint64_t)4095)) return 1;
+	return 0;
+}
+
+// "Maps" part of a library file by reading it into place; like mmap, bytes
+// past the end of the file read as zero.
+static void place(long fd, uint64_t at, uint64_t len, uint64_t off)
+{
+	uint64_t done = 0;
+	while (done < len) {
+		long n = __wasm_env_host_syscall(SYS_pread64, fd, (long)(at + done), (long)(len - done), (long)(off + done), 0, 0);
+		if (n <= 0) break;
+		done += (uint64_t)n;
+	}
+	__builtin_memset((void *)(uintptr_t)(at + done), 0, len - done);
+}
+
+// Handles the syscalls that involve translated libraries. Returns 1 if it
+// did (the result is in x0).
+static int library_syscall(long nr)
+{
+	if (!guest_lib_count) return 0;
+	switch (nr) {
+	case SYS_openat: {
+		long fd = __wasm_env_host_syscall(nr, (long)R[0], (long)R[1], (long)R[2], (long)R[3], 0, 0);
+		if (fd >= 0 && fd < LIB_FDS) fd_lib[fd] = (uint16_t)(lib_for_path((const char *)(uintptr_t)R[1]) + 1);
+		R[0] = (uint64_t)fd;
+		return 1;
+	}
+	case SYS_close:
+		if (R[0] < LIB_FDS) fd_lib[R[0]] = 0;
+		return 0;
+	case SYS_mmap: {
+		uint64_t addr = R[0], len = R[1], flags = R[3], off = R[5];
+		long fd = (long)R[4];
+		if (!(flags & MAP_ANONYMOUS) && fd >= 0 && fd < LIB_FDS && fd_lib[fd]) {
+			// The first mapping of a library passes its lowest segment
+			// address as a hint (0 for a shared object): map at base + hint.
+			uint64_t at = (flags & MAP_FIXED) ? addr : guest_libs[fd_lib[fd] - 1].base + addr;
+			place(fd, at, len, off);
+			R[0] = at;
+			return 1;
+		}
+		if ((flags & MAP_FIXED) && (flags & MAP_ANONYMOUS) && in_a_lib(addr)) {
+			__builtin_memset((void *)(uintptr_t)addr, 0, len); // .bss
+			R[0] = addr;
+			return 1;
+		}
+		return 0;
+	}
+	case SYS_munmap:
+		if (in_a_lib(R[0])) { // dlclose: the translation stays
+			R[0] = 0;
+			return 1;
+		}
+		return 0;
+	}
+	return 0;
+}
+
 // svc #0: the syscall number is in x8, arguments in x0–x5, the result goes
 // to x0. arm64 Linux uses the same generic syscall table as wasm-env, so
 // calls pass straight through.
@@ -109,6 +214,7 @@ void __wasm_env_svc(void)
 		R[0] = (uint64_t)-ENOSYS;
 		return;
 	}
+	if (library_syscall(nr)) return;
 	R[0] = (uint64_t)__wasm_env_host_syscall(nr, (long)R[0], (long)R[1], (long)R[2], (long)R[3],
 	                                         (long)R[4], (long)R[5]);
 }

@@ -70,7 +70,8 @@ fn main() -> Result<()> {
         let mut host = PathBuf::from(&program);
         let head = std::fs::read(&host).map(|b| b.into_iter().take(256).collect::<Vec<_>>()).unwrap_or_default();
         if translate::is_arm64_elf(&head) {
-            host = translate::ensure_translated(&host, trace)
+            let name = host.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            host = translate::ensure_translated(&host, &root, &name, trace)
                 .map_err(|e| anyhow::anyhow!("{program}: can't translate (errno {e})"))?;
         }
         let name = PathBuf::from(&program).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();

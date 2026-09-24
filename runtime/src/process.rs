@@ -189,7 +189,8 @@ pub fn resolve_exec(fs: &Fs, path: &str, mut argv: Vec<Vec<u8>>, env: Vec<Vec<u8
             // Translate the arm64 binary to WebAssembly; it targets the same
             // ABI, so it runs like any other program. argv[0] stays the
             // guest path.
-            let wasm = crate::translate::ensure_translated(&host, trace)?;
+            let name = guest.rsplit('/').next().unwrap_or_default();
+            let wasm = crate::translate::ensure_translated(&host, &fs.host("/"), name, trace)?;
             return Ok(ExecImage { host: wasm, path: guest, argv, env });
         }
         let Some(line) = head.strip_prefix(b"#!") else {

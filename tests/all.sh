@@ -19,7 +19,7 @@ step() {
 }
 
 step "unit tests (runtime, bench harness)" cargo test -q --release -p wasm-env -p bench-harness
-step "unit tests (translator)" cargo test -q -p wasm-env-translate
+step "unit tests (translator)" cargo test -q -p wasm-env-translate --features lift
 step "M0: toolchain, runtime, BusyBox" tests/m0.sh
 step "M1: processes and a shell" env SKIP_BUILD=1 tests/m1.sh
 step "M2: arm64 translation (differential vs qemu)" tests/m2.sh

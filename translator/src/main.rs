@@ -3,8 +3,15 @@
 //!
 //!   wasm-env-translate census BINARY   count instructions by operation
 //!   wasm-env-translate blocks BINARY   list the basic blocks discovery finds
-//!   wasm-env-translate translate BINARY OUT.wasm [--lib SO]... [--interp LD_SO]   (needs `lift`)
+//!   wasm-env-translate translate BINARY OUT.wasm [--root DIR] [--dlopen PATH]...
+//!                                 [--lib SO]... [--interp LD_SO] [--deps-out FILE]   (needs `lift`)
+//!
+//! With `--root`, the dynamic linker and libraries are found inside DIR the
+//! way the dynamic linker will find them; `--dlopen` adds libraries the
+//! program loads later. `--lib`/`--interp` name host files directly.
 
+#[cfg(feature = "lift")]
+mod deps;
 mod discover;
 mod elf;
 #[cfg(feature = "lift")]
@@ -46,19 +53,59 @@ fn census(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// What to translate along with the executable.
+#[cfg(feature = "lift")]
+#[derive(Default)]
+struct Inputs {
+    /// Where to list the host files the translation read (`--deps-out`), so a
+    /// cache can tell when it goes stale.
+    deps_out: Option<String>,
+    /// Shared libraries on the host (`--lib`).
+    libs: Vec<String>,
+    /// The dynamic linker on the host (`--interp`).
+    interp: Option<String>,
+    /// A root filesystem to find the interpreter and libraries in (`--root`).
+    root: Option<String>,
+    /// Libraries (paths inside the root, or directories of them) the program
+    /// `dlopen`s (`--dlopen`); their dependencies are included too.
+    dlopen: Vec<String>,
+}
+
 /// Translates an arm64 executable (with any shared libraries) into a
 /// wasm-env program.
 #[cfg(feature = "lift")]
-fn translate(input: &str, output: &str, libs: &[String], interp: Option<&str>) -> Result<()> {
+fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("reading {input}"))?;
-    let read = |p: &str| -> Result<(String, Vec<u8>)> { Ok((p.to_string(), std::fs::read(p).with_context(|| format!("reading {p}"))?)) };
+    // (name, bytes): the name is the path the dynamic linker will open.
+    let read_files = std::cell::RefCell::new(Vec::new());
+    let read = |name: &str, host: &std::path::Path| -> Result<(String, Vec<u8>)> {
+        read_files.borrow_mut().push(host.to_path_buf());
+        Ok((name.to_string(), std::fs::read(host).with_context(|| format!("reading {}", host.display()))?))
+    };
+    let mut libs = Vec::new();
+    let mut interp = inputs.interp.as_deref().map(|p| read(p, p.as_ref())).transpose()?;
+    if let Some(root) = &inputs.root {
+        let root = std::path::Path::new(root);
+        let found = deps::resolve(root, &bytes, &inputs.dlopen)?;
+        if interp.is_none() {
+            interp = found.interp.map(|d| read(&d.guest, &d.host)).transpose()?;
+        }
+        for d in found.libs {
+            libs.push(read(&d.guest, &d.host)?);
+        }
+    }
+    for l in &inputs.libs {
+        libs.push(read(l, l.as_ref())?);
+    }
     let image = if libs.is_empty() && interp.is_none() {
         elf::Image::load(&bytes)?
     } else {
-        let libs = libs.iter().map(|l| read(l)).collect::<Result<Vec<_>>>()?;
-        let interp = interp.map(read).transpose()?;
         elf::Image::load_dynamic(&bytes, &libs, interp.as_ref())?
     };
+    if let Some(path) = &inputs.deps_out {
+        let list: String = read_files.borrow().iter().map(|p| format!("{}\n", p.display())).collect();
+        std::fs::write(path, list).with_context(|| format!("writing {path}"))?;
+    }
     let prog = discover::discover(&image);
     let lifted = lift::lift(&image, &prog);
     for (op, (n, example)) in &lifted.unsupported {
@@ -96,18 +143,21 @@ fn main() -> Result<()> {
         ["blocks", path] => blocks(path),
         #[cfg(feature = "lift")]
         ["translate", input, output, libs @ ..] => {
-            // translate INPUT OUT [--lib SO]... [--interp LD_SO]
-            let mut so = Vec::new();
-            let mut interp = None;
+            // translate INPUT OUT [--lib SO]... [--interp LD_SO] [--root DIR] [--dlopen PATH]...
+            let mut inputs = Inputs::default();
             let mut it = libs.iter();
             while let Some(a) = it.next() {
+                let mut value = || it.next().map(|s| s.to_string()).with_context(|| format!("{a} needs a value"));
                 match *a {
-                    "--lib" => so.push(it.next().context("--lib needs a path")?.to_string()),
-                    "--interp" => interp = Some(*it.next().context("--interp needs a path")?),
+                    "--lib" => inputs.libs.push(value()?),
+                    "--interp" => inputs.interp = Some(value()?),
+                    "--root" => inputs.root = Some(value()?),
+                    "--dlopen" => inputs.dlopen.push(value()?),
+                    "--deps-out" => inputs.deps_out = Some(value()?),
                     other => bail!("unexpected argument {other}"),
                 }
             }
-            translate(input, output, &so, interp)
+            translate(input, output, &inputs)
         }
         #[cfg(feature = "lift")]
         ["emit", input] => {

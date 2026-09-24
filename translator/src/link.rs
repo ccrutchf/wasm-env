@@ -183,6 +183,9 @@ declare void @dispatch(i64)
 @guest_phnum = constant i64 7
 @guest_app_entry = constant i64 4194304
 @guest_interp_base = constant i64 0
+%lib = type { ptr, i64, i64 }
+@guest_libs = constant [0 x %lib] zeroinitializer
+@guest_lib_count = constant i64 0
 "#;
 
     const IMAGE_END: u64 = 0x410000;

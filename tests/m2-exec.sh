@@ -43,5 +43,28 @@ out=$("$wasm_env" run --root "$rootfs" /bin/sh -c '/bin/hello x; echo exit=$?' 2
 check "shell exec: runs translated binary" "hello from wasm64-linux-musl, argc=2" "$(sed -n 2p <<<"$out")"
 check "shell exec: exit status" "exit=7" "$(printf '%s\n' "$out" | tail -1)"
 
+# 4. A dynamically-linked program: the runtime finds its dynamic linker and
+# libraries in the environment, plus the plugin it dlopens, which
+# /etc/wasm-env/dlopen declares.
+: "${AARCH64_MUSL:?run inside nix develop}"
+mkdir -p "$rootfs/lib" "$rootfs/usr/lib" "$rootfs/etc/wasm-env"
+cp "$AARCH64_MUSL/lib/libc.so" "$rootfs/lib/ld-musl-aarch64.so.1"
+cc=aarch64-unknown-linux-musl-gcc
+$cc -O2 -shared -fPIC -o "$rootfs/usr/lib/libgreet.so" tests/arm64/libgreet.c
+$cc -O2 -shared -fPIC -o "$rootfs/usr/lib/libplugin.so" tests/arm64/plugin.c -L"$rootfs/usr/lib" -lgreet
+$cc -O2 -o "$rootfs/bin/greet" tests/arm64/greet.c -L"$rootfs/usr/lib" -lgreet -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1
+echo "greet* /usr/lib/libplugin.so" > "$rootfs/etc/wasm-env/dlopen"
+expected=$(env -i HOME=/root PATH=/bin qemu-aarch64 -L "$rootfs" "$rootfs/bin/greet" shell)
+out=$("$wasm_env" run --root "$rootfs" /bin/sh -c '/bin/greet shell; echo status=$?' 2>&1)
+check "dynamic program via the shell" "$expected
+status=0" "$out"
+
+# 5. The cache notices a changed library: rebuild libgreet with a different
+# greeting, and the next exec retranslates.
+sed 's/hello, /HELLO, /' tests/arm64/libgreet.c > "$root/build/libgreet-v2.c"
+$cc -O2 -shared -fPIC -o "$rootfs/usr/lib/libgreet.so" "$root/build/libgreet-v2.c"
+out=$("$wasm_env" run --root "$rootfs" /bin/greet again 2>&1 | sed -n 2p)
+check "cache retranslates after a library changes" "HELLO, world (call 1)" "$out"
+
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]
