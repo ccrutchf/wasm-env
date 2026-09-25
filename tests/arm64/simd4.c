@@ -204,6 +204,19 @@ int main(void)
 		OPAQUE(v4);
 		printf("fmla.4s %a\n", (double)vgetq_lane_f32(vfmaq_f32(vdupq_n_f32(-1.0f), v4, v4), 3));
 	}
+	{
+		uint8_t src[96];
+		for (int k = 0; k < 96; k++) src[k] = (uint8_t)(k * 7 + 3);
+		OPAQUE(src[0]);
+		float64x2x2_t d2 = vld2q_f64((const double *)src); P("ld2.2d 0", d2.val[0]); P("ld2.2d 1", d2.val[1]);
+		uint8x16x3_t b3 = vld3q_u8(src); P("ld3.16b 0", b3.val[0]); P("ld3.16b 2", b3.val[2]);
+		uint16x4x4_t h4 = vld4_u16((const uint16_t *)src); P("ld4.4h 1", vcombine_u16(h4.val[1], h4.val[3]));
+		uint32x4x2_t w2 = vld2q_u32((const uint32_t *)src); P("ld2.4s 1", w2.val[1]);
+		uint8_t dst[96] = { 0 };
+		vst2q_u32((uint32_t *)dst, w2); P("st2.4s", vld1q_u8(dst)); P("st2.4s hi", vld1q_u8(dst + 16));
+		vst3_u8(dst, (uint8x8x3_t){ { vget_low_u8(b3.val[0]), vget_low_u8(b3.val[1]), vget_high_u8(b3.val[2]) } }); P("st3.8b", vld1q_u8(dst + 8));
+		vst4q_f32((float *)dst, (float32x4x4_t){ { vdupq_n_f32(1), vdupq_n_f32(2), vdupq_n_f32(3), vdupq_n_f32(4) } }); P("st4.4s", vld1q_u8(dst + 48));
+	}
 	uint8_t bmem[16] = { 0 };
 	vst1q_lane_u8(&bmem[3], vdupq_n_u8(0x7e), 9);
 	printf("st1 lane b: %x %x %x\n", bmem[2], bmem[3], bmem[4]);

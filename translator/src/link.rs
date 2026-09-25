@@ -60,6 +60,49 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// How long one unit may take to compile before it's retried more simply
+/// (see link_chunked): `$WASM_ENV_COMPILE_LIMIT` seconds, default 600.
+fn compile_limit() -> std::time::Duration {
+    let secs = std::env::var("WASM_ENV_COMPILE_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Runs `cmd`, giving up after `limit`: Ok(true) if it succeeded, Ok(false)
+/// if it ran out of time (it's killed), an error if it failed. Its stderr
+/// goes to a file, so a chatty command can't block on a full pipe.
+fn run_limited(cmd: &mut Command, limit: std::time::Duration) -> Result<bool> {
+    let log = std::env::temp_dir().join(format!(
+        "wasm-env-cc-{}-{:?}.err",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let mut child = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log)?)
+        .spawn()
+        .with_context(|| format!("running {:?}", cmd.get_program()))?;
+    let start = std::time::Instant::now();
+    let result = loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                break Ok(true);
+            }
+            let err = std::fs::read_to_string(&log).unwrap_or_default();
+            break Err(anyhow::anyhow!("{:?} failed:\n{err}", cmd.get_program()));
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let _ = std::fs::remove_file(&log);
+    // A retry through `run` captures its output again, for error messages.
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    result
+}
+
 /// Compiles and links `ir` with the support code into a WebAssembly
 /// module, using `work` for intermediate files.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -176,9 +219,25 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
                         cmd.args(["-ffreestanding", "-nostdlib"]);
                     }
                     cmd.arg("-c").arg(src).arg("-o").arg(&tmp);
+                    // A unit that compiles pathologically slowly (LLVM's
+                    // WebAssembly backend can all but hang on vectors its SLP
+                    // vectorizer formed) is compiled again without that
+                    // vectorizer: one unit's code gets slower, never the
+                    // whole translation stuck.
+                    let compiled = run_limited(&mut cmd, compile_limit()).and_then(|done| {
+                        if !done {
+                            eprintln!(
+                                "warning: compiling {} took over {} s; again without the SLP vectorizer",
+                                src.display(),
+                                compile_limit().as_secs()
+                            );
+                            run(cmd.arg("-fno-slp-vectorize"))?;
+                        }
+                        Ok(())
+                    });
                     // Compile to a temporary name, then rename: concurrent
                     // translations never see a partial object.
-                    match run(&mut cmd).and_then(|()| Ok(std::fs::rename(&tmp, obj)?)) {
+                    match compiled.and_then(|()| Ok(std::fs::rename(&tmp, obj)?)) {
                         Ok(()) => {}
                         Err(e) => {
                             let _ = std::fs::remove_file(&tmp);
@@ -501,6 +560,17 @@ define void @B_400000(i64 %_) {{
         assert_eq!(&d[300..303], b"xyz");
         assert_eq!(&d[0x1_0005..0x1_0008], &[7, 7, 7], "addresses above 2^16 (multi-byte LEB)");
         assert_eq!(d[303], 0);
+    }
+
+    #[test]
+    fn slow_commands_are_stopped_at_the_limit() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        assert!(!run_limited(Command::new("sleep").arg("10"), Duration::from_millis(300)).unwrap(), "timed out");
+        assert!(start.elapsed() < Duration::from_secs(5), "and killed, not waited for");
+        assert!(run_limited(&mut Command::new("true"), Duration::from_secs(10)).unwrap());
+        let err = run_limited(Command::new("sh").args(["-c", "echo broken >&2; exit 1"]), Duration::from_secs(10));
+        assert!(err.unwrap_err().to_string().contains("broken"), "failures report stderr");
     }
 
     #[test]

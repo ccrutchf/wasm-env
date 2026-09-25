@@ -596,32 +596,38 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         "ld2" | "ld3" | "ld4" | "st2" | "st3" | "st4" => {
             // Interleaved structures: element k of register r is at
             // addr + (k * N + r) * element size.
+            // One vector load or store of all N registers' elements, split or
+            // interleaved with shuffles.
             let (regs, elem, total) = reg_list(&ops[0])?;
             let addr = structure_address(b, i)?;
             let n = regs.len() as u32;
-            let at = |b: &mut Block, k: u32, r: u32| b.val(format!("add i64 {addr}, {}", (k * n + r) * elem / 8));
+            let lanes = nlanes(total, elem);
+            let all = format!("<{} x i{elem}>", n * lanes);
+            let one = format!("<{lanes} x i{elem}>");
+            let p = b.val(format!("inttoptr i64 {addr} to ptr"));
             if m.starts_with("ld") {
-                let mut values = Vec::new();
-                for r in 0..n {
-                    let mut parts = Vec::new();
-                    for k in 0..nlanes(total, elem) {
-                        let a = at(b, k, r);
-                        parts.push(b.load(&a, elem));
-                    }
-                    values.push(vbuild(b, elem, &parts));
-                }
+                let v = b.val(format!("load {all}, ptr {p}, align 1"));
+                let values: Vec<String> = (0..n)
+                    .map(|r| {
+                        let mask: Vec<String> = (0..lanes).map(|k| format!("i32 {}", k * n + r)).collect();
+                        let reg = b.val(format!("shufflevector {all} {v}, {all} poison, <{lanes} x i32> <{}>", mask.join(", ")));
+                        let bits = b.val(format!("bitcast {one} {reg} to i{total}"));
+                        if total == 128 { bits } else { b.val(format!("zext i{total} {bits} to i128")) }
+                    })
+                    .collect();
                 for (&reg, v) in regs.iter().zip(values) {
                     b.write_v(reg, v, 128);
                 }
             } else {
+                let mut acc = "poison".to_string();
                 for (r, &reg) in regs.iter().enumerate() {
                     let v = b.read_v(reg, 128);
-                    for k in 0..nlanes(total, elem) {
+                    for k in 0..lanes {
                         let lane = vlane(b, &v, elem, k);
-                        let a = at(b, k, r as u32);
-                        b.store(&a, &lane, elem);
+                        acc = b.val(format!("insertelement {all} {acc}, i{elem} {lane}, i32 {}", k * n + r as u32));
                     }
                 }
+                b.line(format!("store {all} {acc}, ptr {p}, align 1"));
             }
         }
         "ld1" | "st1" | "ld1r" => {
@@ -876,9 +882,50 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         }
         // --- More SIMD floating point: fused multiply-add, compares, pairwise
         // and across-vector reductions. -------------------------------------------------
-        "fmla" | "fmls" if is_v(ops.first()) => {
+        "fmla" | "fmls" if is_v(ops.first()) && matches!(vec_dst(&ops[0])?.1, 32 | 64) => {
             // Vector, by element, or scalar by element (fmla d0, d1, v2.d[1]),
-            // fused: d + x*y, or d - x*y as d + (-x)*y.
+            // fused, as one vector operation: d + x*y, or d - x*y as
+            // d + (-x)*y.
+            let (d, elem, total) = vec_dst(&ops[0])?;
+            let ty = fp_ty(elem)?.0;
+            let acc = b.read_v(d, 128);
+            let (acc, vt) = fp_vec_in(b, &acc, elem, total)?;
+            let x = read_v128(b, &ops[1])?;
+            let (x, _) = fp_vec_in(b, &x, elem, total)?;
+            let y = fp_second_vec(b, &ops[2], elem, total)?;
+            let x = if m == "fmls" { b.val(format!("fneg {vt} {x}")) } else { x };
+            let s = if elem == 64 { "v2f64" } else { "v4f32" };
+            let r = b.val(format!("call {vt} @llvm.wasm.relaxed.madd.{s}({vt} {x}, {vt} {y}, {vt} {acc})"));
+            b.check_fp_vec(ty, 128 / elem, &[&x, &y, &acc], &r, false);
+            let r = b.val(format!("bitcast {vt} {r} to i128"));
+            b.write_v(d, r, 128);
+        }
+        // (A 64-bit fdiv stays lane by lane: its zeroed upper lanes would
+        // divide 0 by 0 and raise a spurious invalid flag.)
+        "fadd" | "fsub" | "fmul" | "fdiv" | "fmax" | "fmin" | "fmaxnm" | "fminnm"
+            if has_arrspec(&ops[0])
+                && matches!(vec_dst(&ops[0])?.1, 32 | 64)
+                && (m != "fdiv" || vec_dst(&ops[0])?.2 == 128) =>
+        {
+            let (d, elem, total) = vec_dst(&ops[0])?;
+            let ty = fp_ty(elem)?.0;
+            let x = read_v128(b, &ops[1])?;
+            let (x, vt) = fp_vec_in(b, &x, elem, total)?;
+            let y = fp_second_vec(b, &ops[2], elem, total)?;
+            let r = match m {
+                "fmax" | "fmin" | "fmaxnm" | "fminnm" => fp_minmax(b, m, &vt, &x, &y),
+                _ => {
+                    let r = b.val(format!("{m} {vt} {x}, {y}"));
+                    b.check_fp_vec(ty, 128 / elem, &[&x, &y], &r, m == "fdiv");
+                    r
+                }
+            };
+            let r = b.val(format!("bitcast {vt} {r} to i128"));
+            b.write_v(d, r, 128);
+        }
+        "fmla" | "fmls" if is_v(ops.first()) => {
+            // Half precision: lane by lane, fused: d + x*y, or d - x*y as
+            // d + (-x)*y.
             let (d, elem, total) = vec_dst(&ops[0])?;
             let ty = fp_ty(elem)?.0;
             let acc = b.read_v(d, 128);
@@ -929,7 +976,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                     xf = b.val(format!("call {ty} @llvm.fabs.{s}({ty} {xf})"));
                     yf = b.val(format!("call {ty} @llvm.fabs.{s}({ty} {yf})"));
                 }
-                let c = b.val(format!("fcmp {pred} {ty} {xf}, {yf}"));
+                let c = b.fcmp(pred, ty, &xf, &yf);
                 parts.push(b.val(format!("sext i1 {c} to i{elem}")));
             }
             let r = vbuild(b, elem, &parts);
@@ -1699,7 +1746,7 @@ fn fround(b: &mut Block, mode: char, bits: u32, x: &str) -> Result<String> {
             let t = b.val(format!("call {ty} @llvm.trunc.{s}({ty} {x})"));
             let f = b.val(format!("fsub {ty} {x}, {t}"));
             let af = b.val(format!("call {ty} @llvm.fabs.{s}({ty} {f})"));
-            let up = b.val(format!("fcmp oge {ty} {af}, 5.000000e-01"));
+            let up = b.fcmp("oge", ty, &af, "5.000000e-01");
             let one = b.val(format!("call {ty} @llvm.copysign.{s}({ty} 1.000000e+00, {ty} {x})"));
             let stepped = b.val(format!("fadd {ty} {t}, {one}"));
             b.val(format!("select i1 {up}, {ty} {stepped}, {ty} {t}"))
@@ -1761,7 +1808,14 @@ fn fp_exceptions(b: &mut Block, ty: &str, inputs: &[&str], r: &str, div: bool) {
 fn fp_convert_exceptions(b: &mut Block, ty: &str, x: &str, bits: u32, signed: bool) {
     let (lo, hi) = if signed { (-(2f64.powi(bits as i32 - 1)), 2f64.powi(bits as i32 - 1)) } else { (-1.0, 2f64.powi(bits as i32)) };
     let (lo, hi) = (format!("0x{:016X}", lo.to_bits()), format!("0x{:016X}", hi.to_bits()));
-    let x = if ty == "double" { x.to_string() } else { b.val(format!("fpext {ty} {x} to double")) };
+    // Widened behind a fence, or LLVM narrows these comparisons back to
+    // half-precision ones, which hang its WebAssembly backend (see Block::fcmp).
+    let x = if ty == "double" {
+        x.to_string()
+    } else {
+        let w = b.val(format!("fpext {ty} {x} to double"));
+        b.val(format!("call double @llvm.arithmetic.fence.f64(double {w})"))
+    };
     // In range: lo < x < hi for unsigned (after truncation, x > -1), lo <= x < hi for signed.
     let above = b.val(format!("fcmp {} double {x}, {lo}", if signed { "oge" } else { "ogt" }));
     let below = b.val(format!("fcmp olt double {x}, {hi}"));
@@ -1793,29 +1847,40 @@ fn fused(b: &mut Block, ty: &str, x: &str, y: &str, z: &str) -> String {
 /// `llvm.minimum`/`llvm.maximum` (wasm's own f64.min/f64.max); the NM forms
 /// return the other operand when exactly one is NaN.
 fn fp_minmax(b: &mut Block, m: &str, ty: &str, x: &str, y: &str) -> String {
-    let s = match ty {
-        "double" => "f64",
-        "float" => "f32",
-        _ => "f16",
+    // Scalars and whole vectors alike (`ty` may be `<4 x float>`).
+    let (s, cond) = match ty {
+        "double" => ("f64", "i1"),
+        "float" => ("f32", "i1"),
+        "half" => ("f16", "i1"),
+        "<2 x double>" => ("v2f64", "<2 x i1>"),
+        _ => ("v4f32", "<4 x i1>"),
     };
     let f = if m.contains("max") { "maximum" } else { "minimum" };
     let r = b.val(format!("call {ty} @llvm.{f}.{s}({ty} {x}, {ty} {y})"));
-    if !m.contains("nm") {
-        return r;
+    let x_nan = b.fcmp("uno", ty, x, x);
+    let y_nan = b.fcmp("uno", ty, y, y);
+    if m.contains("nm") {
+        // One NaN: the other operand. Both: x's NaN, as FMIN would.
+        let r = b.val(format!("select {cond} {y_nan}, {ty} {x}, {ty} {r}"));
+        let t = if cond == "i1" { "true" } else { "splat (i1 true)" };
+        let not_y = b.val(format!("xor {cond} {y_nan}, {t}"));
+        let only_x = b.val(format!("and {cond} {x_nan}, {not_y}"));
+        b.val(format!("select {cond} {only_x}, {ty} {y}, {ty} {r}"))
+    } else {
+        // wasm's min/max give a canonical NaN; arm64 gives the NaN operand,
+        // x's first.
+        let r = b.val(format!("select {cond} {y_nan}, {ty} {y}, {ty} {r}"));
+        b.val(format!("select {cond} {x_nan}, {ty} {x}, {ty} {r}"))
     }
-    let x_nan = b.val(format!("fcmp uno {ty} {x}, {x}"));
-    let y_nan = b.val(format!("fcmp uno {ty} {y}, {y}"));
-    let r = b.val(format!("select i1 {y_nan}, {ty} {x}, {ty} {r}"));
-    b.val(format!("select i1 {x_nan}, {ty} {y}, {ty} {r}"))
 }
 
 /// Sets N Z C V from comparing FP values x and y (arm64 FPCompare).
 fn fp_compare(b: &mut Block, ty: &str, x: &str, y: &str) {
-    let lt = b.val(format!("fcmp olt {ty} {x}, {y}"));
-    let eq = b.val(format!("fcmp oeq {ty} {x}, {y}"));
+    let lt = b.fcmp("olt", ty, x, y);
+    let eq = b.fcmp("oeq", ty, x, y);
     // C is set unless strictly less-than and ordered; V is set when unordered.
-    let c = b.val(format!("fcmp uge {ty} {x}, {y}"));
-    let v = b.val(format!("fcmp uno {ty} {x}, {y}"));
+    let c = b.fcmp("uge", ty, x, y);
+    let v = b.fcmp("uno", ty, x, y);
     b.set_flags(lt, eq, c, v);
     let _ = (N, Z, C, V);
 }
@@ -1878,20 +1943,53 @@ fn broadcast(elem: u32, total: u32) -> u128 {
 }
 
 /// Extracts lane `k` (of `elem` bits) from a 128-bit vector value.
-fn vlane(b: &mut Block, v: &str, elem: u32, k: u32) -> String {
-    let shifted = if k == 0 { v.to_string() } else { b.val(format!("lshr i128 {v}, {}", k * elem)) };
-    b.val(format!("trunc i128 {shifted} to i{elem}"))
+/// A 128-bit register value as a vector of `elem`-bit floats (`<4 x float>`,
+/// `<2 x double>`), for whole-vector arithmetic. For a 64-bit arrangement
+/// (`.2s`, or one element) the upper half is zeroed first: those lanes then
+/// compute zeros, raising no FP exceptions and leaving the result's upper
+/// half zero, as arm64 requires.
+fn fp_vec_in(b: &mut Block, v: &str, elem: u32, total: u32) -> Result<(String, String)> {
+    let ty = fp_ty(elem)?.0;
+    let vt = format!("<{} x {ty}>", 128 / elem);
+    let v = if total < 128 {
+        b.val(format!("and i128 {v}, {}", konst128((1u128 << total) - 1)))
+    } else {
+        v.to_string()
+    };
+    Ok((b.val(format!("bitcast i128 {v} to {vt}")), vt))
 }
 
-/// Combines lanes (each `elem` bits) into a 128-bit vector value.
+/// The second source of a vector FP operation as a vector (see fp_vec_in):
+/// a whole register, or one element (`v2.s[3]`) in every active lane.
+fn fp_second_vec(b: &mut Block, op: &Operand, elem: u32, total: u32) -> Result<String> {
+    let (v, lane) = second_operand(b, op)?;
+    let Some(lane) = lane else { return Ok(fp_vec_in(b, &v, elem, total)?.0) };
+    let (full, vt) = fp_vec_in(b, &v, elem, 128)?;
+    let n = 128 / elem;
+    // Lanes past the arrangement take element n, the first of the zeros.
+    let mask: Vec<String> =
+        (0..n).map(|k| format!("i32 {}", if k * elem < total { lane } else { n })).collect();
+    Ok(b.val(format!("shufflevector {vt} {full}, {vt} zeroinitializer, <{n} x i32> <{}>", mask.join(", "))))
+}
+
+/// Through LLVM vector types (`extractelement` of `<N x iE>`), not 128-bit
+/// shifts: wasm has no i128, and lane-wise code built this way is what
+/// LLVM's SLP vectorizer turns back into SIMD.
+fn vlane(b: &mut Block, v: &str, elem: u32, k: u32) -> String {
+    let n = 128 / elem;
+    let vec = b.val(format!("bitcast i128 {v} to <{n} x i{elem}>"));
+    b.val(format!("extractelement <{n} x i{elem}> {vec}, i32 {k}"))
+}
+
+/// Combines lanes (each `elem` bits) into a 128-bit vector value; lanes
+/// beyond `parts` are zero.
 fn vbuild(b: &mut Block, elem: u32, parts: &[String]) -> String {
-    let mut acc = "0".to_string();
+    let n = 128 / elem;
+    let mut acc = "zeroinitializer".to_string();
     for (k, p) in parts.iter().enumerate() {
-        let z = b.val(format!("zext i{elem} {p} to i128"));
-        let s = if k == 0 { z } else { b.val(format!("shl i128 {z}, {}", k as u32 * elem)) };
-        acc = if k == 0 { s } else { b.val(format!("or i128 {acc}, {s}")) };
+        acc = b.val(format!("insertelement <{n} x i{elem}> {acc}, i{elem} {p}, i32 {k}"));
     }
-    acc
+    b.val(format!("bitcast <{n} x i{elem}> {acc} to i128"))
 }
 
 /// A register list operand (`{v0.16b}`): (indices, element bits, total bits).

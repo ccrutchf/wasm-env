@@ -126,6 +126,8 @@ pub fn region_of(addr: u64) -> u64 {
 /// An FP result awaiting its exception check (see Block::check_fp).
 struct FpCheck {
     ty: String,
+    /// 0 for a scalar, else the number of lanes of vector values.
+    lanes: u32,
     inputs: Vec<String>,
     r: String,
     div: bool,
@@ -292,7 +294,7 @@ impl<'a> Block<'a> {
     /// Records an FP result whose exceptions (invalid, divide by zero,
     /// overflow: see __wasm_env_fp_flags in support/runtime.c) FPSR must
     /// reflect. The common case, a finite result, costs a comparison here;
-    /// the flags are worked out after the instruction, only if some
+    /// the flags are worked out a few instructions later, only if some
     /// recorded result was NaN or infinite.
     pub fn check_fp(&mut self, ty: &str, inputs: &[&str], r: &str, div: bool) {
         let (s, inf) = match ty {
@@ -301,7 +303,7 @@ impl<'a> Block<'a> {
             _ => ("f16", "0xH7C00"),
         };
         let a = self.val(format!("call {ty} @llvm.fabs.{s}({ty} {r})"));
-        let special = self.val(format!("fcmp ueq {ty} {a}, {inf}"));
+        let special = self.fcmp("ueq", ty, &a, inf);
         let special = match self.fp_special.take() {
             Some(old) => self.val(format!("or i1 {old}, {special}")),
             None => special,
@@ -309,6 +311,49 @@ impl<'a> Block<'a> {
         self.fp_special = Some(special);
         self.fp_pending.push(FpCheck {
             ty: ty.to_string(),
+            lanes: 0,
+            inputs: inputs.iter().map(|x| x.to_string()).collect(),
+            r: r.to_string(),
+            div,
+        });
+    }
+
+    /// `fcmp pred ty x, y`, comparing half-precision values as float (which
+    /// is exact): the WebAssembly backend all but hangs on comparisons of
+    /// half vectors (LLVM 21), which LLVM's vectorizer forms from lane-wise
+    /// code. The fence keeps LLVM from narrowing the comparison back to half.
+    pub fn fcmp(&mut self, pred: &str, ty: &str, x: &str, y: &str) -> String {
+        if ty == "half" {
+            let [x, y] = [x, y].map(|v| {
+                let f = self.val(format!("fpext half {v} to float"));
+                self.val(format!("call float @llvm.arithmetic.fence.f32(float {f})"))
+            });
+            return self.val(format!("fcmp {pred} float {x}, {y}"));
+        }
+        self.val(format!("fcmp {pred} {ty} {x}, {y}"))
+    }
+
+    /// How many FP results await their exception check.
+    pub fn pending_fp_checks(&self) -> usize {
+        self.fp_pending.len()
+    }
+
+    /// check_fp for vectors of `lanes` elements of type `ty`: one vector
+    /// comparison, reduced to a bit.
+    pub fn check_fp_vec(&mut self, ty: &str, lanes: u32, inputs: &[&str], r: &str, div: bool) {
+        let (s, inf) = if ty == "double" { ("f64", "0x7FF0000000000000") } else { ("f32", "0x7FF0000000000000") };
+        let vt = format!("<{lanes} x {ty}>");
+        let a = self.val(format!("call {vt} @llvm.fabs.v{lanes}{s}({vt} {r})"));
+        let lanes_special = self.val(format!("fcmp ueq {vt} {a}, splat ({ty} {inf})"));
+        let special = self.val(format!("call i1 @llvm.vector.reduce.or.v{lanes}i1(<{lanes} x i1> {lanes_special})"));
+        let special = match self.fp_special.take() {
+            Some(old) => self.val(format!("or i1 {old}, {special}")),
+            None => special,
+        };
+        self.fp_special = Some(special);
+        self.fp_pending.push(FpCheck {
+            ty: ty.to_string(),
+            lanes,
             inputs: inputs.iter().map(|x| x.to_string()).collect(),
             r: r.to_string(),
             div,
@@ -316,8 +361,8 @@ impl<'a> Block<'a> {
     }
 
     /// Works out the flags of the recorded FP results (see check_fp), if any
-    /// was NaN or infinite, with one branch. The lifter calls it after each
-    /// instruction; flushing does too.
+    /// was NaN or infinite, with one branch. The lifter calls it every few
+    /// instructions; flushing does too.
     pub fn resolve_fp_checks(&mut self) {
         let Some(special) = self.fp_special.take() else { return };
         let pending = std::mem::take(&mut self.fp_pending);
@@ -328,18 +373,26 @@ impl<'a> Block<'a> {
         self.place_label(&slow);
         let mut bits = "0".to_string();
         for c in &pending {
-            let as_double = |b: &mut Self, v: &str| {
-                if c.ty == "double" { v.to_string() } else { b.val(format!("fpext {} {v} to double", c.ty)) }
-            };
-            let mut args: Vec<String> = c.inputs.iter().map(|x| as_double(self, x)).collect();
-            args.resize(3, "0.0".into());
-            let r = as_double(self, &c.r);
-            let kind = c.inputs.len() as u32 | (c.div as u32) << 2;
-            let f = self.val(format!(
-                "call i32 @__wasm_env_fp_flags(double {}, double {}, double {}, double {r}, i32 {kind})",
-                args[0], args[1], args[2]
-            ));
-            bits = self.val(format!("or i32 {bits}, {f}"));
+            // Each lane (or the scalar), its values widened to double.
+            for k in 0..c.lanes.max(1) {
+                let arg = |b: &mut Self, v: &str| {
+                    let v = if c.lanes == 0 {
+                        v.to_string()
+                    } else {
+                        b.val(format!("extractelement <{} x {}> {v}, i32 {k}", c.lanes, c.ty))
+                    };
+                    if c.ty == "double" { v } else { b.val(format!("fpext {} {v} to double", c.ty)) }
+                };
+                let mut args: Vec<String> = c.inputs.iter().map(|x| arg(self, x)).collect();
+                args.resize(3, "0.0".into());
+                let r = arg(self, &c.r);
+                let kind = c.inputs.len() as u32 | (c.div as u32) << 2;
+                let f = self.val(format!(
+                    "call i32 @__wasm_env_fp_flags(double {}, double {}, double {}, double {r}, i32 {kind})",
+                    args[0], args[1], args[2]
+                ));
+                bits = self.val(format!("or i32 {bits}, {f}"));
+            }
         }
         self.line(format!("br label %{done}"));
         self.place_label(&done);
@@ -802,10 +855,16 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
                 };
                 match insn::lift(&mut b, i) {
                     Ok(true) => break,
-                    // An instruction's FP exception checks resolve right after
-                    // it (one branch for all its lanes), so its values needn't
-                    // stay live across a large block.
-                    Ok(false) => b.resolve_fp_checks(),
+                    // FP exception checks resolve every few instructions (one
+                    // branch for all of them), and at the block's end: often
+                    // enough that their values needn't stay live across a
+                    // large block (clang's time grows fast with that), rarely
+                    // enough not to split an unrolled kernel into tiny blocks.
+                    Ok(false) => {
+                        if b.pending_fp_checks() >= 16 {
+                            b.resolve_fp_checks();
+                        }
+                    }
                     Err(e) => {
                         unsupported.entry(i.op().mnem().to_string()).or_insert_with(|| (0, format!("`{i}`: {e}"))).0 +=
                             1;
@@ -968,6 +1027,18 @@ fn intrinsics() -> String {
     // Fused multiply-add (see insn::fused).
     ir.push_str("declare <2 x double> @llvm.wasm.relaxed.madd.v2f64(<2 x double>, <2 x double>, <2 x double>)\n");
     ir.push_str("declare <4 x float> @llvm.wasm.relaxed.madd.v4f32(<4 x float>, <4 x float>, <4 x float>)\n");
+    ir.push_str("declare float @llvm.arithmetic.fence.f32(float)\n"); // see Block::fcmp
+    ir.push_str("declare double @llvm.arithmetic.fence.f64(double)\n");
+    // Whole-vector FP (see insn::fp_vec_in).
+    for (v, s) in [("<2 x double>", "v2f64"), ("<4 x float>", "v4f32")] {
+        for f in ["minimum", "maximum"] {
+            let _ = writeln!(ir, "declare {v} @llvm.{f}.{s}({v}, {v})");
+        }
+        let _ = writeln!(ir, "declare {v} @llvm.fabs.{s}({v})");
+    }
+    for n in [2, 4] {
+        let _ = writeln!(ir, "declare i1 @llvm.vector.reduce.or.v{n}i1(<{n} x i1>)");
+    }
     for t in ["i32", "i64"] {
         let _ = writeln!(
             ir,
