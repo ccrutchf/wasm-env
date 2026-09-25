@@ -31,7 +31,7 @@ w() { timeout 900 "$wasm_env" run --root "$R" "$@" 2>&1 | od -c; echo "[${PIPEST
 t() { compare "$*" "$(q "$@")" "$(w "$@")"; }
 
 # The C fixtures, against glibc.
-for f in c/hello.c arm64/control.c arm64/memory.c arm64/arith.c arm64/fp.c arm64/computedgoto.c arm64/simd3.c; do
+for f in c/hello.c arm64/control.c arm64/memory.c arm64/arith.c arm64/fp.c arm64/computedgoto.c arm64/simd3.c arm64/calls.c; do
 	name=$(basename "$f" .c)
 	flags=(-O2)
 	[ "$name" = simd3 ] && flags+=(-march=armv8.2-a+crc+sha3)

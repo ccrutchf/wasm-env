@@ -37,6 +37,7 @@ fixtures=(
 	"simd4:tests/arm64/simd4.c:-static"
 	"fpexc:tests/arm64/fpexc.c:-static -lm"
 	"flags:tests/arm64/flags.c:-static"
+	"calls:tests/arm64/calls.c:-static"
 	"control:tests/arm64/control.c:-static"
 	"memory:tests/arm64/memory.c:-static"
 	# Static PIE (loaded at a chosen base, relocations applied on translate).
