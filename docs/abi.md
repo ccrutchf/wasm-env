@@ -95,6 +95,8 @@ Processes are created with **`vfork` + `execve`**, which covers `posix_spawn`, `
 
 `vfork` returns twice, so libc defines it as a macro around `setjmp` (see `toolchain/musl-overlay/src/process/wasm64/vfork.c`); the child must not return from the function that called `vfork`, the usual vfork rule. `clone` with any other flags returns `-ENOSYS`.
 
+Translated (arm64) programs use the same protocol through the translator's support code, so their own libc's `vfork`, `posix_spawn` and `system` work: at the guest's `clone(CLONE_VM | CLONE_VFORK, stack)` the support code saves the guest registers and the address after the `svc`, and the child continues (on `stack` if one is given, as glibc's `posix_spawn` does). When the runtime returns the child's pid from its `execve` or `exit`, the support code restores the registers, puts the pid in x0 and resumes the parent after its `clone`.
+
 **execve** accepts WebAssembly programs, `#!` scripts (up to four levels of interpreter) and arm64 ELF binaries, which the runtime translates on first use (with their dynamic linker and libraries from the environment) and caches. Other files fail with `-ENOEXEC`. Outside a vfork child, a successful `execve` replaces the running program; the pid, descriptors (minus close-on-exec ones), working directory, umask and ignored signals carry over.
 
 **Process model.** Each process runs on its own host thread, all inside the environment's one host process. `wait4` supports the usual targets (-1, a pid, 0, -pgid) and `WNOHANG`, and reports standard Linux wait statuses. Pipes are in-runtime buffers of 64 KB; writing to a pipe without readers raises `SIGPIPE`.

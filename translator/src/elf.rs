@@ -1,5 +1,7 @@
 //! Loading the parts of an arm64 ELF executable the translator needs.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
 use object::elf;
 use object::read::elf::{ElfFile64, FileHeader, ProgramHeader};
@@ -56,6 +58,54 @@ pub struct Image {
 /// fixed at translation time, so the 1:1 guest-address model still holds:
 /// each shared object gets a base assigned once and everything is prelinked.
 pub const PIE_BASE: u64 = 0x40_0000;
+
+/// Alignment of library bases: glibc's 64 KB-aligned reservations, and a
+/// multiple of the lifter's chunk span, so a library's chunks don't depend
+/// on its neighbours.
+const LIB_ALIGN: u64 = 0x10000;
+
+/// The address space a shared object's PT_LOAD segments span from base 0.
+fn extent(bytes: &[u8]) -> Result<u64> {
+    let file = ElfFile64::<Endianness>::parse(bytes).context("not a 64-bit ELF file")?;
+    let endian = file.endian();
+    Ok(file
+        .elf_program_headers()
+        .iter()
+        .filter(|ph| ph.p_type(endian) == elf::PT_LOAD)
+        .map(|ph| ph.p_vaddr(endian) + ph.p_memsz(endian))
+        .max()
+        .unwrap_or(0))
+}
+
+/// Chooses a base for each (name, extent), at or above `start`: the base in
+/// `layout` if the object still fits there, else above everything placed.
+/// Keeping earlier bases keeps a library's translated code identical (and
+/// cached) when libraries are added or change size.
+pub fn place(objects: &[(&str, u64)], start: u64, layout: &HashMap<String, u64>) -> Vec<u64> {
+    let mut bases = vec![None; objects.len()];
+    let mut taken: Vec<(u64, u64)> = Vec::new();
+    for (k, (name, size)) in objects.iter().enumerate() {
+        if let Some(&base) = layout.get(*name) {
+            let end = base + size;
+            if base >= start && base % LIB_ALIGN == 0 && taken.iter().all(|&(b, e)| end <= b || base >= e) {
+                taken.push((base, end.next_multiple_of(LIB_ALIGN)));
+                bases[k] = Some(base);
+            }
+        }
+    }
+    let mut next = taken.iter().map(|&(_, e)| e).max().unwrap_or(start).max(start);
+    bases
+        .into_iter()
+        .zip(objects)
+        .map(|(base, (_, size))| {
+            base.unwrap_or_else(|| {
+                let b = next;
+                next = (b + size).next_multiple_of(LIB_ALIGN);
+                b
+            })
+        })
+        .collect()
+}
 
 /// One relocation, with its site and symbol resolved to absolute addresses
 /// once, then applied against the whole-image symbol table.
@@ -386,14 +436,26 @@ impl Image {
     /// start it: it sets up TLS, runs constructors and jumps to the program.
     /// Its own relocation pass over the prelinked image is idempotent (RELA
     /// relocations store absolute values).
-    pub fn load_dynamic(exe: &[u8], libs: &[(String, Vec<u8>)], interp: Option<&(String, Vec<u8>)>) -> Result<Image> {
+    /// `layout` gives bases from an earlier translation (library name →
+    /// base), kept where they still fit, so adding a library doesn't move
+    /// the others and their translated code stays cached (see `place`).
+    pub fn load_dynamic(
+        exe: &[u8],
+        libs: &[(String, Vec<u8>)],
+        interp: Option<&(String, Vec<u8>)>,
+        layout: &HashMap<String, u64>,
+    ) -> Result<Image> {
         let mut objects = vec![parse_object(exe, elf_base(exe)?)?];
-        // Place each library above the previous object, page-aligned.
-        let mut next = objects[0].top.next_multiple_of(0x10000).max(PIE_BASE);
+        let start = objects[0].top.next_multiple_of(LIB_ALIGN).max(PIE_BASE);
+        let all: Vec<&(String, Vec<u8>)> = libs.iter().chain(interp).collect();
+        let sizes = all
+            .iter()
+            .map(|(name, bytes)| Ok((name.as_str(), extent(bytes).with_context(|| format!("loading {name}"))?)))
+            .collect::<Result<Vec<_>>>()?;
+        let bases = place(&sizes, start, layout);
         let mut placed = Vec::new();
-        for (k, (name, bytes)) in libs.iter().chain(interp).enumerate() {
-            let obj = parse_object(bytes, next).with_context(|| format!("loading {name}"))?;
-            next = obj.top.next_multiple_of(0x10000);
+        for (k, ((name, bytes), base)) in all.into_iter().zip(bases).enumerate() {
+            let obj = parse_object(bytes, base).with_context(|| format!("loading {name}"))?;
             if k < libs.len() {
                 placed.push((name.clone(), obj.base, obj.top));
             }
@@ -580,7 +642,7 @@ mod dynamic_tests {
 
         // With the library, everything resolves and the two objects occupy
         // distinct, non-overlapping address ranges.
-        let image = Image::load_dynamic(&main, &[("dynlib.so".into(), lib)], None).unwrap();
+        let image = Image::load_dynamic(&main, &[("dynlib.so".into(), lib)], None, &HashMap::new()).unwrap();
         let ranges: Vec<_> = image.segments.iter().map(|s| (s.vaddr, s.vaddr + s.memsz)).collect();
         for (i, a) in ranges.iter().enumerate() {
             for b in &ranges[i + 1..] {
@@ -592,5 +654,37 @@ mod dynamic_tests {
         // The library's exported functions are present as blocks to lift.
         assert!(image.functions.iter().any(|f| f.1 == "lib_add"));
         assert!(image.functions.iter().any(|f| f.1 == "lib_sum"));
+    }
+}
+
+#[cfg(test)]
+mod place_tests {
+    use super::*;
+
+    #[test]
+    fn places_new_objects_after_each_other() {
+        let bases = place(&[("a", 0x12345), ("b", 0x10000), ("c", 1)], 0x50_0000, &HashMap::new());
+        assert_eq!(bases, [0x50_0000, 0x52_0000, 0x53_0000]);
+    }
+
+    #[test]
+    fn keeps_earlier_bases_so_added_libraries_move_nothing() {
+        let layout = HashMap::from([("a".to_string(), 0x50_0000), ("c".to_string(), 0x53_0000)]);
+        // "b" is new and comes between them in load order: it goes above
+        // everything instead of shifting "c".
+        let bases = place(&[("a", 0x12345), ("b", 0x10000), ("c", 1)], 0x50_0000, &layout);
+        assert_eq!(bases, [0x50_0000, 0x54_0000, 0x53_0000]);
+    }
+
+    #[test]
+    fn moves_an_object_that_no_longer_fits() {
+        let layout = HashMap::from([("a".to_string(), 0x50_0000), ("c".to_string(), 0x52_0000)]);
+        // "a" grew into "c"'s place: "a" keeps its base (it comes first), "c"
+        // moves above.
+        let bases = place(&[("a", 0x30000), ("c", 0x100)], 0x50_0000, &layout);
+        assert_eq!(bases, [0x50_0000, 0x53_0000]);
+        // A base below the start (the executable grew) isn't reused.
+        let bases = place(&[("a", 0x100)], 0x60_0000, &layout);
+        assert_eq!(bases, [0x60_0000]);
     }
 }

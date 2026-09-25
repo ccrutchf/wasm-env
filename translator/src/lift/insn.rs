@@ -70,7 +70,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             b.fail(pc, &format!("`{i}` executed"));
             return Ok(true);
         }
-        "svc" => b.call_support("__wasm_env_svc"),
+        "svc" => b.svc(i.address() + 4),
         "nop" | "hint" | "yield" | "wfe" | "wfi" | "sev" | "sevl" | "csdb" | "isb" | "dmb" | "dsb" | "clrex"
         | "bti" | "prfm" | "prfum" | "paciasp" | "autiasp" | "pacibsp" | "autibsp" | "xpaclri" | "pacia"
         | "autia1716" | "autib1716" | "pacia1716" | "pacib1716" | "autia" | "pacib" | "autib" | "dc" | "ic" | "dvp"
@@ -117,7 +117,12 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 // musl's memset takes its plain-store path.
                 "ctr_el0" => konst(0x8444_c004, 64),
                 "dczid_el0" => konst(0x10, 64),
-                "midr_el1" | "fpcr" | "fpsr" | "cntfrq_el0" | "cntvct_el0" => konst(0, 64),
+                "fpsr" => {
+                    b.flush();
+                    let v = b.val("load i32, ptr @FPSR");
+                    b.val(format!("zext i32 {v} to i64"))
+                }
+                "midr_el1" | "fpcr" | "cntfrq_el0" | "cntvct_el0" => konst(0, 64),
                 other => bail!("system register {other}"),
             };
             b.write(d, v, 64)?;
@@ -127,7 +132,13 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let v = b.operand(&ops[1], 64)?;
             match name.as_str() {
                 "tpidr_el0" => b.line(format!("store i64 {v}, ptr @TP")),
-                "fpcr" | "fpsr" => {}
+                "fpsr" => {
+                    // Flags raised earlier in the block are overwritten too.
+                    b.flush();
+                    let v = b.val(format!("trunc i64 {v} to i32"));
+                    b.line(format!("store i32 {v}, ptr @FPSR"));
+                }
+                "fpcr" => {}
                 other => bail!("system register {other}"),
             }
         }
@@ -791,17 +802,11 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                     let p = b.val(format!("fmul {ty} {x}, {y}"));
                     b.val(format!("fneg {ty} {p}"))
                 }
-                // Compare + select (no wasm fmin/fmax, and llvm.minnum needs
-                // libm). Differs from arm64 only on NaN and signed zero.
-                "fmin" | "fminnm" => {
-                    let c = b.val(format!("fcmp olt {ty} {x}, {y}"));
-                    b.val(format!("select i1 {c}, {ty} {x}, {ty} {y}"))
-                }
-                _ => {
-                    let c = b.val(format!("fcmp ogt {ty} {x}, {y}"));
-                    b.val(format!("select i1 {c}, {ty} {x}, {ty} {y}"))
-                }
+                _ => fp_minmax(b, m, ty, &x, &y),
             };
+            if !m.contains("min") && !m.contains("max") {
+                fp_exceptions(b, ty, &[&x, &y], &r, m == "fdiv");
+            }
             write_fp(b, d, r, bits)?;
         }
         "fabs" | "fneg" | "fsqrt" if is_scalar_fp(ops) && ops.len() == 2 && is_v(ops.get(1)) => {
@@ -813,27 +818,23 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 "fneg" => b.val(format!("fneg {ty} {x}")),
                 _ => b.val(format!("call {ty} @llvm.sqrt.{s}({ty} {x})")),
             };
+            if m == "fsqrt" {
+                fp_exceptions(b, ty, &[&x], &r, false);
+            }
             write_fp(b, d, r, bits)?;
         }
         "fmadd" | "fmsub" | "fnmadd" | "fnmsub" => {
-            // WebAssembly has no fused multiply-add, and lowering @llvm.fma
-            // needs a libm `fma`. Use a separate multiply and add: two
-            // roundings instead of one, a last-bit difference from true FMA.
+            // Fused, one rounding (see `fused`): fmadd a + x*y, fmsub a - x*y,
+            // fnmadd -a - x*y, fnmsub -a + x*y.
             let (d, bits) = fp_reg(&ops[0])?;
             let ty = fp_ty(bits)?.0;
             let x = read_fp(b, &ops[1], bits)?;
             let y = read_fp(b, &ops[2], bits)?;
             let a = read_fp(b, &ops[3], bits)?;
-            let p = b.val(format!("fmul {ty} {x}, {y}"));
-            let r = match m {
-                "fmadd" => b.val(format!("fadd {ty} {a}, {p}")),
-                "fmsub" => b.val(format!("fsub {ty} {a}, {p}")),
-                "fnmsub" => b.val(format!("fsub {ty} {p}, {a}")),
-                _ => {
-                    let s = b.val(format!("fadd {ty} {a}, {p}"));
-                    b.val(format!("fneg {ty} {s}")) // fnmadd = -(a + x*y)
-                }
-            };
+            let x = if matches!(m, "fmsub" | "fnmadd") { b.val(format!("fneg {ty} {x}")) } else { x };
+            let a = if matches!(m, "fnmadd" | "fnmsub") { b.val(format!("fneg {ty} {a}")) } else { a };
+            let r = fused(b, ty, &x, &y, &a);
+            fp_exceptions(b, ty, &[&x, &y, &a], &r, false);
             write_fp(b, d, r, bits)?;
         }
         "fcmp" | "fcmpe" => {
@@ -876,9 +877,8 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         // --- More SIMD floating point: fused multiply-add, compares, pairwise
         // and across-vector reductions. -------------------------------------------------
         "fmla" | "fmls" if is_v(ops.first()) => {
-            // Vector, by element, or scalar by element (fmla d0, d1, v2.d[1]).
-            // Multiply then add: WebAssembly has no fused multiply-add here, so
-            // the result can differ from hardware's in the last bit.
+            // Vector, by element, or scalar by element (fmla d0, d1, v2.d[1]),
+            // fused: d + x*y, or d - x*y as d + (-x)*y.
             let (d, elem, total) = vec_dst(&ops[0])?;
             let ty = fp_ty(elem)?.0;
             let acc = b.read_v(d, 128);
@@ -890,8 +890,9 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                     let l = vlane(b, v, elem, j);
                     b.val(format!("bitcast i{elem} {l} to {ty}"))
                 });
-                let p = b.val(format!("fmul {ty} {xf}, {yf}"));
-                let r = b.val(format!("{} {ty} {af}, {p}", if m == "fmla" { "fadd" } else { "fsub" }));
+                let xf = if m == "fmls" { b.val(format!("fneg {ty} {xf}")) } else { xf };
+                let r = fused(b, ty, &xf, &yf, &af);
+                fp_exceptions(b, ty, &[&xf, &yf, &af], &r, false);
                 parts.push(b.val(format!("bitcast {ty} {r} to i{elem}")));
             }
             let r = vbuild(b, elem, &parts);
@@ -937,11 +938,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         "faddp" | "fmaxp" | "fminp" | "fmaxnmp" | "fminnmp" if is_v(ops.first()) => {
             let combine = |b: &mut Block, ty: &str, p: &str, q: &str| match m {
                 "faddp" => b.val(format!("fadd {ty} {p}, {q}")),
-                _ => {
-                    let pred = if m.starts_with("fmax") { "ogt" } else { "olt" };
-                    let c = b.val(format!("fcmp {pred} {ty} {p}, {q}"));
-                    b.val(format!("select i1 {c}, {ty} {p}, {ty} {q}"))
-                }
+                _ => fp_minmax(b, m, ty, p, q),
             };
             if ops.len() == 3 {
                 // Vector: pairs of the concatenation vn:vm.
@@ -980,7 +977,6 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let ty = fp_ty(bits)?.0;
             let (_, elem, total) = vec_dst(&ops[1])?;
             let x = read_v128(b, &ops[1])?;
-            let pred = if m.starts_with("fmax") { "ogt" } else { "olt" };
             let lanes: Vec<String> = (0..nlanes(total, elem))
                 .map(|k| {
                     let l = vlane(b, &x, elem, k);
@@ -989,8 +985,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 .collect();
             let mut acc = lanes[0].clone();
             for l in &lanes[1..] {
-                let c = b.val(format!("fcmp {pred} {ty} {acc}, {l}"));
-                acc = b.val(format!("select i1 {c}, {ty} {acc}, {ty} {l}"));
+                acc = fp_minmax(b, m, ty, &acc, l);
             }
             write_fp(b, d, acc, bits)?;
         }
@@ -1103,6 +1098,8 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 let lane = vlane(b, &x, e * 2, k);
                 let f = b.val(format!("bitcast i{} {lane} to {wide}", e * 2));
                 let t = b.val(format!("fptrunc {wide} {f} to {narrow}"));
+                let back = b.val(format!("fpext {narrow} {t} to {wide}"));
+                fp_exceptions(b, wide, &[&f], &back, false);
                 parts.push(b.val(format!("bitcast {narrow} {t} to i{e}")));
             }
             let r = vbuild(b, e, &parts);
@@ -1296,7 +1293,11 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             Ok(match m {
                 "fneg" => b.val(format!("fneg {ty} {x}")),
                 "fabs" => b.val(format!("call {ty} @llvm.fabs.{s}({ty} {x})")),
-                _ => b.val(format!("call {ty} @llvm.sqrt.{s}({ty} {x})")),
+                _ => {
+                    let r = b.val(format!("call {ty} @llvm.sqrt.{s}({ty} {x})"));
+                    fp_exceptions(b, ty, &[x], &r, false);
+                    r
+                }
             })
         })?,
         "fadd" | "fsub" | "fmul" | "fdiv" | "fmax" | "fmin" | "fmaxnm" | "fminnm" if has_arrspec(&ops[0]) => {
@@ -1311,12 +1312,12 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 let xf = b.val(format!("bitcast i{elem} {xl} to {ty}"));
                 let yf = b.val(format!("bitcast i{elem} {yl} to {ty}"));
                 let r = match m {
-                    "fadd" | "fsub" | "fmul" | "fdiv" => b.val(format!("{m} {ty} {xf}, {yf}")),
-                    _ => {
-                        let pred = if m.starts_with("fmax") { "ogt" } else { "olt" };
-                        let c = b.val(format!("fcmp {pred} {ty} {xf}, {yf}"));
-                        b.val(format!("select i1 {c}, {ty} {xf}, {ty} {yf}"))
+                    "fadd" | "fsub" | "fmul" | "fdiv" => {
+                        let r = b.val(format!("{m} {ty} {xf}, {yf}"));
+                        fp_exceptions(b, ty, &[&xf, &yf], &r, m == "fdiv");
+                        r
                     }
+                    _ => fp_minmax(b, m, ty, &xf, &yf),
                 };
                 parts.push(b.val(format!("bitcast {ty} {r} to i{elem}")));
             }
@@ -1422,6 +1423,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             vector_map(b, i, |b, bits, lane| {
                 let (ty, s) = fp_ty(bits)?;
                 let x = b.val(format!("bitcast i{bits} {lane} to {ty}"));
+                fp_convert_exceptions(b, ty, &x, bits, m == "fcvtzs");
                 Ok(b.val(format!("call i{bits} @llvm.{op}.i{bits}.{s}({ty} {x})")))
             })?
         }
@@ -1438,10 +1440,12 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             // To a general register, or (fcvtzs d0, d1) a SIMD one.
             if is_v(ops.first()) {
                 let (dn, dbits) = fp_reg(&ops[0])?;
+                fp_convert_exceptions(b, sty, &x, dbits, m == "fcvtzs");
                 let r = b.val(format!("call i{dbits} @llvm.{op}.i{dbits}.{s}({sty} {x})"));
                 b.write_v(dn, r, dbits);
             } else {
                 let (d, dbits) = b.reg_op(i, 0)?;
+                fp_convert_exceptions(b, sty, &x, dbits, m == "fcvtzs");
                 let r = b.val(format!("call i{dbits} @llvm.{op}.i{dbits}.{s}({sty} {x})"));
                 b.write(d, r, dbits)?;
             }
@@ -1529,6 +1533,11 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             } else {
                 b.val(format!("fptrunc {sty} {x} to {dty}"))
             };
+            if dbits < sbits {
+                // Overflow when a finite value is too large for the narrower type.
+                let wide = b.val(format!("fpext {dty} {r} to {sty}"));
+                fp_exceptions(b, sty, &[&x], &wide, false);
+            }
             write_fp(b, d, r, dbits)?;
         }
 
@@ -1734,6 +1743,70 @@ fn write_fp(b: &mut Block, idx: u8, val: String, bits: u32) -> Result<()> {
     let iv = b.val(format!("bitcast {ty} {val} to i{bits}"));
     b.write_v(idx, iv, bits);
     Ok(())
+}
+
+/// FPSR cumulative exception flags.
+const FPSR_IOC: u32 = 1; // invalid operation
+
+/// Raises the FPSR exceptions an arithmetic result `r` of `inputs` implies:
+/// invalid, divide by zero (`div`: x / y) and overflow (see
+/// Block::check_fp).
+fn fp_exceptions(b: &mut Block, ty: &str, inputs: &[&str], r: &str, div: bool) {
+    b.check_fp(ty, inputs, r, div);
+}
+
+/// Raises FPSR's invalid flag if converting `x` (type `ty`) to a `bits`-wide
+/// integer is out of range or NaN, as FCVTZS/FCVTZU and friends do (they
+/// saturate).
+fn fp_convert_exceptions(b: &mut Block, ty: &str, x: &str, bits: u32, signed: bool) {
+    let (lo, hi) = if signed { (-(2f64.powi(bits as i32 - 1)), 2f64.powi(bits as i32 - 1)) } else { (-1.0, 2f64.powi(bits as i32)) };
+    let (lo, hi) = (format!("0x{:016X}", lo.to_bits()), format!("0x{:016X}", hi.to_bits()));
+    let x = if ty == "double" { x.to_string() } else { b.val(format!("fpext {ty} {x} to double")) };
+    // In range: lo < x < hi for unsigned (after truncation, x > -1), lo <= x < hi for signed.
+    let above = b.val(format!("fcmp {} double {x}, {lo}", if signed { "oge" } else { "ogt" }));
+    let below = b.val(format!("fcmp olt double {x}, {hi}"));
+    let ok = b.val(format!("and i1 {above}, {below}"));
+    let bits = b.val(format!("select i1 {ok}, i32 0, i32 {FPSR_IOC}"));
+    b.raise_fp(bits);
+}
+
+/// x*y + z with a single rounding, as arm64's multiply-adds compute it.
+/// WebAssembly's only fused multiply-add is relaxed SIMD's `madd`, which
+/// the runtime runs deterministically (fused; see its engine config), so the
+/// scalar goes through lane 0 of a vector. Half precision computes in single
+/// precision.
+fn fused(b: &mut Block, ty: &str, x: &str, y: &str, z: &str) -> String {
+    if ty == "half" {
+        let [x, y, z] = [x, y, z].map(|v| b.val(format!("fpext half {v} to float")));
+        let r = fused(b, "float", &x, &y, &z);
+        return b.val(format!("fptrunc float {r} to half"));
+    }
+    let (n, s) = if ty == "double" { (2, "v2f64") } else { (4, "v4f32") };
+    let v = format!("<{n} x {ty}>");
+    let [x, y, z] = [x, y, z].map(|e| b.val(format!("insertelement {v} poison, {ty} {e}, i64 0")));
+    let r = b.val(format!("call {v} @llvm.wasm.relaxed.madd.{s}({v} {x}, {v} {y}, {v} {z})"));
+    b.val(format!("extractelement {v} {r}, i64 0"))
+}
+
+/// arm64 FP minimum/maximum for the mnemonic `m` (fmin, fmaxnmp, fminv,
+/// ...): FMIN/FMAX propagate NaN and order -0 below +0, which is
+/// `llvm.minimum`/`llvm.maximum` (wasm's own f64.min/f64.max); the NM forms
+/// return the other operand when exactly one is NaN.
+fn fp_minmax(b: &mut Block, m: &str, ty: &str, x: &str, y: &str) -> String {
+    let s = match ty {
+        "double" => "f64",
+        "float" => "f32",
+        _ => "f16",
+    };
+    let f = if m.contains("max") { "maximum" } else { "minimum" };
+    let r = b.val(format!("call {ty} @llvm.{f}.{s}({ty} {x}, {ty} {y})"));
+    if !m.contains("nm") {
+        return r;
+    }
+    let x_nan = b.val(format!("fcmp uno {ty} {x}, {x}"));
+    let y_nan = b.val(format!("fcmp uno {ty} {y}, {y}"));
+    let r = b.val(format!("select i1 {y_nan}, {ty} {x}, {ty} {r}"));
+    b.val(format!("select i1 {x_nan}, {ty} {y}, {ty} {r}"))
 }
 
 /// Sets N Z C V from comparing FP values x and y (arm64 FPCompare).

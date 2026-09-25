@@ -1,0 +1,13 @@
+child says 0
+vfork+execve: exit 5
+child says 1
+vfork+execve: exit 5
+child says 2
+vfork+execve: exit 5
+vfork+_exit: exit 42
+vfork+failed execve: exit 99
+child says spawned
+posix_spawn: exit 5
+from system
+system: exit 3
+parent still has 2.5 and 3

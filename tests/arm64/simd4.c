@@ -170,6 +170,40 @@ int main(void)
 		__asm__("eor %0.8b, %1.8b, %1.8b" : "=w"(r8) : "w"(q));
 		P("eor 8b", r8);
 	}
+	{
+		float64x2_t n2 = { __builtin_nan(""), 2.0 }, t2 = { 2.0, __builtin_nan("") }, z = { -0.0, 0.0 }, zr = { 0.0, -0.0 };
+		float32x4_t n4 = { 1.0f, __builtin_nanf(""), -3.0f, 0.5f };
+		OPAQUE(n2); OPAQUE(t2); OPAQUE(z); OPAQUE(zr); OPAQUE(n4);
+		P("fmin nan", vminq_f64(n2, t2)); P("fmax nan", vmaxq_f64(n2, t2));
+		P("fminnm nan", vminnmq_f64(n2, t2)); P("fmaxnm nan", vmaxnmq_f64(n2, t2));
+		P("fmin zeros", vminq_f64(z, zr)); P("fmax zeros", vmaxq_f64(z, zr));
+		P("fminnm zeros", vminnmq_f64(z, zr)); P("fmaxnm zeros", vmaxnmq_f64(zr, z));
+		P("fminp nan", vpminq_f64(n2, t2)); P("fmaxnmp nan", vpmaxnmq_f64(n2, t2));
+		printf("fminv nan %g fminnmv nan %g fmaxv nan %g fmaxnmv nan %g\n", (double)vminvq_f32(n4), (double)vminnmvq_f32(n4), (double)vmaxvq_f32(n4), (double)vmaxnmvq_f32(n4));
+		float64x1_t sa = vdup_n_f64(__builtin_nan("")), sb = vdup_n_f64(-4.0);
+		OPAQUE(sa); OPAQUE(sb);
+		printf("scalar fmin %g fminnm %g fmax %g fmaxnm %g\n", vget_lane_f64(vmin_f64(sa, sb), 0), vget_lane_f64(vminnm_f64(sa, sb), 0), vget_lane_f64(vmax_f64(sb, sa), 0), vget_lane_f64(vmaxnm_f64(sb, sa), 0));
+	}
+	{
+		double x = 1.0 + 0x1p-27, one = 1.0, r1, r2, r3, r4;
+		OPAQUE(x); OPAQUE(one);
+		__asm__("fmadd %d0, %d1, %d1, %d2" : "=w"(r1) : "w"(x), "w"(-one));
+		__asm__("fmsub %d0, %d1, %d1, %d2" : "=w"(r2) : "w"(x), "w"(one));
+		__asm__("fnmadd %d0, %d1, %d1, %d2" : "=w"(r3) : "w"(x), "w"(-one));
+		__asm__("fnmsub %d0, %d1, %d1, %d2" : "=w"(r4) : "w"(x), "w"(one));
+		printf("fused d: %a %a %a %a\n", r1, r2, r3, r4);
+		float xf = 1.0f + 0x1p-13f, rf;
+		OPAQUE(xf);
+		__asm__("fmadd %s0, %s1, %s1, %s2" : "=w"(rf) : "w"(xf), "w"(-1.0f));
+		printf("fused s: %a\n", (double)rf);
+		float64x2_t vx = vdupq_n_f64(x), vm = vdupq_n_f64(-1.0);
+		OPAQUE(vx); OPAQUE(vm);
+		float64x2_t fm = vfmaq_f64(vm, vx, vx), fs = vfmsq_f64(vdupq_n_f64(1.0), vx, vx), fe = vfmaq_laneq_f64(vm, vx, vx, 1);
+		printf("fmla %a fmls %a fmla elem %a\n", vgetq_lane_f64(fm, 1), vgetq_lane_f64(fs, 0), vgetq_lane_f64(fe, 0));
+		float32x4_t v4 = vdupq_n_f32(xf);
+		OPAQUE(v4);
+		printf("fmla.4s %a\n", (double)vgetq_lane_f32(vfmaq_f32(vdupq_n_f32(-1.0f), v4, v4), 3));
+	}
 	uint8_t bmem[16] = { 0 };
 	vst1q_lane_u8(&bmem[3], vdupq_n_u8(0x7e), 9);
 	printf("st1 lane b: %x %x %x\n", bmem[2], bmem[3], bmem[4]);

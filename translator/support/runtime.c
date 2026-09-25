@@ -128,6 +128,33 @@ void __wasm_env_bad_target(uint64_t pc)
 	die("jump to an address that wasn't translated", pc);
 }
 
+// The FPSR exceptions an FP result `r` implies, as the lifted code's slow
+// path asks (translator/src/lift/mod.rs, Block::check_fp): invalid when the
+// result is NaN and no input was, divide by zero for x / y with y zero and x
+// finite and nonzero, overflow when it's infinite from finite inputs. `kind`
+// is the number of inputs (x, y, z; unused ones are 0), plus 4 for a
+// division. Values arrive widened to double, which keeps NaN, infinity and
+// finiteness. Underflow and inexact aren't modelled.
+enum { FPSR_IOC = 1, FPSR_DZC = 2, FPSR_OFC = 4 };
+
+uint32_t __wasm_env_fp_flags(double x, double y, double z, double r, uint32_t kind)
+{
+	const double inf = __builtin_inf();
+	if (r == r && __builtin_fabs(r) != inf)
+		return 0; // finite: another result in the block was special
+	double in[3] = { x, y, z };
+	int in_nan = 0, in_inf = 0;
+	for (uint32_t i = 0; i < (kind & 3); i++) {
+		in_nan |= in[i] != in[i];
+		in_inf |= __builtin_fabs(in[i]) == inf;
+	}
+	if (r != r)
+		return in_nan ? 0 : FPSR_IOC;
+	if ((kind & 4) && y == 0 && x == x && x != 0 && __builtin_fabs(x) != inf)
+		return FPSR_DZC;
+	return in_nan || in_inf ? 0 : FPSR_OFC;
+}
+
 // The CRC32* instructions: CRC-32 (or CRC-32C, by polynomial) of the low
 // `bytes` bytes of `data`, least significant first.
 uint32_t __wasm_env_crc32(uint32_t crc, uint64_t data, uint32_t bytes, uint32_t poly)
@@ -316,21 +343,106 @@ static int library_syscall(long nr)
 // svc #0: the syscall number is in x8, arguments in x0–x5, the result goes
 // to x0. arm64 Linux uses the same generic syscall table as wasm-env, so
 // calls pass straight through.
+// vfork for translated code. The runtime's vfork (docs/abi.md, "Processes")
+// runs the child in the parent's memory until it execs or exits, then
+// returns the child's pid from that execve/exit. Here the parent's guest
+// registers are saved at the clone and restored then, and the lifted code
+// resumes the parent after its clone (with the pid in x0), redirected by
+// __wasm_env_svc_at's return value. The child may run on the parent's stack
+// (glibc's vfork) or a new one (glibc's posix_spawn); either way the parent
+// was waiting at its clone, as with a real CLONE_VFORK.
+extern uint8_t F[4];
+extern __uint128_t V[32];
+struct vfork_frame {
+	uint64_t r[32], tp, resume;
+	uint8_t f[4];
+	__uint128_t v[32];
+};
+#define VFORK_DEPTH 4
+static struct vfork_frame vfork_frames[VFORK_DEPTH];
+static int vfork_depth;
+static uint64_t svc_next, svc_redirect;
+
+enum { SYS_uname = 160, SYS_exit = 93, SYS_execve = 221, CLONE_VM = 0x100, CLONE_VFORK = 0x4000 };
+
+static void vfork_clone(void)
+{
+	uint64_t flags = R[0], stack = R[1];
+	if ((flags & (CLONE_VM | CLONE_VFORK)) != (CLONE_VM | CLONE_VFORK) || vfork_depth == VFORK_DEPTH) {
+		// fork, threads: not yet.
+		R[0] = (uint64_t)-ENOSYS;
+		return;
+	}
+	long r = __wasm_env_host_syscall(SYS_clone, (long)flags, 0, 0, 0, 0, 0);
+	if (r < 0) {
+		R[0] = (uint64_t)r;
+		return;
+	}
+	struct vfork_frame *f = &vfork_frames[vfork_depth++];
+	__builtin_memcpy(f->r, R, sizeof f->r);
+	__builtin_memcpy(f->f, F, sizeof f->f);
+	__builtin_memcpy(f->v, V, sizeof f->v);
+	f->tp = TP;
+	f->resume = svc_next;
+	R[0] = 0; // the child
+	if (stack)
+		R[31] = stack;
+}
+
+// The vfork child exec'd or exited (the runtime returned its pid): continue
+// as the parent, after its clone.
+static void vfork_resume(long pid)
+{
+	struct vfork_frame *f = &vfork_frames[--vfork_depth];
+	__builtin_memcpy(R, f->r, sizeof f->r);
+	__builtin_memcpy(F, f->f, sizeof f->f);
+	__builtin_memcpy(V, f->v, sizeof f->v);
+	TP = f->tp;
+	R[0] = (uint64_t)pid;
+	svc_redirect = f->resume;
+}
+
 void __wasm_env_svc(void)
 {
 	long nr = (long)R[8];
 	if (nr == SYS_clone) {
-		// A translated process can't vfork/fork yet: the runtime's vfork
-		// protocol expects wasm-env's libc, not the guest's.
-		R[0] = (uint64_t)-ENOSYS;
+		vfork_clone();
 		return;
 	}
 	if (library_syscall(nr)) return;
+	if (vfork_depth && (nr == SYS_execve || nr == SYS_exit || nr == SYS_exit_group)) {
+		long r = __wasm_env_host_syscall(nr == SYS_exit ? SYS_exit_group : nr, (long)R[0], (long)R[1],
+		                                 (long)R[2], 0, 0, 0);
+		if (r > 0)
+			vfork_resume(r);
+		else
+			R[0] = (uint64_t)r; // a failed execve: the child goes on
+		return;
+	}
 	// kill, tkill or tgkill with SIGABRT: the program is aborting.
 	if (debug && ((nr == 129 && R[1] == 6) || (nr == 130 && R[1] == 6) || (nr == 131 && R[2] == 6)))
 		print_recent(RECENT);
+	uint64_t arg0 = R[0];
 	R[0] = (uint64_t)__wasm_env_host_syscall(nr, (long)R[0], (long)R[1], (long)R[2], (long)R[3],
 	                                         (long)R[4], (long)R[5]);
+	if (nr == SYS_uname && R[0] == 0) {
+		// The runtime reports its own machine (wasm64); a translated program
+		// is an arm64 program, and code chooses paths and packages by it.
+		// struct utsname: six 65-byte fields, machine the fifth.
+		char *machine = (char *)(uintptr_t)arg0 + 4 * 65;
+		__builtin_memset(machine, 0, 65);
+		__builtin_memcpy(machine, "aarch64", 7);
+	}
+}
+
+// The lifted code's SVC: `next` is the address after it. Returns where to
+// continue instead, or 0 to go on (see vfork_clone).
+int64_t __wasm_env_svc_at(int64_t next)
+{
+	svc_next = (uint64_t)next;
+	svc_redirect = 0;
+	__wasm_env_svc();
+	return (int64_t)svc_redirect;
 }
 
 // The guest's stack. The wasm-env runtime puts the initial process stack

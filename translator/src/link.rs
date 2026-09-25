@@ -17,7 +17,7 @@ pub const SUPPORT_C: &str = include_str!("../support/runtime.c");
 /// WebAssembly target and features, shared by the lifted code and the
 /// support code.
 const WASM_FLAGS: &[&str] =
-    &["--target=wasm64-unknown-unknown", "-mtail-call", "-mbulk-memory", "-mexception-handling"];
+    &["--target=wasm64-unknown-unknown", "-mtail-call", "-mbulk-memory", "-mexception-handling", "-mrelaxed-simd"];
 
 /// Optimization level for the lifted IR. It is already low-level, and one
 /// module can hold a whole translated library, so `-O2` makes clang use
@@ -315,6 +315,7 @@ target triple = "wasm64-unknown-unknown"
 @F = global [4 x i8] zeroinitializer
 @V = global [32 x i128] zeroinitializer, align 16
 @TP = global i64 0
+@FPSR = global i32 0
 %seg = type { i64, i64, i64, ptr }
 declare void @__wasm_env_svc()
 declare void @__wasm_env_fatal(ptr, i64)

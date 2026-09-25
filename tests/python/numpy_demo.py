@@ -1,7 +1,6 @@
 # numpy (the manylinux wheel from PyPI, with its bundled OpenBLAS) under
 # wasm-env, compared with qemu by tests/ubuntu.sh. Floating-point results
-# are rounded: wasm-env computes multiply-add unfused, which can differ from
-# hardware in the last bit.
+# are rounded, so the comparison doesn't depend on BLAS summation order.
 import numpy as np
 
 print("numpy", np.__version__)

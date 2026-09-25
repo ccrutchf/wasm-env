@@ -38,6 +38,11 @@ for f in c/hello.c arm64/control.c arm64/memory.c arm64/arith.c arm64/fp.c arm64
 	"${cc[@]}" "${flags[@]}" -o "$R/opt/tests/$name" "tests/$f" || { compare "$name: build" ok failed; continue; }
 	t "/opt/tests/$name" a "b c"
 done
+# Creating processes (vfork, posix_spawn, system) from translated code.
+# Against a written expectation: qemu-user can't exec arm64 programs from
+# inside the guest.
+"${cc[@]}" -O2 -o "$R/opt/tests/spawn" tests/arm64/spawn.c &&
+	compare spawn "$(cat tests/arm64/spawn.expected)" "$(timeout 600 "$wasm_env" run --root "$R" /opt/tests/spawn 2>&1)"
 # Atomics (LSE) and dlopen through glibc's dynamic linker.
 "${cc[@]}" -O2 -march=armv8.1-a -o "$R/opt/tests/atomics" tests/arm64/atomics.c && t /opt/tests/atomics
 "${cc[@]}" -O2 -shared -fPIC -o "$R/usr/lib/libgreet.so" tests/arm64/libgreet.c
@@ -51,24 +56,31 @@ t /opt/tests/greet you
 t /usr/bin/cat /etc/os-release
 t /usr/bin/sort -t: -k3 -n /etc/passwd
 t /usr/bin/sha256sum /etc/os-release
+t /usr/bin/uname -m
 t /usr/bin/printf "%08.3f|%x|%-5s|%e\n" 3.14159 255 ab 12345.678
 t /usr/bin/mawk 'BEGIN { for (i = 0; i < 20000; i++) a[i] = i "x"; n = 0; for (k in a) n += length(a[k]); print n }'
 t /usr/bin/find /usr/share/doc -name copyright
 t /usr/bin/python3.12 -c 'import sys; print(1 + 1, sys.version_info[:2])'
 
-# numpy from PyPI's manylinux wheel (bundled OpenBLAS). stdout only: numpy's
-# floating-point RuntimeWarnings come from FPSR exception flags, which
-# wasm-env doesn't model. qemu runs without SVE so OpenBLAS picks the same
-# NEON kernels.
-if tests/wheel-fetch.sh numpy==2.5.3 >/dev/null 2>&1; then
-	echo "python3* /usr/lib/python3.12/lib-dynload /usr/local/lib/python3.12/dist-packages/numpy" >> "$R/etc/wasm-env/dlopen"
-	cp tests/python/numpy_demo.py "$R/root/numpy_demo.py"
-	expected=$(cd "$R" && env -i HOME=/root OPENBLAS_NUM_THREADS=1 QEMU_CPU=max,sve=off,sme=off \
-		qemu-aarch64 -L . -0 /usr/bin/python3.12 ./usr/bin/python3.12 /root/numpy_demo.py 2>/dev/null)
-	actual=$(OPENBLAS_NUM_THREADS=1 timeout 1800 "$wasm_env" run --root "$R" /usr/bin/python3.12 /root/numpy_demo.py 2>/dev/null)
-	compare "numpy demo" "$expected" "$actual"
+# numpy and pandas from PyPI's manylinux wheels (numpy bundles OpenBLAS),
+# stdout and stderr (numpy's floating-point RuntimeWarnings come from FPSR
+# exception flags). qemu runs without SVE so OpenBLAS picks the same NEON
+# kernels.
+wheels=(numpy==2.5.3 pandas==3.0.6 python-dateutil==2.9.0.post0 six==1.17.0 tzdata==2026.4)
+if tests/wheel-fetch.sh "${wheels[@]}" >/dev/null 2>&1; then
+	site=/usr/local/lib/python3.12/dist-packages
+	echo "python3* /usr/lib/python3.12/lib-dynload $site/numpy $site/pandas" >> "$R/etc/wasm-env/dlopen"
+	# The first run translates Python with numpy and pandas (with a cold
+	# cache, tens of minutes), hence the long timeout.
+	for demo in numpy pandas; do
+		cp "tests/python/${demo}_demo.py" "$R/root/"
+		expected=$(cd "$R" && env -i HOME=/root OPENBLAS_NUM_THREADS=1 QEMU_CPU=max,sve=off,sme=off \
+			qemu-aarch64 -L . -0 /usr/bin/python3.12 ./usr/bin/python3.12 "/root/${demo}_demo.py" 2>&1)
+		actual=$(OPENBLAS_NUM_THREADS=1 timeout 7200 "$wasm_env" run --root "$R" /usr/bin/python3.12 "/root/${demo}_demo.py" 2>&1)
+		compare "$demo demo" "$expected" "$actual"
+	done
 else
-	echo "skipped numpy: can't fetch the wheel (offline?)"
+	echo "skipped numpy and pandas: can't fetch the wheels (offline?)"
 fi
 
 echo "$passed passed, $failed failed"

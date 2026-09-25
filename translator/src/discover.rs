@@ -47,13 +47,15 @@ pub fn direct_target(i: &Instruction) -> Option<u64> {
     })
 }
 
-/// Instructions that end a block.
+/// Instructions that end a block. SVC does too: a vfork parent resumes at
+/// the instruction after its clone (see __wasm_env_svc_at in support/runtime.c),
+/// so that must be a block.
 pub fn is_control(i: &Instruction) -> bool {
     let m = i.op().mnem();
     matches!(
         m,
         "b" | "bl" | "br" | "blr" | "ret" | "cbz" | "cbnz" | "tbz" | "tbnz" | "braa" | "brab" | "blraa"
-            | "blrab" | "retaa" | "retab" | "brk" | "udf" | "hlt"
+            | "blrab" | "retaa" | "retab" | "brk" | "udf" | "hlt" | "svc"
     ) || m.starts_with("b.")
 }
 

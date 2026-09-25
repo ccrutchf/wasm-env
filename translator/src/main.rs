@@ -4,7 +4,8 @@
 //!   wasm-env-translate census BINARY   count instructions by operation
 //!   wasm-env-translate blocks BINARY   list the basic blocks discovery finds
 //!   wasm-env-translate translate BINARY OUT.wasm [--root DIR] [--dlopen PATH]...
-//!                                 [--lib SO]... [--interp LD_SO] [--deps-out FILE] [--roots FILE]   (needs `lift`)
+//!                                 [--lib SO]... [--interp LD_SO] [--deps-out FILE] [--roots FILE]
+//!                                 [--layout FILE]   (needs `lift`)
 //!
 //! With `--root`, the dynamic linker and libraries are found inside DIR the
 //! way the dynamic linker will find them; `--dlopen` adds libraries the
@@ -63,6 +64,10 @@ struct Inputs {
     /// Where to list the host files the translation read (`--deps-out`), so a
     /// cache can tell when it goes stale.
     deps_out: Option<String>,
+    /// Library bases from an earlier translation (`--layout FILE`,
+    /// "base<TAB>name" lines), reused where they still fit so added
+    /// libraries don't move the others; the file is then rewritten.
+    layout: Option<String>,
     /// Shared libraries on the host (`--lib`).
     libs: Vec<String>,
     /// The dynamic linker on the host (`--interp`).
@@ -107,7 +112,22 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     let mut image = if libs.is_empty() && interp.is_none() {
         elf::Image::load(&bytes)?
     } else {
-        elf::Image::load_dynamic(&bytes, &libs, interp.as_ref())?
+        let mut layout = std::collections::HashMap::new();
+        if let Some(text) = inputs.layout.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+            for line in text.lines() {
+                if let Some((base, name)) = line.split_once('\t')
+                    && let Ok(base) = u64::from_str_radix(base.trim_start_matches("0x"), 16)
+                {
+                    layout.insert(name.to_string(), base);
+                }
+            }
+        }
+        let image = elf::Image::load_dynamic(&bytes, &libs, interp.as_ref(), &layout)?;
+        if let Some(path) = &inputs.layout {
+            let text: String = image.objects[1..].iter().map(|(name, base, _)| format!("{base:#x}\t{name}\n")).collect();
+            std::fs::write(path, text).with_context(|| format!("writing {path}"))?;
+        }
+        image
     };
     image.objects[0].0 = input.to_string();
     if let Some(path) = &inputs.roots {
@@ -197,6 +217,7 @@ fn main() -> Result<()> {
                     "--dlopen" => inputs.dlopen.push(value()?),
                     "--deps-out" => inputs.deps_out = Some(value()?),
                     "--roots" => inputs.roots = Some(value()?),
+                    "--layout" => inputs.layout = Some(value()?),
                     other => bail!("unexpected argument {other}"),
                 }
             }

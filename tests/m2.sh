@@ -35,6 +35,7 @@ fixtures=(
 	"atomics:tests/arm64/atomics.c:-static -march=armv8.1-a"
 	"simd3:tests/arm64/simd3.c:-static -march=armv8.2-a+crc+sha3"
 	"simd4:tests/arm64/simd4.c:-static"
+	"fpexc:tests/arm64/fpexc.c:-static -lm"
 	"control:tests/arm64/control.c:-static"
 	"memory:tests/arm64/memory.c:-static"
 	# Static PIE (loaded at a chosen base, relocations applied on translate).

@@ -142,6 +142,11 @@ pub fn engine() -> Result<Engine> {
         .wasm_memory64(true)
         .wasm_exceptions(true)
         .wasm_tail_call(true)
+        // Relaxed SIMD's madd is how translated code gets a fused
+        // multiply-add (arm64's FMADD, FMLA); deterministic mode makes it
+        // fused on every host.
+        .wasm_relaxed_simd(true)
+        .relaxed_simd_deterministic(true)
         .cranelift_opt_level(wasmtime::OptLevel::Speed)
         .memory_reservation(1 << MASK_BITS)
         .memory_may_move(false)

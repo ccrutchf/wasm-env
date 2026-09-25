@@ -162,6 +162,14 @@ pub fn ensure_translated(elf: &Path, root: &Path, program: &str, trace: bool) ->
     for lib in &dlopen {
         cmd.arg("--dlopen").arg(lib);
     }
+    // Library bases from this program's last translation, whatever its
+    // dlopen list was, so a changed list moves no library whose code is
+    // already compiled (the translator's object cache).
+    let layout = dir.join(format!(
+        "{:016x}.layout",
+        hash(elf.as_os_str().as_encoded_bytes()) ^ hash(root.as_os_str().as_encoded_bytes()).rotate_left(5)
+    ));
+    cmd.arg("--layout").arg(&layout);
     // Addresses earlier runs found missing (see record_missed_target).
     let roots = out.with_extension("roots");
     if roots.exists() {

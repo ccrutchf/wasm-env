@@ -123,6 +123,14 @@ pub fn region_of(addr: u64) -> u64 {
     addr / REGION_SPAN * REGION_SPAN
 }
 
+/// An FP result awaiting its exception check (see Block::check_fp).
+struct FpCheck {
+    ty: String,
+    inputs: Vec<String>,
+    r: String,
+    div: bool,
+}
+
 /// Builds the body of one block, a basic block of its region's function.
 pub struct Block<'a> {
     pub body: String,
@@ -138,6 +146,12 @@ pub struct Block<'a> {
     flags_dirty: [bool; 4],
     vec: [Option<String>; 32],
     vec_dirty: [bool; 32],
+    /// FPSR exception flags raised in this block and not yet stored (i32).
+    fpsr_raised: Option<String>,
+    /// FP results to check for exceptions at the next flush (see check_fp),
+    /// and whether any of them was NaN or infinite (i1).
+    fp_pending: Vec<FpCheck>,
+    fp_special: Option<String>,
     /// Private string constants this block needs (for fatal messages),
     /// emitted in the same module as the block: (name, LLVM constant text).
     pub strings: Vec<(String, String)>,
@@ -159,6 +173,9 @@ impl<'a> Block<'a> {
             flags_dirty: [false; 4],
             vec: Default::default(),
             vec_dirty: [false; 32],
+            fpsr_raised: None,
+            fp_pending: Vec::new(),
+            fp_special: None,
             strings: Vec::new(),
         }
     }
@@ -264,6 +281,79 @@ impl<'a> Block<'a> {
                 self.flags_dirty[f] = false;
             }
         }
+        self.resolve_fp_checks();
+        if let Some(raised) = self.fpsr_raised.take() {
+            let old = self.val("load i32, ptr @FPSR");
+            let new = self.val(format!("or i32 {old}, {raised}"));
+            self.line(format!("store i32 {new}, ptr @FPSR"));
+        }
+    }
+
+    /// Records an FP result whose exceptions (invalid, divide by zero,
+    /// overflow: see __wasm_env_fp_flags in support/runtime.c) FPSR must
+    /// reflect. The common case, a finite result, costs a comparison here;
+    /// the flags are worked out after the instruction, only if some
+    /// recorded result was NaN or infinite.
+    pub fn check_fp(&mut self, ty: &str, inputs: &[&str], r: &str, div: bool) {
+        let (s, inf) = match ty {
+            "double" => ("f64", "0x7FF0000000000000"),
+            "float" => ("f32", "0x7FF0000000000000"),
+            _ => ("f16", "0xH7C00"),
+        };
+        let a = self.val(format!("call {ty} @llvm.fabs.{s}({ty} {r})"));
+        let special = self.val(format!("fcmp ueq {ty} {a}, {inf}"));
+        let special = match self.fp_special.take() {
+            Some(old) => self.val(format!("or i1 {old}, {special}")),
+            None => special,
+        };
+        self.fp_special = Some(special);
+        self.fp_pending.push(FpCheck {
+            ty: ty.to_string(),
+            inputs: inputs.iter().map(|x| x.to_string()).collect(),
+            r: r.to_string(),
+            div,
+        });
+    }
+
+    /// Works out the flags of the recorded FP results (see check_fp), if any
+    /// was NaN or infinite, with one branch. The lifter calls it after each
+    /// instruction; flushing does too.
+    pub fn resolve_fp_checks(&mut self) {
+        let Some(special) = self.fp_special.take() else { return };
+        let pending = std::mem::take(&mut self.fp_pending);
+        let (pre, slow, done) = (self.label(), self.label(), self.label());
+        self.line(format!("br label %{pre}"));
+        self.place_label(&pre);
+        self.line(format!("br i1 {special}, label %{slow}, label %{done}"));
+        self.place_label(&slow);
+        let mut bits = "0".to_string();
+        for c in &pending {
+            let as_double = |b: &mut Self, v: &str| {
+                if c.ty == "double" { v.to_string() } else { b.val(format!("fpext {} {v} to double", c.ty)) }
+            };
+            let mut args: Vec<String> = c.inputs.iter().map(|x| as_double(self, x)).collect();
+            args.resize(3, "0.0".into());
+            let r = as_double(self, &c.r);
+            let kind = c.inputs.len() as u32 | (c.div as u32) << 2;
+            let f = self.val(format!(
+                "call i32 @__wasm_env_fp_flags(double {}, double {}, double {}, double {r}, i32 {kind})",
+                args[0], args[1], args[2]
+            ));
+            bits = self.val(format!("or i32 {bits}, {f}"));
+        }
+        self.line(format!("br label %{done}"));
+        self.place_label(&done);
+        let raised = self.val(format!("phi i32 [ 0, %{pre} ], [ {bits}, %{slow} ]"));
+        self.raise_fp(raised);
+    }
+
+    /// Raises FPSR cumulative exception flags (an i32 of FPSR bits).
+    pub fn raise_fp(&mut self, bits: String) {
+        let v = match self.fpsr_raised.take() {
+            Some(old) => self.val(format!("or i32 {old}, {bits}")),
+            None => bits,
+        };
+        self.fpsr_raised = Some(v);
     }
 
     /// Forgets cached values, after a call that may have changed the globals.
@@ -624,10 +714,21 @@ impl<'a> Block<'a> {
     }
 
     /// A call into the support code that may change guest registers.
-    pub fn call_support(&mut self, callee: &str) {
+    /// A system call (SVC) whose next instruction is at `next`. The support
+    /// code may redirect control (a vfork child that exec'd or exited
+    /// resumes its parent after the parent's clone), returning where to go
+    /// on, else 0.
+    pub fn svc(&mut self, next: u64) {
         self.flush();
-        self.line(format!("call void @{callee}()"));
+        let to = self.val(format!("call i64 @__wasm_env_svc_at(i64 {})", next as i64));
         self.invalidate();
+        let redirect = self.val(format!("icmp ne i64 {to}, 0"));
+        let (away, on) = (self.label(), self.label());
+        self.line(format!("br i1 {redirect}, label %{away}, label %{on}"));
+        self.place_label(&away);
+        self.line(format!("musttail call void @dispatch(i64 {to})"));
+        self.line("ret void");
+        self.place_label(&on);
     }
 }
 
@@ -701,7 +802,10 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
                 };
                 match insn::lift(&mut b, i) {
                     Ok(true) => break,
-                    Ok(false) => {}
+                    // An instruction's FP exception checks resolve right after
+                    // it (one branch for all its lanes), so its values needn't
+                    // stay live across a large block.
+                    Ok(false) => b.resolve_fp_checks(),
                     Err(e) => {
                         unsupported.entry(i.op().mnem().to_string()).or_insert_with(|| (0, format!("`{i}`: {e}"))).0 +=
                             1;
@@ -738,8 +842,11 @@ fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
          @F = external global [4 x i8]\n\
          @V = external global [32 x i128]\n\
          @TP = external global i64\n\
+         @FPSR = external global i32\n\
          declare void @dispatch(i64)\n\
          declare void @__wasm_env_svc()\n\
+         declare i64 @__wasm_env_svc_at(i64)\n\
+         declare i32 @__wasm_env_fp_flags(double, double, double, double, i32)\n\
          declare void @__wasm_env_fatal(ptr, i64)\n\
          declare void @__wasm_env_bad_target(i64)\n\
          declare i32 @__wasm_env_crc32(i32, i64, i32, i32)\n{}",
@@ -777,7 +884,8 @@ fn build_data(image: &Image, prog: &Program) -> String {
     ir.push_str("@R = global [32 x i64] zeroinitializer, align 8\n");
     ir.push_str("@F = global [4 x i8] zeroinitializer\n");
     ir.push_str("@V = global [32 x i128] zeroinitializer, align 16\n");
-    ir.push_str("@TP = global i64 0\n\n");
+    ir.push_str("@TP = global i64 0\n");
+    ir.push_str("@FPSR = global i32 0\n\n");
 
     // The segments' bytes aren't here: they're added to the linked module as
     // data segments at their own addresses (link::add_data_segments), so the
@@ -857,6 +965,9 @@ fn build_data(image: &Image, prog: &Program) -> String {
 /// The LLVM intrinsic declarations the lifted code may call.
 fn intrinsics() -> String {
     let mut ir = String::new();
+    // Fused multiply-add (see insn::fused).
+    ir.push_str("declare <2 x double> @llvm.wasm.relaxed.madd.v2f64(<2 x double>, <2 x double>, <2 x double>)\n");
+    ir.push_str("declare <4 x float> @llvm.wasm.relaxed.madd.v4f32(<4 x float>, <4 x float>, <4 x float>)\n");
     for t in ["i32", "i64"] {
         let _ = writeln!(
             ir,
@@ -895,6 +1006,8 @@ fn intrinsics() -> String {
              declare {t} @llvm.fma.{s}({t}, {t}, {t})\n\
              declare {t} @llvm.minnum.{s}({t}, {t})\n\
              declare {t} @llvm.maxnum.{s}({t}, {t})\n\
+             declare {t} @llvm.minimum.{s}({t}, {t})\n\
+             declare {t} @llvm.maximum.{s}({t}, {t})\n\
              declare {t} @llvm.rint.{s}({t})\n\
              declare {t} @llvm.roundeven.{s}({t})\n\
              declare {t} @llvm.trunc.{s}({t})\n\
