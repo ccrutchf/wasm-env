@@ -154,6 +154,15 @@ pub struct Block<'a> {
     /// and whether any of them was NaN or infinite (i1).
     fp_pending: Vec<FpCheck>,
     fp_special: Option<String>,
+    /// Flag liveness facts (see `lift`): whether the block reads NZCV before
+    /// setting them, whether it sets them, the addresses it jumps to
+    /// directly, and whether it jumps anywhere else.
+    pub flags_read_first: bool,
+    pub flags_set: bool,
+    pub succs: Vec<u64>,
+    pub indirect: bool,
+    /// Set while flushing before a system call, whose flag stores are kept.
+    keep_flags: bool,
     /// Private string constants this block needs (for fatal messages),
     /// emitted in the same module as the block: (name, LLVM constant text).
     pub strings: Vec<(String, String)>,
@@ -178,6 +187,11 @@ impl<'a> Block<'a> {
             fpsr_raised: None,
             fp_pending: Vec::new(),
             fp_special: None,
+            flags_read_first: false,
+            flags_set: false,
+            succs: Vec::new(),
+            indirect: false,
+            keep_flags: false,
             strings: Vec::new(),
         }
     }
@@ -228,6 +242,9 @@ impl<'a> Block<'a> {
         if let Some(v) = &self.flags[f] {
             return v.clone();
         }
+        if !self.flags_set {
+            self.flags_read_first = true;
+        }
         let p = self.val(format!("getelementptr [4 x i8], ptr @F, i64 0, i64 {f}"));
         let b = self.val(format!("load i8, ptr {p}{REG}"));
         let v = self.val(format!("trunc i8 {b} to i1"));
@@ -236,6 +253,7 @@ impl<'a> Block<'a> {
     }
 
     pub fn set_flags(&mut self, n: String, z: String, c: String, v: String) {
+        self.flags_set = true;
         for (i, x) in [n, z, c, v].into_iter().enumerate() {
             self.flags[i] = Some(x);
             self.flags_dirty[i] = true;
@@ -274,6 +292,12 @@ impl<'a> Block<'a> {
                 self.vec_dirty[i] = false;
             }
         }
+        // Flag stores are marked: `lift` drops them where no later block can
+        // read them (see flag liveness there). Those before a system call stay.
+        let marked = !self.keep_flags && self.flags_dirty.iter().any(|&d| d);
+        if marked {
+            self.line(";FLAGS");
+        }
         for f in 0..4 {
             if self.flags_dirty[f] {
                 let v = self.flags[f].clone().unwrap();
@@ -282,6 +306,9 @@ impl<'a> Block<'a> {
                 self.line(format!("store i8 {b}, ptr {p}{REG}"));
                 self.flags_dirty[f] = false;
             }
+        }
+        if marked {
+            self.line(";ENDFLAGS");
         }
         self.resolve_fp_checks();
         if let Some(raised) = self.fpsr_raised.take() {
@@ -724,6 +751,7 @@ impl<'a> Block<'a> {
     /// region, a tail call to another region's function, or, for an address
     /// that isn't a block, `@dispatch` (which reports it).
     pub fn jump(&mut self, target: u64) {
+        self.succs.push(target);
         self.flush();
         if self.leaders.contains(&target) {
             let region = region_of(target);
@@ -739,9 +767,29 @@ impl<'a> Block<'a> {
         self.line("ret void");
     }
 
-    /// Ends the block by jumping to a computed address.
+    /// Ends the block by jumping to a computed address: through the dispatch
+    /// cache (see `dispatch` in support/runtime.c, whose hash this matches),
+    /// probed here so a hit costs no call into the dispatcher, else through
+    /// `dispatch`.
     pub fn jump_to(&mut self, target: String) {
+        self.indirect = true;
         self.flush();
+        let region = self.val(format!("lshr i64 {target}, 12"));
+        let high = self.val(format!("lshr i64 {region}, 12"));
+        let mixed = self.val(format!("xor i64 {region}, {high}"));
+        let slot = self.val(format!("and i64 {mixed}, 4095"));
+        let tag_at = self.val(format!("getelementptr [4096 x {{ i64, ptr }}], ptr @__wasm_env_dispatch_cache, i64 0, i64 {slot}, i32 0"));
+        let tag = self.val(format!("load i64, ptr {tag_at}"));
+        let want = self.val(format!("add i64 {region}, 1"));
+        let hit = self.val(format!("icmp eq i64 {tag}, {want}"));
+        let (cached, miss) = (self.label(), self.label());
+        self.line(format!("br i1 {hit}, label %{cached}, label %{miss}"));
+        self.place_label(&cached);
+        let fn_at = self.val(format!("getelementptr [4096 x {{ i64, ptr }}], ptr @__wasm_env_dispatch_cache, i64 0, i64 {slot}, i32 1"));
+        let f = self.val(format!("load ptr, ptr {fn_at}"));
+        self.line(format!("musttail call void {f}(i64 {target})"));
+        self.line("ret void");
+        self.place_label(&miss);
         self.line(format!("musttail call void @dispatch(i64 {target})"));
         self.line("ret void");
     }
@@ -772,7 +820,9 @@ impl<'a> Block<'a> {
     /// resumes its parent after the parent's clone), returning where to go
     /// on, else 0.
     pub fn svc(&mut self, next: u64) {
+        self.keep_flags = true;
         self.flush();
+        self.keep_flags = false;
         let to = self.val(format!("call i64 @__wasm_env_svc_at(i64 {})", next as i64));
         self.invalidate();
         let redirect = self.val(format!("icmp ne i64 {to}, 0"));
@@ -783,6 +833,52 @@ impl<'a> Block<'a> {
         self.line("ret void");
         self.place_label(&on);
     }
+}
+
+/// What flag liveness needs to know about a block (see Block's fields).
+struct FlagFacts {
+    read_first: bool,
+    set: bool,
+    succs: Vec<u64>,
+    unknown: bool,
+}
+
+/// The blocks whose NZCV flags some later block may read, so they must be
+/// stored when the block ends. Flags are live into a block that reads them
+/// before setting them, or doesn't set them and passes them on; live out of
+/// one with an unknown successor, or a successor they're live into (a
+/// target that isn't a block counts as reading them).
+fn flags_live_out(facts: &std::collections::HashMap<u64, FlagFacts>) -> std::collections::HashSet<u64> {
+    use std::collections::{HashMap, HashSet};
+    let mut preds: HashMap<u64, Vec<u64>> = HashMap::new();
+    for (&b, f) in facts {
+        for &s in &f.succs {
+            preds.entry(s).or_default().push(b);
+        }
+    }
+    let mut live_in: HashSet<u64> = facts.iter().filter(|(_, f)| f.read_first).map(|(&b, _)| b).collect();
+    let live_out_of = |b: &u64, live_in: &HashSet<u64>| {
+        let f = &facts[b];
+        f.unknown || f.succs.iter().any(|s| !facts.contains_key(s) || live_in.contains(s))
+    };
+    // Worklist: when a block becomes live-in, its predecessors that pass
+    // flags through may too.
+    let mut work: Vec<u64> = live_in.iter().copied().collect();
+    work.extend(facts.iter().filter(|(_, f)| f.unknown || f.succs.iter().any(|s| !facts.contains_key(s))).map(|(&b, _)| b));
+    while let Some(b) = work.pop() {
+        let f = &facts[&b];
+        if !live_in.contains(&b) && !f.set && live_out_of(&b, &live_in) {
+            live_in.insert(b);
+        } else if !live_in.contains(&b) {
+            continue;
+        }
+        for p in preds.get(&b).into_iter().flatten() {
+            if !live_in.contains(p) && !facts[p].set {
+                work.push(*p);
+            }
+        }
+    }
+    facts.keys().filter(|b| live_out_of(b, &live_in)).copied().collect()
 }
 
 /// The guest address range whose blocks go in one compilation module. Bounds
@@ -835,24 +931,27 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
         regions.entry(region_of(leader)).or_default().push(leader);
     }
 
-    let mut lifted = Vec::new();
+    // Lift every block, keeping its text and flag liveness facts.
+    struct Lifted1 {
+        bodies: Vec<(u64, String)>,
+        strings: Vec<(String, String)>,
+        calls: std::collections::BTreeSet<u64>,
+    }
+    let mut facts: std::collections::HashMap<u64, FlagFacts> = std::collections::HashMap::new();
+    let mut lifted1 = Vec::new();
     for (&region, leaders) in &regions {
-        // The region's function: entered at any of its blocks (the dispatcher
-        // and other regions pass the block's address), then branching within.
-        let mut text = format!("define void @R_{region:x}(i64 %pc) {{\nentry:\n  switch i64 %pc, label %bad [\n");
-        for &a in leaders {
-            let _ = writeln!(text, "    i64 {}, label %b_{a:x}", a as i64);
-        }
-        text.push_str("  ]\n");
         let (mut tmp, mut strings, mut calls) = (0, Vec::new(), std::collections::BTreeSet::new());
+        let mut bodies = Vec::new();
         for &start in leaders {
             let mut b = Block::new(start, tmp, &prog.leaders);
             let mut pc = start;
+            let mut last = "";
             loop {
                 let Some(i) = prog.insns.get(&pc) else {
                     b.fail(pc, "undecodable instruction");
                     break;
                 };
+                last = i.op().mnem();
                 match insn::lift(&mut b, i) {
                     Ok(true) => break,
                     // FP exception checks resolve every few instructions (one
@@ -879,12 +978,52 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
                 }
             }
             tmp = b.next_tmp;
-            let _ = write!(text, "b_{start:x}:\n{}", b.body);
+            // Calls and returns don't carry flags (the arm64 procedure call
+            // standard leaves NZCV undefined across them, and compiled code
+            // never reads them on entry), so they don't propagate liveness;
+            // other indirect jumps (jump tables) might, so they're assumed to.
+            let (succs, unknown) = match last {
+                "bl" | "blr" | "blraa" | "blrab" | "ret" | "retaa" | "retab" => (Vec::new(), false),
+                _ => (std::mem::take(&mut b.succs), b.indirect),
+            };
+            facts.insert(start, FlagFacts { read_first: b.flags_read_first, set: b.flags_set, succs, unknown });
+            bodies.push((start, std::mem::take(&mut b.body)));
             strings.append(&mut b.strings);
             calls.append(&mut b.calls);
         }
+        lifted1.push((region, leaders, Lifted1 { bodies, strings, calls }));
+    }
+
+    let live_out = flags_live_out(&facts);
+
+    // Assemble each region's function: entered at any of its blocks (the
+    // dispatcher and other regions pass the block's address), then branching
+    // within. Blocks whose flags no successor reads drop their flag stores.
+    let mut lifted = Vec::new();
+    for (region, leaders, l) in lifted1 {
+        let mut text = format!("define void @R_{region:x}(i64 %pc) {{\nentry:\n  switch i64 %pc, label %bad [\n");
+        for &a in leaders {
+            let _ = writeln!(text, "    i64 {}, label %b_{a:x}", a as i64);
+        }
+        text.push_str("  ]\n");
+        for (start, body) in &l.bodies {
+            let _ = writeln!(text, "b_{start:x}:");
+            let keep = live_out.contains(start);
+            let mut in_flags = false;
+            for line in body.lines() {
+                match line.trim() {
+                    ";FLAGS" => in_flags = true,
+                    ";ENDFLAGS" => in_flags = false,
+                    _ if in_flags && !keep => {}
+                    _ => {
+                        text.push_str(line);
+                        text.push('\n');
+                    }
+                }
+            }
+        }
         text.push_str("bad:\n  call void @__wasm_env_bad_target(i64 %pc)\n  unreachable\n}\n\n");
-        lifted.push(LiftedRegion { start: region, text, strings, calls });
+        lifted.push(LiftedRegion { start: region, text, strings: l.strings, calls: l.calls });
     }
 
     let chunks = build_chunks(&lifted);
@@ -918,6 +1057,7 @@ fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
          @V = external global [32 x i128]\n\
          @TP = external global i64\n\
          @FPSR = external global i32\n\
+         @__wasm_env_dispatch_cache = external global [4096 x {{ i64, ptr }}]\n\
          declare void @dispatch(i64)\n\
          declare void @__wasm_env_svc()\n\
          declare i64 @__wasm_env_svc_at(i64)\n\

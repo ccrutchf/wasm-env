@@ -171,11 +171,15 @@ uint32_t __wasm_env_crc32(uint32_t crc, uint64_t data, uint32_t bytes, uint32_t 
 #define REGION_SHIFT 12
 // A direct-mapped cache of region lookups, tagged with region number + 1 so
 // the zeroed initial entries match nothing. Processes are single-threaded.
+// The lifted code probes it inline at every indirect branch (see
+// Block::jump_to) and calls `dispatch` only on a miss; the layout and hash
+// must match. With WASM_ENV_DEBUG=1 nothing is cached, so every indirect
+// branch comes through `dispatch` and is recorded for error reports.
 #define DISPATCH_CACHE 4096
-static struct {
+struct dispatch_entry {
 	uint64_t tag;
 	block_fn fn;
-} dispatch_cache[DISPATCH_CACHE];
+} __wasm_env_dispatch_cache[DISPATCH_CACHE];
 
 // Find `pc`'s region function and tail-call it (a WebAssembly return_call,
 // so the host stack doesn't grow): from the cache, else by binary search of
@@ -185,9 +189,9 @@ void dispatch(long pc)
 	uint64_t target = (uint64_t)pc;
 	wasm_env_recent[wasm_env_recent_count++ % RECENT] = target;
 	uint64_t region = target >> REGION_SHIFT;
-	uint64_t slot = (region ^ (region >> 12)) % DISPATCH_CACHE;
-	if (dispatch_cache[slot].tag == region + 1) {
-		block_fn f = dispatch_cache[slot].fn;
+	struct dispatch_entry *e = &__wasm_env_dispatch_cache[(region ^ (region >> 12)) % DISPATCH_CACHE];
+	if (e->tag == region + 1) {
+		block_fn f = e->fn;
 		__attribute__((musttail)) return f(pc); // the region function enters at pc
 	}
 	uint64_t start = region << REGION_SHIFT;
@@ -197,8 +201,10 @@ void dispatch(long pc)
 		uint64_t a = dispatch_addrs[mid];
 		if (a == start) {
 			block_fn f = (block_fn)dispatch_fns[mid];
-			dispatch_cache[slot].tag = region + 1;
-			dispatch_cache[slot].fn = f;
+			if (!debug) {
+				e->tag = region + 1;
+				e->fn = f;
+			}
 			__attribute__((musttail)) return f(pc);
 		}
 		if (a < start)
