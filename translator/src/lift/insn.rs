@@ -606,7 +606,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let one = format!("<{lanes} x i{elem}>");
             let p = b.val(format!("inttoptr i64 {addr} to ptr"));
             if m.starts_with("ld") {
-                let v = b.val(format!("load {all}, ptr {p}, align 1"));
+                let v = b.val(format!("load {all}, ptr {p}, align 1{}", super::MEM));
                 let values: Vec<String> = (0..n)
                     .map(|r| {
                         let mask: Vec<String> = (0..lanes).map(|k| format!("i32 {}", k * n + r)).collect();
@@ -627,7 +627,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                         acc = b.val(format!("insertelement {all} {acc}, i{elem} {lane}, i32 {}", k * n + r as u32));
                     }
                 }
-                b.line(format!("store {all} {acc}, ptr {p}, align 1"));
+                b.line(format!("store {all} {acc}, ptr {p}, align 1{}", super::MEM));
             }
         }
         "ld1" | "st1" | "ld1r" => {

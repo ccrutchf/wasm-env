@@ -214,7 +214,7 @@ impl<'a> Block<'a> {
             return v.clone();
         }
         let p = self.val(format!("getelementptr [32 x i64], ptr @R, i64 0, i64 {i}"));
-        let v = self.val(format!("load i64, ptr {p}"));
+        let v = self.val(format!("load i64, ptr {p}{REG}"));
         self.gpr[i] = Some(v.clone());
         v
     }
@@ -229,7 +229,7 @@ impl<'a> Block<'a> {
             return v.clone();
         }
         let p = self.val(format!("getelementptr [4 x i8], ptr @F, i64 0, i64 {f}"));
-        let b = self.val(format!("load i8, ptr {p}"));
+        let b = self.val(format!("load i8, ptr {p}{REG}"));
         let v = self.val(format!("trunc i8 {b} to i1"));
         self.flags[f] = Some(v.clone());
         v
@@ -248,7 +248,7 @@ impl<'a> Block<'a> {
             return v.clone();
         }
         let p = self.val(format!("getelementptr [32 x i128], ptr @V, i64 0, i64 {i}"));
-        let v = self.val(format!("load i128, ptr {p}, align 16"));
+        let v = self.val(format!("load i128, ptr {p}, align 16{REG}"));
         self.vec[i] = Some(v.clone());
         v
     }
@@ -264,13 +264,13 @@ impl<'a> Block<'a> {
             if self.gpr_dirty[i] {
                 let v = self.gpr[i].clone().unwrap();
                 let p = self.val(format!("getelementptr [32 x i64], ptr @R, i64 0, i64 {i}"));
-                self.line(format!("store i64 {v}, ptr {p}"));
+                self.line(format!("store i64 {v}, ptr {p}{REG}"));
                 self.gpr_dirty[i] = false;
             }
             if self.vec_dirty[i] {
                 let v = self.vec[i].clone().unwrap();
                 let p = self.val(format!("getelementptr [32 x i128], ptr @V, i64 0, i64 {i}"));
-                self.line(format!("store i128 {v}, ptr {p}, align 16"));
+                self.line(format!("store i128 {v}, ptr {p}, align 16{REG}"));
                 self.vec_dirty[i] = false;
             }
         }
@@ -279,7 +279,7 @@ impl<'a> Block<'a> {
                 let v = self.flags[f].clone().unwrap();
                 let b = self.val(format!("zext i1 {v} to i8"));
                 let p = self.val(format!("getelementptr [4 x i8], ptr @F, i64 0, i64 {f}"));
-                self.line(format!("store i8 {b}, ptr {p}"));
+                self.line(format!("store i8 {b}, ptr {p}{REG}"));
                 self.flags_dirty[f] = false;
             }
         }
@@ -710,12 +710,12 @@ impl<'a> Block<'a> {
 
     pub fn load(&mut self, addr: &str, bits: u32) -> String {
         let p = self.val(format!("inttoptr i64 {addr} to ptr"));
-        self.val(format!("load i{bits}, ptr {p}, align 1"))
+        self.val(format!("load i{bits}, ptr {p}, align 1{MEM}"))
     }
 
     pub fn store(&mut self, addr: &str, v: &str, bits: u32) {
         let p = self.val(format!("inttoptr i64 {addr} to ptr"));
-        self.line(format!("store i{bits} {v}, ptr {p}, align 1"));
+        self.line(format!("store i{bits} {v}, ptr {p}, align 1{MEM}"));
     }
 
     // --- Control flow ------------------------------------------------------------
@@ -894,6 +894,22 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
 
 /// Assembles the code modules: region functions grouped into chunks, each
 /// with the declarations it needs.
+/// Type-based alias information for every module: guest registers (the
+/// `@R`, `@V`, `@F` globals) and guest memory are different types, so LLVM
+/// knows a guest load or store never touches a register. Without it every
+/// store through a guest pointer might change any register, and registers
+/// must be reloaded; with it, LLVM keeps them in wasm locals across a
+/// region's blocks and out of its loops. (Sound: guest memory lies below the
+/// support code's globals, see link.rs.)
+const TBAA: &str = "!900 = !{!\"wasm-env\"}\n\
+                    !901 = !{!\"guest register\", !900, i64 0}\n\
+                    !902 = !{!901, !901, i64 0}\n\
+                    !903 = !{!\"guest memory\", !900, i64 0}\n\
+                    !904 = !{!903, !903, i64 0}\n";
+/// Access tags (see TBAA).
+pub const REG: &str = ", !tbaa !902";
+pub const MEM: &str = ", !tbaa !904";
+
 fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
     let preamble = format!(
         "target triple = \"wasm64-unknown-unknown\"\n\
@@ -905,10 +921,12 @@ fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
          declare void @dispatch(i64)\n\
          declare void @__wasm_env_svc()\n\
          declare i64 @__wasm_env_svc_at(i64)\n\
-         declare i32 @__wasm_env_fp_flags(double, double, double, double, i32)\n\
+         declare i32 @__wasm_env_fp_flags(double, double, double, double, i32) memory(none)\n\
          declare void @__wasm_env_fatal(ptr, i64)\n\
          declare void @__wasm_env_bad_target(i64)\n\
-         declare i32 @__wasm_env_crc32(i32, i64, i32, i32)\n{}",
+         declare i32 @__wasm_env_crc32(i32, i64, i32, i32) memory(none)\n\
+         {}{}",
+        TBAA,
         intrinsics()
     );
     let mut groups: BTreeMap<u64, Vec<&LiftedRegion>> = BTreeMap::new();
