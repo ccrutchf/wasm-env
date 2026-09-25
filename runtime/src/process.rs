@@ -69,8 +69,9 @@ pub struct Process {
     pub pid: i32,
     pub memory: Option<Memory>,
     pub space: AddressSpace,
-    /// The program break. It never moves (docs/abi.md, "Memory").
+    /// The program break, and where it started (docs/abi.md, "Memory").
     pub brk: u64,
+    pub brk_start: u64,
     pub fds: FdTable,
     pub fs: Fs,
     pub umask: u32,
@@ -126,6 +127,11 @@ pub fn signal_effect(sig: i32, handler: u64) -> Option<Termination> {
     }
 }
 
+/// `WASM_ENV_DEADLINE`, in seconds, if set (see engine()).
+fn deadline() -> Option<f64> {
+    std::env::var("WASM_ENV_DEADLINE").ok()?.parse().ok()
+}
+
 /// The engine for wasm-env programs: masked memory64 (see PLAN.md).
 pub fn engine() -> Result<Engine> {
     // Our patched compiler reads the mask width from the environment.
@@ -140,6 +146,12 @@ pub fn engine() -> Result<Engine> {
         .memory_reservation(1 << MASK_BITS)
         .memory_may_move(false)
         .memory_guard_size(64 << 20);
+    // Debugging aid: WASM_ENV_DEADLINE=SECONDS stops programs still running
+    // after that long, with a trap whose backtrace names the code running
+    // (for a translated program, the block). Off by default: it costs checks.
+    if deadline().is_some() {
+        config.epoch_interruption(true);
+    }
     if let Some(dir) = cache_dir() {
         let mut cache = wasmtime::CacheConfig::new();
         cache.with_directory(dir);
@@ -248,6 +260,7 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
         memory: None,
         space: AddressSpace::new(0),
         brk: 0,
+        brk_start: 0,
         fds: inherit.fds,
         fs,
         umask: inherit.umask,
@@ -259,6 +272,14 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
         module: image.host.clone(),
     };
     let mut store = Store::new(&kernel.engine, process);
+    if let Some(seconds) = deadline() {
+        store.set_epoch_deadline(1);
+        let engine = kernel.engine.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+            engine.increment_epoch();
+        });
+    }
     match start(&mut store, &module, &image) {
         Ok(()) => Outcome::Done(Termination::Exit(0)),
         Err(e) => match store.data_mut().pending.take() {
@@ -301,8 +322,12 @@ fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Resu
     let stack_pointer = instance.get_global(&mut *store, "__stack_pointer").unwrap();
     let sp = global_i64(stack_pointer.get(&mut *store))?;
 
-    let space = AddressSpace::new(heap_base);
-    store.data_mut().brk = space.start;
+    // The program break starts at the heap base and may grow by up to
+    // mem::BRK_MAX; mmap allocations start above that (docs/abi.md, "Memory").
+    let brk = mem::page_align(heap_base);
+    let space = AddressSpace::new(brk + mem::BRK_MAX);
+    store.data_mut().brk = brk;
+    store.data_mut().brk_start = brk;
     store.data_mut().space = space;
     store.data_mut().memory = Some(memory);
 
@@ -310,7 +335,35 @@ fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Resu
     stack_pointer.set(&mut *store, Val::I64(sp as i64))?;
 
     let start = instance.get_typed_func::<i64, ()>(&mut *store, "_start")?;
-    Ok(start.call(&mut *store, sp as i64)?)
+    let result = start.call(&mut *store, sp as i64);
+    if result.is_err() {
+        recent_blocks(store, &instance, memory);
+    }
+    Ok(result?)
+}
+
+/// For a translated program that stopped with a trap (not an exit): prints
+/// the guest blocks it ran last, which the support code records in a ring
+/// buffer (support/runtime.c), when it exports one.
+fn recent_blocks(store: &mut Store<Process>, instance: &wasmtime::Instance, memory: Memory) {
+    if store.data().pending.is_some() {
+        return; // exit or exec, not a fault
+    }
+    let (Some(buf), Some(count)) =
+        (instance.get_global(&mut *store, "wasm_env_recent"), instance.get_global(&mut *store, "wasm_env_recent_count"))
+    else {
+        return;
+    };
+    let (Ok(buf), Ok(count)) = (global_i64(buf.get(&mut *store)), global_i64(count.get(&mut *store))) else { return };
+    let data = memory.data(&*store);
+    let word = |a: u64| data.get(a as usize..a as usize + 8).map(|w| u64::from_le_bytes(w.try_into().unwrap()));
+    let Some(n) = word(count) else { return };
+    eprintln!("wasm-env: the translated program's most recent blocks, oldest first:");
+    for k in n.saturating_sub(16)..n {
+        if let Some(a) = word(buf + 8 * (k % 64)) {
+            eprintln!("  {a:#x}");
+        }
+    }
 }
 
 fn global_i64(v: Val) -> Result<u64> {

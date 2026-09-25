@@ -77,6 +77,16 @@ pub fn discover(image: &Image) -> Program {
     roots.extend(image.functions.iter().map(|f| f.0));
     roots.extend(&image.roots);
 
+    // Branch Target Identification landing pads (bti; paciasp/pacibsp at
+    // function entries act as one): in binaries built with branch
+    // protection, as Ubuntu's are, every legal indirect-branch target has
+    // one, so they name the targets of jump tables and computed gotos.
+    for (&a, i) in &insns {
+        if matches!(i.op().mnem(), "bti" | "paciasp" | "pacibsp") {
+            roots.insert(a);
+        }
+    }
+
     // Code addresses built in registers: ADR, or ADRP followed by ADD.
     let mut prev_adrp: BTreeMap<u32, u64> = BTreeMap::new();
     for i in insns.values() {
@@ -106,6 +116,7 @@ pub fn discover(image: &Image) -> Program {
     }
     roots.retain(|&a| in_code(a));
 
+    let code = Code::new(&insns);
     // Follow control flow from the roots.
     let mut leaders = roots.clone();
     let mut work: Vec<u64> = roots.into_iter().collect();
@@ -144,7 +155,7 @@ pub fn discover(image: &Image) -> Program {
                         }
                         window.insert(0, prev);
                     }
-                    let targets = jump_table(image, &insns, &window);
+                    let targets = jump_table(image, &code, &window);
                     // WASM_ENV_DEBUG_BR=ADDR (hex) reports what was found for that br.
                     if std::env::var("WASM_ENV_DEBUG_BR").ok().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()) == Some(pc) {
                         eprintln!("br at {pc:#x}: window from {:#x} ({} insns), {} targets: {:x?}", window[0].0, window.len(), targets.len(), targets);
@@ -168,6 +179,25 @@ pub fn discover(image: &Image) -> Program {
     Program { insns, leaders }
 }
 
+/// The decoded code, with every direct branch indexed by its target, for
+/// tracing values back through the paths that reach an instruction.
+struct Code<'a> {
+    insns: &'a BTreeMap<u64, Instruction>,
+    incoming: std::collections::HashMap<u64, Vec<u64>>,
+}
+
+impl<'a> Code<'a> {
+    fn new(insns: &'a BTreeMap<u64, Instruction>) -> Self {
+        let mut incoming: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+        for (&a, i) in insns {
+            if let Some(t) = direct_target(i) {
+                incoming.entry(t).or_default().push(a);
+            }
+        }
+        Code { insns, incoming }
+    }
+}
+
 /// A canonical general-register id (x and w of the same number share one),
 /// with sp=31, fp=29, lr=30.
 fn gpr_id(op: &Operand) -> Option<u32> {
@@ -182,6 +212,23 @@ fn gpr_id(op: &Operand) -> Option<u32> {
     }
 }
 
+/// A recognized jump table.
+struct Table {
+    /// The address entries are relative to.
+    label: u64,
+    /// The table itself, its entry width in bytes, and whether entries load
+    /// sign-extended.
+    base: u64,
+    width: u32,
+    signed: bool,
+    /// The dispatching add's extension (how an entry is interpreted).
+    ext: bad64::Shift,
+    /// The index register (for finding the bounds check).
+    index: Option<u32>,
+    /// Bytes per entry unit: 4 for instruction counts, 1 for byte offsets.
+    scale: i64,
+}
+
 /// Recognizes the GCC/LLVM arm64 switch idiom ending in `br` and returns
 /// the case target addresses by reading the offset table:
 ///
@@ -193,7 +240,8 @@ fn gpr_id(op: &Operand) -> Option<u32> {
 ///
 /// Register absolute values (from adr/adrp/add-imm/mov) are tracked across
 /// the block. Table entries are read until one points outside the code.
-fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, &Instruction)]) -> Vec<u64> {
+fn jump_table(image: &Image, code: &Code, block: &[(u64, &Instruction)]) -> Vec<u64> {
+    let insns = code.insns;
     use bad64::{Operand::*, Shift};
     let br = block.last().unwrap().1;
     let Some(target_reg) = br.operands().first().and_then(gpr_id) else { return vec![] };
@@ -203,8 +251,7 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
     // The last load into each register: (resolved table base, width, signed,
     // index register).
     let mut load: std::collections::HashMap<u32, (u64, u32, bool, Option<u32>)> = std::collections::HashMap::new();
-    // (label, table base, entry width, load signed, the add's extension, index register)
-    let mut table: Option<(u64, u64, u32, bool, Shift, Option<u32>)> = None;
+    let mut table: Option<Table> = None;
 
     for &(addr, i) in block {
         let ops = i.operands();
@@ -233,12 +280,21 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
                     (ops.get(1).and_then(gpr_id), ops.get(2))
                 {
                     let scaled = matches!(shift, Shift::SXTH(2) | Shift::SXTB(2) | Shift::SXTW(2) | Shift::UXTH(2) | Shift::UXTW(2) | Shift::UXTB(2) | Shift::LSL(2));
-                    let label = val.get(&base_reg).copied().or_else(|| register_value_before(insns, addr, base_reg, 0));
+                    let label = val.get(&base_reg).copied().or_else(|| register_value_before(code, addr, base_reg, 0));
                     if let (Some(label), Some(idx), true) = (label, gpr_id(&Reg { reg: *idx, arrspec: None }), scaled)
                         && let Some(&(base, width, signed, index)) = load.get(&idx)
                     {
-                        table = Some((label, base, width, signed, *shift, index));
+                        table = Some(Table { label, base, width, signed, ext: *shift, index, scale: 4 });
                     }
+                }
+                // add xD, xB, xR: GCC's computed goto (labels as values), where
+                // xR is a 32-bit byte offset from a table (glibc's printf).
+                if let (Some(base_reg), Some(r @ Reg { .. })) = (ops.get(1).and_then(gpr_id), ops.get(2))
+                    && let Some(idx) = gpr_id(r)
+                    && let Some(&(base, 4, signed, index)) = load.get(&idx)
+                    && let Some(label) = val.get(&base_reg).copied().or_else(|| register_value_before(code, addr, base_reg, 0))
+                {
+                    table = Some(Table { label, base, width: 4, signed, ext: Shift::LSL(0), index, scale: 1 });
                 }
             }
             "ldrb" | "ldrsb" | "ldrh" | "ldrsh" | "ldrsw" => {
@@ -251,7 +307,7 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
                 };
                 // The table base, from this window or, if it was set up earlier
                 // (before a loop, say), the nearest preceding definition.
-                let base = tab.and_then(|t| val.get(&t).copied().or_else(|| register_value_before(insns, addr, t, 0)));
+                let base = tab.and_then(|t| val.get(&t).copied().or_else(|| register_value_before(code, addr, t, 0)));
                 if let (Some(d), Some(base)) = (d, base) {
                     let width = if i.op().mnem().contains('h') { 2 } else if i.op().mnem().ends_with('w') { 4 } else { 1 };
                     let signed = i.op().mnem().contains('s');
@@ -268,7 +324,7 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
                     _ => None,
                 };
                 match (d, slot) {
-                    (Some(d), Some((b @ (29 | 31), off))) => match stack_slot_value(insns, addr, b, off) {
+                    (Some(d), Some((b @ (29 | 31), off))) => match stack_slot_value(code, addr, b, off) {
                         Some(v) => {
                             val.insert(d, v);
                         }
@@ -298,7 +354,7 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
         }
     }
 
-    let Some((label, base, width, signed, ext, index)) = table else { return vec![] };
+    let Some(Table { label, base, width, signed, ext, index, scale }) = table else { return vec![] };
     let sx = |v: u64, bits: u32| ((v << (64 - bits)) as i64) >> (64 - bits);
     // The table's length, from the bounds check before it (`cmp wI, #max;
     // b.hi default`), when it's just before this block.
@@ -321,7 +377,7 @@ fn jump_table(image: &Image, insns: &BTreeMap<u64, Instruction>, block: &[(u64, 
             Shift::UXTW(_) => (v & 0xffff_ffff) as i64,
             _ => v as i64,
         };
-        let target = label.wrapping_add((entry * 4) as u64);
+        let target = label.wrapping_add((entry * scale) as u64);
         if !image.is_code(target) {
             // Without a known length, the first non-code entry ends the table.
             if count.is_none() {
@@ -374,7 +430,8 @@ fn table_length(insns: &BTreeMap<u64, Instruction>, window: &[(u64, &Instruction
 /// finds the nearest preceding `str xS, [base, #off]` and resolves xS. A
 /// linear, bounded look back: enough for the table addresses compilers hoist
 /// out of loops and spill.
-fn stack_slot_value(insns: &BTreeMap<u64, Instruction>, from: u64, base: u32, off: i64) -> Option<u64> {
+fn stack_slot_value(code: &Code, from: u64, base: u32, off: i64) -> Option<u64> {
+    let insns = code.insns;
     use bad64::Operand::*;
     let mut pc = from;
     for _ in 0..4096 {
@@ -386,7 +443,7 @@ fn stack_slot_value(insns: &BTreeMap<u64, Instruction>, from: u64, base: u32, of
             && gpr_id(&Reg { reg: *r, arrspec: None }) == Some(base)
             && imm_u64(offset) as i64 == off
         {
-            return register_value_before(insns, pc, gpr_id(&ops[0])?, 0);
+            return register_value_before(code, pc, gpr_id(&ops[0])?, 0);
         }
     }
     None
@@ -394,24 +451,27 @@ fn stack_slot_value(insns: &BTreeMap<u64, Instruction>, from: u64, base: u32, of
 
 /// The constant address register `r` holds just before `at`, if it was built
 /// by adr, adrp, or adrp + add in the preceding instructions.
-fn register_value_before(insns: &BTreeMap<u64, Instruction>, at: u64, r: u32, depth: u32) -> Option<u64> {
+fn register_value_before(code: &Code, at: u64, r: u32, depth: u32) -> Option<u64> {
     use bad64::Operand::*;
     if depth > 4 {
         return None;
     }
+    let insns = code.insns;
     let mut pc = at;
     for _ in 0..1024 {
+        // At a merge point, try the paths that branch here first: the code
+        // just above may be unrelated (another case of a switch, say).
+        if pc != at
+            && let Some(sources) = code.incoming.get(&pc)
+            && let Some(v) = sources.iter().take(8).find_map(|&s| register_value_before(code, s, r, depth + 1))
+        {
+            return Some(v);
+        }
         let prev = pc.checked_sub(4)?;
         let i = insns.get(&prev)?;
         if is_terminal(i) {
-            // Code at pc is only entered by branches (the instruction before
-            // doesn't fall through): continue from each branch that targets
-            // it, rather than from unrelated code that happens to precede it.
-            let start = pc;
-            return insns
-                .range(start.saturating_sub(0x10000)..start + 0x10000)
-                .filter(|(_, b)| direct_target(b) == Some(start))
-                .find_map(|(&a, _)| register_value_before(insns, a, r, depth + 1));
+            // Only entered by branches, which were tried above.
+            return None;
         }
         pc = prev;
         let ops = i.operands();
@@ -422,7 +482,7 @@ fn register_value_before(insns: &BTreeMap<u64, Instruction>, at: u64, r: u32, de
         return match (m, ops.get(1), ops.get(2)) {
             ("adr" | "adrp", Some(Label(imm)), _) => Some(imm_u64(imm)),
             ("add", Some(src), Some(Imm32 { imm, .. } | Imm64 { imm, .. })) => {
-                Some(register_value_before(insns, pc, gpr_id(src)?, depth + 1)?.wrapping_add(imm_u64(imm)))
+                Some(register_value_before(code, pc, gpr_id(src)?, depth + 1)?.wrapping_add(imm_u64(imm)))
             }
             _ => None,
         };

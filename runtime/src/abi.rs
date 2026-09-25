@@ -46,6 +46,7 @@ pub mod nr {
     pub const WASM_ENV_MISSED_TARGET: i64 = 1 << 32;
     pub const SET_TID_ADDRESS: i64 = 96;
     pub const SET_ROBUST_LIST: i64 = 99;
+    pub const FUTEX: i64 = 98;
     pub const NANOSLEEP: i64 = 101;
     pub const CLOCK_NANOSLEEP: i64 = 115;
     pub const CLOCK_GETTIME: i64 = 113;
@@ -123,6 +124,7 @@ pub mod errno {
     pub const EBADF: i64 = 9;
     pub const ECHILD: i64 = 10;
     pub const EAGAIN: i64 = 11;
+    pub const ETIMEDOUT: i64 = 110;
     pub const ENOMEM: i64 = 12;
     pub const EACCES: i64 = 13;
     pub const EFAULT: i64 = 14;

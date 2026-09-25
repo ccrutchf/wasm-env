@@ -59,6 +59,10 @@ pub fn iovecs(data: &[u8], addr: u64, count: u64) -> SysResult<Vec<(u64, u64)>> 
         .collect()
 }
 
+/// How far the program break may grow (the region between the heap base and
+/// the mmap area). Beyond it brk fails, and allocators fall back to mmap.
+pub const BRK_MAX: u64 = 64 << 20;
+
 pub fn page_align(n: u64) -> u64 {
     n.div_ceil(PAGE_SIZE) * PAGE_SIZE
 }

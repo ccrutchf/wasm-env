@@ -542,7 +542,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         "ld1" | "st1" if reg_list(&ops[0])?.0.len() > 1 => {
             // Several consecutive registers: register r at addr + r * size.
             let (regs, _, total) = reg_list(&ops[0])?;
-            let addr = b.address(&ops[1])?;
+            let addr = structure_address(b, i)?;
             for (r, &n) in regs.iter().enumerate() {
                 let a = b.val(format!("add i64 {addr}, {}", r as u32 * total / 8));
                 if m == "ld1" {
@@ -558,7 +558,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             // Interleaved structures: element k of register r is at
             // addr + (k * N + r) * element size.
             let (regs, elem, total) = reg_list(&ops[0])?;
-            let addr = b.address(&ops[1])?;
+            let addr = structure_address(b, i)?;
             let n = regs.len() as u32;
             let at = |b: &mut Block, k: u32, r: u32| b.val(format!("add i64 {addr}, {}", (k * n + r) * elem / 8));
             if m.starts_with("ld") {
@@ -588,7 +588,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         "ld1" | "st1" | "ld1r" => {
             let list = &ops[0];
             let (regs, elem, total) = reg_list(list)?;
-            let addr = b.address(&ops[1])?;
+            let addr = structure_address(b, i)?;
             if regs.len() != 1 {
                 bail!("{m} with {} registers", regs.len());
             }
@@ -1363,6 +1363,20 @@ fn read_fp(b: &mut Block, op: &Operand, bits: u32) -> Result<String> {
     Ok(b.val(format!("bitcast i{bits} {iv} to {ty}")))
 }
 
+/// The address of a SIMD structure load/store (ld1-4, st1-4, ld1r). bad64
+/// decodes the post-index immediate form (`[x2], #16`) as the base register
+/// plus a separate immediate operand, so the writeback happens here.
+fn structure_address(b: &mut Block, i: &Instruction) -> Result<String> {
+    let ops = i.operands();
+    let addr = b.address(&ops[1])?;
+    if let (Operand::MemReg(r), Some(Operand::Imm32 { .. } | Operand::Imm64 { .. })) = (&ops[1], ops.get(2)) {
+        let step = b.imm_op(i, 2)?;
+        let next = b.val(format!("add i64 {addr}, {}", step as i64));
+        b.write(reg(*r)?.0, next, 64)?;
+    }
+    Ok(addr)
+}
+
 /// Decodes an LSE atomic mnemonic: ldOP/stOP (OP one of add, clr, eor, set,
 /// smax, smin, umax, umin), swp or cas, each with optional acquire/release
 /// ordering (a, l, al) and size (b, h). Returns (operation, explicit width).
@@ -1674,16 +1688,34 @@ fn vector_shift(b: &mut Block, i: &Instruction, m: &str) -> Result<()> {
                 let amt = b.imm_op(i, 2)?;
                 b.val(format!("lshr i{elem} {xk}, {}", konst(amt, elem)))
             }
-            // Register shift: the low byte of each lane is a signed count.
+            // Register shift: the low byte of each lane is a signed count;
+            // negative counts shift right (logically for ushl, arithmetically
+            // for sshl), and counts of the element width or more give 0 (or,
+            // shifting sshl right, the sign in every bit).
             "sshl" | "ushl" => {
                 let y = read_v128(b, &i.operands()[2])?;
                 let yk = vlane(b, &y, elem, k);
-                let shift = b.val(format!("and i{elem} {yk}, {}", elem - 1));
-                if m == "ushl" {
-                    b.val(format!("shl i{elem} {xk}, {shift}"))
+                let byte = if elem == 8 { yk } else { b.val(format!("trunc i{elem} {yk} to i8")) };
+                let s = b.val(format!("sext i8 {byte} to i32"));
+                let neg = b.val(format!("icmp slt i32 {s}, 0"));
+                let minus = b.val(format!("sub i32 0, {s}"));
+                let mag = b.val(format!("select i1 {neg}, i32 {minus}, i32 {s}"));
+                let big = b.val(format!("icmp uge i32 {mag}, {elem}"));
+                let clamped = b.val(format!("select i1 {big}, i32 {}, i32 {mag}", elem - 1));
+                let amount = match elem {
+                    32 => clamped,
+                    64 => b.val(format!("zext i32 {clamped} to i64")),
+                    _ => b.val(format!("trunc i32 {clamped} to i{elem}")),
+                };
+                let left = b.val(format!("shl i{elem} {xk}, {amount}"));
+                let left = b.val(format!("select i1 {big}, i{elem} 0, i{elem} {left}"));
+                let right = if m == "ushl" {
+                    let r = b.val(format!("lshr i{elem} {xk}, {amount}"));
+                    b.val(format!("select i1 {big}, i{elem} 0, i{elem} {r}"))
                 } else {
-                    b.val(format!("ashr i{elem} {xk}, {shift}"))
-                }
+                    b.val(format!("ashr i{elem} {xk}, {amount}")) // clamped: sign fill
+                };
+                b.val(format!("select i1 {neg}, i{elem} {right}, i{elem} {left}"))
             }
             _ => bail!("vector shift {m}"),
         };

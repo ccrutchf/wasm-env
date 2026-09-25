@@ -30,6 +30,7 @@ pub fn syscall(
     let result = match n {
         nr::MMAP => mmap(&mut caller, &args),
         nr::MREMAP => mremap(&mut caller, &args),
+        nr::BRK => brk(&mut caller, args[0] as u64),
         _ => {
             let memory = caller.data().memory.expect("memory is set before _start");
             let (data, process) = memory.data_and_store_mut(&mut caller);
@@ -115,6 +116,29 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
         file.seek(SeekFrom::Start(pos)).map_err(|e| fs::errno(&e))?;
     }
     Ok(addr as i64)
+}
+
+/// brk: moves the break within [brk_start, brk_start + BRK_MAX), growing
+/// linear memory to cover it and zeroing what it newly exposes. Like Linux,
+/// it returns the new break, or the old one when the request can't be met.
+fn brk(caller: &mut Caller<'_, Process>, want: u64) -> SysResult<i64> {
+    let (old, start) = (caller.data().brk, caller.data().brk_start);
+    if want < start || want > start + mem::BRK_MAX {
+        return Ok(old as i64);
+    }
+    let memory = caller.data().memory.unwrap();
+    let size = memory.data_size(&*caller) as u64;
+    if want > size {
+        let pages = (want - size).div_ceil(65536);
+        if memory.grow(&mut *caller, pages).is_err() {
+            return Ok(old as i64);
+        }
+    }
+    if want > old {
+        mem::slice_mut(memory.data_mut(&mut *caller), old, want - old)?.fill(0);
+    }
+    caller.data_mut().brk = want;
+    Ok(want as i64)
 }
 
 fn mremap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
@@ -435,6 +459,7 @@ impl Process {
                 Ok(0)
             }
             nr::NANOSLEEP => self.sleep(data, ua, ub),
+            nr::FUTEX => self.futex(data, ua, b, c as u32, d as u64),
             nr::CLOCK_NANOSLEEP => {
                 const TIMER_ABSTIME: i64 = 1;
                 if b & TIMER_ABSTIME != 0 {
@@ -452,7 +477,6 @@ impl Process {
                 mem::write(data, uc, &[1]).map(|_| 8)
             }
             nr::UMASK => Ok(std::mem::replace(&mut self.umask, (a & 0o777) as u32) as i64),
-            nr::BRK => Ok(self.brk as i64),
             nr::MUNMAP => {
                 let len = page_align(ub);
                 if self.space.contains(ua, len) {
@@ -560,6 +584,45 @@ impl Process {
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// futex for a single-threaded process: nothing else can change the word
+    /// or wake a waiter, so a wake finds nobody, and a wait on an unchanged
+    /// word sleeps out its timeout or returns as a spurious wakeup (EINTR,
+    /// which callers must handle).
+    fn futex(&self, data: &mut [u8], addr: u64, op: i64, val: u32, timeout: u64) -> SysResult<i64> {
+        const WAIT: i64 = 0;
+        const WAKE: i64 = 1;
+        const REQUEUE: i64 = 3;
+        const CMP_REQUEUE: i64 = 4;
+        const WAKE_OP: i64 = 5;
+        const WAIT_BITSET: i64 = 9;
+        const WAKE_BITSET: i64 = 10;
+        const CLOCK_REALTIME_FLAG: i64 = 256;
+        match op & 0x7f {
+            WAIT | WAIT_BITSET => {
+                let word = u32::from_le_bytes(mem::slice(data, addr, 4)?.try_into().unwrap());
+                if word != val {
+                    return Err(EAGAIN);
+                }
+                if timeout == 0 {
+                    return Err(EINTR);
+                }
+                let t = read_timespec(data, timeout)?;
+                // FUTEX_WAIT's timeout is relative; FUTEX_WAIT_BITSET's is a
+                // deadline on CLOCK_MONOTONIC, or CLOCK_REALTIME if flagged.
+                let wait = if op & 0x7f == WAIT {
+                    t
+                } else {
+                    let now = self.clock(if op & CLOCK_REALTIME_FLAG != 0 { 0 } else { 1 })?;
+                    t.saturating_sub(now)
+                };
+                self.sleep_for(wait).map_err(|(e, _)| e)?;
+                Err(ETIMEDOUT)
+            }
+            WAKE | WAKE_BITSET | REQUEUE | CMP_REQUEUE | WAKE_OP => Ok(0),
+            _ => Err(ENOSYS),
         }
     }
 

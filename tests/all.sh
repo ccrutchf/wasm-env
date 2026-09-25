@@ -27,4 +27,5 @@ step "M2: translation on exec (runtime integration)" tests/m2-exec.sh
 step "M3: dynamic linking (differential vs qemu)" tests/m3.sh
 step "Alpine arm64 userland (differential vs qemu)" tests/alpine.sh
 step "Python 3.14 from Alpine (differential vs qemu)" tests/python.sh
+step "Ubuntu 24.04 arm64, glibc (differential vs qemu)" tests/ubuntu.sh
 exit $status

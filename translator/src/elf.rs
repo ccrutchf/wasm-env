@@ -188,6 +188,14 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
                 _ => r.addend(),
             };
             relocs.push(Reloc { at: base + offset, r_type, sym, addend, discovery_only: false });
+            // Lazy binding: until first called, a PLT slot holds the address of
+            // the PLT header (link-time value, relocated by the dynamic linker).
+            if r_type == 1026
+                && let Some(off) = loads.iter().find(|&&(va, _, sz)| offset >= va && offset + 8 <= va + sz).map(|&(va, fo, _)| (fo + offset - va) as usize)
+                && let Some(w) = bytes.get(off..off + 8)
+            {
+                roots.push(base + u64::from_le_bytes(w.try_into().unwrap()));
+            }
         }
     }
     // RELR: a compact list of relative relocations (entries are an address,
@@ -234,6 +242,12 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
         .filter(|s| s.kind() == SymbolKind::Text && s.address() != 0)
         .map(|s| (base + s.address(), s.name().unwrap_or("?").to_string()))
         .collect();
+    // Every defined dynamic symbol is a possible entry (IFUNC symbols, whose
+    // resolvers the dynamic linker calls, aren't typed as functions);
+    // discovery keeps only those in code.
+    roots.extend(file.dynamic_symbols().filter(|s| !s.is_undefined() && s.address() != 0).map(|s| base + s.address()));
+    // IRELATIVE relocations name IFUNC resolvers by address.
+    roots.extend(relocs.iter().filter(|r| r.r_type == 1032).map(|r| base.wrapping_add(r.addend as u64)));
     functions.sort();
     functions.dedup_by_key(|f| f.0);
 
@@ -320,6 +334,14 @@ fn link(objects: Vec<Parsed>, interp: bool, libs: Vec<(String, u64, u64)>, names
                 _ if interp => continue,
                 other => bail!("unsupported relocation type {other}"),
             };
+            if interp && r.r_type == JUMP_SLOT {
+                // glibc binds lazily by default, initializing each slot as
+                // `*slot += load base` from the file's value (the PLT header),
+                // which isn't idempotent: leave the slot as in the file. The
+                // resolved function is still a root.
+                roots.push(value);
+                continue;
+            }
             write_word(&mut obj.segments, r.at, value)?;
         }
         roots.append(&mut obj.roots);

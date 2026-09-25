@@ -67,14 +67,14 @@ The program exits by calling `exit_group`. If `_start` returns, the runtime trea
 
 - The program's memory is **masked memory64** (see PLAN.md, "Masked addressing"): up to 2^38 bytes (256 GB). Addresses above that wrap; out-of-bounds addresses below it trap.
 - Static data and the C stack sit below `__heap_base`, laid out by the linker. The default stack is 8 MB, like Linux.
-- Above `__heap_base`, the runtime manages the address space for `mmap`, in 4 KB pages, growing the WebAssembly memory as needed. Anonymous mappings come back zero-filled. `munmap` returns pages for reuse.
-- `brk` never grows: it always returns the current break, which is how Linux reports failure. musl's allocator then uses `mmap`, which is its normal fallback.
+- Above the break's region, the runtime manages the address space for `mmap`, in 4 KB pages, growing the WebAssembly memory as needed. Anonymous mappings come back zero-filled. `munmap` returns pages for reuse.
+- The program break starts at `__heap_base` and `brk` moves it within a 64 MB region (zero-filling what it exposes); a request beyond that returns the current break, which is how Linux reports failure, and allocators fall back to `mmap`. The `mmap` region begins above the break's.
 - Page protections (`mprotect`) are accepted and ignored: WebAssembly can't enforce them inside linear memory. `PROT_EXEC` mappings are meaningless, since code can't be generated at runtime (see non-goals in PLAN.md).
 - File-backed `mmap` is copied in on `mmap` (and, for `MAP_SHARED` writable mappings, written back on `msync`/`munmap`). Version 0 supports read-only file mappings only.
 
 ## Threads and thread-local storage
 
-Version 0 is single-threaded. `clone` with `CLONE_THREAD` returns `-ENOSYS`, so `pthread_create` fails cleanly. (Separate processes do run concurrently; see "Processes".)
+Version 0 is single-threaded. `clone` with `CLONE_THREAD` returns `-ENOSYS`, so `pthread_create` fails cleanly. `futex` behaves as it does for a process with one thread: a wake finds no waiters, and a wait returns `-EAGAIN` if the word changed, otherwise sleeps out its timeout (`-ETIMEDOUT`) or returns `-EINTR` as a spurious wakeup. (Separate processes do run concurrently; see "Processes".)
 
 musl's thread pointer, which it uses for `errno` and its own bookkeeping, is an ordinary global variable in libc, set by `__set_thread_area`. There is no ELF TLS segment. C `_Thread_local` variables compile to ordinary globals, which is correct with one thread.
 

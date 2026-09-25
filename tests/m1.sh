@@ -26,6 +26,8 @@ for applet in $("$wasm_env" run --root "$rootfs" /bin/busybox --list); do
 	ln -sf busybox "$rootfs/bin/$applet"
 done
 $cc -O2 tests/c/spawn.c -o "$rootfs/bin/spawn-test"
+$cc -O2 tests/c/futex.c -o "$rootfs/bin/futex-test"
+$cc -O2 tests/c/brk.c -o "$rootfs/bin/brk-test"
 echo 'root:x:0:0:root:/root:/bin/sh' > "$rootfs/etc/passwd"
 printf 'b\na\nc\n' > "$rootfs/data/letters"
 cat > "$rootfs/bin/greet" <<'EOF'
@@ -92,6 +94,16 @@ check "C vfork" "vfork: child exit 42" "$(sed -n 4p <<<"$out")"
 check "C system" "system: 5" "$(sed -n 5p <<<"$out")"
 check "C popen" "popen: FROM POPEN" "$(sed -n 6p <<<"$out")"
 check "C kill" "kill: signaled=1 sig=15" "$(sed -n 8p <<<"$out")"
+
+# futex, single-threaded (glibc relies on it).
+check "futex" "wait on a changed word: EAGAIN
+wait with a timeout: ETIMEDOUT
+wait_bitset with a deadline: ETIMEDOUT
+deadline respected: 1
+wake: 0" "$(timeout 30 "$wasm_env" run --root "$rootfs" /bin/futex-test 2>&1)"
+
+# The program break (glibc's malloc uses it).
+check "brk" "$(printf "grew: 1\nzero-filled: 1\nwritable: 1\npast the limit: unchanged\nzeroed after regrowing: 1")" "$(timeout 30 "$wasm_env" run --root "$rootfs" /bin/brk-test 2>&1)"
 
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]

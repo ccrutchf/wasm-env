@@ -80,6 +80,25 @@ int main(void)
 	}
 	printf("ld1/st1 post-index reg: %d %ld\n", __builtin_memcmp(buf, out, 64) == 0, (long)(p - buf));
 
+	// Shift by register: the low byte of each lane is a signed count, and
+	// negative counts shift right (as vectorized byte extraction relies on).
+	int64x2_t cnt64 = { -8, 3 }, big64 = { -70, 70 };
+	int32x4_t cnt32 = { -1, -31, 5, -40 };
+	int8x16_t cnt8 = { -1, -7, -8, 0, 1, 7, 8, -128, 127, -3, 3, -9, 9, 2, -2, 0 };
+	OPAQUE(cnt64);
+	OPAQUE(cnt32);
+	OPAQUE(cnt8);
+	uint64x2_t w64 = { 0x8123456789abcdefull, 0xfedcba9876543210ull };
+	OPAQUE(w64);
+	P("ushl.2d", vshlq_u64(w64, cnt64));
+	P("sshl.2d", vshlq_s64(vreinterpretq_s64_u64(w64), cnt64));
+	P("ushl.2d big", vshlq_u64(w64, big64));
+	P("sshl.2d big", vshlq_s64(vreinterpretq_s64_u64(w64), big64));
+	P("ushl.4s", vshlq_u32(vreinterpretq_u32_u64(w64), cnt32));
+	P("sshl.4s", vshlq_s32(vreinterpretq_s32_u64(w64), cnt32));
+	P("ushl.16b", vshlq_u8(vreinterpretq_u8_u64(w64), cnt8));
+	P("sshl.16b", vshlq_s8(vreinterpretq_s8_u64(w64), cnt8));
+
 	uint64x2_t e1 = { 0x0123456789abcdefull, 0xfedcba9876543210ull }, e2 = { 0xffff0000ffff0000ull, 1 },
 		   e3 = { 42, 0x8000000000000000ull };
 	OPAQUE(e1);

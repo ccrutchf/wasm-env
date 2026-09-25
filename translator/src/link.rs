@@ -199,7 +199,9 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
     ld.args(["-m", "wasm64", "--no-entry", "-z", "stack-size=1048576"])
         .arg(format!("--global-base={}", global_base(image_end)))
         .args(["--export=__stack_pointer", "--export=__heap_base"])
-        .args(["--export=R", "--export=F", "--export=V", "--export=TP"]);
+        .args(["--export=R", "--export=F", "--export=V", "--export=TP"])
+        // For the runtime's report when a translated program faults.
+        .args(["--export=wasm_env_recent", "--export=wasm_env_recent_count"]);
     for (_, obj, _) in &units {
         ld.arg(obj);
     }

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Ubuntu 24.04 arm64 (glibc): the C fixtures built against Ubuntu's glibc
+# (clang with the Ubuntu root as its sysroot), Ubuntu's own coreutils, and
+# Ubuntu's python3.12, each run under wasm-env and compared with
+# qemu-aarch64. Fetches packages the first time (tests/ubuntu-fetch.sh) and
+# skips if that isn't possible.
+#
+#   nix develop -c tests/ubuntu.sh
+set -uo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+if ! tests/ubuntu-fetch.sh libc6-dev libgcc-13-dev python3.12-minimal >/dev/null 2>&1; then
+	echo "skipped: can't fetch Ubuntu packages (offline?)"
+	exit 0
+fi
+cargo build -q --release -p wasm-env -p wasm-env-translate --features wasm-env-translate/lift || exit 1
+export WASM_ENV_CACHE=$root/build/ubuntu-wasm-cache
+R=$root/build/ubuntu
+wasm_env=$root/target/release/wasm-env
+gcc_lib=$R/usr/lib/gcc/aarch64-linux-gnu/13
+cc=("$WASM_CC" --target=aarch64-linux-gnu --sysroot="$R" -fuse-ld=lld -B"$gcc_lib" -L"$gcc_lib" -lm
+	-Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1)
+mkdir -p "$R/opt/tests" "$R/etc/wasm-env"
+
+passed=0; failed=0
+compare() { # name, expected, actual
+	if [ "$2" = "$3" ]; then passed=$((passed+1)); else failed=$((failed+1)); echo "FAIL $1"; diff <(echo "$2") <(echo "$3") | head -8; fi
+}
+q() { (cd "$R" && timeout 120 env -i PATH=/usr/bin:/bin HOME=/root TERM=xterm qemu-aarch64 -L . -0 "$1" ".$1" "${@:2}" 2>&1 | od -c; echo "[${PIPESTATUS[0]}]"); }
+w() { timeout 900 "$wasm_env" run --root "$R" "$@" 2>&1 | od -c; echo "[${PIPESTATUS[0]}]"; }
+t() { compare "$*" "$(q "$@")" "$(w "$@")"; }
+
+# The C fixtures, against glibc.
+for f in c/hello.c arm64/control.c arm64/memory.c arm64/arith.c arm64/fp.c arm64/computedgoto.c arm64/simd3.c; do
+	name=$(basename "$f" .c)
+	flags=(-O2)
+	[ "$name" = simd3 ] && flags+=(-march=armv8.2-a+crc+sha3)
+	"${cc[@]}" "${flags[@]}" -o "$R/opt/tests/$name" "tests/$f" || { compare "$name: build" ok failed; continue; }
+	t "/opt/tests/$name" a "b c"
+done
+# Atomics (LSE) and dlopen through glibc's dynamic linker.
+"${cc[@]}" -O2 -march=armv8.1-a -o "$R/opt/tests/atomics" tests/arm64/atomics.c && t /opt/tests/atomics
+"${cc[@]}" -O2 -shared -fPIC -o "$R/usr/lib/libgreet.so" tests/arm64/libgreet.c
+"${cc[@]}" -O2 -shared -fPIC -o "$R/usr/lib/libplugin.so" tests/arm64/plugin.c -L"$R/usr/lib" -lgreet
+"${cc[@]}" -O2 -o "$R/opt/tests/greet" tests/arm64/greet.c -L"$R/usr/lib" -lgreet -ldl
+echo "greet /usr/lib/libplugin.so" > "$R/etc/wasm-env/dlopen"
+t /opt/tests/greet you
+
+# Ubuntu's own programs (paths inside the root only: qemu reads the host's
+# files for paths the root lacks).
+t /usr/bin/cat /etc/os-release
+t /usr/bin/sort -t: -k3 -n /etc/passwd
+t /usr/bin/sha256sum /etc/os-release
+t /usr/bin/printf "%08.3f|%x|%-5s|%e\n" 3.14159 255 ab 12345.678
+t /usr/bin/mawk 'BEGIN { for (i = 0; i < 20000; i++) a[i] = i "x"; n = 0; for (k in a) n += length(a[k]); print n }'
+t /usr/bin/find /usr/share/doc -name copyright
+t /usr/bin/python3.12 -c 'import sys; print(1 + 1, sys.version_info[:2])'
+
+echo "$passed passed, $failed failed"
+[ "$failed" = 0 ]

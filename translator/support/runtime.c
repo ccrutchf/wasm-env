@@ -62,11 +62,13 @@ struct lib { const char *path; uint64_t base, end; };
 extern const struct lib guest_objects[];
 extern const uint64_t guest_object_count;
 
-_Noreturn static void die(const char *what, uint64_t pc)
+// The most recent block addresses dispatched to, for error messages.
+#define RECENT 64
+uint64_t wasm_env_recent[RECENT];
+uint64_t wasm_env_recent_count;
+
+static void put_address(uint64_t pc)
 {
-	put("wasm-env: translated program: ", 30);
-	put(what, len(what));
-	put(" at ", 4);
 	put_hex(pc);
 	for (uint64_t k = 0; k < guest_object_count; k++) {
 		const struct lib *o = &guest_objects[k];
@@ -78,7 +80,21 @@ _Noreturn static void die(const char *what, uint64_t pc)
 			put(")", 1);
 		}
 	}
-	put("\n", 1);
+}
+
+_Noreturn static void die(const char *what, uint64_t pc)
+{
+	put("wasm-env: translated program: ", 30);
+	put(what, len(what));
+	put(" at ", 4);
+	put_address(pc);
+	put("\nwasm-env: most recent blocks, oldest first:\n", 46);
+	uint64_t n = wasm_env_recent_count < 16 ? wasm_env_recent_count : 16;
+	for (uint64_t k = wasm_env_recent_count - n; k < wasm_env_recent_count; k++) {
+		put("  ", 2);
+		put_address(wasm_env_recent[k % RECENT]);
+		put("\n", 1);
+	}
 	__builtin_trap();
 }
 
@@ -119,6 +135,7 @@ uint32_t __wasm_env_crc32(uint32_t crc, uint64_t data, uint32_t bytes, uint32_t 
 void dispatch(long pc)
 {
 	uint64_t target = (uint64_t)pc;
+	wasm_env_recent[wasm_env_recent_count++ % RECENT] = target;
 	uint64_t lo = 0, hi = dispatch_count;
 	while (lo < hi) {
 		uint64_t mid = lo + (hi - lo) / 2;
@@ -150,6 +167,18 @@ enum { MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20 };
 #define LIB_FDS 1024
 static uint16_t fd_lib[LIB_FDS];
 
+// The library most recently opened and not yet mapped (1 + index, or 0).
+// glibc maps a library whose segments are aligned beyond the page size by
+// first reserving an anonymous, inaccessible region, then mapping the file
+// at an aligned address inside it; that reservation must be the library's
+// prelinked base.
+static uint64_t pending_lib;
+
+// Reservations made that way: unmapping parts of them is a no-op.
+#define RESERVATIONS 256
+static struct { uint64_t start, end; } reserved[RESERVATIONS];
+static uint64_t reservation_count;
+
 static int same(const char *a, const char *b)
 {
 	while (*a && *a == *b) a++, b++;
@@ -180,6 +209,8 @@ static int in_a_lib(uint64_t addr)
 {
 	for (uint64_t k = 0; k < guest_lib_count; k++)
 		if (addr >= guest_libs[k].base && addr < ((guest_libs[k].end + 4095) & ~(uint64_t)4095)) return 1;
+	for (uint64_t k = 0; k < reservation_count; k++)
+		if (addr >= reserved[k].start && addr < reserved[k].end) return 1;
 	return 0;
 }
 
@@ -204,7 +235,10 @@ static int library_syscall(long nr)
 	switch (nr) {
 	case SYS_openat: {
 		long fd = __wasm_env_host_syscall(nr, (long)R[0], (long)R[1], (long)R[2], (long)R[3], 0, 0);
-		if (fd >= 0 && fd < LIB_FDS) fd_lib[fd] = (uint16_t)(lib_for_path((const char *)(uintptr_t)R[1]) + 1);
+		if (fd >= 0 && fd < LIB_FDS) {
+			fd_lib[fd] = (uint16_t)(lib_for_path((const char *)(uintptr_t)R[1]) + 1);
+			pending_lib = fd_lib[fd];
+		}
 		R[0] = (uint64_t)fd;
 		return 1;
 	}
@@ -214,7 +248,17 @@ static int library_syscall(long nr)
 	case SYS_mmap: {
 		uint64_t addr = R[0], len = R[1], flags = R[3], off = R[5];
 		long fd = (long)R[4];
+		if ((flags & MAP_ANONYMOUS) && !(flags & MAP_FIXED) && addr == 0 && R[2] == 0 && pending_lib
+		    && reservation_count < RESERVATIONS) {
+			// glibc's reservation for an aligned library (see pending_lib).
+			uint64_t base = guest_libs[pending_lib - 1].base;
+			reserved[reservation_count].start = base;
+			reserved[reservation_count++].end = base + len;
+			R[0] = base;
+			return 1;
+		}
 		if (!(flags & MAP_ANONYMOUS) && fd >= 0 && fd < LIB_FDS && fd_lib[fd]) {
+			pending_lib = 0;
 			// The first mapping of a library passes its lowest segment
 			// address as a hint (0 for a shared object): map at base + hint.
 			uint64_t at = (flags & MAP_FIXED) ? addr : guest_libs[fd_lib[fd] - 1].base + addr;

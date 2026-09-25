@@ -29,6 +29,7 @@
               pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
               pkgs.qemu-user
               pkgs.gnumake
+              pkgs.zstd # Ubuntu .deb packages (tests/ubuntu-fetch.sh)
             ];
             # The wrapped clang injects host flags that break wasm targets,
             # so wasm builds use the unwrapped compiler.
