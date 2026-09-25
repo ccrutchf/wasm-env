@@ -158,9 +158,17 @@ pub fn engine() -> Result<Engine> {
         config.epoch_interruption(true);
     }
     // Profiling aid: WASM_ENV_PERFMAP=1 writes /tmp/perf-PID.map so `perf`
-    // names the wasm functions (for a translated program, the regions).
-    if std::env::var_os("WASM_ENV_PERFMAP").is_some() {
-        config.profiler(wasmtime::ProfilingStrategy::PerfMap);
+    // names the wasm functions (for a translated program, the regions);
+    // WASM_ENV_PERFMAP=jitdump writes a jitdump (`perf record -k 1`, then
+    // `perf inject --jit`) so `perf annotate` shows their instructions.
+    match std::env::var("WASM_ENV_PERFMAP").as_deref() {
+        Ok("jitdump") => {
+            config.profiler(wasmtime::ProfilingStrategy::JitDump);
+        }
+        Ok(_) => {
+            config.profiler(wasmtime::ProfilingStrategy::PerfMap);
+        }
+        Err(_) => {}
     }
     Ok(Engine::new(&config)?)
 }

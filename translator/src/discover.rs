@@ -27,6 +27,11 @@ pub struct Program {
     pub insns: BTreeMap<u64, Instruction>,
     /// Block start addresses reachable from the roots.
     pub leaders: BTreeSet<u64>,
+    /// Blocks that may be entered other than by a direct branch or falling
+    /// through: the roots, jump table targets, and where calls and system
+    /// calls return to (the lifter adds targets of branches from other
+    /// regions). The rest need no entry into their region (see lift).
+    pub entries: BTreeSet<u64>,
 }
 
 pub fn imm_u64(imm: &bad64::Imm) -> u64 {
@@ -121,6 +126,7 @@ pub fn discover(image: &Image) -> Program {
     let code = Code::new(&insns);
     // Follow control flow from the roots.
     let mut leaders = roots.clone();
+    let mut entries = roots.clone();
     let mut work: Vec<u64> = roots.into_iter().collect();
     let mut walked = BTreeSet::new();
     while let Some(start) = work.pop() {
@@ -142,6 +148,9 @@ pub fn discover(image: &Image) -> Program {
                 }
                 if !is_terminal(i) {
                     add(pc + 4);
+                    if matches!(i.op().mnem(), "bl" | "blr" | "blraa" | "blrab" | "svc") && in_code(pc + 4) {
+                        entries.insert(pc + 4);
+                    }
                 }
                 // A `br` with no writeback is usually a switch: read the
                 // jump table (case targets aren't stored as pointers).
@@ -164,6 +173,9 @@ pub fn discover(image: &Image) -> Program {
                     }
                     for t in targets {
                         add(t);
+                        if in_code(t) {
+                            entries.insert(t);
+                        }
                     }
                 }
                 break;
@@ -178,7 +190,7 @@ pub fn discover(image: &Image) -> Program {
             }
         }
     }
-    Program { insns, leaders }
+    Program { insns, leaders, entries }
 }
 
 /// The decoded code, with every direct branch indexed by its target, for

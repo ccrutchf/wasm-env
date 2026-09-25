@@ -937,6 +937,9 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
         calls: std::collections::BTreeSet<u64>,
     }
     let mut facts: std::collections::HashMap<u64, FlagFacts> = std::collections::HashMap::new();
+    // Blocks entered other than by a branch or fall-through within their
+    // region: those discovery found, plus targets of other regions' branches.
+    let mut entries = prog.entries.clone();
     let mut lifted1 = Vec::new();
     for (&region, leaders) in &regions {
         let (mut tmp, mut strings, mut calls) = (0, Vec::new(), std::collections::BTreeSet::new());
@@ -981,6 +984,12 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
             // standard leaves NZCV undefined across them, and compiled code
             // never reads them on entry), so they don't propagate liveness;
             // other indirect jumps (jump tables) might, so they're assumed to.
+            // Entries from other regions (see the region switch below).
+            for &s in &b.succs {
+                if region_of(s) != region {
+                    entries.insert(s);
+                }
+            }
             let (succs, unknown) = match last {
                 "bl" | "blr" | "blraa" | "blrab" | "ret" | "retaa" | "retab" => (Vec::new(), false),
                 _ => (std::mem::take(&mut b.succs), b.indirect),
@@ -995,13 +1004,17 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
 
     let live_out = flags_live_out(&facts);
 
-    // Assemble each region's function: entered at any of its blocks (the
+    // Assemble each region's function: entered at its entry blocks (the
     // dispatcher and other regions pass the block's address), then branching
-    // within. Blocks whose flags no successor reads drop their flag stores.
+    // within. Only real entries are cases of the switch, so LLVM can keep
+    // registers in SSA across the region's other blocks. (A jump to any other
+    // block reaches `bad`, which reports it as a missed target, learned by
+    // the next translation.) Blocks whose flags no successor reads drop their
+    // flag stores.
     let mut lifted = Vec::new();
     for (region, leaders, l) in lifted1 {
         let mut text = format!("define void @R_{region:x}(i64 %pc) {{\nentry:\n  switch i64 %pc, label %bad [\n");
-        for &a in leaders {
+        for &a in leaders.iter().filter(|a| entries.contains(a)) {
             let _ = writeln!(text, "    i64 {}, label %b_{a:x}", a as i64);
         }
         text.push_str("  ]\n");
