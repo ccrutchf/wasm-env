@@ -603,25 +603,24 @@ impl<'a> Block<'a> {
     // --- Flags and conditions ---------------------------------------------
 
     /// arm64 AddWithCarry: returns a + b + carry, setting N Z C V if asked.
+    /// Computed at the operands' width (wasm has no i128, which widening a
+    /// 64-bit sum would need): the carry out is `r < a` (`r <= a` with a
+    /// carry in), and signed overflow is when both operands' signs differ
+    /// from the result's.
     pub fn add_with_carry(&mut self, a: &str, b: &str, carry: &str, bits: u32, set: bool) -> String {
-        let w = bits * 2;
-        let ua = self.val(format!("zext i{bits} {a} to i{w}"));
-        let ub = self.val(format!("zext i{bits} {b} to i{w}"));
-        let uc = self.val(format!("zext i1 {carry} to i{w}"));
-        let us0 = self.val(format!("add i{w} {ua}, {ub}"));
-        let us = self.val(format!("add i{w} {us0}, {uc}"));
-        let r = self.val(format!("trunc i{w} {us} to i{bits}"));
+        let c_in = self.val(format!("zext i1 {carry} to i{bits}"));
+        let s = self.val(format!("add i{bits} {a}, {b}"));
+        let r = self.val(format!("add i{bits} {s}, {c_in}"));
         if set {
-            let sa = self.val(format!("sext i{bits} {a} to i{w}"));
-            let sb = self.val(format!("sext i{bits} {b} to i{w}"));
-            let ss0 = self.val(format!("add i{w} {sa}, {sb}"));
-            let ss = self.val(format!("add i{w} {ss0}, {uc}"));
             let n = self.val(format!("icmp slt i{bits} {r}, 0"));
             let z = self.val(format!("icmp eq i{bits} {r}, 0"));
-            let ur = self.val(format!("zext i{bits} {r} to i{w}"));
-            let c = self.val(format!("icmp ne i{w} {us}, {ur}"));
-            let sr = self.val(format!("sext i{bits} {r} to i{w}"));
-            let v = self.val(format!("icmp ne i{w} {ss}, {sr}"));
+            let below = self.val(format!("icmp ult i{bits} {r}, {a}"));
+            let at_or_below = self.val(format!("icmp ule i{bits} {r}, {a}"));
+            let c = self.val(format!("select i1 {carry}, i1 {at_or_below}, i1 {below}"));
+            let ar = self.val(format!("xor i{bits} {a}, {r}"));
+            let br = self.val(format!("xor i{bits} {b}, {r}"));
+            let both = self.val(format!("and i{bits} {ar}, {br}"));
+            let v = self.val(format!("icmp slt i{bits} {both}, 0"));
             self.set_flags(n, z, c, v);
         }
         r
