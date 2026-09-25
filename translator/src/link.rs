@@ -194,6 +194,9 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
         bail!("compiling modules failed:\n{}", errors.join("\n"));
     }
 
+    if std::env::var_os("WASM_ENV_TIMINGS").is_some() {
+        eprintln!("[timing] compiled {} of {} units", todo.len(), units.len());
+    }
     let wasm = work.join("program.wasm");
     let mut ld = Command::new(&tc.wasm_ld);
     ld.args(["-m", "wasm64", "--no-entry", "-z", "stack-size=1048576"])

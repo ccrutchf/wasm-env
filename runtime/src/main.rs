@@ -28,7 +28,7 @@ use crate::kernel::Kernel;
 use crate::process::{ExecImage, Inherit};
 
 fn usage() -> ! {
-    eprintln!("usage: wasm-env run [--root DIR] [--env KEY=VALUE]... [--trace] PROGRAM [ARGS]...");
+    eprintln!("usage: wasm-env run [--root DIR] [--env KEY=VALUE]... [--argv0 NAME] [--trace] PROGRAM [ARGS]...");
     std::process::exit(2);
 }
 
@@ -40,11 +40,14 @@ fn main() -> Result<()> {
     let mut root = std::env::current_dir()?;
     let mut env = vec![];
     let mut trace = std::env::var_os("WASM_ENV_TRACE").is_some_and(|v| v != "0");
+    // The program's argv[0] (default: its path, or a host file's name).
+    let mut argv0: Option<String> = None;
     let program = loop {
         match args.next() {
             Some(a) if a == "--root" => root = PathBuf::from(args.next().unwrap_or_else(|| usage())),
             Some(a) if a == "--env" => env.push(args.next().unwrap_or_else(|| usage())),
             Some(a) if a == "--trace" => trace = true,
+            Some(a) if a == "--argv0" => argv0 = Some(args.next().unwrap_or_else(|| usage())),
             Some(a) if a.starts_with("--") => bail!("unknown option {a}"),
             Some(a) => break a,
             None => usage(),
@@ -62,7 +65,7 @@ fn main() -> Result<()> {
     let in_root = program.starts_with('/')
         && fs.resolve("/", &program, true).is_ok_and(|g| fs.host(&g).is_file());
     let image = if in_root {
-        let argv = std::iter::once(program.clone()).chain(rest).map(String::into_bytes).collect();
+        let argv = std::iter::once(argv0.clone().unwrap_or_else(|| program.clone())).chain(rest).map(String::into_bytes).collect();
         process::resolve_exec(&fs, &program, argv, env, trace)
             .map_err(|e| anyhow::anyhow!("{program}: can't execute (errno {e})"))?
     } else {
@@ -74,7 +77,7 @@ fn main() -> Result<()> {
             host = translate::ensure_translated(&host, &root, &name, trace)
                 .map_err(|e| anyhow::anyhow!("{program}: can't translate (errno {e})"))?;
         }
-        let name = PathBuf::from(&program).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = argv0.clone().unwrap_or_else(|| PathBuf::from(&program).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
         let argv = std::iter::once(name).chain(rest).map(String::into_bytes).collect();
         ExecImage { host, path: program, argv, env }
     };

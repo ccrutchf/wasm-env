@@ -1,17 +1,22 @@
 //! arm64 → LLVM IR.
 //!
-//! Each basic block becomes an LLVM function `void @B_<addr>(i64)`. Blocks
-//! pass control with guaranteed tail calls (`musttail`, which the
-//! WebAssembly backend compiles to `return_call`), so the host stack never
-//! grows however the guest branches, calls or returns. Direct branches call
-//! the target block; indirect ones (BR, BLR, RET) call `@dispatch`, a
-//! switch over every block start. The unused `i64` parameter keeps every
-//! signature identical, which `musttail` requires.
+//! Code is lifted a region (REGION_SPAN bytes of guest address space) at a
+//! time: each region becomes one LLVM function `void @R_<start>(i64 pc)`,
+//! entered at any of its blocks (a `switch` on `pc`), whose blocks branch to
+//! each other directly, so LLVM optimizes loops within it. Control leaves a
+//! region by guaranteed tail call (`musttail`, which the WebAssembly backend
+//! compiles to `return_call`), so the host stack never grows however the
+//! guest branches, calls or returns: to another region's function for a
+//! direct branch, or to `@dispatch` (in the support code) for an indirect
+//! one (BR, BLR, RET), which finds the region by binary search. Every
+//! function has the same signature, which `musttail` requires. (One
+//! function per block would also exceed WebAssembly's limit of a million
+//! functions in a module for large programs.)
 //!
 //! Guest state lives in globals: `@R` (x0–x30 and SP), `@F` (N Z C V),
 //! `@V` (v0–v31) and `@TP` (TPIDR_EL0). Within a block, registers are
 //! loaded on first use, kept as SSA values, and stored back when the block
-//! ends, so LLVM optimizes each block freely. Guest memory is the
+//! ends. Guest memory is the
 //! WebAssembly memory itself: guest address A is WebAssembly address A.
 //!
 //! Instruction semantics are in `insn.rs`.
@@ -110,11 +115,23 @@ pub const Z: usize = 1;
 pub const C: usize = 2;
 pub const V: usize = 3;
 
-/// Builds the body of one block function.
-pub struct Block {
+/// The guest address range lifted into one function (a "region"): its blocks
+/// branch to each other directly, so LLVM optimizes loops within it.
+pub const REGION_SPAN: u64 = 0x1000;
+
+pub fn region_of(addr: u64) -> u64 {
+    addr / REGION_SPAN * REGION_SPAN
+}
+
+/// Builds the body of one block, a basic block of its region's function.
+pub struct Block<'a> {
     pub body: String,
     addr: u64,
     next_tmp: usize,
+    /// Every block start, to tell direct jumps to blocks from others.
+    leaders: &'a std::collections::BTreeSet<u64>,
+    /// Other regions this block tail-calls.
+    pub calls: std::collections::BTreeSet<u64>,
     gpr: [Option<String>; 32],
     gpr_dirty: [bool; 32],
     flags: [Option<String>; 4],
@@ -126,12 +143,16 @@ pub struct Block {
     pub strings: Vec<(String, String)>,
 }
 
-impl Block {
-    fn new(addr: u64) -> Self {
+impl<'a> Block<'a> {
+    /// A block at `addr`, numbering its temporaries from `first_tmp` (unique
+    /// within the region's function).
+    fn new(addr: u64, first_tmp: usize, leaders: &'a std::collections::BTreeSet<u64>) -> Self {
         Block {
             body: String::new(),
             addr,
-            next_tmp: 0,
+            next_tmp: first_tmp,
+            leaders,
+            calls: Default::default(),
             gpr: Default::default(),
             gpr_dirty: [false; 32],
             flags: Default::default(),
@@ -556,12 +577,22 @@ impl Block {
 
     // --- Control flow ------------------------------------------------------------
 
-    /// Ends the block by jumping to a known address. All control flow goes
-    /// through `@dispatch` (a binary search over the block table), so blocks
-    /// never reference each other directly and can be split across modules.
+    /// Ends the block by jumping to a known address: a branch within the
+    /// region, a tail call to another region's function, or, for an address
+    /// that isn't a block, `@dispatch` (which reports it).
     pub fn jump(&mut self, target: u64) {
         self.flush();
-        self.line(format!("musttail call void @dispatch(i64 {})", target as i64));
+        if self.leaders.contains(&target) {
+            let region = region_of(target);
+            if region == region_of(self.addr) {
+                self.line(format!("br label %b_{target:x}"));
+                return;
+            }
+            self.calls.insert(region);
+            self.line(format!("musttail call void @R_{region:x}(i64 {})", target as i64));
+        } else {
+            self.line(format!("musttail call void @dispatch(i64 {})", target as i64));
+        }
         self.line("ret void");
     }
 
@@ -608,9 +639,14 @@ impl Block {
 /// (link.rs) reuses the rest.
 const CHUNK_SPAN: u64 = 0x8000;
 
-/// A lifted block: its guest address, LLVM function body, and the private
-/// string constants (fatal messages) it references.
-type LiftedBlock = (u64, String, Vec<(String, String)>);
+/// A lifted region: the text of its function, the private string constants
+/// (fatal messages) its blocks use, and the other regions it tail-calls.
+struct LiftedRegion {
+    start: u64,
+    text: String,
+    strings: Vec<(String, String)>,
+    calls: std::collections::BTreeSet<u64>,
+}
 
 pub struct Lifted {
     /// The data module: guest state, the guest image, block-function
@@ -640,42 +676,62 @@ impl Lifted {
 /// functions are independent and split across modules for compilation.
 pub fn lift(image: &Image, prog: &Program) -> Lifted {
     let mut unsupported = BTreeMap::new();
-    let mut blocks: Vec<LiftedBlock> = Vec::new();
+    let mut regions: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for &leader in &prog.leaders {
+        regions.entry(region_of(leader)).or_default().push(leader);
+    }
 
-    for &start in &prog.leaders {
-        let mut b = Block::new(start);
-        let mut pc = start;
-        loop {
-            let Some(i) = prog.insns.get(&pc) else {
-                b.fail(pc, "undecodable instruction");
-                break;
-            };
-            match insn::lift(&mut b, i) {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(e) => {
-                    unsupported.entry(i.op().mnem().to_string()).or_insert_with(|| (0, format!("`{i}`: {e}"))).0 += 1;
-                    b.fail(pc, &format!("unsupported instruction `{i}`: {e}"));
+    let mut lifted = Vec::new();
+    for (&region, leaders) in &regions {
+        // The region's function: entered at any of its blocks (the dispatcher
+        // and other regions pass the block's address), then branching within.
+        let mut text = format!("define void @R_{region:x}(i64 %pc) {{\nentry:\n  switch i64 %pc, label %bad [\n");
+        for &a in leaders {
+            let _ = writeln!(text, "    i64 {}, label %b_{a:x}", a as i64);
+        }
+        text.push_str("  ]\n");
+        let (mut tmp, mut strings, mut calls) = (0, Vec::new(), std::collections::BTreeSet::new());
+        for &start in leaders {
+            let mut b = Block::new(start, tmp, &prog.leaders);
+            let mut pc = start;
+            loop {
+                let Some(i) = prog.insns.get(&pc) else {
+                    b.fail(pc, "undecodable instruction");
+                    break;
+                };
+                match insn::lift(&mut b, i) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(e) => {
+                        unsupported.entry(i.op().mnem().to_string()).or_insert_with(|| (0, format!("`{i}`: {e}"))).0 +=
+                            1;
+                        b.fail(pc, &format!("unsupported instruction `{i}`: {e}"));
+                        break;
+                    }
+                }
+                pc += 4;
+                if prog.leaders.contains(&pc) || is_control(i) {
+                    b.jump(pc);
                     break;
                 }
             }
-            pc += 4;
-            if prog.leaders.contains(&pc) || is_control(i) {
-                b.jump(pc);
-                break;
-            }
+            tmp = b.next_tmp;
+            let _ = write!(text, "b_{start:x}:\n{}", b.body);
+            strings.append(&mut b.strings);
+            calls.append(&mut b.calls);
         }
-        blocks.push((start, std::mem::take(&mut b.body), std::mem::take(&mut b.strings)));
+        text.push_str("bad:\n  call void @__wasm_env_bad_target(i64 %pc)\n  unreachable\n}\n\n");
+        lifted.push(LiftedRegion { start: region, text, strings, calls });
     }
 
-    let chunks = build_chunks(&blocks);
+    let chunks = build_chunks(&lifted);
     let data = build_data(image, prog);
     Lifted { data, chunks, unsupported, blocks: prog.leaders.len() }
 }
 
-/// Assembles the code modules: block definitions grouped into chunks, each
+/// Assembles the code modules: region functions grouped into chunks, each
 /// with the declarations it needs.
-fn build_chunks(blocks: &[LiftedBlock]) -> Vec<String> {
+fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
     let preamble = format!(
         "target triple = \"wasm64-unknown-unknown\"\n\
          @R = external global [32 x i64]\n\
@@ -689,19 +745,25 @@ fn build_chunks(blocks: &[LiftedBlock]) -> Vec<String> {
          declare i32 @__wasm_env_crc32(i32, i64, i32, i32)\n{}",
         intrinsics()
     );
-    let mut groups: BTreeMap<u64, Vec<&LiftedBlock>> = BTreeMap::new();
-    for block in blocks {
-        groups.entry(block.0 / CHUNK_SPAN).or_default().push(block);
+    let mut groups: BTreeMap<u64, Vec<&LiftedRegion>> = BTreeMap::new();
+    for r in regions {
+        groups.entry(r.start / CHUNK_SPAN).or_default().push(r);
     }
     groups
         .into_values()
         .map(|group| {
             let mut m = preamble.clone();
-            for (addr, body, strings) in group {
-                for (name, text) in strings {
+            // Regions this chunk calls but doesn't define.
+            let defined: std::collections::BTreeSet<u64> = group.iter().map(|r| r.start).collect();
+            let called: std::collections::BTreeSet<u64> = group.iter().flat_map(|r| r.calls.iter().copied()).collect();
+            for c in called.difference(&defined) {
+                let _ = writeln!(m, "declare void @R_{c:x}(i64)");
+            }
+            for r in group {
+                for (name, text) in &r.strings {
                     let _ = writeln!(m, "{name} = private constant {text}");
                 }
-                let _ = writeln!(m, "define void @B_{addr:x}(i64 %_) {{\n{body}}}\n");
+                m.push_str(&r.text);
             }
             m
         })
@@ -772,8 +834,9 @@ fn build_data(image: &Image, prog: &Program) -> String {
     // Declare every block function, then build the dispatch table: parallel
     // arrays of sorted addresses and their function pointers, searched by
     // the support code's `dispatch`.
-    for &a in &prog.leaders {
-        let _ = writeln!(ir, "declare void @B_{a:x}(i64)");
+    let regions: std::collections::BTreeSet<u64> = prog.leaders.iter().map(|&a| region_of(a)).collect();
+    for r in &regions {
+        let _ = writeln!(ir, "declare void @R_{r:x}(i64)");
     }
     let n = prog.leaders.len();
     let _ = write!(ir, "@dispatch_addrs = constant [{n} x i64] [");
@@ -783,7 +846,7 @@ fn build_data(image: &Image, prog: &Program) -> String {
     ir.push_str("]\n");
     let _ = write!(ir, "@dispatch_fns = constant [{n} x ptr] [");
     for (i, &a) in prog.leaders.iter().enumerate() {
-        let _ = write!(ir, "{}ptr @B_{a:x}", if i == 0 { "" } else { ", " });
+        let _ = write!(ir, "{}ptr @R_{:x}", if i == 0 { "" } else { ", " }, region_of(a));
     }
     ir.push_str("]\n");
     let _ = writeln!(ir, "@dispatch_count = constant i64 {n}");
@@ -802,7 +865,9 @@ fn intrinsics() -> String {
              declare {t} @llvm.fptosi.sat.{t}.f64(double)\n\
              declare {t} @llvm.fptoui.sat.{t}.f64(double)\n\
              declare {t} @llvm.fptosi.sat.{t}.f32(float)\n\
-             declare {t} @llvm.fptoui.sat.{t}.f32(float)"
+             declare {t} @llvm.fptoui.sat.{t}.f32(float)\n\
+             declare {t} @llvm.fptosi.sat.{t}.f16(half)\n\
+             declare {t} @llvm.fptoui.sat.{t}.f16(half)"
         );
     }
     ir.push_str("declare i16 @llvm.bswap.i16(i16)\n");
@@ -814,10 +879,14 @@ fn intrinsics() -> String {
              declare {t} @llvm.smin.{t}({t}, {t})\n\
              declare {t} @llvm.smax.{t}({t}, {t})\n\
              declare {t} @llvm.ctpop.{t}({t})\n\
+             declare {t} @llvm.uadd.sat.{t}({t}, {t})\n\
+             declare {t} @llvm.sadd.sat.{t}({t}, {t})\n\
+             declare {t} @llvm.usub.sat.{t}({t}, {t})\n\
+             declare {t} @llvm.ssub.sat.{t}({t}, {t})\n\
              declare {t} @llvm.bitreverse.{t}({t})"
         );
     }
-    for (t, s) in [("double", "f64"), ("float", "f32")] {
+    for (t, s) in [("double", "f64"), ("float", "f32"), ("half", "f16")] {
         let _ = writeln!(
             ir,
             "declare {t} @llvm.sqrt.{s}({t})\n\

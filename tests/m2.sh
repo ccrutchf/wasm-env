@@ -28,11 +28,13 @@ fixtures=(
 	"jumptable:tests/arm64/jumptable.S:-static -nostdlib"
 	"jumptable2:tests/arm64/jumptable2.S:-static -nostdlib"
 	"jumptable3:tests/arm64/jumptable3.S:-static -nostdlib"
+	"jumptable4:tests/arm64/jumptable4.S:-static -nostdlib"
 	"computedgoto:tests/arm64/computedgoto.c:-static"
 	"bti:tests/arm64/bti.S:-static -nostdlib"
 	"strrchr:tests/arm64/strrchr.c:-static tests/arm64/glibc_strrchr.S"
 	"atomics:tests/arm64/atomics.c:-static -march=armv8.1-a"
 	"simd3:tests/arm64/simd3.c:-static -march=armv8.2-a+crc+sha3"
+	"simd4:tests/arm64/simd4.c:-static"
 	"control:tests/arm64/control.c:-static"
 	"memory:tests/arm64/memory.c:-static"
 	# Static PIE (loaded at a chosen base, relocations applied on translate).

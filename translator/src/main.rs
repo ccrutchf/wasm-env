@@ -89,7 +89,11 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     let mut interp = inputs.interp.as_deref().map(|p| read(p, p.as_ref())).transpose()?;
     if let Some(root) = &inputs.root {
         let root = std::path::Path::new(root);
-        let found = deps::resolve(root, &bytes, &inputs.dlopen)?;
+        // The program's own path inside the root, for $ORIGIN in its RPATH.
+        let exe_guest = std::fs::canonicalize(input).ok().zip(std::fs::canonicalize(root).ok()).and_then(|(i, r)| {
+            i.strip_prefix(&r).ok().map(|rel| format!("/{}", rel.display()))
+        });
+        let found = deps::resolve(root, &bytes, exe_guest.as_deref(), &inputs.dlopen)?;
         if interp.is_none() {
             interp = found.interp.map(|d| read(&d.guest, &d.host)).transpose()?;
         }
@@ -120,8 +124,20 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         let list: String = read_files.borrow().iter().map(|p| format!("{}\n", p.display())).collect();
         std::fs::write(path, list).with_context(|| format!("writing {path}"))?;
     }
+    // WASM_ENV_TIMINGS=1 reports how long each phase takes.
+    let timings = std::env::var_os("WASM_ENV_TIMINGS").is_some();
+    let phase = std::cell::Cell::new(std::time::Instant::now());
+    let lap = |what: &str| {
+        if timings {
+            eprintln!("[timing] {what}: {:.2} s", phase.get().elapsed().as_secs_f64());
+        }
+        phase.set(std::time::Instant::now());
+    };
+    lap("load");
     let prog = discover::discover(&image);
+    lap("discover");
     let lifted = lift::lift(&image, &prog);
+    lap("lift");
     for (op, (n, example)) in &lifted.unsupported {
         eprintln!("warning: {n} × `{op}` not supported yet (traps if executed): {example}");
     }
@@ -129,6 +145,7 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     let image_end = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(0);
     let work = std::env::temp_dir().join(format!("wasm-env-translate-{}", std::process::id()));
     let wasm = link::link_chunked(&tc, &lifted.data, &lifted.chunks, image_end, &work);
+    lap("compile and link");
     // WASM_ENV_KEEP_WORK=1 keeps the generated IR and objects for debugging.
     if std::env::var_os("WASM_ENV_KEEP_WORK").is_some() {
         eprintln!("kept {}", work.display());

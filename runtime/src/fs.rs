@@ -118,6 +118,46 @@ pub enum DevPath {
     Device(Device),
     /// /dev/stdin, /dev/stdout, /dev/stderr and /dev/fd/N: another descriptor.
     Fd(i64),
+    /// A read-only file the runtime generates (/proc, /sys).
+    Synthetic(Synthetic),
+}
+
+/// Files under /proc and /sys that programs read to learn about the machine,
+/// which the runtime generates whatever the root contains.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Synthetic {
+    /// /proc/cpuinfo: one arm64 CPU with the features translated programs
+    /// may use (matching AT_HWCAP in the translator's support code).
+    CpuInfo,
+    /// /sys/devices/system/cpu/{possible,online,present}: "0", one CPU.
+    CpuList,
+}
+
+impl Synthetic {
+    pub fn content(self) -> &'static [u8] {
+        match self {
+            Synthetic::CpuInfo => {
+                b"processor\t: 0\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd crc32 atomics lrcpc\n\
+                  CPU implementer\t: 0x00\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\n\
+                  CPU revision\t: 0\n\n"
+            }
+            Synthetic::CpuList => b"0\n",
+        }
+    }
+
+    /// The content as an open host file (an unlinked temporary), so reading,
+    /// seeking, stat and mmap work as for any file.
+    pub fn open(self) -> std::io::Result<File> {
+        use std::io::{Seek, Write};
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("wasm-env-synthetic-{}-{n}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+        let _ = std::fs::remove_file(&path);
+        file.write_all(self.content())?;
+        file.rewind()?;
+        Ok(file)
+    }
 }
 
 impl Fs {
@@ -134,12 +174,16 @@ impl Fs {
                 _ => parts.push(c.to_string()),
             }
         }
-        let [dev, rest @ ..] = parts.as_slice() else { return None };
-        if dev != "dev" {
-            return None;
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        match parts.as_slice() {
+            ["proc", "cpuinfo"] => return Some(DevPath::Synthetic(Synthetic::CpuInfo)),
+            ["sys", "devices", "system", "cpu", "possible" | "online" | "present"] => {
+                return Some(DevPath::Synthetic(Synthetic::CpuList));
+            }
+            _ => {}
         }
-        let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
-        match rest.as_slice() {
+        let ["dev", rest @ ..] = parts.as_slice() else { return None };
+        match rest {
             ["null"] => Some(DevPath::Device(Device::Null)),
             ["zero"] => Some(DevPath::Device(Device::Zero)),
             ["random"] | ["urandom"] => Some(DevPath::Device(Device::Random)),
@@ -499,6 +543,9 @@ mod tests {
         assert_eq!(fs.device("/dev", "fd/3"), Some(DevPath::Fd(3)));
         assert_eq!(fs.device("/tmp", "../dev/../dev/zero"), Some(DevPath::Device(Device::Zero)));
         assert_eq!(fs.device("/", "/dev/sda"), None);
+        assert_eq!(fs.device("/", "/proc/cpuinfo"), Some(DevPath::Synthetic(Synthetic::CpuInfo)));
+        assert_eq!(fs.device("/sys", "devices/system/cpu/online"), Some(DevPath::Synthetic(Synthetic::CpuList)));
+        assert_eq!(fs.device("/", "/proc/meminfo"), None);
         #[cfg(unix)]
         {
             assert_eq!(fs.resolve("/", "/bin/sh", true).unwrap(), "/bin/busybox");

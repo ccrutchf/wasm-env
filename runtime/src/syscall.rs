@@ -757,6 +757,14 @@ impl Process {
                 let fd = Fd { cloexec: flags & o::CLOEXEC != 0, ..self.fds.get(n)?.clone() };
                 return self.fds.insert(fd, 0);
             }
+            Some(DevPath::Synthetic(s)) => {
+                if flags & o::ACCMODE != 0 {
+                    return Err(EACCES);
+                }
+                let file = s.open().map_err(|e| fs::errno(&e))?;
+                let open = Arc::new(Mutex::new(Open::File { file, path: path.to_string(), append: false }));
+                return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
+            }
             None => {}
         }
         let guest = self.fs.resolve(&dir, path, flags & o::NOFOLLOW == 0)?;
@@ -883,6 +891,10 @@ impl Process {
         match self.fs.device(&dir, path) {
             Some(DevPath::Device(d)) => return Ok(fs::device_stat_bytes(d)),
             Some(DevPath::Fd(n)) => return self.fstat(n),
+            Some(DevPath::Synthetic(s)) => {
+                let meta = s.open().and_then(|f| f.metadata()).map_err(|e| fs::errno(&e))?;
+                return Ok(fs::stat_bytes(&meta));
+            }
             None => {}
         }
         let guest = self.fs.resolve(&dir, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;

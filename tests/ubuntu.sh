@@ -56,5 +56,20 @@ t /usr/bin/mawk 'BEGIN { for (i = 0; i < 20000; i++) a[i] = i "x"; n = 0; for (k
 t /usr/bin/find /usr/share/doc -name copyright
 t /usr/bin/python3.12 -c 'import sys; print(1 + 1, sys.version_info[:2])'
 
+# numpy from PyPI's manylinux wheel (bundled OpenBLAS). stdout only: numpy's
+# floating-point RuntimeWarnings come from FPSR exception flags, which
+# wasm-env doesn't model. qemu runs without SVE so OpenBLAS picks the same
+# NEON kernels.
+if tests/wheel-fetch.sh numpy==2.5.3 >/dev/null 2>&1; then
+	echo "python3* /usr/lib/python3.12/lib-dynload /usr/local/lib/python3.12/dist-packages/numpy" >> "$R/etc/wasm-env/dlopen"
+	cp tests/python/numpy_demo.py "$R/root/numpy_demo.py"
+	expected=$(cd "$R" && env -i HOME=/root OPENBLAS_NUM_THREADS=1 QEMU_CPU=max,sve=off,sme=off \
+		qemu-aarch64 -L . -0 /usr/bin/python3.12 ./usr/bin/python3.12 /root/numpy_demo.py 2>/dev/null)
+	actual=$(OPENBLAS_NUM_THREADS=1 timeout 1800 "$wasm_env" run --root "$R" /usr/bin/python3.12 /root/numpy_demo.py 2>/dev/null)
+	compare "numpy demo" "$expected" "$actual"
+else
+	echo "skipped numpy: can't fetch the wheel (offline?)"
+fi
+
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]

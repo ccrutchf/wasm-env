@@ -82,19 +82,29 @@ static void put_address(uint64_t pc)
 	}
 }
 
+// WASM_ENV_DEBUG=1 in the program's environment: report the recent blocks
+// when it aborts, too.
+static int debug;
+
+static void print_recent(uint64_t count)
+{
+	put("wasm-env: most recent blocks, oldest first:\n", 45);
+	uint64_t n = wasm_env_recent_count < count ? wasm_env_recent_count : count;
+	for (uint64_t k = wasm_env_recent_count - n; k < wasm_env_recent_count; k++) {
+		put("  ", 2);
+		put_address(wasm_env_recent[k % RECENT]);
+		put("\n", 1);
+	}
+}
+
 _Noreturn static void die(const char *what, uint64_t pc)
 {
 	put("wasm-env: translated program: ", 30);
 	put(what, len(what));
 	put(" at ", 4);
 	put_address(pc);
-	put("\nwasm-env: most recent blocks, oldest first:\n", 46);
-	uint64_t n = wasm_env_recent_count < 16 ? wasm_env_recent_count : 16;
-	for (uint64_t k = wasm_env_recent_count - n; k < wasm_env_recent_count; k++) {
-		put("  ", 2);
-		put_address(wasm_env_recent[k % RECENT]);
-		put("\n", 1);
-	}
+	put("\n", 1);
+	print_recent(debug ? RECENT : 16);
 	__builtin_trap();
 }
 
@@ -142,7 +152,7 @@ void dispatch(long pc)
 		uint64_t a = dispatch_addrs[mid];
 		if (a == target) {
 			block_fn f = (block_fn)dispatch_fns[mid];
-			__attribute__((musttail)) return f(0);
+			__attribute__((musttail)) return f(pc); // the region function enters at pc
 		}
 		if (a < target)
 			lo = mid + 1;
@@ -296,6 +306,9 @@ void __wasm_env_svc(void)
 		return;
 	}
 	if (library_syscall(nr)) return;
+	// kill, tkill or tgkill with SIGABRT: the program is aborting.
+	if (debug && ((nr == 129 && R[1] == 6) || (nr == 130 && R[1] == 6) || (nr == 131 && R[2] == 6)))
+		print_recent(RECENT);
 	R[0] = (uint64_t)__wasm_env_host_syscall(nr, (long)R[0], (long)R[1], (long)R[2], (long)R[3],
 	                                         (long)R[4], (long)R[5]);
 }
@@ -306,7 +319,14 @@ void __wasm_env_svc(void)
 #define GUEST_STACK (8u << 20)
 static uint8_t guest_stack[GUEST_STACK] __attribute__((aligned(16)));
 
-enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_BASE = 7, AT_ENTRY = 9 };
+enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_BASE = 7, AT_ENTRY = 9, AT_HWCAP = 16, AT_HWCAP2 = 26 };
+
+// The CPU features translated code may use: exactly what the translator
+// implements (FP, ASIMD, CRC32, LSE atomics, LRCPC), so libraries choose
+// those paths and not, say, SVE, AES or half-precision arithmetic. Programs
+// such as numpy check their build baseline against these at startup.
+enum { HWCAP_FP = 1 << 0, HWCAP_ASIMD = 1 << 1, HWCAP_CRC32 = 1 << 7, HWCAP_ATOMICS = 1 << 8, HWCAP_LRCPC = 1 << 15 };
+#define GUEST_HWCAP (HWCAP_FP | HWCAP_ASIMD | HWCAP_CRC32 | HWCAP_ATOMICS | HWCAP_LRCPC)
 
 // Copies argc, argv, envp and auxv from the runtime's initial stack to the
 // guest stack, adding the ELF entries the kernel would (AT_PHDR for TLS
@@ -317,6 +337,11 @@ static uint64_t guest_initial_stack(const uint64_t *sp)
 	uint64_t argc = sp[0];
 	const uint64_t *p = sp + 1 + argc + 1;
 	while (*p) p++;                  // envp
+	for (const uint64_t *e = sp + 1 + argc + 1; *e; e++) {
+		const char *s = (const char *)(uintptr_t)*e, *want = "WASM_ENV_DEBUG=1";
+		while (*want && *s == *want) s++, want++;
+		if (!*want && !*s) debug = 1;
+	}
 	const uint64_t *auxv = p + 1;
 	const uint64_t *q = auxv;
 	while (q[0] != AT_NULL) q += 2;
@@ -336,6 +361,11 @@ static uint64_t guest_initial_stack(const uint64_t *sp)
 		*a++ = AT_BASE; *a++ = guest_interp_base;
 	}
 	*a++ = AT_NULL;  *a++ = 0;
+	// Report the features the translation supports (the runtime says none).
+	for (uint64_t *p = out + (auxv - sp); p[0] != AT_NULL; p += 2) {
+		if (p[0] == AT_HWCAP) p[1] = GUEST_HWCAP;
+		if (p[0] == AT_HWCAP2) p[1] = 0;
+	}
 	return (uint64_t)out;
 }
 

@@ -30,6 +30,8 @@
               pkgs.qemu-user
               pkgs.gnumake
               pkgs.zstd # Ubuntu .deb packages (tests/ubuntu-fetch.sh)
+              pkgs.jq # PyPI metadata (tests/wheel-fetch.sh)
+              pkgs.unzip # wheels
             ];
             # The wrapped clang injects host flags that break wasm targets,
             # so wasm builds use the unwrapped compiler.

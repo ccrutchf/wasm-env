@@ -459,10 +459,10 @@ fn register_value_before(code: &Code, at: u64, r: u32, depth: u32) -> Option<u64
     let insns = code.insns;
     let mut pc = at;
     for _ in 0..1024 {
-        // At a merge point, try the paths that branch here first: the code
-        // just above may be unrelated (another case of a switch, say).
-        if pc != at
-            && let Some(sources) = code.incoming.get(&pc)
+        // At a merge point (including where the search starts), try the paths
+        // that branch here first: the code just above may be unrelated
+        // (another case of a switch, say).
+        if let Some(sources) = code.incoming.get(&pc)
             && let Some(v) = sources.iter().take(8).find_map(|&s| register_value_before(code, s, r, depth + 1))
         {
             return Some(v);

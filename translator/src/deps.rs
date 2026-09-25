@@ -141,10 +141,43 @@ fn system_path(root: &Path, musl: bool) -> Vec<String> {
     ["/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/lib", "/usr/lib"].map(String::from).to_vec()
 }
 
+/// Substitutes $ORIGIN (or ${ORIGIN}) in RPATH/RUNPATH entries with the
+/// directory of the object they belong to (its path as opened), as the
+/// dynamic linker does. Entries stay unexpanded when that's unknown.
+fn expand_origin(rpath: &[String], object: Option<&str>) -> Vec<String> {
+    let origin = object.map(|p| match p.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(i) => p[..i].to_string(),
+        None => ".".to_string(),
+    });
+    rpath
+        .iter()
+        .map(|d| match &origin {
+            Some(o) => d.replace("${ORIGIN}", o).replace("$ORIGIN", o),
+            None => d.clone(),
+        })
+        .collect()
+}
+
+/// Collects the guest paths of the shared objects (names containing ".so")
+/// in the directory `dir` inside `root`, recursively.
+fn shared_objects(root: &Path, dir: &str, out: &mut Vec<String>, depth: u32) {
+    let Ok(entries) = std::fs::read_dir(host(root, dir)) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let guest = format!("{dir}/{name}");
+        match e.file_type() {
+            Ok(t) if t.is_dir() && depth < 16 => shared_objects(root, &guest, out, depth + 1),
+            Ok(t) if !t.is_dir() && name.contains(".so") => out.push(guest),
+            _ => {}
+        }
+    }
+}
+
 /// Finds the interpreter and every shared library `exe` needs inside `root`,
 /// plus `dlopen` (guest paths of libraries the program loads itself, or
 /// directories of them) and everything those need.
-pub fn resolve(root: &Path, exe: &[u8], dlopen: &[String]) -> Result<Deps> {
+pub fn resolve(root: &Path, exe: &[u8], exe_guest: Option<&str>, dlopen: &[String]) -> Result<Deps> {
     let info = dyn_info(exe)?;
     let Some(interp_path) = info.interp.clone() else {
         return Ok(Deps { interp: None, libs: Vec::new() });
@@ -157,18 +190,17 @@ pub fn resolve(root: &Path, exe: &[u8], dlopen: &[String]) -> Result<Deps> {
     let mut seen: HashSet<String> = HashSet::from([interp_real.clone()]);
     let mut libs = Vec::new();
     // (needed name, the requester's search directories), breadth-first.
-    let mut queue: VecDeque<(String, Vec<String>)> = info.needed.iter().map(|n| (n.clone(), info.rpath.clone())).collect();
+    let exe_rpath = expand_origin(&info.rpath, exe_guest);
+    let mut queue: VecDeque<(String, Vec<String>)> = info.needed.iter().map(|n| (n.clone(), exe_rpath.clone())).collect();
     for p in dlopen {
         let real = realpath(root, p).with_context(|| format!("{p} not found in the root"))?;
-        let h = host(root, &real);
-        if h.is_dir() {
-            let mut names: Vec<String> = std::fs::read_dir(&h)?
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.contains(".so"))
-                .collect();
-            names.sort();
-            queue.extend(names.into_iter().map(|n| (format!("{}/{n}", p.trim_end_matches('/')), Vec::new())));
+        if host(root, &real).is_dir() {
+            // Every shared object below the directory (Python packages nest
+            // their extension modules).
+            let mut found = Vec::new();
+            shared_objects(root, p.trim_end_matches('/'), &mut found, 0);
+            found.sort();
+            queue.extend(found.into_iter().map(|g| (g, Vec::new())));
         } else {
             queue.push_back((p.clone(), Vec::new()));
         }
@@ -182,7 +214,7 @@ pub fn resolve(root: &Path, exe: &[u8], dlopen: &[String]) -> Result<Deps> {
         } else {
             rpath
                 .iter()
-                .filter(|d| !d.contains("$ORIGIN"))
+                .filter(|d| !d.contains('$')) // unexpanded (unknown $ORIGIN, $LIB...)
                 .chain(sys.iter())
                 .find_map(|dir| {
                     let guest = format!("{}/{name}", dir.trim_end_matches('/'));
@@ -195,8 +227,9 @@ pub fn resolve(root: &Path, exe: &[u8], dlopen: &[String]) -> Result<Deps> {
         }
         let bytes = std::fs::read(host(root, &real)).with_context(|| format!("reading {real}"))?;
         let dep_info = dyn_info(&bytes).with_context(|| format!("reading {real}"))?;
+        let dep_rpath = expand_origin(&dep_info.rpath, Some(&guest));
         for n in dep_info.needed {
-            queue.push_back((n, dep_info.rpath.clone()));
+            queue.push_back((n, dep_rpath.clone()));
         }
         libs.push(Dep { guest, host: host(root, &real) });
     }
@@ -231,6 +264,36 @@ mod tests {
         assert_eq!(realpath(&root, "/usr/lib/rel.so").as_deref(), Some("/lib/ld-musl-aarch64.so.1"));
         assert_eq!(realpath(&root, "/usr/../lib/./ld-musl-aarch64.so.1").as_deref(), Some("/lib/ld-musl-aarch64.so.1"));
         assert_eq!(realpath(&root, "/nope"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    #[test]
+    fn origin_is_the_objects_directory() {
+        let rpath = vec!["$ORIGIN/../../numpy.libs".to_string(), "${ORIGIN}".to_string(), "/opt/lib".to_string()];
+        assert_eq!(
+            expand_origin(&rpath, Some("/usr/lib/python3/numpy/_core/_umath.so")),
+            ["/usr/lib/python3/numpy/_core/../../numpy.libs", "/usr/lib/python3/numpy/_core", "/opt/lib"]
+        );
+        assert_eq!(expand_origin(&rpath, None)[0], "$ORIGIN/../../numpy.libs", "unknown origin: left alone");
+    }
+
+    #[test]
+    fn dlopen_directories_are_searched_recursively() {
+        let root = std::env::temp_dir().join(format!("wasm-env-so-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg/sub/deeper")).unwrap();
+        for f in ["pkg/a.so", "pkg/sub/b.cpython-312-aarch64-linux-gnu.so", "pkg/sub/deeper/c.so.1", "pkg/x.py"] {
+            std::fs::write(root.join(f), b"").unwrap();
+        }
+        let mut found = Vec::new();
+        shared_objects(&root, "/pkg", &mut found, 0);
+        found.sort();
+        assert_eq!(found, ["/pkg/a.so", "/pkg/sub/b.cpython-312-aarch64-linux-gnu.so", "/pkg/sub/deeper/c.so.1"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

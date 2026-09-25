@@ -73,7 +73,8 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         "svc" => b.call_support("__wasm_env_svc"),
         "nop" | "hint" | "yield" | "wfe" | "wfi" | "sev" | "sevl" | "csdb" | "isb" | "dmb" | "dsb" | "clrex"
         | "bti" | "prfm" | "prfum" | "paciasp" | "autiasp" | "pacibsp" | "autibsp" | "xpaclri" | "pacia"
-| "autia" | "pacib" | "autib" | "dc" | "ic" | "dvp" | "cfp" | "cpp" => {}
+        | "autia1716" | "autib1716" | "pacia1716" | "pacib1716" | "autia" | "pacib" | "autib" | "dc" | "ic" | "dvp"
+        | "cfp" | "cpp" => {}
 
         // --- Element / register moves between files ------------------------------
         "mov" if is_v(ops.first()) || is_v(ops.get(1)) || ops.iter().any(is_elem) => vector_move(b, i)?,
@@ -238,7 +239,9 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
 
         // --- Logic --------------------------------------------------------------
         // orr/bic vd.T, #imm{, lsl #s}: the (shifted) immediate in every lane.
-        "orr" | "bic" if is_v(ops.first()) && matches!(ops.get(1), Some(Operand::Imm32 { .. } | Operand::Imm64 { .. })) => {
+        "orr" | "bic"
+            if is_v(ops.first()) && matches!(ops.get(1), Some(Operand::Imm32 { .. } | Operand::Imm64 { .. })) =>
+        {
             let (d, e, total) = vec_dst(&ops[0])?;
             let imm = b.imm_op(i, 1)? as u128 & ((1u128 << e) - 1);
             let pattern = imm * broadcast(e, total);
@@ -253,18 +256,24 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         }
         "and" | "orr" | "eor" | "bic" | "orn" | "eon" | "ands" | "bics" | "tst" | "mvn" if is_v(ops.first()) => {
             // Whole-register bitwise operations on vectors.
-            let (d, _) = b.reg_op(i, 0)?;
-            let R::V(vd) = d else { unreachable!() };
+            let (vd, _, total) = vec_dst(&ops[0])?;
             let x = read_v128(b, &ops[1])?;
-            let y = if m == "mvn" { x.clone() } else { read_v128(b, &ops[2])? };
-            let y = if matches!(m, "bic" | "orn" | "mvn") { b.val(format!("xor i128 {y}, -1")) } else { y };
-            let op = match m {
-                "and" | "bic" => "and",
-                "orr" | "orn" | "mvn" => "or",
-                "eor" | "eon" => "xor",
-                _ => bail!("vector {m}"),
+            let mut r = if m == "mvn" {
+                b.val(format!("xor i128 {x}, -1"))
+            } else {
+                let y = read_v128(b, &ops[2])?;
+                let y = if matches!(m, "bic" | "orn") { b.val(format!("xor i128 {y}, -1")) } else { y };
+                let op = match m {
+                    "and" | "bic" => "and",
+                    "orr" | "orn" => "or",
+                    "eor" | "eon" => "xor",
+                    _ => bail!("vector {m}"),
+                };
+                b.val(format!("{op} i128 {x}, {y}"))
             };
-            let r = b.val(format!("{op} i128 {x}, {y}"));
+            if total < 128 {
+                r = b.val(format!("and i128 {r}, {}", konst128((1u128 << total) - 1)));
+            }
             b.write_v(vd, r, 128);
         }
         "and" | "orr" | "eor" | "bic" | "orn" | "eon" | "ands" | "bics" | "tst" | "mvn" => {
@@ -538,6 +547,25 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 }
             }
         }
+        // Single-lane structure load/store (`ld2 {v0.s, v1.s}[1], [x0]`):
+        // lane k of register r is at addr + r * element size; other lanes
+        // are kept.
+        "ld1" | "ld2" | "ld3" | "ld4" | "st1" | "st2" | "st3" | "st4" if list_lane(&ops[0]).is_some() => {
+            let k = list_lane(&ops[0]).unwrap();
+            let (regs, elem, _) = reg_list(&ops[0])?;
+            let addr = structure_address(b, i)?;
+            for (r, &n) in regs.iter().enumerate() {
+                let a = b.val(format!("add i64 {addr}, {}", r as u32 * elem / 8));
+                if m.starts_with("ld") {
+                    let v = b.load(&a, elem);
+                    insert_lane(b, n, elem, k, v);
+                } else {
+                    let v = b.read_v(n, 128);
+                    let lane = vlane(b, &v, elem, k);
+                    b.store(&a, &lane, elem);
+                }
+            }
+        }
         // Vector load/store of a single register (`ld1 {v0.16b}, [x0]`).
         "ld1" | "st1" if reg_list(&ops[0])?.0.len() > 1 => {
             // Several consecutive registers: register r at addr + r * size.
@@ -739,11 +767,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let index = b.imm_op(i, 3)? * 8; // byte index -> bit shift
             // result = (concat(y, x) >> index) truncated to `total` bits.
             let lo = b.val(format!("lshr i128 {x}, {index}"));
-            let hi = if index == 0 {
-                "0".to_string()
-            } else {
-                b.val(format!("shl i128 {y}, {}", 128 - index))
-            };
+            let hi = if index == 0 { "0".to_string() } else { b.val(format!("shl i128 {y}, {}", 128 - index)) };
             let mut r = b.val(format!("or i128 {lo}, {hi}"));
             if total < 128 {
                 r = b.val(format!("and i128 {r}, {}", konst128((1u128 << total) - 1)));
@@ -849,6 +873,201 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let r = b.val(format!("select i1 {cond}, {ty} {x}, {ty} {y}"));
             write_fp(b, d, r, bits)?;
         }
+        // --- More SIMD floating point: fused multiply-add, compares, pairwise
+        // and across-vector reductions. -------------------------------------------------
+        "fmla" | "fmls" if is_v(ops.first()) => {
+            // Vector, by element, or scalar by element (fmla d0, d1, v2.d[1]).
+            // Multiply then add: WebAssembly has no fused multiply-add here, so
+            // the result can differ from hardware's in the last bit.
+            let (d, elem, total) = vec_dst(&ops[0])?;
+            let ty = fp_ty(elem)?.0;
+            let acc = b.read_v(d, 128);
+            let x = read_v128(b, &ops[1])?;
+            let (y, ylane) = second_operand(b, &ops[2])?;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, elem) {
+                let [af, xf, yf] = [(&acc, k), (&x, k), (&y, ylane.unwrap_or(k))].map(|(v, j)| {
+                    let l = vlane(b, v, elem, j);
+                    b.val(format!("bitcast i{elem} {l} to {ty}"))
+                });
+                let p = b.val(format!("fmul {ty} {xf}, {yf}"));
+                let r = b.val(format!("{} {ty} {af}, {p}", if m == "fmla" { "fadd" } else { "fsub" }));
+                parts.push(b.val(format!("bitcast {ty} {r} to i{elem}")));
+            }
+            let r = vbuild(b, elem, &parts);
+            b.write_v(d, r, 128);
+        }
+        "fcmeq" | "fcmge" | "fcmgt" | "fcmle" | "fcmlt" | "facge" | "facgt" if is_v(ops.first()) => {
+            // All ones where the comparison holds; against a register or #0.0.
+            let (d, elem, total) = vec_dst(&ops[0])?;
+            let (ty, s) = fp_ty(elem)?;
+            let x = read_v128(b, &ops[1])?;
+            let y = match ops.get(2) {
+                Some(op @ Operand::Reg { .. }) => Some(read_v128(b, op)?),
+                _ => None,
+            };
+            let pred = match m {
+                "fcmeq" => "oeq",
+                "fcmge" | "facge" => "oge",
+                "fcmgt" | "facgt" => "ogt",
+                "fcmle" => "ole",
+                _ => "olt",
+            };
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, elem) {
+                let xl = vlane(b, &x, elem, k);
+                let mut xf = b.val(format!("bitcast i{elem} {xl} to {ty}"));
+                let mut yf = match &y {
+                    Some(y) => {
+                        let yl = vlane(b, y, elem, k);
+                        b.val(format!("bitcast i{elem} {yl} to {ty}"))
+                    }
+                    None => "0.0".to_string(),
+                };
+                if m.starts_with("fac") {
+                    xf = b.val(format!("call {ty} @llvm.fabs.{s}({ty} {xf})"));
+                    yf = b.val(format!("call {ty} @llvm.fabs.{s}({ty} {yf})"));
+                }
+                let c = b.val(format!("fcmp {pred} {ty} {xf}, {yf}"));
+                parts.push(b.val(format!("sext i1 {c} to i{elem}")));
+            }
+            let r = vbuild(b, elem, &parts);
+            b.write_v(d, r, 128);
+        }
+        "faddp" | "fmaxp" | "fminp" | "fmaxnmp" | "fminnmp" if is_v(ops.first()) => {
+            let combine = |b: &mut Block, ty: &str, p: &str, q: &str| match m {
+                "faddp" => b.val(format!("fadd {ty} {p}, {q}")),
+                _ => {
+                    let pred = if m.starts_with("fmax") { "ogt" } else { "olt" };
+                    let c = b.val(format!("fcmp {pred} {ty} {p}, {q}"));
+                    b.val(format!("select i1 {c}, {ty} {p}, {ty} {q}"))
+                }
+            };
+            if ops.len() == 3 {
+                // Vector: pairs of the concatenation vn:vm.
+                let (d, elem, total) = vec_dst(&ops[0])?;
+                let ty = fp_ty(elem)?.0;
+                let x = read_v128(b, &ops[1])?;
+                let y = read_v128(b, &ops[2])?;
+                let mut parts = Vec::new();
+                for src in [&x, &y] {
+                    for k in 0..nlanes(total, elem) / 2 {
+                        let [p, q] = [2 * k, 2 * k + 1].map(|j| {
+                            let l = vlane(b, src, elem, j);
+                            b.val(format!("bitcast i{elem} {l} to {ty}"))
+                        });
+                        let r = combine(b, ty, &p, &q);
+                        parts.push(b.val(format!("bitcast {ty} {r} to i{elem}")));
+                    }
+                }
+                let r = vbuild(b, elem, &parts);
+                b.write_v(d, r, 128);
+            } else {
+                // Scalar: the two lanes of the source (faddp d0, v1.2d).
+                let (d, bits) = fp_reg(&ops[0])?;
+                let ty = fp_ty(bits)?.0;
+                let x = read_v128(b, &ops[1])?;
+                let [p, q] = [0, 1].map(|j| {
+                    let l = vlane(b, &x, bits, j);
+                    b.val(format!("bitcast i{bits} {l} to {ty}"))
+                });
+                let r = combine(b, ty, &p, &q);
+                write_fp(b, d, r, bits)?;
+            }
+        }
+        "fmaxv" | "fminv" | "fmaxnmv" | "fminnmv" => {
+            let (d, bits) = fp_reg(&ops[0])?;
+            let ty = fp_ty(bits)?.0;
+            let (_, elem, total) = vec_dst(&ops[1])?;
+            let x = read_v128(b, &ops[1])?;
+            let pred = if m.starts_with("fmax") { "ogt" } else { "olt" };
+            let lanes: Vec<String> = (0..nlanes(total, elem))
+                .map(|k| {
+                    let l = vlane(b, &x, elem, k);
+                    b.val(format!("bitcast i{elem} {l} to {ty}"))
+                })
+                .collect();
+            let mut acc = lanes[0].clone();
+            for l in &lanes[1..] {
+                let c = b.val(format!("fcmp {pred} {ty} {acc}, {l}"));
+                acc = b.val(format!("select i1 {c}, {ty} {acc}, {ty} {l}"));
+            }
+            write_fp(b, d, acc, bits)?;
+        }
+
+        // --- More SIMD integer: multiply-accumulate, shift-right-accumulate,
+        // saturating narrows. -----------------------------------------------------------
+        "mla" | "mls" if is_v(ops.first()) => {
+            let (d, elem, total) = vec_dst(&ops[0])?;
+            let acc = b.read_v(d, 128);
+            let x = read_v128(b, &ops[1])?;
+            let (y, ylane) = second_operand(b, &ops[2])?;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, elem) {
+                let a = vlane(b, &acc, elem, k);
+                let xk = vlane(b, &x, elem, k);
+                let yk = vlane(b, &y, elem, ylane.unwrap_or(k));
+                let p = b.val(format!("mul i{elem} {xk}, {yk}"));
+                parts.push(b.val(format!("{} i{elem} {a}, {p}", if m == "mla" { "add" } else { "sub" })));
+            }
+            let r = vbuild(b, elem, &parts);
+            b.write_v(d, r, 128);
+        }
+        "usra" | "ssra" => {
+            let (d, elem, total) = vec_dst(&ops[0])?;
+            let s = b.imm_op(i, 2)?.min(elem as u64 - 1 + u64::from(m == "usra"));
+            let acc = b.read_v(d, 128);
+            let x = read_v128(b, &ops[1])?;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, elem) {
+                let a = vlane(b, &acc, elem, k);
+                let xk = vlane(b, &x, elem, k);
+                // A shift by the element size (allowed for usra) gives 0.
+                let sh = if s as u32 >= elem {
+                    "0".to_string()
+                } else {
+                    b.val(format!("{} i{elem} {xk}, {s}", if m == "usra" { "lshr" } else { "ashr" }))
+                };
+                parts.push(b.val(format!("add i{elem} {a}, {sh}")));
+            }
+            let r = vbuild(b, elem, &parts);
+            b.write_v(d, r, 128);
+        }
+        "sqxtn" | "uqxtn" | "sqxtun" | "sqxtn2" | "uqxtn2" | "sqxtun2" => {
+            // Narrow each lane with saturation; the "2" forms fill the upper
+            // half and keep the lower. (FPSR.QC isn't modelled.)
+            let (d, e, _) = vec_dst(&ops[0])?;
+            let (_, wide, src_total) = vec_dst(&ops[1])?;
+            let x = read_v128(b, &ops[1])?;
+            let old = b.read_v(d, 128);
+            let n = src_total / wide;
+            let (lo, hi): (i128, i128) = match m.trim_end_matches('2') {
+                "sqxtn" => (-(1i128 << (e - 1)), (1i128 << (e - 1)) - 1),
+                _ => (0, (1i128 << e) - 1),
+            };
+            let src_signed = m.starts_with("sq");
+            let mut parts = Vec::new();
+            if m.ends_with('2') {
+                for k in 0..n {
+                    parts.push(vlane(b, &old, e, k));
+                }
+            }
+            for k in 0..n {
+                let v = vlane(b, &x, wide, k);
+                let (gt, lt) = if src_signed { ("sgt", "slt") } else { ("ugt", "ult") };
+                let too_big = b.val(format!("icmp {gt} i{wide} {v}, {hi}"));
+                let v = b.val(format!("select i1 {too_big}, i{wide} {hi}, i{wide} {v}"));
+                let v = if lo < 0 || src_signed {
+                    let too_small = b.val(format!("icmp {lt} i{wide} {v}, {lo}"));
+                    b.val(format!("select i1 {too_small}, i{wide} {lo}, i{wide} {v}"))
+                } else {
+                    v
+                };
+                parts.push(b.val(format!("trunc i{wide} {v} to i{e}")));
+            }
+            let r = vbuild(b, e, &parts);
+            b.write_v(d, r, 128);
+        }
         "fcvtl" | "fcvtl2" => {
             // Widen the low (high, for fcvtl2) half's floats: .2s -> .2d.
             let (d, e, _) = vec_dst(&ops[0])?;
@@ -897,7 +1116,13 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let x = read_v128(b, &ops[1])?;
             let old = b.read_v(d, 128);
             let lane_mask = if e == 64 { u64::MAX } else { (1u64 << e) - 1 };
-            let keep = if m == "sli" { !(lane_mask << s) & lane_mask } else if s >= e { lane_mask } else { !(lane_mask >> s) & lane_mask };
+            let keep = if m == "sli" {
+                !(lane_mask << s) & lane_mask
+            } else if s >= e {
+                lane_mask
+            } else {
+                !(lane_mask >> s) & lane_mask
+            };
             let mut parts = Vec::new();
             for k in 0..nlanes(total, e) {
                 let xk = vlane(b, &x, e, k);
@@ -913,8 +1138,8 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let r = vbuild(b, e, &parts);
             b.write_v(d, r, 128);
         }
-        "umull" | "smull" | "umull2" | "smull2" | "umlal" | "smlal" | "umlal2" | "smlal2" | "umlsl" | "smlsl" | "umlsl2"
-        | "smlsl2"
+        "umull" | "smull" | "umull2" | "smull2" | "umlal" | "smlal" | "umlal2" | "smlal2" | "umlsl" | "smlsl"
+        | "umlsl2" | "smlsl2"
             if is_v(ops.first()) =>
         {
             // Widening multiply (and accumulate/subtract): the narrow
@@ -1021,6 +1246,39 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 vector_fp_unary(b, i, |b, bits, x| fround(b, mode, bits, x))?;
             }
         }
+        "fcvtas" | "fcvtau" | "fcvtns" | "fcvtnu" | "fcvtms" | "fcvtmu" | "fcvtps" | "fcvtpu"
+            if has_arrspec(&ops[0]) =>
+        {
+            // Per lane: round in the given mode, then convert with saturation.
+            let mode = m.as_bytes()[4] as char;
+            let op = if m.ends_with('s') { "fptosi.sat" } else { "fptoui.sat" };
+            vector_map(b, i, |b, bits, lane| {
+                let (ty, s) = fp_ty(bits)?;
+                let x = b.val(format!("bitcast i{bits} {lane} to {ty}"));
+                let r = fround(b, mode, bits, &x)?;
+                Ok(b.val(format!("call i{bits} @llvm.{op}.i{bits}.{s}({ty} {r})")))
+            })?
+        }
+        "uqadd" | "sqadd" | "uqsub" | "sqsub" if is_v(ops.first()) => {
+            // Saturating add/subtract (vector or scalar). FPSR.QC isn't modelled.
+            let f = match m {
+                "uqadd" => "uadd.sat",
+                "sqadd" => "sadd.sat",
+                "uqsub" => "usub.sat",
+                _ => "ssub.sat",
+            };
+            let (d, elem, total) = vec_dst(&ops[0])?;
+            let x = read_v128(b, &ops[1])?;
+            let y = read_v128(b, &ops[2])?;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, elem) {
+                let xk = vlane(b, &x, elem, k);
+                let yk = vlane(b, &y, elem, k);
+                parts.push(b.val(format!("call i{elem} @llvm.{f}.i{elem}(i{elem} {xk}, i{elem} {yk})")));
+            }
+            let r = vbuild(b, elem, &parts);
+            b.write_v(d, r, 128);
+        }
         "fcvtas" | "fcvtau" | "fcvtns" | "fcvtnu" | "fcvtms" | "fcvtmu" | "fcvtps" | "fcvtpu" if !is_v(ops.first()) => {
             let (d, dbits) = b.reg_op(i, 0)?;
             let (_, sbits) = fp_reg(&ops[1])?;
@@ -1045,11 +1303,11 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let (d, elem, total) = vec_dst(&ops[0])?;
             let ty = fp_ty(elem)?.0;
             let x = read_v128(b, &ops[1])?;
-            let y = read_v128(b, &ops[2])?;
+            let (y, ylane) = second_operand(b, &ops[2])?;
             let mut parts = Vec::new();
             for k in 0..nlanes(total, elem) {
                 let xl = vlane(b, &x, elem, k);
-                let yl = vlane(b, &y, elem, k);
+                let yl = vlane(b, &y, elem, ylane.unwrap_or(k));
                 let xf = b.val(format!("bitcast i{elem} {xl} to {ty}"));
                 let yf = b.val(format!("bitcast i{elem} {yl} to {ty}"));
                 let r = match m {
@@ -1140,7 +1398,9 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let r = vbuild(b, elem, &parts);
             b.write_v(d, r, 128);
         }
-        "sxtl" | "uxtl" | "sxtl2" | "uxtl2" | "sshll" | "ushll" | "sshll2" | "ushll2" => {
+        "sxtl" | "uxtl" | "sxtl2" | "uxtl2" | "sshll" | "ushll" | "sshll2" | "ushll2" | "shll" | "shll2" => {
+            // (shll shifts by the element size, pushing out any sign bits, so
+            // its extension doesn't matter.)
             // Widen the low (or, for the "2" forms, high) half's lanes.
             let (d, e, _) = vec_dst(&ops[0])?;
             let x = read_v128(b, &ops[1])?;
@@ -1349,6 +1609,7 @@ fn fp_reg(op: &Operand) -> Result<(u8, u32)> {
 
 fn fp_ty(bits: u32) -> Result<(&'static str, &'static str)> {
     match bits {
+        16 => Ok(("half", "f16")),
         32 => Ok(("float", "f32")),
         64 => Ok(("double", "f64")),
         _ => bail!("{bits}-bit floating point"),
@@ -1375,6 +1636,16 @@ fn structure_address(b: &mut Block, i: &Instruction) -> Result<String> {
         b.write(reg(*r)?.0, next, 64)?;
     }
     Ok(addr)
+}
+
+/// The second source of a vector operation: a whole vector, or a single
+/// element (`v2.s[3]`, the "by element" forms) as the vector holding it and
+/// the lane to use for every lane of the result.
+fn second_operand(b: &mut Block, op: &Operand) -> Result<(String, Option<u32>)> {
+    Ok(match elem_of(op) {
+        Some((n, _, lane)) => (b.read_v(n, 128), Some(lane)),
+        None => (read_v128(b, op)?, None),
+    })
 }
 
 /// Decodes an LSE atomic mnemonic: ldOP/stOP (OP one of add, clr, eor, set,
@@ -1571,6 +1842,14 @@ fn reg_list(op: &Operand) -> Result<(Vec<u8>, u32, u32)> {
     }
 }
 
+/// The lane of a single-lane register list (`{v0.s, v1.s}[1]`), if any.
+fn list_lane(op: &Operand) -> Option<u32> {
+    match op {
+        Operand::Reg { arrspec: Some(a), .. } | Operand::MultiReg { arrspec: Some(a), .. } => a.lane(),
+        _ => None,
+    }
+}
+
 fn nlanes(total: u32, elem: u32) -> u32 {
     total / elem
 }
@@ -1580,15 +1859,17 @@ fn vector_binary(b: &mut Block, i: &Instruction, m: &str) -> Result<()> {
     let (d, elem, total) = vec_dst(&i.operands()[0])?;
     let x = read_v128(b, &i.operands()[1])?;
     // The second operand is a register, or an immediate (cmeq v0.4s, v1.4s, #0).
+    // The second operand is a register, an element (mul v0.4s, v1.4s,
+    // v2.s[1]), or an immediate (cmeq v0.4s, v1.4s, #0).
     let y = match &i.operands()[2] {
         Operand::Imm32 { .. } | Operand::Imm64 { .. } => Err(konst(b.imm_op(i, 2)?, elem)),
-        op => Ok(read_v128(b, op)?),
+        op => Ok(second_operand(b, op)?),
     };
     let mut parts = Vec::new();
     for k in 0..nlanes(total, elem) {
         let xk = vlane(b, &x, elem, k);
         let yk = match &y {
-            Ok(y) => vlane(b, y, elem, k),
+            Ok((y, lane)) => vlane(b, y, elem, lane.unwrap_or(k)),
             Err(imm) => imm.clone(),
         };
         let r = match m {
