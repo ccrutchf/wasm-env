@@ -71,7 +71,10 @@ fn main() -> Result<()> {
     } else {
         // A host file: a .wasm module, or an arm64 ELF to translate.
         let mut host = PathBuf::from(&program);
-        let head = std::fs::read(&host).map(|b| b.into_iter().take(256).collect::<Vec<_>>()).unwrap_or_default();
+        let mut head = Vec::new();
+        if let Ok(f) = std::fs::File::open(&host) {
+            let _ = std::io::Read::read_to_end(&mut std::io::Read::take(f, 256), &mut head);
+        }
         if translate::is_arm64_elf(&head) {
             let name = host.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             host = translate::ensure_translated(&host, &root, &name, trace)

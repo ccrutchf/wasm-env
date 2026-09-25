@@ -27,7 +27,7 @@ use crate::abi::errno::*;
 use crate::memory::SysResult;
 
 /// A 64-bit FNV-1a hash of some bytes, for naming cache entries.
-fn hash(bytes: &[u8]) -> u64 {
+pub fn hash(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for &b in bytes {
         h = (h ^ b as u64).wrapping_mul(0x100000001b3);

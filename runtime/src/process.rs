@@ -152,12 +152,53 @@ pub fn engine() -> Result<Engine> {
     if deadline().is_some() {
         config.epoch_interruption(true);
     }
-    if let Some(dir) = cache_dir() {
-        let mut cache = wasmtime::CacheConfig::new();
-        cache.with_directory(dir);
-        config.cache(Some(wasmtime::Cache::new(cache)?));
+    // Profiling aid: WASM_ENV_PERFMAP=1 writes /tmp/perf-PID.map so `perf`
+    // names the wasm functions (for a translated program, the regions).
+    if std::env::var_os("WASM_ENV_PERFMAP").is_some() {
+        config.profiler(wasmtime::ProfilingStrategy::PerfMap);
     }
     Ok(Engine::new(&config)?)
+}
+
+/// Loads the compiled program for a .wasm file, compiling it only the first
+/// time. Compiled code is cached uncompressed and
+/// mapped straight from the file, so a cached load of a large translated
+/// program (hundreds of MB of wasm) takes milliseconds: wasmtime's own cache
+/// hashes the whole .wasm and decompresses its entry on every load.
+///
+/// The entry is named by the .wasm's path and records its size, mtime and
+/// the engine's settings; a .wasm that changes replaces its entry.
+pub fn load_module(engine: &Engine, host: &std::path::Path) -> Result<Module> {
+    use std::hash::{Hash, Hasher};
+    let Some(dir) = cache_dir() else { return Ok(Module::from_file(engine, host)?) };
+    let host = std::fs::canonicalize(host)?;
+    let meta = std::fs::metadata(&host)?;
+    let mtime = meta.modified()?.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut h);
+    let stamp = format!("{} {} {} {:016x}\n", meta.len(), mtime.as_nanos(), MASK_BITS, h.finish());
+    let key = crate::translate::hash(host.as_os_str().as_encoded_bytes());
+    let (entry, stamp_file) = (dir.join(format!("{key:016x}.cwasm")), dir.join(format!("{key:016x}.stamp")));
+    if std::fs::read_to_string(&stamp_file).is_ok_and(|s| s == stamp) {
+        // SAFETY: the entry was written by `Module::serialize` below, for
+        // this engine configuration (the stamp says so), and is replaced
+        // only by rename, never modified in place.
+        if let Ok(module) = unsafe { Module::deserialize_file(engine, &entry) } {
+            return Ok(module);
+        }
+    }
+    let module = Module::from_file(engine, &host)?;
+    // Best effort: a cache that can't be written just means compiling again.
+    let _ = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        let tmp = dir.join(format!("{key:016x}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, module.serialize().map_err(std::io::Error::other)?)?;
+        std::fs::rename(&tmp, &entry)?;
+        let tmp = dir.join(format!("{key:016x}.{}.stamp.tmp", std::process::id()));
+        std::fs::write(&tmp, &stamp)?;
+        std::fs::rename(&tmp, &stamp_file)
+    })();
+    Ok(module)
 }
 
 /// Checks the module against docs/abi.md's "Module shape".

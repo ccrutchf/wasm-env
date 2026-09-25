@@ -779,15 +779,15 @@ fn build_data(image: &Image, prog: &Program) -> String {
     ir.push_str("@V = global [32 x i128] zeroinitializer, align 16\n");
     ir.push_str("@TP = global i64 0\n\n");
 
+    // The segments' bytes aren't here: they're added to the linked module as
+    // data segments at their own addresses (link::add_data_segments), so the
+    // data pointers are null.
     ir.push_str("%seg = type { i64, i64, i64, ptr }\n");
-    for (k, s) in image.segments.iter().enumerate() {
-        let _ = writeln!(ir, "@seg{k} = private constant [{} x i8] {}", s.data.len(), cstring_raw(&s.data));
-    }
     let _ = write!(ir, "@guest_segments = constant [{} x %seg] [", image.segments.len());
     for (k, s) in image.segments.iter().enumerate() {
         let _ = write!(
             ir,
-            "{}%seg {{ i64 {}, i64 {}, i64 {}, ptr @seg{k} }}",
+            "{}%seg {{ i64 {}, i64 {}, i64 {}, ptr null }}",
             if k == 0 { "" } else { ", " },
             s.vaddr as i64,
             s.data.len(),
@@ -831,22 +831,23 @@ fn build_data(image: &Image, prog: &Program) -> String {
     let _ = writeln!(ir, "@guest_object_count = constant i64 {}", image.objects.len());
     let _ = writeln!(ir, "@guest_phnum = constant i64 {}\n", image.phnum);
 
-    // Declare every block function, then build the dispatch table: parallel
-    // arrays of sorted addresses and their function pointers, searched by
-    // the support code's `dispatch`.
+    // Declare every region function, then build the dispatch table: parallel
+    // arrays of sorted region addresses and their functions, searched by the
+    // support code's `dispatch`. A region function checks that the address
+    // it's entered at is one of its blocks.
     let regions: std::collections::BTreeSet<u64> = prog.leaders.iter().map(|&a| region_of(a)).collect();
     for r in &regions {
         let _ = writeln!(ir, "declare void @R_{r:x}(i64)");
     }
-    let n = prog.leaders.len();
+    let n = regions.len();
     let _ = write!(ir, "@dispatch_addrs = constant [{n} x i64] [");
-    for (i, &a) in prog.leaders.iter().enumerate() {
-        let _ = write!(ir, "{}i64 {}", if i == 0 { "" } else { ", " }, a as i64);
+    for (i, &r) in regions.iter().enumerate() {
+        let _ = write!(ir, "{}i64 {}", if i == 0 { "" } else { ", " }, r as i64);
     }
     ir.push_str("]\n");
     let _ = write!(ir, "@dispatch_fns = constant [{n} x ptr] [");
-    for (i, &a) in prog.leaders.iter().enumerate() {
-        let _ = write!(ir, "{}ptr @R_{:x}", if i == 0 { "" } else { ", " }, region_of(a));
+    for (i, &r) in regions.iter().enumerate() {
+        let _ = write!(ir, "{}ptr @R_{r:x}", if i == 0 { "" } else { ", " });
     }
     ir.push_str("]\n");
     let _ = writeln!(ir, "@dispatch_count = constant i64 {n}");

@@ -144,7 +144,10 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     let tc = link::Toolchain::from_env().context("$WASM_CC isn't set (run inside `nix develop`)")?;
     let image_end = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(0);
     let work = std::env::temp_dir().join(format!("wasm-env-translate-{}", std::process::id()));
-    let wasm = link::link_chunked(&tc, &lifted.data, &lifted.chunks, image_end, &work);
+    let wasm = link::link_chunked(&tc, &lifted.data, &lifted.chunks, image_end, &work).and_then(|wasm| {
+        let segments: Vec<(u64, &[u8])> = image.segments.iter().map(|s| (s.vaddr, s.data.as_slice())).collect();
+        link::add_data_segments(&wasm, &segments)
+    });
     lap("compile and link");
     // WASM_ENV_KEEP_WORK=1 keeps the generated IR and objects for debugging.
     if std::env::var_os("WASM_ENV_KEEP_WORK").is_some() {

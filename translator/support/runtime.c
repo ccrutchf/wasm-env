@@ -21,11 +21,12 @@ extern const uint64_t guest_segment_count, guest_entry, guest_phdr, guest_phnum;
 // runs first (guest_entry is then its entry), its load address (AT_BASE).
 extern const uint64_t guest_app_entry, guest_interp_base;
 
-// The block table, defined by the lifted data module: sorted guest block
-// addresses and their translated functions. `dispatch` maps a guest address
-// to its function; the lifted code routes every branch, call and return
-// through it, so blocks never reference each other directly (which lets them
-// be split across compilation units).
+// The region table, defined by the lifted data module: the sorted start
+// addresses of the translated regions (REGION_SPAN bytes of guest code each)
+// and their functions. `dispatch` maps a guest address to its region's
+// function, which enters at the block there (or reports a missed target if
+// there's none); the lifted code routes indirect branches and returns
+// through it.
 extern const uint64_t dispatch_addrs[];
 extern void *const dispatch_fns[];
 extern const uint64_t dispatch_count;
@@ -139,22 +140,41 @@ uint32_t __wasm_env_crc32(uint32_t crc, uint64_t data, uint32_t bytes, uint32_t 
 	return crc;
 }
 
-// Binary search the block table for `pc` and tail-call its function (a
-// WebAssembly return_call, so the host stack doesn't grow). An address with
-// no block was never translated.
+// Must match the translator's REGION_SPAN (translator/src/lift/mod.rs).
+#define REGION_SHIFT 12
+// A direct-mapped cache of region lookups, tagged with region number + 1 so
+// the zeroed initial entries match nothing. Processes are single-threaded.
+#define DISPATCH_CACHE 4096
+static struct {
+	uint64_t tag;
+	block_fn fn;
+} dispatch_cache[DISPATCH_CACHE];
+
+// Find `pc`'s region function and tail-call it (a WebAssembly return_call,
+// so the host stack doesn't grow): from the cache, else by binary search of
+// the region table. An address in no region was never translated.
 void dispatch(long pc)
 {
 	uint64_t target = (uint64_t)pc;
 	wasm_env_recent[wasm_env_recent_count++ % RECENT] = target;
+	uint64_t region = target >> REGION_SHIFT;
+	uint64_t slot = (region ^ (region >> 12)) % DISPATCH_CACHE;
+	if (dispatch_cache[slot].tag == region + 1) {
+		block_fn f = dispatch_cache[slot].fn;
+		__attribute__((musttail)) return f(pc); // the region function enters at pc
+	}
+	uint64_t start = region << REGION_SHIFT;
 	uint64_t lo = 0, hi = dispatch_count;
 	while (lo < hi) {
 		uint64_t mid = lo + (hi - lo) / 2;
 		uint64_t a = dispatch_addrs[mid];
-		if (a == target) {
+		if (a == start) {
 			block_fn f = (block_fn)dispatch_fns[mid];
-			__attribute__((musttail)) return f(pc); // the region function enters at pc
+			dispatch_cache[slot].tag = region + 1;
+			dispatch_cache[slot].fn = f;
+			__attribute__((musttail)) return f(pc);
 		}
-		if (a < target)
+		if (a < start)
 			lo = mid + 1;
 		else
 			hi = mid;
@@ -372,9 +392,13 @@ static uint64_t guest_initial_stack(const uint64_t *sp)
 __attribute__((__export_name__("_start")))
 void _start(uint64_t sp)
 {
-	// Map the guest image at its original addresses.
+	// Map the guest image at its original addresses. The translator places
+	// segments there as the module's own data segments (data is null), and
+	// memory starts zeroed; otherwise copy them.
 	for (uint64_t k = 0; k < guest_segment_count; k++) {
 		const struct seg *s = &guest_segments[k];
+		if (!s->data)
+			continue;
 		uint8_t *dst = (uint8_t *)(uintptr_t)s->vaddr;
 		__builtin_memcpy(dst, s->data, s->filesz);
 		__builtin_memset(dst + s->filesz, 0, s->memsz - s->filesz);

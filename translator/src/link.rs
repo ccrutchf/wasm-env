@@ -213,6 +213,96 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
     Ok(std::fs::read(&wasm)?)
 }
 
+/// Adds active data segments to a linked wasm64 module: each (address,
+/// bytes) is placed in memory at that address when the module is
+/// instantiated. The guest image goes in this way, at its original
+/// addresses, rather than being copied there at startup: wasmtime then maps
+/// it copy-on-write from the compiled module, and a process only pays for
+/// the pages it touches.
+pub fn add_data_segments(wasm: &[u8], segments: &[(u64, &[u8])]) -> Result<Vec<u8>> {
+    const DATA: u8 = 11;
+    const DATA_COUNT: u8 = 12;
+    if wasm.get(..8) != Some(b"\0asm\x01\0\0\0".as_slice()) {
+        bail!("not a wasm module");
+    }
+    let mut out = wasm[..8].to_vec();
+    let mut pos = 8;
+    let mut added = false;
+    while pos < wasm.len() {
+        let id = wasm[pos];
+        let (size, n) = read_uleb(&wasm[pos + 1..])?;
+        let body = &wasm[pos + 1 + n..pos + 1 + n + size as usize];
+        pos += 1 + n + size as usize;
+        let new_body = match id {
+            DATA => {
+                let (count, n) = read_uleb(body)?;
+                let mut b = Vec::new();
+                write_uleb(&mut b, count + segments.len() as u64);
+                b.extend_from_slice(&body[n..]);
+                for (addr, bytes) in segments {
+                    b.push(0); // active, memory 0
+                    b.push(0x42); // i64.const
+                    write_sleb(&mut b, *addr as i64);
+                    b.push(0x0b); // end
+                    write_uleb(&mut b, bytes.len() as u64);
+                    b.extend_from_slice(bytes);
+                }
+                added = true;
+                b
+            }
+            DATA_COUNT => {
+                let (count, _) = read_uleb(body)?;
+                let mut b = Vec::new();
+                write_uleb(&mut b, count + segments.len() as u64);
+                b
+            }
+            _ => body.to_vec(),
+        };
+        out.push(id);
+        write_uleb(&mut out, new_body.len() as u64);
+        out.extend_from_slice(&new_body);
+    }
+    if !added {
+        bail!("the module has no data section");
+    }
+    Ok(out)
+}
+
+fn read_uleb(b: &[u8]) -> Result<(u64, usize)> {
+    let mut v = 0u64;
+    for (i, &byte) in b.iter().enumerate().take(10) {
+        v |= ((byte & 0x7f) as u64) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Ok((v, i + 1));
+        }
+    }
+    bail!("bad LEB128")
+}
+
+fn write_uleb(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn write_sleb(out: &mut Vec<u8>, mut v: i64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        let done = (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0);
+        out.push(if done { byte } else { byte | 0x80 });
+        if done {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +472,34 @@ define void @B_400000(i64 %_) {{
         assert_ne!(content_key(&[b"ab", b"c"]), content_key(&[b"a", b"bc"]), "boundaries count");
         assert_ne!(content_key(&[b"abc"]), content_key(&[b"abd"]));
         assert_eq!(content_key(&[b""]).len(), 32);
+    }
+
+    #[test]
+    fn added_data_segments_are_placed_at_their_addresses() {
+        // A memory64 module exporting its memory, with one data segment
+        // ("ab" at 16) and a data count section.
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        wasm.extend([5, 3, 1, 0x04, 2]); // memory: 1, memory64, min 2 pages
+        wasm.extend([7, 10, 1, 6]);
+        wasm.extend(b"memory");
+        wasm.extend([2, 0]); // export "memory"
+        wasm.extend([12, 1, 1]); // data count 1
+        wasm.extend([11, 8, 1, 0, 0x42, 16, 0x0b, 2, b'a', b'b']);
+        let far = vec![7u8; 3];
+        let out = add_data_segments(&wasm, &[(0x1_0000 + 5, &far), (300, b"xyz")]).unwrap();
+
+        let mut config = Config::new();
+        config.wasm_memory64(true);
+        let engine = Engine::new(&config).unwrap();
+        let module = Module::new(&engine, &out).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+        let d = memory.data(&store);
+        assert_eq!(&d[16..18], b"ab", "existing segments are kept");
+        assert_eq!(&d[300..303], b"xyz");
+        assert_eq!(&d[0x1_0005..0x1_0008], &[7, 7, 7], "addresses above 2^16 (multi-byte LEB)");
+        assert_eq!(d[303], 0);
     }
 
     #[test]

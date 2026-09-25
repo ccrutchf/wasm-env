@@ -226,7 +226,7 @@ impl Kernel {
             && (*mtime, *len) == stamp {
                 return Ok(module.clone());
             }
-        let module = Module::from_file(&self.engine, host).map_err(|e| format!("{e:?}"))?;
+        let module = process::load_module(&self.engine, host).map_err(|e| format!("{e:?}"))?;
         process::check_shape(&module).map_err(|e| e.to_string())?;
         self.modules.lock().unwrap().insert(host.to_path_buf(), (stamp.0, stamp.1, module.clone()));
         Ok(module)
