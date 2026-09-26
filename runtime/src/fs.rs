@@ -131,18 +131,30 @@ pub enum Synthetic {
     CpuInfo,
     /// /sys/devices/system/cpu/{possible,online,present}: "0", one CPU.
     CpuList,
+    /// /etc/resolv.conf, when the root's is missing or empty (as in a
+    /// fresh image): the host's, so the guest resolves names as the host
+    /// does, whose sockets it uses (as Docker gives containers).
+    ResolvConf,
 }
 
 impl Synthetic {
-    pub fn content(self) -> &'static [u8] {
-        match self {
+    pub fn content(self) -> std::borrow::Cow<'static, [u8]> {
+        let fixed: &'static [u8] = match self {
             Synthetic::CpuInfo => {
                 b"processor\t: 0\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd crc32 atomics lrcpc\n\
                   CPU implementer\t: 0x00\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\n\
                   CPU revision\t: 0\n\n"
             }
             Synthetic::CpuList => b"0\n",
-        }
+            Synthetic::ResolvConf => {
+                return match std::fs::read("/etc/resolv.conf") {
+                    Ok(host) if !host.is_empty() => host.into(),
+                    // No host resolver configuration (Windows, say): public ones.
+                    _ => b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n".as_slice().into(),
+                };
+            }
+        };
+        fixed.into()
     }
 
     /// The content as an open host file (an unlinked temporary), so reading,
@@ -154,7 +166,7 @@ impl Synthetic {
         let path = std::env::temp_dir().join(format!("wasm-env-synthetic-{}-{n}", std::process::id()));
         let mut file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
         let _ = std::fs::remove_file(&path);
-        file.write_all(self.content())?;
+        file.write_all(&self.content())?;
         file.rewind()?;
         Ok(file)
     }
@@ -179,6 +191,12 @@ impl Fs {
             ["proc", "cpuinfo"] => return Some(DevPath::Synthetic(Synthetic::CpuInfo)),
             ["sys", "devices", "system", "cpu", "possible" | "online" | "present"] => {
                 return Some(DevPath::Synthetic(Synthetic::CpuList));
+            }
+            ["etc", "resolv.conf"]
+                if std::fs::metadata(self.host("/etc/resolv.conf")).is_ok_and(|m| m.len() == 0)
+                    || std::fs::symlink_metadata(self.host("/etc/resolv.conf")).is_err() =>
+            {
+                return Some(DevPath::Synthetic(Synthetic::ResolvConf));
             }
             _ => {}
         }
@@ -318,6 +336,7 @@ pub enum Open {
     File { file: File, path: String, append: bool },
     Dir { path: String, entries: Option<Vec<DirEntry>>, pos: usize },
     Pipe(PipeEnd),
+    Socket(std::sync::Arc<crate::net::GuestSocket>),
     Device(Device),
 }
 

@@ -82,6 +82,24 @@ pub mod nr {
     pub const PRLIMIT64: i64 = 261;
     pub const RENAMEAT2: i64 = 276;
     pub const GETRANDOM: i64 = 278;
+    pub const PSELECT6: i64 = 72;
+    pub const PPOLL: i64 = 73;
+    pub const SOCKET: i64 = 198;
+    pub const BIND: i64 = 200;
+    pub const LISTEN: i64 = 201;
+    pub const ACCEPT: i64 = 202;
+    pub const CONNECT: i64 = 203;
+    pub const GETSOCKNAME: i64 = 204;
+    pub const GETPEERNAME: i64 = 205;
+    pub const SENDTO: i64 = 206;
+    pub const RECVFROM: i64 = 207;
+    pub const SETSOCKOPT: i64 = 208;
+    pub const GETSOCKOPT: i64 = 209;
+    pub const SHUTDOWN: i64 = 210;
+    pub const SENDMSG: i64 = 211;
+    pub const RECVMSG: i64 = 212;
+    pub const ACCEPT4: i64 = 242;
+    pub const SENDMMSG: i64 = 269;
 }
 
 /// Syscall name for tracing.
@@ -108,7 +126,12 @@ pub fn name(n: i64) -> &'static str {
         MREMAP => "mremap", MMAP => "mmap", MPROTECT => "mprotect", MADVISE => "madvise",
         PRLIMIT64 => "prlimit64", GETRANDOM => "getrandom", PIPE2 => "pipe2", CLONE => "clone",
         EXECVE => "execve", WAIT4 => "wait4", SETPGID => "setpgid", GETPGID => "getpgid",
-        GETSID => "getsid", SETSID => "setsid",
+        GETSID => "getsid", SETSID => "setsid", PSELECT6 => "pselect6", PPOLL => "ppoll",
+        SOCKET => "socket", BIND => "bind", LISTEN => "listen", ACCEPT => "accept",
+        CONNECT => "connect", GETSOCKNAME => "getsockname", GETPEERNAME => "getpeername",
+        SENDTO => "sendto", RECVFROM => "recvfrom", SETSOCKOPT => "setsockopt",
+        GETSOCKOPT => "getsockopt", SHUTDOWN => "shutdown", SENDMSG => "sendmsg",
+        RECVMSG => "recvmsg", ACCEPT4 => "accept4", SENDMMSG => "sendmmsg",
         _ => "?",
     }
 }

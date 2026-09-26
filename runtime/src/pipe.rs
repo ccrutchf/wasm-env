@@ -115,6 +115,16 @@ impl Pipe {
     pub fn available(&self) -> usize {
         self.state.lock().unwrap().data.len()
     }
+
+    /// For poll: whether a read wouldn't block (data, or EOF), whether a
+    /// write wouldn't (room, or no reader: EPIPE), and whether the other
+    /// side has gone (POLLHUP for readers, POLLERR for writers).
+    pub fn readiness(&self) -> (bool, bool, bool, bool) {
+        let s = self.state.lock().unwrap();
+        let readable = !s.data.is_empty() || s.writers == 0;
+        let writable = s.data.len() < CAPACITY || s.readers == 0;
+        (readable, writable, s.writers == 0, s.readers == 0)
+    }
 }
 
 #[cfg(test)]

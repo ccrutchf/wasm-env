@@ -103,12 +103,22 @@ pub fn is_arm64_elf(head: &[u8]) -> bool {
 
 /// A fingerprint of the files a translation read: one "size<TAB>mtime<TAB>path"
 /// line each. A missing file fingerprints as "absent", so deleting a library
-/// invalidates the entry too.
+/// invalidates the entry too. A directory (one the program dlopens libraries
+/// from) fingerprints as the shared objects under it, so installing one
+/// (`pip install` of a package with an extension module) translates again,
+/// while other changes there (Python's bytecode caches, pure-Python
+/// packages) don't.
 fn fingerprint(paths: &str) -> String {
     paths
         .lines()
         .filter(|l| !l.is_empty())
         .map(|p| match std::fs::metadata(p) {
+            Ok(m) if m.is_dir() => {
+                let mut libs = Vec::new();
+                shared_objects(Path::new(p), &mut libs, 0);
+                libs.sort();
+                format!("dir\t{:016x}\t{p}\n", hash(libs.join("\n").as_bytes()))
+            }
             Ok(m) => {
                 let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
                 format!("{}\t{}\t{p}\n", m.len(), t.map_or(0, |d| d.as_nanos()))
@@ -116,6 +126,25 @@ fn fingerprint(paths: &str) -> String {
             Err(_) => format!("absent\t\t{p}\n"),
         })
         .collect()
+}
+
+/// "path size mtime" of each shared object under `dir`, recursively, as the
+/// translator finds them for `--dlopen` (skipping bytecode caches).
+fn shared_objects(dir: &Path, out: &mut Vec<String>, depth: u32) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let path = e.path();
+        match e.file_type() {
+            Ok(t) if t.is_dir() && depth < 16 && name != "__pycache__" => shared_objects(&path, out, depth + 1),
+            Ok(t) if !t.is_dir() && name.to_string_lossy().contains(".so") => {
+                let m = e.metadata().ok();
+                let t = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+                out.push(format!("{} {} {}", path.display(), m.map_or(0, |m| m.len()), t.map_or(0, |d| d.as_nanos())));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Whether a cache entry's recorded inputs are all unchanged.
@@ -238,6 +267,29 @@ mod cache_tests {
         std::fs::remove_file(&lib).unwrap();
         assert!(!still_valid(&deps), "a deleted library");
         assert!(!still_valid(&dir.join("missing.deps")), "no record");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dlopen_directory_changes_only_with_its_libraries() {
+        let dir = std::env::temp_dir().join(format!("wasm-env-fp-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (site, deps) = (dir.join("site"), dir.join("entry.deps"));
+        std::fs::create_dir_all(site.join("pkg/__pycache__")).unwrap();
+        std::fs::write(site.join("pkg/ext.cpython-312-aarch64-linux-gnu.so"), b"v1").unwrap();
+        let record = || std::fs::write(&deps, fingerprint(&format!("{}\n", site.display()))).unwrap();
+        record();
+        assert!(still_valid(&deps));
+        std::fs::write(site.join("pkg/__pycache__/mod.cpython-312.pyc"), b"x").unwrap();
+        std::fs::create_dir_all(site.join("purepy")).unwrap();
+        std::fs::write(site.join("purepy/__init__.py"), b"").unwrap();
+        assert!(still_valid(&deps), "bytecode caches and pure-Python packages don't count");
+        std::fs::create_dir_all(site.join("newpkg")).unwrap();
+        std::fs::write(site.join("newpkg/speedups.so"), b"").unwrap();
+        assert!(!still_valid(&deps), "a new extension module does");
+        record();
+        std::fs::write(site.join("pkg/ext.cpython-312-aarch64-linux-gnu.so"), b"version 2").unwrap();
+        assert!(!still_valid(&deps), "and so does a changed one");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

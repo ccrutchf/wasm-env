@@ -83,5 +83,29 @@ else
 	echo "skipped numpy and pandas: can't fetch the wheels (offline?)"
 fi
 
+# Networking, if PyPI is reachable: DNS (glibc's resolver, over the host's
+# resolv.conf), HTTPS (Ubuntu's OpenSSL with its CA certificates), and pip
+# installing a package from PyPI. Ubuntu's ca-certificates package builds
+# its bundle when installed; here the fetch script only unpacks, so do that.
+if curl -sSf -o /dev/null https://pypi.org/simple/ 2>/dev/null \
+	&& tests/ubuntu-fetch.sh ca-certificates >/dev/null 2>&1 && tests/wheel-fetch.sh pip==26.2.1 >/dev/null 2>&1; then
+	mkdir -p "$R/etc/ssl/certs"
+	cat "$R"/usr/share/ca-certificates/mozilla/*.crt > "$R/etc/ssl/certs/ca-certificates.crt"
+	# Translated programs can't start threads yet; pip draws progress bars in one.
+	printf '[global]\nprogress_bar = off\n' > "$R/etc/pip.conf"
+	py() { timeout 1800 "$wasm_env" run --root "$R" --env HOME=/root --env PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3.12 "$@" 2>&1; }
+	compare "DNS and HTTPS" "resolved: True
+200 six 1.17.0" "$(py -c '
+import json, socket, urllib.request
+print("resolved:", bool(socket.getaddrinfo("pypi.org", 443, type=socket.SOCK_STREAM)))
+r = urllib.request.urlopen("https://pypi.org/pypi/six/1.17.0/json", timeout=60)
+print(r.status, json.load(r)["info"]["name"], "1.17.0")')"
+	rm -rf "$R/tmp/pip-test"
+	py -m pip install --disable-pip-version-check --root-user-action=ignore --target /tmp/pip-test attrs==25.3.0 >/dev/null
+	compare "pip install from PyPI" "attrs 25.3.0" "$(py -c 'import sys; sys.path.insert(0, "/tmp/pip-test"); import attrs; print("attrs", attrs.__version__)')"
+else
+	echo "skipped networking: PyPI isn't reachable"
+fi
+
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]

@@ -15,6 +15,7 @@ mod abi;
 mod fs;
 mod kernel;
 mod memory;
+mod net;
 mod pipe;
 mod process;
 mod syscall;

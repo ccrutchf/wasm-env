@@ -28,6 +28,7 @@ done
 $cc -O2 tests/c/spawn.c -o "$rootfs/bin/spawn-test"
 $cc -O2 tests/c/futex.c -o "$rootfs/bin/futex-test"
 $cc -O2 tests/c/brk.c -o "$rootfs/bin/brk-test"
+$cc -O2 tests/c/net.c -o "$rootfs/bin/net-test"
 echo 'root:x:0:0:root:/root:/bin/sh' > "$rootfs/etc/passwd"
 printf 'b\na\nc\n' > "$rootfs/data/letters"
 cat > "$rootfs/bin/greet" <<'EOF'
@@ -94,6 +95,24 @@ check "C vfork" "vfork: child exit 42" "$(sed -n 4p <<<"$out")"
 check "C system" "system: 5" "$(sed -n 5p <<<"$out")"
 check "C popen" "popen: FROM POPEN" "$(sed -n 6p <<<"$out")"
 check "C kill" "kill: signaled=1 sig=15" "$(sed -n 8p <<<"$out")"
+
+# Sockets over loopback: TCP (non-blocking connect, poll, select), UDP.
+check "sockets" "listening: 127.0.0.1, port assigned: yes
+connect: in progress
+poll: 1, writable 1
+SO_ERROR 0
+accepted: yes
+sent 14
+received 14: hello over tcp
+sent back 4
+select: 1, readable 1
+received 4: pong
+after close: read 0
+idle poll: 0
+udp sent 8
+udp received 8: datagram from 127.0.0.1
+refused: ECONNREFUSED
+unix socket: EAFNOSUPPORT" "$(timeout 30 "$wasm_env" run --root "$rootfs" /bin/net-test 2>&1)"
 
 # futex, single-threaded (glibc relies on it).
 check "futex" "wait on a changed word: EAGAIN

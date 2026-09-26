@@ -102,6 +102,7 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         if interp.is_none() {
             interp = found.interp.map(|d| read(&d.guest, &d.host)).transpose()?;
         }
+        read_files.borrow_mut().extend(found.scanned);
         for d in found.libs {
             libs.push(read(&d.guest, &d.host)?);
         }

@@ -23,6 +23,10 @@ pub struct Dep {
 pub struct Deps {
     pub interp: Option<Dep>,
     pub libs: Vec<Dep>,
+    /// The `dlopen` directories (host paths): a cache records them so it
+    /// notices libraries installed there later (the runtime compares the
+    /// shared objects under each).
+    pub scanned: Vec<PathBuf>,
 }
 
 /// The dynamic-linking facts of one ELF object.
@@ -180,7 +184,7 @@ fn shared_objects(root: &Path, dir: &str, out: &mut Vec<String>, depth: u32) {
 pub fn resolve(root: &Path, exe: &[u8], exe_guest: Option<&str>, dlopen: &[String]) -> Result<Deps> {
     let info = dyn_info(exe)?;
     let Some(interp_path) = info.interp.clone() else {
-        return Ok(Deps { interp: None, libs: Vec::new() });
+        return Ok(Deps { interp: None, libs: Vec::new(), scanned: Vec::new() });
     };
     let interp_real =
         realpath(root, &interp_path).with_context(|| format!("dynamic linker {interp_path} not found in the root"))?;
@@ -192,6 +196,7 @@ pub fn resolve(root: &Path, exe: &[u8], exe_guest: Option<&str>, dlopen: &[Strin
     // (needed name, the requester's search directories), breadth-first.
     let exe_rpath = expand_origin(&info.rpath, exe_guest);
     let mut queue: VecDeque<(String, Vec<String>)> = info.needed.iter().map(|n| (n.clone(), exe_rpath.clone())).collect();
+    let mut scanned = Vec::new();
     for p in dlopen {
         let real = realpath(root, p).with_context(|| format!("{p} not found in the root"))?;
         if host(root, &real).is_dir() {
@@ -199,6 +204,7 @@ pub fn resolve(root: &Path, exe: &[u8], exe_guest: Option<&str>, dlopen: &[Strin
             // their extension modules).
             let mut found = Vec::new();
             shared_objects(root, p.trim_end_matches('/'), &mut found, 0);
+            scanned.push(host(root, &real));
             found.sort();
             queue.extend(found.into_iter().map(|g| (g, Vec::new())));
         } else {
@@ -233,7 +239,7 @@ pub fn resolve(root: &Path, exe: &[u8], exe_guest: Option<&str>, dlopen: &[Strin
         }
         libs.push(Dep { guest, host: host(root, &real) });
     }
-    Ok(Deps { interp: Some(Dep { guest: interp_path, host: host(root, &interp_real) }), libs })
+    Ok(Deps { interp: Some(Dep { guest: interp_path, host: host(root, &interp_real) }), libs, scanned })
 }
 
 #[cfg(test)]

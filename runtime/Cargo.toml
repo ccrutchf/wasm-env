@@ -9,4 +9,6 @@ publish = false
 [dependencies]
 anyhow = "1"
 getrandom = "0.3"
+libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
 wasmtime = "49"

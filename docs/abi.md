@@ -105,6 +105,8 @@ Translated (arm64) programs use the same protocol through the translator's suppo
 
 **Devices.** The runtime provides `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd/N`, whatever the root directory contains.
 
+**Networking.** Sockets are the host's: a program reaches the network, and binds ports, as the host would. Supported: `AF_INET` and `AF_INET6` sockets, stream and datagram (`SOCK_NONBLOCK` and `SOCK_CLOEXEC` too); `connect` (a non-blocking one reports `-EINPROGRESS`, then its result through `SO_ERROR`), `bind`, `listen`, `accept`/`accept4`, `getsockname`, `getpeername`, `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (no control messages), `sendmmsg`, `shutdown`, `read`/`write` on sockets, and `setsockopt`/`getsockopt` for the common options (others are accepted and ignored). Blocking follows the descriptor's `O_NONBLOCK` (`fcntl` or `ioctl(FIONBIO)`). `ppoll` and `pselect6` work across sockets, pipes and files (files are always ready). Other address families (`AF_UNIX`, `AF_NETLINK`) return `-EAFNOSUPPORT`; glibc copes (no nscd; `getaddrinfo` assumes both IP families). Names resolve as the guest's libc does, from the root's `/etc/hosts` and `/etc/resolv.conf`; if the root's `/etc/resolv.conf` is missing or empty, as in a fresh image, the runtime provides the host's (as Docker does for containers). Writing to a broken connection returns `-EPIPE` without raising `SIGPIPE`.
+
 **fork**, for programs that fork without exec, remains open. The options:
 
 | Option | How it works | Trade-off |

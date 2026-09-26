@@ -164,7 +164,7 @@ fn mremap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
 impl Process {
     /// Handles syscalls that only need access to memory, not the store.
     fn call(&mut self, data: &mut [u8], n: i64, args: &[i64; 6]) -> SysResult<i64> {
-        let [a, b, c, d, ..] = *args;
+        let [a, b, c, d, e, g] = *args;
         let (ua, ub, uc) = (a as u64, b as u64, c as u64);
         match n {
             nr::READ => self.read(a, mem::slice_mut(data, ub, uc)?),
@@ -252,6 +252,25 @@ impl Process {
                 Ok(0)
             }
             nr::FCNTL => self.fcntl(a, b, c),
+            // Sockets (net.rs).
+            nr::SOCKET => self.socket(a, b, c),
+            nr::CONNECT => self.connect(data, a, ub, uc),
+            nr::BIND => self.bind(data, a, ub, uc),
+            nr::LISTEN => self.listen(a, b),
+            nr::ACCEPT => self.accept(data, a, ub, uc, 0),
+            nr::ACCEPT4 => self.accept(data, a, ub, uc, d),
+            nr::GETSOCKNAME => self.sock_name(data, a, ub, uc, false),
+            nr::GETPEERNAME => self.sock_name(data, a, ub, uc, true),
+            nr::SENDTO => self.sendto(data, a, ub, uc, d, e as u64, g as u64),
+            nr::RECVFROM => self.recvfrom(data, a, ub, uc, d, e as u64, g as u64),
+            nr::SENDMSG => self.sendmsg(data, a, ub, c),
+            nr::RECVMSG => self.recvmsg(data, a, ub, c),
+            nr::SENDMMSG => self.sendmmsg(data, a, ub, uc, d),
+            nr::SHUTDOWN => self.shutdown(a, b),
+            nr::SETSOCKOPT => self.setsockopt(data, a, b, c, d as u64, e as u64),
+            nr::GETSOCKOPT => self.getsockopt(data, a, b, c, d as u64, e as u64),
+            nr::PPOLL => self.ppoll(data, ua, ub, uc),
+            nr::PSELECT6 => self.pselect(data, a, [ub, uc, d as u64], e as u64),
             nr::IOCTL => self.ioctl(data, a, b, uc),
             nr::DUP => {
                 let fd = Fd { cloexec: false, ..self.fds.get(a)?.clone() };
@@ -654,12 +673,15 @@ impl Process {
     }
 
     /// Whether a blocking call should give up with EINTR.
-    fn interrupted(&self) -> impl Fn() -> bool + use<> {
+    pub(crate) fn interrupted(&self) -> impl Fn() -> bool + use<> {
         let (kernel, pid) = (self.kernel.clone(), self.pid);
         move || kernel.peek_signal(pid).is_some()
     }
 
     fn read(&mut self, fd: i64, buf: &mut [u8]) -> SysResult<i64> {
+        if let Some(s) = self.maybe_socket(fd)? {
+            return crate::net::recv(&s, buf);
+        }
         if let Some((pipe, nonblock)) = self.pipe_of(fd, false)? {
             return pipe.read(buf, nonblock, &self.interrupted()).map(|n| n as i64);
         }
@@ -677,12 +699,15 @@ impl Process {
                 getrandom::fill(buf).map_err(|_| EIO)?;
                 Ok(buf.len())
             }
-            Open::Stdout | Open::Stderr | Open::Pipe(_) => return Err(EBADF),
+            Open::Stdout | Open::Stderr | Open::Pipe(_) | Open::Socket(_) => return Err(EBADF),
         };
         r.map(|n| n as i64).map_err(|e| fs::errno(&e))
     }
 
     fn write(&mut self, fd: i64, buf: &[u8]) -> SysResult<i64> {
+        if let Some(s) = self.maybe_socket(fd)? {
+            return crate::net::send(&s, buf);
+        }
         if let Some((pipe, nonblock)) = self.pipe_of(fd, true)? {
             let r = pipe.write(buf, nonblock, &self.interrupted());
             if r == Err(EPIPE) {
@@ -709,7 +734,7 @@ impl Process {
             }
             Open::Dir { .. } => return Err(EISDIR),
             Open::Device(_) => Ok(()), // writes to /dev devices are discarded
-            Open::Stdin | Open::Pipe(_) => return Err(EBADF),
+            Open::Stdin | Open::Pipe(_) | Open::Socket(_) => return Err(EBADF),
         };
         r.map(|_| buf.len() as i64).map_err(|e| fs::errno(&e))
     }
@@ -937,6 +962,20 @@ impl Process {
         let req = req as u32 as i64;
         const TIOCGWINSZ: i64 = 0x5413;
         const FIONREAD: i64 = 0x541b;
+        const FIONBIO: i64 = 0x5421;
+        if req == FIONBIO {
+            // Set or clear O_NONBLOCK (Python's socket.settimeout does this).
+            let on = u32::from_le_bytes(mem::slice(data, arg, 4)?.try_into().unwrap()) != 0;
+            let fd = self.fds.get_mut(fd)?;
+            fd.flags = if on { fd.flags | o::NONBLOCK } else { fd.flags & !o::NONBLOCK };
+            return Ok(0);
+        }
+        if req == FIONREAD
+            && let Some(s) = self.maybe_socket(fd)?
+        {
+            let n = crate::net::pending(&s)?;
+            return mem::write(data, arg, &(n as i32).to_le_bytes()).map(|_| 0);
+        }
         if req == FIONREAD
             && let Some((pipe, _)) = self.pipe_of(fd, false)? {
                 return mem::write(data, arg, &(pipe.available() as i32).to_le_bytes()).map(|_| 0);
