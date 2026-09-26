@@ -1,6 +1,6 @@
 // futex in a single-threaded process: wake finds no waiters; wait returns
-// EAGAIN when the word changed, times out (relative, or absolute with
-// FUTEX_WAIT_BITSET), and otherwise wakes spuriously. glibc needs these.
+// EAGAIN when the word changed, and times out (relative, or absolute with
+// FUTEX_WAIT_BITSET). glibc needs these.
 // (syscall() is variadic and reads longs: arguments are cast to long.)
 #include <errno.h>
 #include <stdint.h>

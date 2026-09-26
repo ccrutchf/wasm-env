@@ -13,12 +13,14 @@
 
 mod abi;
 mod fs;
+mod image;
 mod kernel;
 mod memory;
 mod net;
 mod pipe;
 mod process;
 mod syscall;
+mod thread;
 mod translate;
 
 use std::path::PathBuf;

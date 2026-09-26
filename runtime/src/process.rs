@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use wasmtime::{Config, Engine, ExternType, Linker, Memory, Module, Store, Trap, Val};
+use wasmtime::{Config, Engine, ExternType, Linker, Memory, MemoryType, Module, SharedMemory, Store, Trap, Val};
 
 use crate::abi::{PAGE_SIZE, at, errno::*};
 use crate::fs::{FdTable, Fs};
 use crate::kernel::{Kernel, Termination};
 use crate::memory::{self as mem, AddressSpace, SysResult};
+use crate::thread::{Group, GroupEnd};
 
 /// Width of masked addresses: 2^38 bytes (256 GB) per process.
 const MASK_BITS: u32 = 38;
@@ -61,17 +62,31 @@ pub struct VforkFrame {
 pub enum Pending {
     Terminate(Termination),
     Exec(ExecImage),
+    /// This thread called exit() while others run.
+    ThreadExit(i32),
+    /// Another thread ended the process (see thread::Group).
+    GroupEnded,
 }
 
-/// Per-process state, owned by the wasmtime store.
+/// A program's memory: its own, or (a translated program, which may have
+/// threads) a shared memory it imports (docs/abi.md, "Threads").
+#[derive(Clone)]
+pub enum Mem {
+    Local(Memory),
+    Shared(SharedMemory),
+}
+
+/// Per-thread state, owned by the thread's wasmtime store. What the
+/// threads of a process share is in `group`, and `fds` is a shared table.
+/// The working directory, umask and signal dispositions are per thread (a
+/// new thread starts with its creator's).
 pub struct Process {
     pub kernel: Arc<Kernel>,
+    /// The process id (the thread group's), and this thread's id.
     pub pid: i32,
-    pub memory: Option<Memory>,
-    pub space: AddressSpace,
-    /// The program break, and where it started (docs/abi.md, "Memory").
-    pub brk: u64,
-    pub brk_start: u64,
+    pub tid: i32,
+    pub memory: Option<Mem>,
+    pub group: Arc<Group>,
     pub fds: FdTable,
     pub fs: Fs,
     pub umask: u32,
@@ -85,6 +100,12 @@ pub struct Process {
     pub start: Instant,
     /// The WebAssembly module this process runs (for translation feedback).
     pub module: PathBuf,
+    /// Where to clear the thread's id when it exits (CLONE_CHILD_CLEARTID,
+    /// set_tid_address), or 0.
+    pub clear_tid: u64,
+    /// For a thread being started: told once it has its registers (see
+    /// thread::spawn).
+    pub started: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl Process {
@@ -104,7 +125,7 @@ impl Process {
 
     /// The state an execve'd program inherits from this process.
     pub fn inherit(&self) -> Inherit {
-        let mut fds = self.fds.clone();
+        let fds = self.fds.copy();
         fds.close_on_exec();
         let ignored = (1..NSIG).filter(|&s| self.handler(s) == SIG_IGN).fold(0u64, |m, s| m | 1 << s);
         Inherit { fds, cwd: self.fs.cwd.clone(), umask: self.umask, ignored }
@@ -142,6 +163,10 @@ pub fn engine() -> Result<Engine> {
         .wasm_memory64(true)
         .wasm_exceptions(true)
         .wasm_tail_call(true)
+        // Translated programs share their memory between threads (docs/abi.md,
+        // "Threads").
+        .wasm_threads(true)
+        .shared_memory(true)
         // Relaxed SIMD's madd is how translated code gets a fused
         // multiply-add (arm64's FMADD, FMLA); deterministic mode makes it
         // fused on every host.
@@ -217,11 +242,21 @@ pub fn load_module(engine: &Engine, host: &std::path::Path) -> Result<Module> {
 /// Checks the module against docs/abi.md's "Module shape".
 pub fn check_shape(module: &Module) -> Result<()> {
     for import in module.imports() {
-        if (import.module(), import.name()) != ("linux", "syscall") {
-            bail!("unsupported import {}.{} (wasm-env programs may only import linux.syscall)", import.module(), import.name());
+        match (import.module(), import.name()) {
+            ("linux", "syscall") => {}
+            ("env", "memory") if shared_memory_type(module).is_some() => {}
+            _ => bail!(
+                "unsupported import {}.{} (wasm-env programs may only import linux.syscall, and a shared memory)",
+                import.module(),
+                import.name()
+            ),
         }
     }
-    for (name, want) in [("memory", "memory"), ("_start", "func"), ("__stack_pointer", "global"), ("__heap_base", "global")] {
+    let mut required = vec![("_start", "func"), ("__stack_pointer", "global"), ("__heap_base", "global")];
+    if shared_memory_type(module).is_none() {
+        required.push(("memory", "memory"));
+    }
+    for (name, want) in required {
         let found = module.get_export(name).map(|t| match t {
             ExternType::Memory(m) if m.is_64() => "memory",
             ExternType::Func(_) => "func",
@@ -233,6 +268,15 @@ pub fn check_shape(module: &Module) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The type of the shared 64-bit memory a module imports as `env.memory`,
+/// if it does (a translated program; docs/abi.md, "Threads").
+pub fn shared_memory_type(module: &Module) -> Option<MemoryType> {
+    module.imports().find_map(|i| match i.ty() {
+        ExternType::Memory(m) if (i.module(), i.name()) == ("env", "memory") && m.is_shared() && m.is_64() => Some(m),
+        _ => None,
+    })
 }
 
 /// Resolves execve(path, argv, env) to a program, following `#!` lines and
@@ -308,13 +352,13 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
     }
     let mut fs = Fs::new(kernel.root.clone());
     fs.cwd = inherit.cwd;
+    let group = Group::new();
     let process = Process {
         kernel: kernel.clone(),
         pid,
+        tid: pid,
         memory: None,
-        space: AddressSpace::new(0),
-        brk: 0,
-        brk_start: 0,
+        group: group.clone(),
         fds: inherit.fds,
         fs,
         umask: inherit.umask,
@@ -324,33 +368,62 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
         trace: kernel.trace,
         start: Instant::now(),
         module: image.host.clone(),
+        clear_tid: 0,
+        started: None,
     };
     let mut store = Store::new(&kernel.engine, process);
+    set_deadline(&mut store);
+    let result = start(&mut store, &module, &image);
+    let p = store.data_mut();
+    // How the process ends: as this thread says, or, if another thread
+    // ended it, as that one says.
+    let from_group = |end: Option<GroupEnd>| match end {
+        Some(GroupEnd::Exec(next, inherit)) => Outcome::Exec(next, inherit),
+        Some(GroupEnd::Terminate(how)) => Outcome::Done(how),
+        None => Outcome::Done(Termination::Exit(0)),
+    };
+    let outcome = match (p.pending.take(), result) {
+        (None, Ok(())) => Outcome::Done(Termination::Exit(0)),
+        (Some(Pending::Exec(next)), _) => Outcome::Exec(next, p.inherit()),
+        (Some(Pending::Terminate(how)), _) => Outcome::Done(how),
+        (Some(Pending::GroupEnded), _) => from_group(group.take_end()),
+        (Some(Pending::ThreadExit(code)), _) => {
+            // exit() in the first thread: the process runs on until its
+            // last thread exits.
+            crate::thread::exit_thread(p);
+            group.thread_exited(Some(code));
+            return from_group(group.wait_end());
+        }
+        (None, Err(e)) => {
+            // A trap ends the process like the matching Linux signal would.
+            eprintln!("wasm-env: {} (pid {pid}): {e}", image.path);
+            Outcome::Done(Termination::Signal(trap_signal(&e)))
+        }
+    };
+    // Any other threads stop at their next syscall.
+    group.end(GroupEnd::Terminate(Termination::Exit(0)));
+    outcome
+}
+
+/// The signal a trap corresponds to.
+pub fn trap_signal(e: &anyhow::Error) -> i32 {
+    match e.downcast_ref::<Trap>() {
+        Some(Trap::MemoryOutOfBounds | Trap::StackOverflow) => 11, // SIGSEGV
+        Some(Trap::UnreachableCodeReached) => 6,                   // SIGABRT
+        Some(_) => 4,                                             // SIGILL
+        None => 6,
+    }
+}
+
+/// WASM_ENV_DEADLINE (see engine()) for a new store.
+pub fn set_deadline(store: &mut Store<Process>) {
     if let Some(seconds) = deadline() {
         store.set_epoch_deadline(1);
-        let engine = kernel.engine.clone();
+        let engine = store.engine().clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
             engine.increment_epoch();
         });
-    }
-    match start(&mut store, &module, &image) {
-        Ok(()) => Outcome::Done(Termination::Exit(0)),
-        Err(e) => match store.data_mut().pending.take() {
-            Some(Pending::Exec(next)) => Outcome::Exec(next, store.data().inherit()),
-            Some(Pending::Terminate(how)) => Outcome::Done(how),
-            None => {
-                // A trap ends the process like the matching Linux signal would.
-                let sig = match e.downcast_ref::<Trap>() {
-                    Some(Trap::MemoryOutOfBounds | Trap::StackOverflow) => 11, // SIGSEGV
-                    Some(Trap::UnreachableCodeReached) => 6,                   // SIGABRT
-                    Some(_) => 4,                                             // SIGILL
-                    None => 6,
-                };
-                eprintln!("wasm-env: {} (pid {pid}): {e}", image.path);
-                Outcome::Done(Termination::Signal(sig))
-            }
-        },
     }
 }
 
@@ -367,11 +440,38 @@ impl std::fmt::Display for Unwind {
 
 impl std::error::Error for Unwind {}
 
-fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Result<()> {
+/// Instantiates `module` in `store`, on `shared` if the module imports its
+/// memory (a translated program), and records the memory in the process.
+pub fn instantiate(store: &mut Store<Process>, module: &Module, shared: Option<&SharedMemory>) -> Result<wasmtime::Instance> {
     let mut linker = Linker::new(store.engine());
     linker.func_wrap("linux", "syscall", crate::syscall::syscall)?;
+    if let Some(memory) = shared {
+        linker.define(&*store, "env", "memory", memory.clone())?;
+    }
     let instance = linker.instantiate(&mut *store, module)?;
-    let memory = instance.get_memory(&mut *store, "memory").unwrap();
+    let memory = match shared {
+        Some(m) => Mem::Shared(m.clone()),
+        None => Mem::Local(instance.get_memory(&mut *store, "memory").unwrap()),
+    };
+    store.data_mut().memory = Some(memory);
+    Ok(instance)
+}
+
+fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Result<()> {
+    // A translated program's memory is shared, so its threads can use it,
+    // and the runtime maps the guest image into it (see image.rs).
+    let shared = match shared_memory_type(module) {
+        Some(ty) => {
+            let memory = SharedMemory::new(store.engine(), ty)?;
+            crate::image::map(&memory, &image.host)?;
+            Some(memory)
+        }
+        None => None,
+    };
+    let instance = instantiate(store, module, shared.as_ref())?;
+    if let Some(memory) = shared {
+        let _ = store.data().group.threading.set(crate::thread::Threading { module: module.clone(), memory });
+    }
     let heap_base = global_i64(instance.get_global(&mut *store, "__heap_base").unwrap().get(&mut *store))?;
     let stack_pointer = instance.get_global(&mut *store, "__stack_pointer").unwrap();
     let sp = global_i64(stack_pointer.get(&mut *store))?;
@@ -379,19 +479,16 @@ fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Resu
     // The program break starts at the heap base and may grow by up to
     // mem::BRK_MAX; mmap allocations start above that (docs/abi.md, "Memory").
     let brk = mem::page_align(heap_base);
-    let space = AddressSpace::new(brk + mem::BRK_MAX);
-    store.data_mut().brk = brk;
-    store.data_mut().brk_start = brk;
-    store.data_mut().space = space;
-    store.data_mut().memory = Some(memory);
+    *store.data().group.mm.lock().unwrap() =
+        crate::thread::Mm { space: AddressSpace::new(brk + mem::BRK_MAX), brk, brk_start: brk };
 
-    let sp = write_initial_stack(memory.data_mut(&mut *store), sp, image)?;
+    let sp = write_initial_stack(crate::syscall::memory_bytes(store), sp, image)?;
     stack_pointer.set(&mut *store, Val::I64(sp as i64))?;
 
     let start = instance.get_typed_func::<i64, ()>(&mut *store, "_start")?;
     let result = start.call(&mut *store, sp as i64);
     if result.is_err() {
-        recent_blocks(store, &instance, memory);
+        recent_blocks(store, &instance);
     }
     Ok(result?)
 }
@@ -399,7 +496,7 @@ fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Resu
 /// For a translated program that stopped with a trap (not an exit): prints
 /// the guest blocks it ran last, which the support code records in a ring
 /// buffer (support/runtime.c), when it exports one.
-fn recent_blocks(store: &mut Store<Process>, instance: &wasmtime::Instance, memory: Memory) {
+fn recent_blocks(store: &mut Store<Process>, instance: &wasmtime::Instance) {
     if store.data().pending.is_some() {
         return; // exit or exec, not a fault
     }
@@ -409,7 +506,7 @@ fn recent_blocks(store: &mut Store<Process>, instance: &wasmtime::Instance, memo
         return;
     };
     let (Ok(buf), Ok(count)) = (global_i64(buf.get(&mut *store)), global_i64(count.get(&mut *store))) else { return };
-    let data = memory.data(&*store);
+    let data = crate::syscall::memory_bytes(store);
     let word = |a: u64| data.get(a as usize..a as usize + 8).map(|w| u64::from_le_bytes(w.try_into().unwrap()));
     let Some(n) = word(count) else { return };
     eprintln!("wasm-env: the translated program's most recent blocks, oldest first:");
@@ -444,7 +541,7 @@ fn write_initial_stack(data: &mut [u8], top: u64, image: &ExecImage) -> Result<u
     }
     let random_off = strings.len() as u64;
     strings.extend_from_slice(&random);
-    let strings_at = (top - strings.len() as u64) & !15;
+    let strings_at = top.checked_sub(strings.len() as u64).ok_or_else(|| fault(EFAULT))? & !15;
     mem::write(data, strings_at, &strings).map_err(fault)?;
 
     let argc = image.argv.len();
@@ -469,7 +566,7 @@ fn write_initial_stack(data: &mut [u8], top: u64, image: &ExecImage) -> Result<u
     for (k, v) in auxv {
         words.extend([k, v]);
     }
-    let sp = (strings_at - words.len() as u64 * 8) & !15;
+    let sp = strings_at.checked_sub(words.len() as u64 * 8).ok_or_else(|| fault(EFAULT))? & !15;
     for (i, w) in words.iter().enumerate() {
         mem::write_u64(data, sp + i as u64 * 8, *w).map_err(fault)?;
     }

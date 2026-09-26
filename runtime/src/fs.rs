@@ -34,6 +34,7 @@ pub fn errno(e: &io::Error) -> i64 {
     }
 }
 
+#[derive(Clone)]
 pub struct Fs {
     root: PathBuf,
     /// Current directory: a normalized absolute guest path.
@@ -126,10 +127,11 @@ pub enum DevPath {
 /// which the runtime generates whatever the root contains.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Synthetic {
-    /// /proc/cpuinfo: one arm64 CPU with the features translated programs
-    /// may use (matching AT_HWCAP in the translator's support code).
+    /// /proc/cpuinfo: an arm64 CPU per host CPU, with the features
+    /// translated programs may use (matching AT_HWCAP in the translator's
+    /// support code).
     CpuInfo,
-    /// /sys/devices/system/cpu/{possible,online,present}: "0", one CPU.
+    /// /sys/devices/system/cpu/{possible,online,present}: the host's CPUs.
     CpuList,
     /// /etc/resolv.conf, when the root's is missing or empty (as in a
     /// fresh image): the host's, so the guest resolves names as the host
@@ -139,22 +141,27 @@ pub enum Synthetic {
 
 impl Synthetic {
     pub fn content(self) -> std::borrow::Cow<'static, [u8]> {
-        let fixed: &'static [u8] = match self {
-            Synthetic::CpuInfo => {
-                b"processor\t: 0\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd crc32 atomics lrcpc\n\
-                  CPU implementer\t: 0x00\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\n\
-                  CPU revision\t: 0\n\n"
-            }
-            Synthetic::CpuList => b"0\n",
-            Synthetic::ResolvConf => {
-                return match std::fs::read("/etc/resolv.conf") {
-                    Ok(host) if !host.is_empty() => host.into(),
-                    // No host resolver configuration (Windows, say): public ones.
-                    _ => b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n".as_slice().into(),
-                };
-            }
-        };
-        fixed.into()
+        let cpus = crate::syscall::cpus();
+        match self {
+            Synthetic::CpuInfo => (0..cpus)
+                .map(|n| {
+                    format!(
+                        "processor\t: {n}\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd crc32 atomics lrcpc\n\
+                         CPU implementer\t: 0x00\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\n\
+                         CPU revision\t: 0\n\n"
+                    )
+                })
+                .collect::<String>()
+                .into_bytes()
+                .into(),
+            Synthetic::CpuList if cpus == 1 => b"0\n".as_slice().into(),
+            Synthetic::CpuList => format!("0-{}\n", cpus - 1).into_bytes().into(),
+            Synthetic::ResolvConf => match std::fs::read("/etc/resolv.conf") {
+                Ok(host) if !host.is_empty() => host.into(),
+                // No host resolver configuration (Windows, say): public ones.
+                _ => b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n".as_slice().into(),
+            },
+        }
     }
 
     /// The content as an open host file (an unlinked temporary), so reading,
@@ -350,55 +357,78 @@ pub struct Fd {
     pub flags: i64,
 }
 
-/// A process's descriptor table. Cloning it (for a vfork child or a new
-/// process) shares the open file descriptions, as fork does on Linux.
-#[derive(Clone)]
+/// A process's descriptor table, shared by its threads: a handle, so
+/// `share` gives another thread the same table. `copy` makes an independent
+/// table (for a vfork child or a new process) that shares the open file
+/// descriptions, as fork does on Linux.
 pub struct FdTable {
-    fds: Vec<Option<Fd>>,
+    fds: Arc<Mutex<Vec<Option<Fd>>>>,
 }
 
 impl FdTable {
     pub fn with_stdio() -> Self {
         let fd = |o| Some(Fd { open: Arc::new(Mutex::new(o)), cloexec: false, flags: 0 });
-        FdTable { fds: vec![fd(Open::Stdin), fd(Open::Stdout), fd(Open::Stderr)] }
+        FdTable { fds: Arc::new(Mutex::new(vec![fd(Open::Stdin), fd(Open::Stdout), fd(Open::Stderr)])) }
     }
 
-    pub fn get(&self, fd: i64) -> SysResult<&Fd> {
-        usize::try_from(fd).ok().and_then(|i| self.fds.get(i)?.as_ref()).ok_or(EBADF)
+    /// The same table (for a new thread).
+    pub fn share(&self) -> Self {
+        FdTable { fds: self.fds.clone() }
     }
 
-    pub fn get_mut(&mut self, fd: i64) -> SysResult<&mut Fd> {
-        usize::try_from(fd).ok().and_then(|i| self.fds.get_mut(i)?.as_mut()).ok_or(EBADF)
+    /// An independent copy of the table.
+    pub fn copy(&self) -> Self {
+        FdTable { fds: Arc::new(Mutex::new(self.fds.lock().unwrap().clone())) }
+    }
+
+    /// The descriptor `fd` (a copy: the table may change once it's returned).
+    pub fn get(&self, fd: i64) -> SysResult<Fd> {
+        let fds = self.fds.lock().unwrap();
+        usize::try_from(fd).ok().and_then(|i| fds.get(i)?.clone()).ok_or(EBADF)
+    }
+
+    /// Changes descriptor `fd`'s flags.
+    pub fn update<T>(&self, fd: i64, f: impl FnOnce(&mut Fd) -> T) -> SysResult<T> {
+        let mut fds = self.fds.lock().unwrap();
+        usize::try_from(fd).ok().and_then(|i| fds.get_mut(i)?.as_mut()).map(f).ok_or(EBADF)
     }
 
     /// Installs `fd` at the lowest free number >= `min`.
-    pub fn insert(&mut self, fd: Fd, min: usize) -> SysResult<i64> {
-        let i = (min..).find(|&i| self.fds.get(i).is_none_or(|f| f.is_none())).unwrap();
+    pub fn insert(&self, fd: Fd, min: usize) -> SysResult<i64> {
+        let mut fds = self.fds.lock().unwrap();
+        let i = (min..).find(|&i| fds.get(i).is_none_or(|f| f.is_none())).unwrap();
         if i >= 1024 {
             return Err(EMFILE);
         }
-        if i >= self.fds.len() {
-            self.fds.resize(i + 1, None);
+        if i >= fds.len() {
+            fds.resize(i + 1, None);
         }
-        self.fds[i] = Some(fd);
+        fds[i] = Some(fd);
         Ok(i as i64)
     }
 
-    pub fn set(&mut self, n: usize, fd: Fd) {
-        if n >= self.fds.len() {
-            self.fds.resize(n + 1, None);
+    pub fn set(&self, n: usize, fd: Fd) {
+        let mut fds = self.fds.lock().unwrap();
+        if n >= fds.len() {
+            fds.resize(n + 1, None);
         }
-        self.fds[n] = Some(fd);
+        fds[n] = Some(fd);
     }
 
-    pub fn close(&mut self, fd: i64) -> SysResult<()> {
-        let slot = usize::try_from(fd).ok().and_then(|i| self.fds.get_mut(i)).ok_or(EBADF)?;
-        slot.take().map(|_| ()).ok_or(EBADF)
+    pub fn close(&self, fd: i64) -> SysResult<()> {
+        // The description is dropped (closing a host file or pipe end) after
+        // the table is unlocked.
+        let closed = {
+            let mut fds = self.fds.lock().unwrap();
+            let slot = usize::try_from(fd).ok().and_then(|i| fds.get_mut(i)).ok_or(EBADF)?;
+            slot.take()
+        };
+        closed.map(|_| ()).ok_or(EBADF)
     }
 
     /// Closes descriptors marked close-on-exec (at execve).
-    pub fn close_on_exec(&mut self) {
-        for slot in &mut self.fds {
+    pub fn close_on_exec(&self) {
+        for slot in self.fds.lock().unwrap().iter_mut() {
             if slot.as_ref().is_some_and(|f| f.cloexec) {
                 *slot = None;
             }
@@ -446,7 +476,7 @@ mod tests {
 
     #[test]
     fn fd_table_allocates_the_lowest_free_number() {
-        let mut t = FdTable::with_stdio();
+        let t = FdTable::with_stdio();
         assert_eq!(t.insert(null_fd(), 0), Ok(3));
         assert_eq!(t.insert(null_fd(), 0), Ok(4));
         t.close(3).unwrap();
@@ -458,7 +488,7 @@ mod tests {
 
     #[test]
     fn fd_table_errors() {
-        let mut t = FdTable::with_stdio();
+        let t = FdTable::with_stdio();
         assert_eq!(t.get(7).err(), Some(EBADF));
         assert_eq!(t.get(-1).err(), Some(EBADF));
         assert_eq!(t.close(7), Err(EBADF));
@@ -468,7 +498,7 @@ mod tests {
 
     #[test]
     fn fd_table_close_on_exec() {
-        let mut t = FdTable::with_stdio();
+        let t = FdTable::with_stdio();
         let kept = t.insert(null_fd(), 0).unwrap();
         let closed = t.insert(Fd { cloexec: true, ..null_fd() }, 0).unwrap();
         t.close_on_exec();
@@ -477,13 +507,23 @@ mod tests {
     }
 
     #[test]
-    fn fd_table_clones_share_open_descriptions() {
-        let mut parent = FdTable::with_stdio();
+    fn fd_table_copies_share_open_descriptions() {
+        let parent = FdTable::with_stdio();
         let fd = parent.insert(null_fd(), 0).unwrap();
-        let mut child = parent.clone();
+        let child = parent.copy();
         assert!(Arc::ptr_eq(&parent.get(fd).unwrap().open, &child.get(fd).unwrap().open));
         child.close(fd).unwrap();
         assert!(parent.get(fd).is_ok(), "closing in the child doesn't affect the parent");
+    }
+
+    #[test]
+    fn threads_share_one_fd_table() {
+        let table = FdTable::with_stdio();
+        let thread = table.share();
+        let fd = thread.insert(null_fd(), 0).unwrap();
+        assert!(table.get(fd).is_ok(), "a descriptor one thread opens, another sees");
+        table.update(fd, |f| f.cloexec = true).unwrap();
+        assert!(thread.get(fd).unwrap().cloexec);
     }
 
     #[test]

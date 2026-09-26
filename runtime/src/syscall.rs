@@ -5,7 +5,7 @@ use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use wasmtime::Caller;
+use wasmtime::{Caller, SharedMemory};
 
 use crate::abi::{self, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, errno::*, nr, o};
 use crate::fs::{self, DevPath, Device, Fd, Open};
@@ -32,15 +32,14 @@ pub fn syscall(
         nr::MREMAP => mremap(&mut caller, &args),
         nr::BRK => brk(&mut caller, args[0] as u64),
         _ => {
-            let memory = caller.data().memory.expect("memory is set before _start");
-            let (data, process) = memory.data_and_store_mut(&mut caller);
+            let (data, process) = data_and_process(&mut caller);
             process.call(data, n, &args)
         }
     };
     let ret = result.unwrap_or_else(|e| -e);
     let process = caller.data_mut();
     if process.trace {
-        eprintln!("[wasm-env] pid {}: {}({a:#x}, {b:#x}, {c:#x}) = {ret}", process.pid, abi::name(n));
+        eprintln!("[wasm-env] pid {}: {}({a:#x}, {b:#x}, {c:#x}) = {ret}", process.tid, abi::name(n));
     }
     if process.pending.is_some() {
         return Err(wasmtime::Error::new(Unwind));
@@ -50,8 +49,13 @@ pub fn syscall(
 }
 
 /// Acts on a signal sent to this process: its default action ends the
-/// process (unless the signal is ignored).
+/// process (unless the signal is ignored). Also stops this thread if
+/// another has ended the process.
 fn deliver_signal(p: &mut Process) -> wasmtime::Result<()> {
+    if p.group.ended() && p.vfork.is_empty() {
+        p.pending = Some(Pending::GroupEnded);
+        return Err(wasmtime::Error::new(Unwind));
+    }
     if let Some(sig) = p.kernel.take_signal(p.pid)
         && let Some(how) = p.signal_effect(sig) {
             p.pending = Some(Pending::Terminate(how));
@@ -60,20 +64,74 @@ fn deliver_signal(p: &mut Process) -> wasmtime::Result<()> {
     Ok(())
 }
 
+/// A shared memory's bytes. Other threads of the process use them at the
+/// same time, as the guest's own threads do: the runtime only touches what a
+/// syscall's arguments point to, as a kernel would.
+pub fn shared_bytes<'a>(memory: &SharedMemory) -> &'a mut [u8] {
+    let data = memory.data();
+    // SAFETY: the memory stays mapped while the process (which holds a
+    // handle to it) runs, and never moves (Config::memory_may_move(false));
+    // UnsafeCell<u8> has u8's layout.
+    unsafe { std::slice::from_raw_parts_mut(data.as_ptr() as *mut u8, data.len()) }
+}
+
+/// The program's memory and the process state, for a syscall.
+fn data_and_process<'a>(caller: &'a mut Caller<'_, Process>) -> (&'a mut [u8], &'a mut Process) {
+    match caller.data().memory.clone().expect("memory is set before _start") {
+        process::Mem::Local(m) => m.data_and_store_mut(caller),
+        process::Mem::Shared(m) => (shared_bytes(&m), caller.data_mut()),
+    }
+}
+
+/// The program's memory, from outside a syscall.
+pub fn memory_bytes(store: &mut wasmtime::Store<Process>) -> &mut [u8] {
+    match store.data().memory.clone().expect("memory is set") {
+        process::Mem::Local(m) => m.data_mut(store),
+        process::Mem::Shared(m) => shared_bytes(&m),
+    }
+}
+
 const MAP_FIXED: i64 = 0x10;
 const MAP_ANONYMOUS: i64 = 0x20;
 const MREMAP_MAYMOVE: i64 = 1;
 
-/// Grows linear memory so it covers the whole mmap region.
-fn cover(caller: &mut Caller<'_, Process>) -> SysResult<()> {
-    let memory = caller.data().memory.unwrap();
-    let top = caller.data().space.top;
-    let size = memory.data_size(&*caller) as u64;
-    if top > size {
-        let pages = (top - size).div_ceil(65536);
-        memory.grow(&mut *caller, pages).map_err(|_| ENOMEM)?;
+/// Grows linear memory so it covers `top` (the whole mmap region, or the
+/// break).
+fn grow_to(caller: &mut Caller<'_, Process>, top: u64) -> SysResult<()> {
+    match caller.data().memory.clone().unwrap() {
+        process::Mem::Local(m) => {
+            let size = m.data_size(&*caller) as u64;
+            if top > size {
+                m.grow(&mut *caller, (top - size).div_ceil(65536)).map_err(|_| ENOMEM)?;
+            }
+        }
+        process::Mem::Shared(m) => grow_shared(&m, top)?,
     }
     Ok(())
+}
+
+fn grow_shared(m: &SharedMemory, top: u64) -> SysResult<()> {
+    // Another thread may grow it first: then this grows by less, or not at
+    // all.
+    loop {
+        let size = m.data_size() as u64;
+        if top <= size {
+            return Ok(());
+        }
+        m.grow((top - size).div_ceil(65536)).map_err(|_| ENOMEM)?;
+    }
+}
+
+/// Allocates `len` bytes of a shared memory's mmap region (a new thread's
+/// thread-local block), zeroed.
+pub fn alloc_shared(group: &crate::thread::Group, memory: &SharedMemory, len: u64) -> SysResult<u64> {
+    let (addr, top) = {
+        let mut mm = group.mm.lock().unwrap();
+        (mm.space.alloc(len), mm.space.top)
+    };
+    grow_shared(memory, top)?;
+    mem::slice_mut(shared_bytes(memory), addr, len)?.fill(0);
+    Ok(addr)
 }
 
 fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
@@ -82,20 +140,23 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
         return Err(EINVAL);
     }
     let len = page_align(len as u64);
-    let space = &mut caller.data_mut().space;
-    let addr = if flags & MAP_FIXED != 0 {
-        let addr = addr as u64;
-        if addr < space.start || !addr.is_multiple_of(abi::PAGE_SIZE) {
-            return Err(EINVAL);
-        }
-        space.alloc_at(addr, len);
-        addr
-    } else {
-        space.alloc(len)
+    let (addr, top) = {
+        let mut mm = caller.data().group.mm.lock().unwrap();
+        let space = &mut mm.space;
+        let addr = if flags & MAP_FIXED != 0 {
+            let addr = addr as u64;
+            if addr < space.start || !addr.is_multiple_of(abi::PAGE_SIZE) {
+                return Err(EINVAL);
+            }
+            space.alloc_at(addr, len);
+            addr
+        } else {
+            space.alloc(len)
+        };
+        (addr, space.top)
     };
-    cover(caller)?;
-    let memory = caller.data().memory.unwrap();
-    let (data, process) = memory.data_and_store_mut(&mut *caller);
+    grow_to(caller, top)?;
+    let (data, process) = data_and_process(caller);
     let range = mem::slice_mut(data, addr, len)?;
     range.fill(0);
     if flags & MAP_ANONYMOUS == 0 {
@@ -122,22 +183,20 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
 /// linear memory to cover it and zeroing what it newly exposes. Like Linux,
 /// it returns the new break, or the old one when the request can't be met.
 fn brk(caller: &mut Caller<'_, Process>, want: u64) -> SysResult<i64> {
-    let (old, start) = (caller.data().brk, caller.data().brk_start);
+    let group = caller.data().group.clone();
+    let mut mm = group.mm.lock().unwrap();
+    let (old, start) = (mm.brk, mm.brk_start);
     if want < start || want > start + mem::BRK_MAX {
         return Ok(old as i64);
     }
-    let memory = caller.data().memory.unwrap();
-    let size = memory.data_size(&*caller) as u64;
-    if want > size {
-        let pages = (want - size).div_ceil(65536);
-        if memory.grow(&mut *caller, pages).is_err() {
-            return Ok(old as i64);
-        }
+    if grow_to(caller, want).is_err() {
+        return Ok(old as i64);
     }
     if want > old {
-        mem::slice_mut(memory.data_mut(&mut *caller), old, want - old)?.fill(0);
+        let (data, _) = data_and_process(caller);
+        mem::slice_mut(data, old, want - old)?.fill(0);
     }
-    caller.data_mut().brk = want;
+    mm.brk = want;
     Ok(want as i64)
 }
 
@@ -147,17 +206,19 @@ fn mremap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
         return Err(ENOMEM);
     }
     let (old, old_len, new_len) = (old as u64, page_align(old_len as u64), page_align(new_len as u64));
-    if !caller.data().space.contains(old, old_len) {
-        return Err(EFAULT);
-    }
-    let new = caller.data_mut().space.alloc(new_len);
-    cover(caller)?;
-    let memory = caller.data().memory.unwrap();
-    let (data, process) = memory.data_and_store_mut(&mut *caller);
+    let (new, top) = {
+        let mut mm = caller.data().group.mm.lock().unwrap();
+        if !mm.space.contains(old, old_len) {
+            return Err(EFAULT);
+        }
+        (mm.space.alloc(new_len), mm.space.top)
+    };
+    grow_to(caller, top)?;
+    let (data, process) = data_and_process(caller);
     let keep = old_len.min(new_len) as usize;
     data.copy_within(old as usize..old as usize + keep, new as usize);
     data[new as usize + keep..(new + new_len) as usize].fill(0);
-    process.space.release(old, old_len);
+    process.group.mm.lock().unwrap().space.release(old, old_len);
     Ok(new as i64)
 }
 
@@ -369,9 +430,19 @@ impl Process {
                 let file = std::fs::File::open(self.fs.host(&guest)).map_err(|e| fs::errno(&e))?;
                 apply(&file)
             }
-            nr::SET_TID_ADDRESS | nr::GETPID | nr::GETTID => Ok(self.pid as i64),
+            nr::SET_TID_ADDRESS => {
+                self.clear_tid = ua;
+                Ok(self.tid as i64)
+            }
+            nr::GETPID => Ok(self.pid as i64),
+            // In a vfork child (a process of its own), the thread is the process.
+            nr::GETTID => Ok(if self.vfork.is_empty() { self.tid } else { self.pid } as i64),
             nr::GETPPID => Ok(self.kernel.ppid(self.pid) as i64),
             nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
+            nr::EXIT if self.vfork.is_empty() && self.group.threads() > 1 => {
+                self.pending = Some(Pending::ThreadExit(a as i32 & 0xff));
+                Ok(0)
+            }
             nr::EXIT | nr::EXIT_GROUP => Ok(self.exit(a as i32 & 0xff)),
             nr::WASM_ENV_MISSED_TARGET => {
                 crate::translate::record_missed_target(&self.module, &mem::cstr(data, ub)?, uc);
@@ -379,7 +450,14 @@ impl Process {
             }
             nr::KILL => self.kernel.kill(self.pid, a as i32, b as i32).map(|_| 0),
             nr::TGKILL => self.kernel.kill(self.pid, a as i32, c as i32).map(|_| 0),
+            nr::CLONE if a & CLONE_THREAD != 0 => self.clone_thread(data, a, b, c, d, e, g),
             nr::CLONE => self.clone_vfork(a, b),
+            nr::WASM_ENV_THREAD_STARTED => {
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                }
+                Ok(0)
+            }
             nr::EXECVE => {
                 let path = mem::cstr(data, ua)?;
                 let argv = string_array(data, ub)?;
@@ -478,7 +556,7 @@ impl Process {
                 Ok(0)
             }
             nr::NANOSLEEP => self.sleep(data, ua, ub),
-            nr::FUTEX => self.futex(data, ua, b, c as u32, d as u64),
+            nr::FUTEX => self.futex(data, args),
             nr::CLOCK_NANOSLEEP => {
                 const TIMER_ABSTIME: i64 = 1;
                 if b & TIMER_ABSTIME != 0 {
@@ -491,15 +569,21 @@ impl Process {
                 self.sleep(data, uc, d as u64)
             }
             nr::SCHED_GETAFFINITY => {
-                // One CPU: the environment is single-threaded.
-                mem::slice_mut(data, uc, ub.min(128))?.fill(0);
-                mem::write(data, uc, &[1]).map(|_| 8)
+                // Every host CPU (threads really run in parallel).
+                let cpus = cpus() as u64;
+                let mask = mem::slice_mut(data, uc, ub.min(128))?;
+                mask.fill(0);
+                for cpu in 0..cpus.min(mask.len() as u64 * 8) {
+                    mask[cpu as usize / 8] |= 1 << (cpu % 8);
+                }
+                Ok(mask.len().min(cpus.div_ceil(64) as usize * 8) as i64)
             }
             nr::UMASK => Ok(std::mem::replace(&mut self.umask, (a & 0o777) as u32) as i64),
             nr::MUNMAP => {
                 let len = page_align(ub);
-                if self.space.contains(ua, len) {
-                    self.space.release(ua, len);
+                let mut mm = self.group.mm.lock().unwrap();
+                if mm.space.contains(ua, len) {
+                    mm.space.release(ua, len);
                 }
                 Ok(0)
             }
@@ -568,9 +652,12 @@ impl Process {
             return Err(ENOSYS);
         }
         let child = self.kernel.create(self.pid);
+        // The child gets its own descriptor table (the parent's may be shared
+        // with its other threads).
+        let own_fds = self.fds.copy();
         self.vfork.push(VforkFrame {
             parent_pid: self.pid,
-            fds: self.fds.clone(),
+            fds: std::mem::replace(&mut self.fds, own_fds),
             cwd: self.fs.cwd.clone(),
             umask: self.umask,
             sigactions: self.sigactions.clone(),
@@ -606,43 +693,86 @@ impl Process {
         }
     }
 
-    /// futex for a single-threaded process: nothing else can change the word
-    /// or wake a waiter, so a wake finds nobody, and a wait on an unchanged
-    /// word sleeps out its timeout or returns as a spurious wakeup (EINTR,
-    /// which callers must handle).
-    fn futex(&self, data: &mut [u8], addr: u64, op: i64, val: u32, timeout: u64) -> SysResult<i64> {
+    /// futex, across the process's threads (thread::Futexes). Futexes are
+    /// per process: processes don't share memory.
+    fn futex(&self, data: &mut [u8], args: &[i64; 6]) -> SysResult<i64> {
         const WAIT: i64 = 0;
         const WAKE: i64 = 1;
         const REQUEUE: i64 = 3;
         const CMP_REQUEUE: i64 = 4;
-        const WAKE_OP: i64 = 5;
         const WAIT_BITSET: i64 = 9;
         const WAKE_BITSET: i64 = 10;
         const CLOCK_REALTIME_FLAG: i64 = 256;
+        let [addr, op, val, timeout, addr2, val3] = *args;
+        let (addr, val) = (addr as u64, val as u32);
+        let futexes = &self.group.futex;
         match op & 0x7f {
             WAIT | WAIT_BITSET => {
-                let word = u32::from_le_bytes(mem::slice(data, addr, 4)?.try_into().unwrap());
-                if word != val {
-                    return Err(EAGAIN);
-                }
-                if timeout == 0 {
-                    return Err(EINTR);
-                }
-                let t = read_timespec(data, timeout)?;
+                let bitset = if op & 0x7f == WAIT { u32::MAX } else { val3 as u32 };
                 // FUTEX_WAIT's timeout is relative; FUTEX_WAIT_BITSET's is a
                 // deadline on CLOCK_MONOTONIC, or CLOCK_REALTIME if flagged.
-                let wait = if op & 0x7f == WAIT {
-                    t
+                let deadline = if timeout == 0 {
+                    None
                 } else {
-                    let now = self.clock(if op & CLOCK_REALTIME_FLAG != 0 { 0 } else { 1 })?;
-                    t.saturating_sub(now)
+                    let t = read_timespec(data, timeout as u64)?;
+                    let wait = if op & 0x7f == WAIT {
+                        t
+                    } else {
+                        let now = self.clock(if op & CLOCK_REALTIME_FLAG != 0 { 0 } else { 1 })?;
+                        t.saturating_sub(now)
+                    };
+                    Some(std::time::Instant::now() + wait)
                 };
-                self.sleep_for(wait).map_err(|(e, _)| e)?;
-                Err(ETIMEDOUT)
+                futexes.wait(data, addr, val, bitset, deadline, &self.interrupted())
             }
-            WAKE | WAKE_BITSET | REQUEUE | CMP_REQUEUE | WAKE_OP => Ok(0),
+            WAKE => Ok(futexes.wake(addr, val, u32::MAX)),
+            WAKE_BITSET => Ok(futexes.wake(addr, val, val3 as u32)),
+            // For requeues the timeout argument is the number to requeue.
+            REQUEUE => futexes.requeue(data, addr, val, timeout as u32, addr2 as u64, None),
+            CMP_REQUEUE => futexes.requeue(data, addr, val, timeout as u32, addr2 as u64, Some(val3 as u32)),
             _ => Err(ENOSYS),
         }
+    }
+
+    /// clone(CLONE_THREAD): a new thread in this process (docs/abi.md,
+    /// "Threads"). The support code passes the new thread's registers in
+    /// `frame`; the thread starts there once running (thread::spawn).
+    #[allow(clippy::too_many_arguments)]
+    fn clone_thread(&mut self, data: &mut [u8], flags: i64, _stack: i64, ptid: i64, _tls: i64, ctid: i64, frame: i64) -> SysResult<i64> {
+        const CLONE_VM: i64 = 0x100;
+        const CLONE_SIGHAND: i64 = 0x800;
+        const CLONE_PARENT_SETTID: i64 = 0x100000;
+        const CLONE_CHILD_CLEARTID: i64 = 0x200000;
+        const CLONE_CHILD_SETTID: i64 = 0x1000000;
+        if flags & (CLONE_VM | CLONE_SIGHAND) != CLONE_VM | CLONE_SIGHAND || !self.vfork.is_empty() {
+            return Err(EINVAL);
+        }
+        let tid = self.kernel.create_thread();
+        for (flag, at) in [(CLONE_PARENT_SETTID, ptid), (CLONE_CHILD_SETTID, ctid)] {
+            if flags & flag != 0 {
+                mem::write(data, at as u64, &tid.to_le_bytes())?;
+            }
+        }
+        let thread = Process {
+            kernel: self.kernel.clone(),
+            pid: self.pid,
+            tid,
+            memory: self.memory.clone(),
+            group: self.group.clone(),
+            fds: self.fds.share(),
+            fs: self.fs.clone(),
+            umask: self.umask,
+            sigactions: self.sigactions.clone(),
+            vfork: Vec::new(),
+            pending: None,
+            trace: self.trace,
+            start: self.start,
+            module: self.module.clone(),
+            clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid as u64 } else { 0 },
+            started: None,
+        };
+        crate::thread::spawn(thread, frame as u64)?;
+        Ok(tid as i64)
     }
 
     fn sleep_for(&self, duration: Duration) -> Result<(), (i64, Duration)> {
@@ -653,7 +783,7 @@ impl Process {
             if now >= deadline {
                 return Ok(());
             }
-            if self.kernel.peek_signal(self.pid).is_some() {
+            if self.kernel.peek_signal(self.pid).is_some() || self.group.ended() {
                 return Err((EINTR, deadline - now));
             }
             std::thread::sleep((deadline - now).min(SLICE));
@@ -674,8 +804,8 @@ impl Process {
 
     /// Whether a blocking call should give up with EINTR.
     pub(crate) fn interrupted(&self) -> impl Fn() -> bool + use<> {
-        let (kernel, pid) = (self.kernel.clone(), self.pid);
-        move || kernel.peek_signal(pid).is_some()
+        let (kernel, pid, group) = (self.kernel.clone(), self.pid, self.group.clone());
+        move || kernel.peek_signal(pid).is_some() || group.ended()
     }
 
     fn read(&mut self, fd: i64, buf: &mut [u8]) -> SysResult<i64> {
@@ -944,13 +1074,12 @@ impl Process {
             }
             F_GETFD => Ok(self.fds.get(fd)?.cloexec as i64),
             F_SETFD => {
-                self.fds.get_mut(fd)?.cloexec = arg & 1 != 0;
+                self.fds.update(fd, |fd| fd.cloexec = arg & 1 != 0)?;
                 Ok(0)
             }
             F_GETFL => Ok(self.fds.get(fd)?.flags & !o::CLOEXEC),
             F_SETFL => {
-                let fd = self.fds.get_mut(fd)?;
-                fd.flags = (fd.flags & o::ACCMODE) | (arg & !o::ACCMODE);
+                self.fds.update(fd, |fd| fd.flags = (fd.flags & o::ACCMODE) | (arg & !o::ACCMODE))?;
                 Ok(0)
             }
             _ => Err(EINVAL),
@@ -966,8 +1095,7 @@ impl Process {
         if req == FIONBIO {
             // Set or clear O_NONBLOCK (Python's socket.settimeout does this).
             let on = u32::from_le_bytes(mem::slice(data, arg, 4)?.try_into().unwrap()) != 0;
-            let fd = self.fds.get_mut(fd)?;
-            fd.flags = if on { fd.flags | o::NONBLOCK } else { fd.flags & !o::NONBLOCK };
+            self.fds.update(fd, |fd| fd.flags = if on { fd.flags | o::NONBLOCK } else { fd.flags & !o::NONBLOCK })?;
             return Ok(0);
         }
         if req == FIONREAD
@@ -1007,6 +1135,13 @@ impl Process {
         }
     }
 }
+
+/// The CPUs the guest sees: the host's.
+pub fn cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+const CLONE_THREAD: i64 = 0x10000;
 
 fn timespec(t: Duration) -> [u8; 16] {
     let mut ts = [0u8; 16];

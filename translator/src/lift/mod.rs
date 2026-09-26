@@ -13,8 +13,9 @@
 //! function per block would also exceed WebAssembly's limit of a million
 //! functions in a module for large programs.)
 //!
-//! Guest state lives in globals: `@R` (x0–x30 and SP), `@F` (N Z C V),
-//! `@V` (v0–v31) and `@TP` (TPIDR_EL0). Within a block, registers are
+//! Guest state lives in thread-local globals, a set per guest thread: `@R`
+//! (x0–x30 and SP), `@F` (N Z C V), `@V` (v0–v31) and `@TP` (TPIDR_EL0).
+//! Within a block, registers are
 //! loaded on first use, kept as SSA values, and stored back when the block
 //! ends. Guest memory is the
 //! WebAssembly memory itself: guest address A is WebAssembly address A.
@@ -744,6 +745,37 @@ impl<'a> Block<'a> {
         self.line(format!("store i{bits} {v}, ptr {p}, align 1{MEM}"));
     }
 
+    // Atomic accesses (acquire/release loads and stores, exclusives, LSE)
+    // become WebAssembly atomics, which are sequentially consistent: at
+    // least as strong as any arm64 ordering. Like arm64's, they must be
+    // naturally aligned (a misaligned one traps).
+
+    pub fn load_atomic(&mut self, addr: &str, bits: u32) -> String {
+        let p = self.val(format!("inttoptr i64 {addr} to ptr"));
+        self.val(format!("load atomic i{bits}, ptr {p} seq_cst, align {}{MEM}", bits / 8))
+    }
+
+    pub fn store_atomic(&mut self, addr: &str, v: &str, bits: u32) {
+        let p = self.val(format!("inttoptr i64 {addr} to ptr"));
+        self.line(format!("store atomic i{bits} {v}, ptr {p} seq_cst, align {}{MEM}", bits / 8));
+    }
+
+    /// `atomicrmw op`: returns the old value.
+    pub fn rmw(&mut self, op: &str, addr: &str, v: &str, bits: u32) -> String {
+        let p = self.val(format!("inttoptr i64 {addr} to ptr"));
+        self.val(format!("atomicrmw {op} ptr {p}, i{bits} {v} seq_cst, align {}{MEM}", bits / 8))
+    }
+
+    /// Compare-and-swap: returns (old value, whether it stored).
+    pub fn cmpxchg(&mut self, addr: &str, expected: &str, new: &str, bits: u32) -> (String, String) {
+        let p = self.val(format!("inttoptr i64 {addr} to ptr"));
+        let pair =
+            self.val(format!("cmpxchg ptr {p}, i{bits} {expected}, i{bits} {new} seq_cst seq_cst, align {}{MEM}", bits / 8));
+        let old = self.val(format!("extractvalue {{ i{bits}, i1 }} {pair}, 0"));
+        let ok = self.val(format!("extractvalue {{ i{bits}, i1 }} {pair}, 1"));
+        (old, ok)
+    }
+
     // --- Control flow ------------------------------------------------------------
 
     /// Ends the block by jumping to a known address: a branch within the
@@ -941,6 +973,8 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
     // region: those discovery found, plus targets of other regions' branches.
     let mut entries = prog.entries.clone();
     let mut lifted1 = Vec::new();
+    // Backward branches within a region: (target, block, end of block).
+    let mut loop_edges: Vec<(u64, u64, u64)> = Vec::new();
     for (&region, leaders) in &regions {
         let (mut tmp, mut strings, mut calls) = (0, Vec::new(), std::collections::BTreeSet::new());
         let mut bodies = Vec::new();
@@ -990,6 +1024,7 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
                     entries.insert(s);
                 }
             }
+            loop_edges.extend(b.succs.iter().filter(|&&s| region_of(s) == region && s <= start).map(|&s| (s, start, pc)));
             let (succs, unknown) = match last {
                 "bl" | "blr" | "blraa" | "blrab" | "ret" | "retaa" | "retab" => (Vec::new(), false),
                 _ => (std::mem::take(&mut b.succs), b.indirect),
@@ -1011,6 +1046,32 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
     // block reaches `bad`, which reports it as a missed target, learned by
     // the next translation.) Blocks whose flags no successor reads drop their
     // flag stores.
+    // Small loops that load guest memory but never store to it are how
+    // compiled code polls a word another thread writes (a `volatile` flag,
+    // a relaxed atomic): their loads are made volatile, or LLVM, which knows
+    // guest memory and registers don't alias (TBAA), would read the word
+    // once, before the loop. Larger store-free loops (a reduction, a search)
+    // keep ordinary loads.
+    const POLL_LOOP_BYTES: u64 = 64;
+    let stores = |body: &str| {
+        body.lines().any(|l| {
+            let l = l.trim_start();
+            (l.starts_with("store ") && l.ends_with(MEM)) || l.contains("atomicrmw ") || l.contains("cmpxchg ")
+        })
+    };
+    let mut polling = std::collections::HashSet::new();
+    for (region, _, l) in &lifted1 {
+        for &(target, _, end) in loop_edges.iter().filter(|e| region_of(e.1) == *region) {
+            if end + 4 - target > POLL_LOOP_BYTES {
+                continue;
+            }
+            let in_loop: Vec<&(u64, String)> = l.bodies.iter().filter(|(s, _)| (target..=end).contains(s)).collect();
+            if !in_loop.iter().any(|(_, body)| stores(body)) {
+                polling.extend(in_loop.iter().map(|(s, _)| *s));
+            }
+        }
+    }
+
     let mut lifted = Vec::new();
     for (region, leaders, l) in lifted1 {
         let mut text = format!("define void @R_{region:x}(i64 %pc) {{\nentry:\n  switch i64 %pc, label %bad [\n");
@@ -1021,12 +1082,17 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
         for (start, body) in &l.bodies {
             let _ = writeln!(text, "b_{start:x}:");
             let keep = live_out.contains(start);
+            let polls = polling.contains(start);
             let mut in_flags = false;
             for line in body.lines() {
                 match line.trim() {
                     ";FLAGS" => in_flags = true,
                     ";ENDFLAGS" => in_flags = false,
                     _ if in_flags && !keep => {}
+                    l if polls && l.ends_with(MEM) && l.contains(" = load ") && !l.contains(" = load atomic ") => {
+                        text.push_str(&line.replacen(" = load ", " = load volatile ", 1));
+                        text.push('\n');
+                    }
                     _ => {
                         text.push_str(line);
                         text.push('\n');
@@ -1064,12 +1130,13 @@ pub const MEM: &str = ", !tbaa !904";
 fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
     let preamble = format!(
         "target triple = \"wasm64-unknown-unknown\"\n\
-         @R = external global [32 x i64]\n\
-         @F = external global [4 x i8]\n\
-         @V = external global [32 x i128]\n\
-         @TP = external global i64\n\
-         @FPSR = external global i32\n\
-         @__wasm_env_dispatch_cache = external global [4096 x {{ i64, ptr }}]\n\
+         @R = external thread_local(localexec) global [32 x i64]\n\
+         @F = external thread_local(localexec) global [4 x i8]\n\
+         @V = external thread_local(localexec) global [32 x i128]\n\
+         @TP = external thread_local(localexec) global i64\n\
+         @FPSR = external thread_local(localexec) global i32\n\
+         @MONITOR = external thread_local(localexec) global i64\n\
+         @__wasm_env_dispatch_cache = external thread_local(localexec) global [4096 x {{ i64, ptr }}]\n\
          declare void @dispatch(i64)\n\
          declare void @__wasm_env_svc()\n\
          declare i64 @__wasm_env_svc_at(i64)\n\
@@ -1110,15 +1177,19 @@ fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
 /// table mapping each block address to its function.
 fn build_data(image: &Image, prog: &Program) -> String {
     let mut ir = String::from("target triple = \"wasm64-unknown-unknown\"\n");
-    ir.push_str("@R = global [32 x i64] zeroinitializer, align 8\n");
-    ir.push_str("@F = global [4 x i8] zeroinitializer\n");
-    ir.push_str("@V = global [32 x i128] zeroinitializer, align 16\n");
-    ir.push_str("@TP = global i64 0\n");
-    ir.push_str("@FPSR = global i32 0\n\n");
+    // Guest state is per thread: each guest thread runs its own instance of
+    // the module, with its own thread-local block (docs/abi.md, "Threads").
+    ir.push_str("@R = thread_local(localexec) global [32 x i64] zeroinitializer, align 8\n");
+    ir.push_str("@F = thread_local(localexec) global [4 x i8] zeroinitializer\n");
+    ir.push_str("@V = thread_local(localexec) global [32 x i128] zeroinitializer, align 16\n");
+    ir.push_str("@TP = thread_local(localexec) global i64 0\n");
+    ir.push_str("@FPSR = thread_local(localexec) global i32 0\n");
+    // The exclusive monitor: the value the last load-exclusive read (see
+    // "stxr" in insn.rs).
+    ir.push_str("@MONITOR = thread_local(localexec) global i64 0\n\n");
 
-    // The segments' bytes aren't here: they're added to the linked module as
-    // data segments at their own addresses (link::add_data_segments), so the
-    // data pointers are null.
+    // The segments' bytes aren't here: they go in the linked module's
+    // guest image section (link::add_image), so the data pointers are null.
     ir.push_str("%seg = type { i64, i64, i64, ptr }\n");
     let _ = write!(ir, "@guest_segments = constant [{} x %seg] [", image.segments.len());
     for (k, s) in image.segments.iter().enumerate() {

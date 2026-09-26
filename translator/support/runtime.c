@@ -1,17 +1,17 @@
 // Support code linked into every translated program.
 //
-// The lifted code (translator/src/lift) keeps guest state in globals and
-// calls into here for program startup, system calls and fatal errors. This
-// file is compiled for wasm64 without libc; it only uses the linux.syscall
-// import (docs/abi.md).
+// The lifted code (translator/src/lift) keeps guest state in thread-local
+// globals and calls into here for program startup, system calls and fatal
+// errors. This file is compiled for wasm64 without libc; it only uses the
+// linux.syscall import (docs/abi.md).
 #include <stdint.h>
 
 long __wasm_env_host_syscall(long, long, long, long, long, long, long)
 	__attribute__((__import_module__("linux"), __import_name__("syscall")));
 
 // Guest state, defined by the lifted code.
-extern uint64_t R[32]; // x0–x30, SP
-extern uint64_t TP;    // TPIDR_EL0
+extern _Thread_local uint64_t R[32]; // x0–x30, SP
+extern _Thread_local uint64_t TP;    // TPIDR_EL0
 
 // The guest image, emitted by the lifter.
 struct seg { uint64_t vaddr, filesz, memsz; const uint8_t *data; };
@@ -170,7 +170,7 @@ uint32_t __wasm_env_crc32(uint32_t crc, uint64_t data, uint32_t bytes, uint32_t 
 // Must match the translator's REGION_SPAN (translator/src/lift/mod.rs).
 #define REGION_SHIFT 12
 // A direct-mapped cache of region lookups, tagged with region number + 1 so
-// the zeroed initial entries match nothing. Processes are single-threaded.
+// the zeroed initial entries match nothing; each thread has its own.
 // The lifted code probes it inline at every indirect branch (see
 // Block::jump_to) and calls `dispatch` only on a miss; the layout and hash
 // must match. With WASM_ENV_DEBUG=1 nothing is cached, so every indirect
@@ -179,7 +179,8 @@ uint32_t __wasm_env_crc32(uint32_t crc, uint64_t data, uint32_t bytes, uint32_t 
 struct dispatch_entry {
 	uint64_t tag;
 	block_fn fn;
-} __wasm_env_dispatch_cache[DISPATCH_CACHE];
+};
+_Thread_local struct dispatch_entry __wasm_env_dispatch_cache[DISPATCH_CACHE];
 
 // Find `pc`'s region function and tail-call it (a WebAssembly return_call,
 // so the host stack doesn't grow): from the cache, else by binary search of
@@ -357,17 +358,17 @@ static int library_syscall(long nr)
 // __wasm_env_svc_at's return value. The child may run on the parent's stack
 // (glibc's vfork) or a new one (glibc's posix_spawn); either way the parent
 // was waiting at its clone, as with a real CLONE_VFORK.
-extern uint8_t F[4];
-extern __uint128_t V[32];
+extern _Thread_local uint8_t F[4];
+extern _Thread_local __uint128_t V[32];
 struct vfork_frame {
 	uint64_t r[32], tp, resume;
 	uint8_t f[4];
 	__uint128_t v[32];
 };
 #define VFORK_DEPTH 4
-static struct vfork_frame vfork_frames[VFORK_DEPTH];
-static int vfork_depth;
-static uint64_t svc_next, svc_redirect;
+static _Thread_local struct vfork_frame vfork_frames[VFORK_DEPTH];
+static _Thread_local int vfork_depth;
+static _Thread_local uint64_t svc_next, svc_redirect;
 
 enum { SYS_uname = 160, SYS_exit = 93, SYS_execve = 221, CLONE_VM = 0x100, CLONE_VFORK = 0x4000 };
 
@@ -375,7 +376,7 @@ static void vfork_clone(void)
 {
 	uint64_t flags = R[0], stack = R[1];
 	if ((flags & (CLONE_VM | CLONE_VFORK)) != (CLONE_VM | CLONE_VFORK) || vfork_depth == VFORK_DEPTH) {
-		// fork, threads: not yet.
+		// fork: not yet.
 		R[0] = (uint64_t)-ENOSYS;
 		return;
 	}
@@ -408,11 +409,55 @@ static void vfork_resume(long pid)
 	svc_redirect = f->resume;
 }
 
+// Threads (docs/abi.md, "Threads"). The runtime runs each guest thread as
+// its own instance of this module, sharing its memory, with its own
+// thread-local guest state. clone(CLONE_THREAD) passes the runtime a frame
+// holding the new thread's registers: the parent's, with x0 = 0, SP = the
+// new stack and TPIDR_EL0 = the tls argument (CLONE_SETTLS), resuming after
+// the clone. The runtime starts the thread at __wasm_env_thread_start with
+// that frame and returns its tid to the parent once the thread has copied
+// the frame.
+enum { CLONE_SETTLS = 0x80000, CLONE_THREAD = 0x10000 };
+#define WASM_ENV_THREAD_STARTED ((1L << 32) + 1)
+static _Thread_local struct vfork_frame clone_frame;
+
+static void thread_clone(void)
+{
+	uint64_t flags = R[0], stack = R[1], tls = R[3];
+	struct vfork_frame *f = &clone_frame;
+	__builtin_memcpy(f->r, R, sizeof f->r);
+	__builtin_memcpy(f->f, F, sizeof f->f);
+	__builtin_memcpy(f->v, V, sizeof f->v);
+	f->r[0] = 0;
+	if (stack)
+		f->r[31] = stack;
+	f->tp = (flags & CLONE_SETTLS) ? tls : TP;
+	f->resume = svc_next;
+	R[0] = (uint64_t)__wasm_env_host_syscall(SYS_clone, (long)flags, (long)stack, (long)R[2], (long)tls, (long)R[4],
+	                                         (long)f);
+}
+
+__attribute__((__export_name__("__wasm_env_thread_start")))
+void __wasm_env_thread_start(const struct vfork_frame *f)
+{
+	__builtin_memcpy(R, f->r, sizeof f->r);
+	__builtin_memcpy(F, f->f, sizeof f->f);
+	__builtin_memcpy(V, f->v, sizeof f->v);
+	TP = f->tp;
+	uint64_t pc = f->resume;
+	// The parent may go on (and reuse the frame) from here.
+	__wasm_env_host_syscall(WASM_ENV_THREAD_STARTED, 0, 0, 0, 0, 0, 0);
+	dispatch((long)pc);
+}
+
 void __wasm_env_svc(void)
 {
 	long nr = (long)R[8];
 	if (nr == SYS_clone) {
-		vfork_clone();
+		if (R[0] & CLONE_THREAD)
+			thread_clone();
+		else
+			vfork_clone();
 		return;
 	}
 	if (library_syscall(nr)) return;
@@ -524,4 +569,11 @@ void _start(uint64_t sp)
 	// Linux starts arm64 processes with every register zero except SP.
 	R[31] = guest_initial_stack((const uint64_t *)(uintptr_t)sp);
 	dispatch(guest_entry);
+}
+
+// This thread's guest registers, for tests and debugging.
+__attribute__((__export_name__("__wasm_env_registers")))
+uint64_t *__wasm_env_registers(void)
+{
+	return R;
 }

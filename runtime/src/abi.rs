@@ -44,6 +44,9 @@ pub mod nr {
     /// by translated programs' support code when they jump to an address that
     /// wasn't translated: (pc, object name, offset in the object).
     pub const WASM_ENV_MISSED_TARGET: i64 = 1 << 32;
+    /// Made by a new thread of a translated program once it has taken its
+    /// registers from the clone frame (see thread::spawn).
+    pub const WASM_ENV_THREAD_STARTED: i64 = (1 << 32) + 1;
     pub const SET_TID_ADDRESS: i64 = 96;
     pub const SET_ROBUST_LIST: i64 = 99;
     pub const FUTEX: i64 = 98;

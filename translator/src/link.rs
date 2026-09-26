@@ -16,8 +16,98 @@ pub const SUPPORT_C: &str = include_str!("../support/runtime.c");
 
 /// WebAssembly target and features, shared by the lifted code and the
 /// support code.
-const WASM_FLAGS: &[&str] =
-    &["--target=wasm64-unknown-unknown", "-mtail-call", "-mbulk-memory", "-mexception-handling", "-mrelaxed-simd"];
+///
+/// Atomics make thread-local variables real (one block per thread) and
+/// guest atomics WebAssembly atomics.
+const WASM_FLAGS: &[&str] = &[
+    "--target=wasm64-unknown-unknown",
+    "-mtail-call",
+    "-mbulk-memory",
+    "-matomics",
+    "-mexception-handling",
+    "-mrelaxed-simd",
+];
+
+/// Linker flags for a translated program. Its memory is shared and
+/// imported, so each guest thread can be an instance of the module on the
+/// same memory (docs/abi.md, "Threads"); wasm-ld then initializes data in a
+/// start function that only the first instance runs, and each thread gives
+/// `__wasm_init_tls` its own thread-local block. The exports are what the
+/// runtime needs for that, and `__heap_base` (docs/abi.md).
+fn ld_args(image_end: u64) -> Vec<String> {
+    let mut args: Vec<String> = ["-m", "wasm64", "--no-entry", "-z", "stack-size=1048576"].map(String::from).to_vec();
+    args.push(format!("--global-base={}", global_base(image_end)));
+    // wasm-ld caps a 64-bit memory at 16 GB; `finish` raises the limit.
+    args.extend(["--shared-memory", "--import-memory", "--max-memory=17179869184"].map(String::from));
+    for export in ["__stack_pointer", "__heap_base", "__wasm_init_tls", "__tls_size", "__tls_align"] {
+        args.push(format!("--export={export}"));
+    }
+    args
+}
+
+/// How much memory a translated program may use: all of its masked address
+/// space (the runtime's MASK_BITS), in 64 KB pages.
+const MAX_PAGES: u64 = 1 << (38 - 16);
+
+/// Post-processes a linked module: its memory may use the whole masked
+/// address space, not just the 16 GB wasm-ld allows.
+fn finish(wasm: Vec<u8>) -> Result<Vec<u8>> {
+    const IMPORT: u8 = 2;
+    let mut out = wasm[..8].to_vec();
+    let mut pos = 8;
+    while pos < wasm.len() {
+        let id = wasm[pos];
+        let (size, n) = read_uleb(&wasm[pos + 1..])?;
+        let body = &wasm[pos + 1 + n..pos + 1 + n + size as usize];
+        pos += 1 + n + size as usize;
+        let new_body = if id == IMPORT { raise_memory_limit(body)? } else { body.to_vec() };
+        out.push(id);
+        write_uleb(&mut out, new_body.len() as u64);
+        out.extend_from_slice(&new_body);
+    }
+    Ok(out)
+}
+
+/// The import section with the imported memory's maximum set to MAX_PAGES.
+fn raise_memory_limit(body: &[u8]) -> Result<Vec<u8>> {
+    let (count, mut p) = read_uleb(body)?;
+    let mut out = Vec::new();
+    write_uleb(&mut out, count);
+    for _ in 0..count {
+        let start = p;
+        for _ in 0..2 {
+            // module and field names
+            let (len, n) = read_uleb(&body[p..])?;
+            p += n + len as usize;
+        }
+        let kind = body[p];
+        p += 1;
+        out.extend_from_slice(&body[start..p]);
+        match kind {
+            0 => {
+                // function: type index
+                let (_, n) = read_uleb(&body[p..])?;
+                out.extend_from_slice(&body[p..p + n]);
+                p += n;
+            }
+            2 => {
+                // memory: flags (bit 0 has maximum, 1 shared, 2 64-bit), min, max
+                let flags = body[p];
+                let (min, n) = read_uleb(&body[p + 1..])?;
+                p += 1 + n;
+                if flags & 1 != 0 {
+                    let (_, n) = read_uleb(&body[p..])?;
+                    p += n;
+                }
+                out.push(flags | 1);
+                write_uleb(&mut out, min);
+                write_uleb(&mut out, MAX_PAGES);
+            }
+            _ => bail!("unexpected import kind {kind} in a translated program"),
+        }
+    }
+    Ok(out)
+}
 
 /// Optimization level for the lifted IR. It is already low-level, and one
 /// module can hold a whole translated library, so `-O2` makes clang use
@@ -116,18 +206,13 @@ pub fn link(tc: &Toolchain, ir: &str, image_end: u64, work: &Path) -> Result<Vec
     run(Command::new(&tc.cc).args(WASM_FLAGS).arg(lift_opt()).arg("-c").arg(&ll).arg("-o").arg(&lifted_o))?;
     run(Command::new(&tc.cc).args(WASM_FLAGS).args(["-O2", "-ffreestanding", "-nostdlib", "-c"]).arg(&support_c).arg("-o").arg(&support_o))?;
     run(Command::new(&tc.wasm_ld)
-        .args(["-m", "wasm64", "--no-entry", "-z", "stack-size=1048576"])
-        .arg(format!("--global-base={}", global_base(image_end)))
-        // Required by the wasm-env ABI (docs/abi.md), plus guest state for
-        // debugging and tests.
-        .args(["--export=__stack_pointer", "--export=__heap_base"])
-        .args(["--export=R", "--export=F", "--export=V", "--export=TP"])
+        .args(ld_args(image_end))
         .arg(&lifted_o)
         .arg(&support_o)
         .args(tc.builtins.iter())
         .arg("-o")
         .arg(&wasm))?;
-    Ok(std::fs::read(&wasm)?)
+    finish(std::fs::read(&wasm)?)
 }
 
 /// Where compiled objects are cached: `$WASM_ENV_OBJECT_CACHE` (empty or "0"
@@ -258,10 +343,7 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
     }
     let wasm = work.join("program.wasm");
     let mut ld = Command::new(&tc.wasm_ld);
-    ld.args(["-m", "wasm64", "--no-entry", "-z", "stack-size=1048576"])
-        .arg(format!("--global-base={}", global_base(image_end)))
-        .args(["--export=__stack_pointer", "--export=__heap_base"])
-        .args(["--export=R", "--export=F", "--export=V", "--export=TP"])
+    ld.args(ld_args(image_end))
         // For the runtime's report when a translated program faults.
         .args(["--export=wasm_env_recent", "--export=wasm_env_recent_count"]);
     for (_, obj, _) in &units {
@@ -269,61 +351,91 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
     }
     ld.args(tc.builtins.iter()).arg("-o").arg(&wasm);
     run(&mut ld)?;
-    Ok(std::fs::read(&wasm)?)
+    finish(std::fs::read(&wasm)?)
 }
 
-/// Adds active data segments to a linked wasm64 module: each (address,
-/// bytes) is placed in memory at that address when the module is
-/// instantiated. The guest image goes in this way, at its original
-/// addresses, rather than being copied there at startup: wasmtime then maps
-/// it copy-on-write from the compiled module, and a process only pays for
-/// the pages it touches.
-pub fn add_data_segments(wasm: &[u8], segments: &[(u64, &[u8])]) -> Result<Vec<u8>> {
-    const DATA: u8 = 11;
-    const DATA_COUNT: u8 = 12;
+/// The name of the custom section holding a translated program's guest
+/// image (see `add_image`).
+pub const IMAGE_SECTION: &str = "wasm-env.image";
+
+/// Appends the guest image to a linked module, as a custom section the
+/// runtime maps into memory: each (address, bytes) belongs at that address.
+/// The memory is shared between the program's threads, and wasmtime only
+/// maps initial contents copy-on-write into memories a module defines, so
+/// the runtime does it itself (see runtime/src/image.rs), and a process only
+/// pays for the pages it touches. Custom sections don't affect compilation.
+///
+/// The section holds the image as runs of whole 4 KB pages, at file offsets
+/// that are multiples of 4 KB so they can be mapped straight from the file:
+///
+/// ```text
+/// u64 count, then count × { u64 address, u64 length, u64 file offset }
+/// padding, then each run's pages
+/// ```
+pub fn add_image(wasm: &[u8], segments: &[(u64, &[u8])]) -> Result<Vec<u8>> {
+    const PAGE: u64 = 4096;
     if wasm.get(..8) != Some(b"\0asm\x01\0\0\0".as_slice()) {
         bail!("not a wasm module");
     }
-    let mut out = wasm[..8].to_vec();
-    let mut pos = 8;
-    let mut added = false;
-    while pos < wasm.len() {
-        let id = wasm[pos];
-        let (size, n) = read_uleb(&wasm[pos + 1..])?;
-        let body = &wasm[pos + 1 + n..pos + 1 + n + size as usize];
-        pos += 1 + n + size as usize;
-        let new_body = match id {
-            DATA => {
-                let (count, n) = read_uleb(body)?;
-                let mut b = Vec::new();
-                write_uleb(&mut b, count + segments.len() as u64);
-                b.extend_from_slice(&body[n..]);
-                for (addr, bytes) in segments {
-                    b.push(0); // active, memory 0
-                    b.push(0x42); // i64.const
-                    write_sleb(&mut b, *addr as i64);
-                    b.push(0x0b); // end
-                    write_uleb(&mut b, bytes.len() as u64);
-                    b.extend_from_slice(bytes);
-                }
-                added = true;
-                b
-            }
-            DATA_COUNT => {
-                let (count, _) = read_uleb(body)?;
-                let mut b = Vec::new();
-                write_uleb(&mut b, count + segments.len() as u64);
-                b
-            }
-            _ => body.to_vec(),
-        };
-        out.push(id);
-        write_uleb(&mut out, new_body.len() as u64);
-        out.extend_from_slice(&new_body);
+    // Compose whole pages (bytes outside every segment are zero, as memory
+    // starts), then group consecutive pages into runs.
+    let mut pages: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
+    for (addr, bytes) in segments {
+        let mut at = *addr;
+        let mut rest = *bytes;
+        while !rest.is_empty() {
+            let page = pages.entry(at / PAGE).or_insert_with(|| vec![0; PAGE as usize]);
+            let off = (at % PAGE) as usize;
+            let n = rest.len().min(PAGE as usize - off);
+            page[off..off + n].copy_from_slice(&rest[..n]);
+            at += n as u64;
+            rest = &rest[n..];
+        }
     }
-    if !added {
-        bail!("the module has no data section");
+    let mut runs: Vec<(u64, Vec<&Vec<u8>>)> = Vec::new();
+    for (&p, page) in &pages {
+        match runs.last_mut() {
+            Some((start, run)) if *start + run.len() as u64 == p => run.push(page),
+            _ => runs.push((p, vec![page])),
+        }
     }
+
+    // The section header: id 0, a size padded to 5 bytes (LEB128 allows it)
+    // so the header's length is known before the size is, then the name.
+    let name = IMAGE_SECTION.as_bytes();
+    let header = 1 + 5 + 1 + name.len() as u64;
+    let table = 8 + 24 * runs.len() as u64;
+    let data_start = (wasm.len() as u64 + header + table).next_multiple_of(PAGE);
+    let mut body = Vec::new();
+    body.push(name.len() as u8);
+    body.extend_from_slice(name);
+    body.extend_from_slice(&(runs.len() as u64).to_le_bytes());
+    let mut offset = data_start;
+    for (start, run) in &runs {
+        let len = run.len() as u64 * PAGE;
+        for v in [start * PAGE, len, offset] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        offset += len;
+    }
+    body.resize((data_start - wasm.len() as u64 - 6) as usize, 0);
+    for (_, run) in &runs {
+        for page in run {
+            body.extend_from_slice(page);
+        }
+    }
+    let size = body.len() as u64;
+    if size >= 1 << 32 {
+        bail!("the guest image is too large ({size} bytes)");
+    }
+    let mut out = Vec::with_capacity(wasm.len() + 6 + body.len());
+    out.extend_from_slice(wasm);
+    out.push(0);
+    for i in 0..5 {
+        let byte = (size >> (7 * i)) as u8 & 0x7f;
+        out.push(if i < 4 { byte | 0x80 } else { byte });
+    }
+    out.extend_from_slice(&body);
     Ok(out)
 }
 
@@ -350,31 +462,20 @@ fn write_uleb(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-fn write_sleb(out: &mut Vec<u8>, mut v: i64) {
-    loop {
-        let byte = (v & 0x7f) as u8;
-        v >>= 7;
-        let done = (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0);
-        out.push(if done { byte } else { byte | 0x80 });
-        if done {
-            return;
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wasmtime::{Config, Engine, Instance, Linker, Memory, Module, Store, Val};
+    use wasmtime::{Config, Engine, Instance, Linker, Module, SharedMemory, Store, Val};
 
     /// Declarations every lifted module has (see lift/mod.rs).
     const PRELUDE: &str = r#"
 target triple = "wasm64-unknown-unknown"
-@R = global [32 x i64] zeroinitializer, align 8
-@F = global [4 x i8] zeroinitializer
-@V = global [32 x i128] zeroinitializer, align 16
-@TP = global i64 0
-@FPSR = global i32 0
+@R = thread_local(localexec) global [32 x i64] zeroinitializer, align 8
+@F = thread_local(localexec) global [4 x i8] zeroinitializer
+@V = thread_local(localexec) global [32 x i128] zeroinitializer, align 16
+@TP = thread_local(localexec) global i64 0
+@FPSR = thread_local(localexec) global i32 0
 %seg = type { i64, i64, i64, ptr }
 declare void @__wasm_env_svc()
 declare void @__wasm_env_fatal(ptr, i64)
@@ -434,13 +535,21 @@ define void @B_400000(i64 %_) {{
         calls: Vec<(i64, [i64; 3])>,
         /// Bytes written to fd 2.
         stderr: Vec<u8>,
-        memory: Option<Memory>,
+        memory: Option<SharedMemory>,
+    }
+
+    /// A shared memory's bytes. Tests run one thread, so nothing else
+    /// accesses them meanwhile.
+    fn bytes(memory: &SharedMemory) -> &mut [u8] {
+        let data = memory.data();
+        // SAFETY: see above; UnsafeCell<u8> has u8's layout.
+        unsafe { std::slice::from_raw_parts_mut(data.as_ptr() as *mut u8, data.len()) }
     }
 
     struct Run {
         store: Store<Host>,
         instance: Instance,
-        memory: Memory,
+        memory: SharedMemory,
     }
 
     impl Run {
@@ -451,11 +560,12 @@ define void @B_400000(i64 %_) {{
             }
         }
         fn u64_at(&self, addr: u64) -> u64 {
-            let d = self.memory.data(&self.store);
+            let d = bytes(&self.memory);
             u64::from_le_bytes(d[addr as usize..addr as usize + 8].try_into().unwrap())
         }
         fn reg(&mut self, n: u64) -> u64 {
-            let r = self.global("R");
+            let f = self.instance.get_typed_func::<(), i64>(&mut self.store, "__wasm_env_registers").unwrap();
+            let r = f.call(&mut self.store, ()).unwrap() as u64;
             self.u64_at(r + n * 8)
         }
     }
@@ -475,9 +585,26 @@ define void @B_400000(i64 %_) {{
         let _ = std::fs::remove_dir_all(&work);
 
         let mut config = Config::new();
-        config.wasm_memory64(true).wasm_tail_call(true).wasm_exceptions(true);
+        config
+            .wasm_memory64(true)
+            .wasm_tail_call(true)
+            .wasm_exceptions(true)
+            .wasm_threads(true)
+            .shared_memory(true)
+            .memory_reservation(1 << 38)
+            .memory_may_move(false);
         let engine = Engine::new(&config).unwrap();
         let module = Module::new(&engine, &wasm).unwrap();
+        let memory_type = module
+            .imports()
+            .find_map(|i| match i.ty() {
+                wasmtime::ExternType::Memory(m) if (i.module(), i.name()) == ("env", "memory") => Some(m),
+                _ => None,
+            })
+            .expect("a translated program imports its memory");
+        assert!(memory_type.is_shared() && memory_type.is_64());
+        assert_eq!(memory_type.maximum(), Some(MAX_PAGES));
+        let memory = SharedMemory::new(&engine, memory_type).unwrap();
         let mut linker = Linker::new(&engine);
         linker
             .func_wrap(
@@ -487,8 +614,8 @@ define void @B_400000(i64 %_) {{
                     caller.data_mut().calls.push((n, [a, b, c]));
                     match n {
                         64 => {
-                            let mem = caller.data().memory.unwrap();
-                            let bytes = mem.data(&caller)[b as usize..(b + c) as usize].to_vec();
+                            let mem = caller.data().memory.clone().unwrap();
+                            let bytes = bytes(&mem)[b as usize..(b + c) as usize].to_vec();
                             if a == 2 {
                                 caller.data_mut().stderr.extend(bytes);
                             }
@@ -501,9 +628,9 @@ define void @B_400000(i64 %_) {{
             )
             .unwrap();
         let mut store = Store::new(&engine, Host::default());
+        linker.define(&store, "env", "memory", memory.clone()).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
-        let memory = instance.get_memory(&mut store, "memory").unwrap();
-        store.data_mut().memory = Some(memory);
+        store.data_mut().memory = Some(memory.clone());
 
         // argc=1, argv={"prog"}, envp={}, auxv={AT_PAGESZ 4096}, below the
         // module's stack pointer, as the runtime lays it out.
@@ -513,7 +640,7 @@ define void @B_400000(i64 %_) {{
         };
         let block = sp - 256;
         {
-            let d = memory.data_mut(&mut store);
+            let d = bytes(&memory);
             d[block as usize + 128..block as usize + 133].copy_from_slice(b"prog\0");
             for (i, w) in [1u64, block + 128, 0, 0, 6, 4096, 0, 0].iter().enumerate() {
                 let at = block as usize + i * 8;
@@ -535,33 +662,37 @@ define void @B_400000(i64 %_) {{
     }
 
     #[test]
-    fn added_data_segments_are_placed_at_their_addresses() {
-        // A memory64 module exporting its memory, with one data segment
-        // ("ab" at 16) and a data count section.
-        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
-        wasm.extend([5, 3, 1, 0x04, 2]); // memory: 1, memory64, min 2 pages
-        wasm.extend([7, 10, 1, 6]);
-        wasm.extend(b"memory");
-        wasm.extend([2, 0]); // export "memory"
-        wasm.extend([12, 1, 1]); // data count 1
-        wasm.extend([11, 8, 1, 0, 0x42, 16, 0x0b, 2, b'a', b'b']);
-        let far = vec![7u8; 3];
-        let out = add_data_segments(&wasm, &[(0x1_0000 + 5, &far), (300, b"xyz")]).unwrap();
+    fn the_image_is_whole_pages_at_mappable_offsets() {
+        let wasm = b"\0asm\x01\0\0\0".to_vec();
+        // Two segments sharing a page, and one on its own far above.
+        let far = vec![7u8; 5000];
+        let segments: [(u64, &[u8]); 3] = [(0x1000 + 10, b"ab"), (0x1000 + 4000, &[9; 200]), (0x40_0000 - 3, &far)];
+        let out = add_image(&wasm, &segments).unwrap();
 
-        let mut config = Config::new();
-        config.wasm_memory64(true);
-        let engine = Engine::new(&config).unwrap();
-        let module = Module::new(&engine, &out).unwrap();
-        let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).unwrap();
-        let memory = instance.get_memory(&mut store, "memory").unwrap();
-        let d = memory.data(&store);
-        assert_eq!(&d[16..18], b"ab", "existing segments are kept");
-        assert_eq!(&d[300..303], b"xyz");
-        assert_eq!(&d[0x1_0005..0x1_0008], &[7, 7, 7], "addresses above 2^16 (multi-byte LEB)");
-        assert_eq!(d[303], 0);
+        // One custom section after the module, named IMAGE_SECTION.
+        assert_eq!(out[8], 0);
+        let (size, n) = read_uleb(&out[9..]).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(14 + size as usize, out.len());
+        let name_len = out[14] as usize;
+        assert_eq!(&out[15..15 + name_len], IMAGE_SECTION.as_bytes());
+        let word = |at: usize| u64::from_le_bytes(out[at..at + 8].try_into().unwrap());
+        let table = 15 + name_len;
+        let runs: Vec<[u64; 3]> =
+            (0..word(table) as usize).map(|k| [0, 8, 16].map(|f| word(table + 8 + 24 * k + f))).collect();
+        assert_eq!(runs.iter().map(|r| (r[0], r[1])).collect::<Vec<_>>(), [(0x1000, 0x2000), (0x3f_f000, 0x3000)]);
+
+        // Reassemble memory from the runs as the runtime maps them.
+        let mut memory = vec![0u8; 0x40_3000];
+        for [addr, len, offset] in runs {
+            assert_eq!(offset % 4096, 0, "file offsets are page-aligned");
+            memory[addr as usize..(addr + len) as usize].copy_from_slice(&out[offset as usize..(offset + len) as usize]);
+        }
+        assert_eq!(&memory[0x100a..0x100c], b"ab");
+        assert_eq!(memory[0x100c], 0);
+        assert_eq!(&memory[0x1000 + 4000..0x1000 + 4200], &[9; 200], "a segment crossing a page boundary");
+        assert_eq!(&memory[0x40_0000 - 3..0x40_0000 - 3 + 5000], &far[..]);
     }
-
     #[test]
     fn slow_commands_are_stopped_at_the_limit() {
         use std::time::{Duration, Instant};
@@ -583,7 +714,7 @@ define void @B_400000(i64 %_) {{
     #[test]
     fn maps_the_guest_image_and_zeroes_bss() {
         let Some(r) = run(&program(""), |d| d[0x400000 + 100] = 0xaa) else { return };
-        let d = r.memory.data(&r.store);
+        let d = bytes(&r.memory);
         assert_eq!(&d[0x400000..0x400010], b"hello from svc!\n");
         assert_eq!(d[0x400000 + 100], 0, ".bss is zeroed even if memory wasn't");
     }
@@ -597,7 +728,7 @@ define void @B_400000(i64 %_) {{
         assert!(sp < stack_pointer, "a separate region, not the runtime's block");
         assert_eq!(r.u64_at(sp), 1, "argc");
         let argv0 = r.u64_at(sp + 8);
-        assert_eq!(&r.memory.data(&r.store)[argv0 as usize..argv0 as usize + 4], b"prog", "strings are shared");
+        assert_eq!(&bytes(&r.memory)[argv0 as usize..argv0 as usize + 4], b"prog", "strings are shared");
         assert_eq!(r.u64_at(sp + 16), 0, "argv NULL");
         assert_eq!(r.u64_at(sp + 24), 0, "envp NULL");
         let mut aux = Vec::new();

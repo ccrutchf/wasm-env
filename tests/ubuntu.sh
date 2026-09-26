@@ -43,6 +43,10 @@ done
 # inside the guest.
 "${cc[@]}" -O2 -o "$R/opt/tests/spawn" tests/arm64/spawn.c &&
 	compare spawn "$(cat tests/arm64/spawn.expected)" "$(timeout 600 "$wasm_env" run --root "$R" /opt/tests/spawn 2>&1)"
+# Threads through glibc's pthreads: exclusives, then LSE atomics (clang's
+# default outline atomics, which pick LSE by AT_HWCAP).
+"${cc[@]}" -O2 -pthread -mno-outline-atomics -o "$R/opt/tests/threads" tests/arm64/threads.c && t /opt/tests/threads
+"${cc[@]}" -O2 -pthread -o "$R/opt/tests/threads-lse" tests/arm64/threads.c && t /opt/tests/threads-lse
 # Atomics (LSE) and dlopen through glibc's dynamic linker.
 "${cc[@]}" -O2 -march=armv8.1-a -o "$R/opt/tests/atomics" tests/arm64/atomics.c && t /opt/tests/atomics
 "${cc[@]}" -O2 -shared -fPIC -o "$R/usr/lib/libgreet.so" tests/arm64/libgreet.c
@@ -83,6 +87,12 @@ else
 	echo "skipped numpy and pandas: can't fetch the wheels (offline?)"
 fi
 
+# Python threads (threading, queues, pools; hashlib in parallel), with
+# Python's extension modules (numpy's rule above includes them).
+grep -q '^python3' "$R/etc/wasm-env/dlopen" || echo "python3* /usr/lib/python3.12/lib-dynload" >> "$R/etc/wasm-env/dlopen"
+cp tests/python/threads_demo.py "$R/root/"
+t /usr/bin/python3.12 /root/threads_demo.py
+
 # Networking, if PyPI is reachable: DNS (glibc's resolver, over the host's
 # resolv.conf), HTTPS (Ubuntu's OpenSSL with its CA certificates), and pip
 # installing a package from PyPI. Ubuntu's ca-certificates package builds
@@ -91,8 +101,8 @@ if curl -sSf -o /dev/null https://pypi.org/simple/ 2>/dev/null \
 	&& tests/ubuntu-fetch.sh ca-certificates >/dev/null 2>&1 && tests/wheel-fetch.sh pip==26.2.1 >/dev/null 2>&1; then
 	mkdir -p "$R/etc/ssl/certs"
 	cat "$R"/usr/share/ca-certificates/mozilla/*.crt > "$R/etc/ssl/certs/ca-certificates.crt"
-	# Translated programs can't start threads yet; pip draws progress bars in one.
-	printf '[global]\nprogress_bar = off\n' > "$R/etc/pip.conf"
+	# pip draws its progress bars from a thread.
+	rm -f "$R/etc/pip.conf"
 	py() { timeout 1800 "$wasm_env" run --root "$R" --env HOME=/root --env PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3.12 "$@" 2>&1; }
 	compare "DNS and HTTPS" "resolved: True
 200 six 1.17.0" "$(py -c '

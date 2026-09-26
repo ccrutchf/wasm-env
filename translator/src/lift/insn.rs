@@ -7,7 +7,7 @@
 use anyhow::{Result, bail};
 use bad64::{Condition, Instruction, Operand, Reg, Shift};
 
-use super::{Block, C, N, R, V, Z, arr_bits, elem_bits, konst, konst128, reg};
+use super::{Block, C, N, R, REG, V, Z, arr_bits, elem_bits, konst, konst128, reg};
 use crate::discover::{direct_target, imm_u64};
 
 pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
@@ -71,7 +71,12 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             return Ok(true);
         }
         "svc" => b.svc(i.address() + 4),
-        "nop" | "hint" | "yield" | "wfe" | "wfi" | "sev" | "sevl" | "csdb" | "isb" | "dmb" | "dsb" | "clrex"
+        // Barriers: a full fence (WebAssembly has only the one). Spin-wait
+        // hints keep the compiler from caching guest memory across them, so
+        // a loop polling a word another thread writes sees the write.
+        "dmb" | "dsb" => b.line("fence seq_cst"),
+        "yield" | "wfe" | "isb" => b.line("fence syncscope(\"singlethread\") seq_cst"),
+        "nop" | "hint" | "wfi" | "sev" | "sevl" | "csdb" | "clrex"
         | "bti" | "prfm" | "prfum" | "paciasp" | "autiasp" | "pacibsp" | "autibsp" | "xpaclri" | "pacia"
         | "autia1716" | "autib1716" | "pacia1716" | "pacib1716" | "autia" | "pacib" | "autib" | "dc" | "ic" | "dvp"
         | "cfp" | "cpp" => {}
@@ -508,9 +513,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
 
         // --- Loads and stores --------------------------------------------------------------
         "ldr" | "ldur" | "str" | "stur" | "ldrb" | "ldurb" | "ldrh" | "ldurh" | "strb" | "sturb" | "strh" | "sturh"
-        | "ldrsb" | "ldursb" | "ldrsh" | "ldursh" | "ldrsw" | "ldursw" | "ldar" | "ldarb" | "ldarh" | "ldaxr"
-        | "ldaxrb" | "ldaxrh" | "ldxr" | "ldxrb" | "ldxrh" | "stlr" | "stlrb" | "stlrh" | "ldapr" | "ldaprb"
-        | "ldaprh" | "ldlar" | "ldlarb" | "ldlarh" | "stllr" | "stllrb" | "stllrh" | "ldtr" | "sttr" => {
+        | "ldrsb" | "ldursb" | "ldrsh" | "ldursh" | "ldrsw" | "ldursw" | "ldtr" | "sttr" => {
             let r = b.reg_op(i, 0)?;
             let (mem_bits, signed) = access_width(m, r.1);
             let addr = b.address(&ops[1])?;
@@ -527,16 +530,47 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 b.write(r.0, v, r.1)?;
             }
         }
+        // Acquire loads and release stores: atomic accesses. A load-exclusive
+        // also records the value it read in the monitor (see "stxr").
+        "ldar" | "ldarb" | "ldarh" | "ldapr" | "ldaprb" | "ldaprh" | "ldlar" | "ldlarb" | "ldlarh" | "ldaxr"
+        | "ldaxrb" | "ldaxrh" | "ldxr" | "ldxrb" | "ldxrh" => {
+            let r = b.reg_op(i, 0)?;
+            let (mem_bits, _) = access_width(m, r.1);
+            let addr = b.address(&ops[1])?;
+            let v = b.load_atomic(&addr, mem_bits);
+            if m.contains("xr") {
+                let wide = b.resize(v.clone(), mem_bits, 64, false);
+                b.line(format!("store i64 {wide}, ptr @MONITOR{REG}"));
+            }
+            let v = b.resize(v, mem_bits, r.1, false);
+            b.write(r.0, v, r.1)?;
+        }
+        "stlr" | "stlrb" | "stlrh" | "stllr" | "stllrb" | "stllrh" => {
+            let r = b.reg_op(i, 0)?;
+            let (mem_bits, _) = access_width(m, r.1);
+            let addr = b.address(&ops[1])?;
+            let v = b.read(r.0, r.1)?;
+            let v = b.resize(v, r.1, mem_bits, false);
+            b.store_atomic(&addr, &v, mem_bits);
+        }
+        // Store-exclusive, as a compare-and-swap against the value the
+        // load-exclusive read: it succeeds (status 0) if memory still holds
+        // that value, which is how QEMU emulates the exclusive monitor. (A
+        // write of the same value in between goes unnoticed, which the
+        // lock-free algorithms compilers emit tolerate.)
         "stxr" | "stlxr" | "stxrb" | "stlxrb" | "stxrh" | "stlxrh" => {
-            // Single-threaded: the store always succeeds (status 0).
             let status = b.reg_op(i, 0)?;
             let r = b.reg_op(i, 1)?;
             let (mem_bits, _) = access_width(m, r.1);
             let addr = b.address(&ops[2])?;
             let v = b.read(r.0, r.1)?;
             let v = b.resize(v, r.1, mem_bits, false);
-            b.store(&addr, &v, mem_bits);
-            b.write(status.0, "0".into(), status.1)?;
+            let seen = b.val(format!("load i64, ptr @MONITOR{REG}"));
+            let seen = b.resize(seen, 64, mem_bits, false);
+            let (_, ok) = b.cmpxchg(&addr, &seen, &v, mem_bits);
+            let failed = b.val(format!("xor i1 {ok}, true"));
+            let failed = b.val(format!("zext i1 {failed} to i{}", status.1));
+            b.write(status.0, failed, status.1)?;
         }
         "ldp" | "stp" | "ldnp" | "stnp" | "ldpsw" => {
             let r1 = b.reg_op(i, 0)?;
@@ -1528,8 +1562,9 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             }
         }
 
-        // --- Atomics (ARMv8.1 LSE). Translated processes are single-threaded,
-        // so a plain read-modify-write is exact. ---------------------------------------------
+        // --- Atomics (ARMv8.1 LSE): WebAssembly atomic read-modify-writes
+        // (LLVM expands the ones WebAssembly lacks into compare-and-swap
+        // loops). ---------------------------------------------------------------------------
         _ if lse_atomic(m).is_some() => {
             let (op, width) = lse_atomic(m).unwrap();
             let (s, sbits) = b.reg_op(i, 0)?;
@@ -1537,31 +1572,32 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             // stADD-style aliases have no destination; cas/swp/ldOP have one.
             let (t, mem) = if ops.len() == 2 { (None, &ops[1]) } else { (Some(b.reg_op(i, 1)?), &ops[2]) };
             let addr = b.address(mem)?;
-            let old = b.load(&addr, width);
             let sv = b.read(s, sbits)?;
             let sv = b.resize(sv, sbits, width, false);
-            let new = match op {
-                "add" => b.val(format!("add i{width} {old}, {sv}")),
+            let old = match op {
                 "clr" => {
                     let ns = b.val(format!("xor i{width} {sv}, -1"));
-                    b.val(format!("and i{width} {old}, {ns}"))
+                    b.rmw("and", &addr, &ns, width)
                 }
-                "eor" => b.val(format!("xor i{width} {old}, {sv}")),
-                "set" => b.val(format!("or i{width} {old}, {sv}")),
-                "smax" | "smin" | "umax" | "umin" => {
-                    b.val(format!("call i{width} @llvm.{op}.i{width}(i{width} {old}, i{width} {sv})"))
-                }
-                "swp" => sv.clone(),
-                _ => {
+                "cas" => {
                     // cas: store Rt if memory equals Rs; Rs receives the old value.
                     let (tr, tbits) = t.unwrap();
                     let tv = b.read(tr, tbits)?;
                     let tv = b.resize(tv, tbits, width, false);
-                    let eq = b.val(format!("icmp eq i{width} {old}, {sv}"));
-                    b.val(format!("select i1 {eq}, i{width} {tv}, i{width} {old}"))
+                    b.cmpxchg(&addr, &sv, &tv, width).0
+                }
+                _ => {
+                    let rmw = match op {
+                        "eor" => "xor",
+                        "set" => "or",
+                        "smax" => "max",
+                        "smin" => "min",
+                        "swp" => "xchg",
+                        other => other, // add, umax, umin
+                    };
+                    b.rmw(rmw, &addr, &sv, width)
                 }
             };
-            b.store(&addr, &new, width);
             // The old value, zero-extended, goes to Rt (Rs for cas).
             let dest = if op == "cas" { Some((s, sbits)) } else { t };
             if let Some((dr, dbits)) = dest {

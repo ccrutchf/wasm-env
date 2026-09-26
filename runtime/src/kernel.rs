@@ -95,6 +95,15 @@ impl Kernel {
         pid
     }
 
+    /// Allocates a thread id: from the same numbers as pids, as on Linux,
+    /// but not a process (the thread belongs to its creator's).
+    pub fn create_thread(&self) -> i32 {
+        let mut p = self.procs.lock().unwrap();
+        let tid = p.next_pid;
+        p.next_pid += 1;
+        tid
+    }
+
     /// Records that `pid` ended, and wakes anyone waiting for it.
     pub fn exit(&self, pid: i32, how: Termination) {
         let mut p = self.procs.lock().unwrap();

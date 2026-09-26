@@ -167,7 +167,7 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     let work = std::env::temp_dir().join(format!("wasm-env-translate-{}", std::process::id()));
     let wasm = link::link_chunked(&tc, &lifted.data, &lifted.chunks, image_end, &work).and_then(|wasm| {
         let segments: Vec<(u64, &[u8])> = image.segments.iter().map(|s| (s.vaddr, s.data.as_slice())).collect();
-        link::add_data_segments(&wasm, &segments)
+        link::add_image(&wasm, &segments)
     });
     lap("compile and link");
     // WASM_ENV_KEEP_WORK=1 keeps the generated IR and objects for debugging.

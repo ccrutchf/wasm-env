@@ -40,6 +40,9 @@ fixtures=(
 	"calls:tests/arm64/calls.c:-static"
 	"control:tests/arm64/control.c:-static"
 	"memory:tests/arm64/memory.c:-static"
+	# Threads: exclusives (the default), then LSE atomics.
+	"threads:tests/arm64/threads.c:-static -pthread"
+	"threads-lse:tests/arm64/threads.c:-static -pthread -march=armv8.1-a"
 	# Static PIE (loaded at a chosen base, relocations applied on translate).
 	"hello-pie:tests/c/hello.c:-static-pie"
 	"control-pie:tests/arm64/control.c:-static-pie"

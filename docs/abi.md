@@ -22,7 +22,7 @@ A module may import nothing else. The runtime rejects modules that don't match.
 
 Programs may use: memory64, bulk memory, mutable globals, sign extension, non-trapping float-to-int, multi-value, reference types, SIMD (128-bit), exception handling (the standard `exnref` form, used for `setjmp`/`longjmp` and C++ exceptions) and tail calls.
 
-Not allowed in version 0: threads, shared memory, multiple memories.
+Not allowed in version 0: threads, shared memory, multiple memories. The runtime's arm64 translator produces modules of a threaded shape instead (see "Threads").
 
 ## System calls
 
@@ -74,9 +74,27 @@ The program exits by calling `exit_group`. If `_start` returns, the runtime trea
 
 ## Threads and thread-local storage
 
-Version 0 is single-threaded. `clone` with `CLONE_THREAD` returns `-ENOSYS`, so `pthread_create` fails cleanly. `futex` behaves as it does for a process with one thread: a wake finds no waiters, and a wait returns `-EAGAIN` if the word changed, otherwise sleeps out its timeout (`-ETIMEDOUT`) or returns `-EINTR` as a spurious wakeup. (Separate processes do run concurrently; see "Processes".)
+Programs built with the wasm-env toolchain (version 0) are single-threaded. `clone` with `CLONE_THREAD` returns `-ENOSYS`, so `pthread_create` fails cleanly. musl's thread pointer, which it uses for `errno` and its own bookkeeping, is an ordinary global variable in libc, set by `__set_thread_area`. There is no ELF TLS segment. C `_Thread_local` variables compile to ordinary globals, which is correct with one thread.
 
-musl's thread pointer, which it uses for `errno` and its own bookkeeping, is an ordinary global variable in libc, set by `__set_thread_area`. There is no ELF TLS segment. C `_Thread_local` variables compile to ordinary globals, which is correct with one thread.
+**Threads.** Translated (arm64) programs can have threads. Their modules have a different shape:
+
+| Item | Kind | Requirement |
+|---|---|---|
+| `env.memory` | imported memory | shared, memory64, with a maximum (the runtime creates it) |
+| `__wasm_init_tls` | exported function `(i64) -> ()` | Points this instance's thread-local block at the address given, and initializes it |
+| `__tls_size`, `__tls_align` | exported `i64` globals | The thread-local block's size and alignment |
+| `__wasm_env_thread_start` | exported function `(i64) -> ()` | Starts a new thread from a clone frame (below) |
+| `wasm-env.image` | custom section | The guest image: pages the runtime maps into memory copy-on-write before instantiating (translator/src/link.rs, `add_image`) |
+
+plus `_start`, `__stack_pointer`, `__heap_base` and `linux.syscall` as above. wasm-ld builds this shape with `--shared-memory --import-memory`: data is initialized by a start function that only the first instance runs.
+
+Each guest thread is its own instance of the module on the shared memory, in its own wasmtime store, on its own host thread. The instance's thread-local block holds the thread's guest registers, its exclusive monitor and its dispatch cache, so translated code runs without any per-thread indirection other than `__tls_base`. At `clone(CLONE_THREAD | CLONE_VM | CLONE_SIGHAND, ...)` the support code writes a *clone frame*: the parent's registers, with x0 = 0, SP = the new stack, TPIDR_EL0 = the `tls` argument (with `CLONE_SETTLS`) and the address after the `svc` to resume at. It passes the frame's address to the runtime's `clone` as a sixth argument. The runtime allocates a tid, honours `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`, instantiates the module again, gives the instance a thread-local block and a 64 KB C stack from the mmap region, and calls `__wasm_env_thread_start(frame)`. The new thread copies its registers and makes the wasm-env call `thread_started`; only then does `clone` return the tid to the parent, which may reuse the frame.
+
+Atomics: load-acquire, store-release and the LSE atomics become WebAssembly atomics (sequentially consistent, so at least as strong as arm64 asks); `dmb`/`dsb` become `atomic.fence`. A load-exclusive records the value it read, and a store-exclusive is a compare-and-swap against that value, as QEMU does it (a store of the same value in between goes unnoticed). Ordinary loads and stores are ordinary WebAssembly accesses.
+
+What threads share: memory, the descriptor table, the address space (`mmap`, `brk`), futexes and signals (a signal to the process is taken by whichever thread makes the next syscall). The working directory, umask and signal dispositions are per thread, copied from the creating thread. `getpid` returns the process id; `gettid` the thread's (the first thread's is the pid). `sched_getaffinity`, `/proc/cpuinfo` and `/sys/devices/system/cpu/{online,possible,present}` report the host's CPUs.
+
+`futex` supports `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` (private or not: processes don't share memory); a wait returns `-EINTR` when a signal arrives or the process is ending. `exit` ends the calling thread (clearing its tid word and waking a waiter on it, for `pthread_join`); when the last thread exits, the process exits with its status. `exit_group`, a fatal signal, a trap in any thread or `execve` end the whole process: the other threads stop at their next syscall, and blocking calls return early. (A thread that never makes another syscall keeps running until the environment exits.)
 
 ## `setjmp` and `longjmp`
 
@@ -124,7 +142,7 @@ Translated (arm64) programs use the same protocol through the translator's suppo
 ## Planned versions
 
 - **Version 1: dynamic linking** (PLAN.md, M3). Several modules in one process, sharing one memory and one function table, loaded and linked by the runtime at run time, including `dlopen`. Needed so translated programs can load shared libraries such as Python extension modules. Translated modules use glibc's symbol versions.
-- **Version 2: threads** (PLAN.md, M6). Shared memory, atomics and `clone(CLONE_THREAD)`, with real thread-local storage. Needed for PyTorch.
+- **Version 2: threads** (PLAN.md, M6). Shared memory, atomics and `clone(CLONE_THREAD)`, with real thread-local storage, for programs built with the toolchain. (Translated programs already have them; see "Threads".)
 
 ## wasm-env's own calls
 
@@ -133,6 +151,7 @@ Syscall numbers from 2^32 up are wasm-env's, not Linux's; unknown ones return `-
 | Number | Call | Arguments |
 |---|---|---|
 | 2^32 | `missed_target` | (address, object name, offset in the object). Made by a translated program's support code when it jumps to code the translation missed. The runtime records the address, and the next translation of that program includes it. |
+| 2^32 + 1 | `thread_started` | (). Made by a new thread of a translated program once it has taken its registers from its clone frame (see "Threads"). |
 
 ## Versioning
 
