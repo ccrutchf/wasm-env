@@ -29,7 +29,9 @@ pub struct Options {
 pub fn convert(image: &str, out: &Path, opts: &Options) -> Result<()> {
     let local = Path::new(image);
     std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
-    if local.is_dir() {
+    if crate::oci::is_layout(local) {
+        crate::oci::import(local, out)?;
+    } else if local.is_dir() {
         copy_tree(local, out)?;
     } else if local.is_file() {
         eprintln!("unpacking {image}");
@@ -41,6 +43,8 @@ pub fn convert(image: &str, out: &Path, opts: &Options) -> Result<()> {
         pull(image, out)?;
     }
     std::fs::write(out.join(".wasm-env-image"), format!("{image}\n"))?;
+    // The image keeps its own translations, made now or on first use.
+    std::fs::create_dir_all(out.join("var/cache/wasm-env/translated"))?;
     if opts.translate {
         translate_all(out, opts.precompile)?;
     }
@@ -235,17 +239,22 @@ fn pull(image: &str, out: &Path) -> Result<()> {
             }
             std::fs::rename(&tmp, &blob)?;
         }
-        let file = std::fs::File::open(&blob)?;
-        let reader: Box<dyn Read> = if media.ends_with("gzip") || media.ends_with("tar.gz") {
-            Box::new(flate2::read::GzDecoder::new(file))
-        } else if media.ends_with(".tar") || media.ends_with("tar") {
-            Box::new(file)
-        } else {
-            bail!("layer {digest}: unsupported media type {media}");
-        };
-        unpack_layer(reader, out)?;
+        apply_layer(&blob, media, out)?;
     }
     Ok(())
+}
+
+/// Applies a layer blob (a tar, possibly gzipped, as its media type says).
+pub fn apply_layer(blob: &Path, media: &str, out: &Path) -> Result<()> {
+    let file = std::fs::File::open(blob)?;
+    let reader: Box<dyn Read> = if media.ends_with("gzip") || media.ends_with("tar.gz") {
+        Box::new(flate2::read::GzDecoder::new(file))
+    } else if media.ends_with(".tar") || media.ends_with("tar") {
+        Box::new(file)
+    } else {
+        bail!("{}: unsupported layer media type {media}", blob.display());
+    };
+    unpack_layer(reader, out)
 }
 
 /// Applies one layer (a tar stream) to `out`: whiteouts (`.wh.NAME`

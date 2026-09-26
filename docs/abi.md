@@ -156,6 +156,8 @@ It also generates `/proc/cpuinfo`, `/sys/devices/system/cpu/{online,possible,pre
 | Asyncify-style unwinding | The compiler instruments code so the call stack can be saved to memory and rebuilt in a copy of the process | Works on any runtime; code grows and slows (roughly 10–50%) |
 | Stack switching | Use the WebAssembly stack-switching proposal to capture the running stack | Cheap, but the proposal isn't finished and wasmtime support is experimental |
 | Runtime-level snapshot | wasmtime copies the instance, including its native stack | No compiler changes; needs deep wasmtime changes |
+**Environments.** `wasm-env convert IMAGE DIR` turns an arm64 Linux image (an OCI reference pulled from its registry, an OCI layout, or a root filesystem tarball or directory) into an environment: its root filesystem, with every arm64 program and library translated into `/var/cache/wasm-env` inside it (`--lazy`: on first use instead). Translations are keyed by content and by the translator's version, and libraries in the image are registered by their path in it, so an environment can move. `wasm-env shell DIR` runs a login shell in it; `wasm-env export DIR OUT[.tar]` writes it as an OCI image layout for platform wasi/wasm (one layer, translations included). Translating needs a toolchain (clang, wasm-ld, compiler-rt builtins for wasm64): an installed wasm-env has one in `lib/wasm-env/toolchain` next to its binaries (`$WASM_ENV_TOOLCHAIN` overrides), and the dev shell provides it through `$WASM_CC`.
+
 
 ## Toolchain
 

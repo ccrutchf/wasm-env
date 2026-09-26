@@ -4,6 +4,7 @@
 //!   wasm-env run [--root DIR] [--env KEY=VALUE]... [--trace] PROGRAM [ARGS]...
 //!   wasm-env convert [--lazy] [--no-precompile] IMAGE DIR   (see convert.rs)
 //!   wasm-env shell DIR [SHELL-ARGS]...   a login shell in an environment
+//!   wasm-env export DIR OUT[.tar]   an environment as an OCI image (see oci.rs)
 //!
 //! PROGRAM is a path inside the environment (e.g. /bin/sh), or else a
 //! .wasm file on the host.
@@ -22,6 +23,7 @@ mod kernel;
 mod memory;
 mod modules;
 mod net;
+mod oci;
 mod pipe;
 mod process;
 mod syscall;
@@ -40,7 +42,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: wasm-env run [--root DIR] [--env KEY=VALUE]... [--argv0 NAME] [--trace] PROGRAM [ARGS]...\n\
          \x20      wasm-env convert [--lazy] [--no-precompile] IMAGE DIR\n\
-         \x20      wasm-env shell DIR [SHELL-ARGS]..."
+         \x20      wasm-env shell DIR [SHELL-ARGS]...\n\
+         \x20      wasm-env export DIR OUT[.tar]"
     );
     std::process::exit(2);
 }
@@ -90,6 +93,10 @@ fn main() -> Result<()> {
     let mut args: Box<dyn Iterator<Item = String>> = match args.next().as_deref() {
         Some("run") => Box::new(args),
         Some("convert") => return convert(args),
+        Some("export") => {
+            let (Some(dir), Some(out), None) = (args.next(), args.next(), args.next()) else { usage() };
+            return oci::export(std::path::Path::new(&dir), std::path::Path::new(&out));
+        }
         Some("shell") => Box::new(shell_args(args).into_iter()),
         _ => usage(),
     };

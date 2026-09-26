@@ -6,7 +6,8 @@
 # Then, in a shell in it (`wasm-env shell`), runs everyday commands (pipes,
 # command substitution, fork, files, dpkg's database) against expected
 # output, and, if Ubuntu's mirror is reachable, installs a package with apt
-# and runs it (translated on first use).
+# and runs it (translated on first use). Finally it exports the environment
+# as an OCI image and converts that back, which translates nothing again.
 #
 #   nix develop -c tests/convert.sh      (FRESH=1 converts again)
 set -uo pipefail
@@ -57,5 +58,19 @@ else
 	echo "skipped apt: the Ubuntu mirror isn't reachable"
 fi
 
+
+# The environment as an OCI image, and back: its translations travel with
+# it, so nothing is translated again.
+oci=$root/build/convert/ubuntu.oci.tar
+copy=$root/build/convert/ubuntu-copy
+rm -rf "$oci" "$copy"
+"$wasm_env" export "$dir" "$oci" >/dev/null 2>&1 && "$wasm_env" convert "$oci" "$copy" >/dev/null 2>&1
+retranslated=$("$wasm_env" run --trace --root "$copy" /bin/bash -c 'ls / >/dev/null; uname -m' 2>&1 | grep -c '^\[wasm-env\] translating')
+if [ "$retranslated" = 0 ] && [ "$("$wasm_env" shell "$copy" -c 'uname -m' 2>&1)" = aarch64 ]; then
+	passed=$((passed+1))
+else
+	failed=$((failed+1)); echo "FAIL OCI export and import ($retranslated translations)"
+fi
+rm -rf "$oci" "$copy"
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]

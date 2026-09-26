@@ -177,10 +177,7 @@ pub fn ensure_translated(elf: &Path, root: &Path, program: &str, trace: bool) ->
     // The cache key covers the binary and the translator's build, so a
     // rebuilt translator retranslates.
     let translator = translator();
-    let tool_stamp = std::fs::metadata(&translator).and_then(|m| m.modified()).ok();
-    let tool_hash = tool_stamp
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos() as u64);
+    let tool_hash = tool_hash();
     let dlopen = dlopen_list(root, program);
     let root_hash = hash(root.as_os_str().as_encoded_bytes()) ^ hash(dlopen.join("\n").as_bytes()).rotate_left(3);
     let key = hash(&bytes) ^ hash(&tool_hash.to_le_bytes()).rotate_left(1) ^ root_hash.rotate_left(2) ^ bytes.len() as u64;
@@ -248,8 +245,11 @@ pub fn monolithic() -> bool {
 /// The translator's build, for cache keys: a rebuilt translator translates
 /// again.
 fn tool_hash() -> u64 {
-    let stamp = std::fs::metadata(translator()).and_then(|m| m.modified()).ok();
-    stamp.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64)
+    // The translator's sources, hashed when the runtime was built (see
+    // build.rs): the translator is built with the runtime, from the same
+    // tree. Unlike the binary's timestamp, it survives rebuilds that change
+    // nothing and copying a converted image to another machine.
+    u64::from_str_radix(env!("WASM_ENV_TRANSLATOR_VERSION"), 16).unwrap_or(0)
 }
 
 /// Runs the translator on `input` with `args`, writing `out` (through a
@@ -321,9 +321,10 @@ pub fn library_extent(bytes: &[u8]) -> Option<u64> {
     (end > 0).then_some(end)
 }
 
-/// The range kept for the library at `path` (a canonical host path) in
-/// the registry file `bases` ("base<TAB>end<TAB>path" lines): its own if it
-/// still fits `extent` bytes, else the first free one.
+/// The range kept for the library named `path` (its path in the root, or
+/// on the host if it's outside) in the registry file `bases`
+/// ("base<TAB>end<TAB>path" lines): its own if it still fits `extent`
+/// bytes, else the first free one.
 fn library_range(bases: &Path, path: &Path, extent: u64) -> SysResult<(u64, u64)> {
     use std::io::Write;
     // Room to grow: a new version of the library usually still fits.
@@ -366,7 +367,13 @@ pub fn ensure_library(path: &Path, root: &Path, trace: bool) -> SysResult<(PathB
     let extent = library_extent(&bytes).ok_or(ENOEXEC)?;
     let dir = image_cache(root).or_else(cache_dir).ok_or(ENOENT)?;
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
-    let (base, end) = library_range(&dir.join("library-bases"), path, extent)?;
+    // A library in the root is recorded by its path there, so the image can
+    // move (and be copied to another machine) without translating again.
+    let name = match path.strip_prefix(root.canonicalize().unwrap_or_else(|_| root.to_path_buf())) {
+        Ok(inside) => PathBuf::from("/").join(inside),
+        Err(_) => path.to_path_buf(),
+    };
+    let (base, end) = library_range(&dir.join("library-bases"), &name, extent)?;
     let key = hash(&bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ base.rotate_left(7) ^ bytes.len() as u64;
     let out = dir.join(format!("{key:016x}.wasm"));
     if !out.exists() {
