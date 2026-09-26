@@ -427,6 +427,24 @@ impl Image {
         link(vec![parse_object(bytes, base)?], false, Vec::new(), vec!["program".into()])
     }
 
+    /// Loads one object of a dynamically-linked program by itself, for
+    /// translating it as its own module (docs/abi.md, "Libraries"): a shared
+    /// object at `base`, or the executable at its own base. References to
+    /// other objects stay unresolved; the dynamic linker binds them at run
+    /// time, and the translated code reaches them through `dispatch`.
+    pub fn load_object(bytes: &[u8], name: &str, base: Option<u64>) -> Result<Image> {
+        let base = match base {
+            Some(b) => b,
+            None => elf_base(bytes)?,
+        };
+        let obj = parse_object(bytes, base)?;
+        let mut image = link(vec![obj], true, Vec::new(), vec![name.to_string()])?;
+        // Not a dynamic linker run first: the object's own entry.
+        image.entry = image.app_entry;
+        image.interp_base = 0;
+        Ok(image)
+    }
+
     /// Loads a dynamically-linked executable together with the shared
     /// objects it needs, prelinking them into one image. `libs` are
     /// (name, bytes) pairs; symbols are resolved across all of them.

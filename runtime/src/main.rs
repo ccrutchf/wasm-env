@@ -16,6 +16,7 @@ mod fs;
 mod image;
 mod kernel;
 mod memory;
+mod modules;
 mod net;
 mod pipe;
 mod process;
@@ -74,18 +75,20 @@ fn main() -> Result<()> {
     } else {
         // A host file: a .wasm module, or an arm64 ELF to translate.
         let mut host = PathBuf::from(&program);
+        let mut interp = None;
         let mut head = Vec::new();
         if let Ok(f) = std::fs::File::open(&host) {
             let _ = std::io::Read::read_to_end(&mut std::io::Read::take(f, 256), &mut head);
         }
         if translate::is_arm64_elf(&head) {
             let name = host.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            interp = process::interpreter(&fs, &host);
             host = translate::ensure_translated(&host, &root, &name, trace)
                 .map_err(|e| anyhow::anyhow!("{program}: can't translate (errno {e})"))?;
         }
         let name = argv0.clone().unwrap_or_else(|| PathBuf::from(&program).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
         let argv = std::iter::once(name).chain(rest).map(String::into_bytes).collect();
-        ExecImage { host, path: program, argv, env }
+        ExecImage { host, path: program, argv, env, interp }
     };
 
     let kernel = Kernel::new(process::engine()?, root, trace);

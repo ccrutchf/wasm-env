@@ -77,6 +77,11 @@ struct Inputs {
     /// Libraries (paths inside the root, or directories of them) the program
     /// `dlopen`s (`--dlopen`); their dependencies are included too.
     dlopen: Vec<String>,
+    /// Translate just this object (`--object`), for a program whose
+    /// libraries are modules of their own (docs/abi.md, "Libraries"): the
+    /// executable, or with `--base` a shared library placed there.
+    object: bool,
+    base: Option<u64>,
 }
 
 /// Translates an arm64 executable (with any shared libraries) into a
@@ -110,7 +115,10 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     for l in &inputs.libs {
         libs.push(read(l, l.as_ref())?);
     }
-    let mut image = if libs.is_empty() && interp.is_none() {
+    let library = inputs.base.is_some();
+    let mut image = if inputs.object {
+        elf::Image::load_object(&bytes, input, inputs.base)?
+    } else if libs.is_empty() && interp.is_none() {
         elf::Image::load(&bytes)?
     } else {
         let mut layout = std::collections::HashMap::new();
@@ -157,7 +165,7 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     lap("load");
     let prog = discover::discover(&image);
     lap("discover");
-    let lifted = lift::lift(&image, &prog);
+    let lifted = lift::lift(&image, &prog, library);
     lap("lift");
     for (op, (n, example)) in &lifted.unsupported {
         eprintln!("warning: {n} × `{op}` not supported yet (traps if executed): {example}");
@@ -165,7 +173,10 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     let tc = link::Toolchain::from_env().context("$WASM_CC isn't set (run inside `nix develop`)")?;
     let image_end = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(0);
     let work = std::env::temp_dir().join(format!("wasm-env-translate-{}", std::process::id()));
-    let wasm = link::link_chunked(&tc, &lifted.data, &lifted.chunks, image_end, &work).and_then(|wasm| {
+    let wasm = link::link_chunked(&tc, &lifted.data, &lifted.chunks, image_end, &work, library).and_then(|wasm| {
+        if library {
+            return link::add_library_info(&wasm, image.objects[0].1, image.objects[0].2);
+        }
         let segments: Vec<(u64, &[u8])> = image.segments.iter().map(|s| (s.vaddr, s.data.as_slice())).collect();
         link::add_image(&wasm, &segments)
     });
@@ -219,6 +230,12 @@ fn main() -> Result<()> {
                     "--deps-out" => inputs.deps_out = Some(value()?),
                     "--roots" => inputs.roots = Some(value()?),
                     "--layout" => inputs.layout = Some(value()?),
+                    "--object" => inputs.object = true,
+                    "--base" => {
+                        let v = value()?;
+                        let base = u64::from_str_radix(v.trim_start_matches("0x"), 16).with_context(|| format!("--base {v}"))?;
+                        inputs.base = Some(base);
+                    }
                     other => bail!("unexpected argument {other}"),
                 }
             }
@@ -229,7 +246,7 @@ fn main() -> Result<()> {
             let bytes = std::fs::read(input)?;
             let image = elf::Image::load(&bytes)?;
             let prog = discover::discover(&image);
-            print!("{}", lift::lift(&image, &prog).ir());
+            print!("{}", lift::lift(&image, &prog, false).ir());
             Ok(())
         }
         _ => bail!("usage: wasm-env-translate census|blocks BINARY | translate BINARY OUT.wasm"),

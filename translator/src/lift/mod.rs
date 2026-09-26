@@ -13,8 +13,8 @@
 //! function per block would also exceed WebAssembly's limit of a million
 //! functions in a module for large programs.)
 //!
-//! Guest state lives in thread-local globals, a set per guest thread: `@R`
-//! (x0–x30 and SP), `@F` (N Z C V), `@V` (v0–v31) and `@TP` (TPIDR_EL0).
+//! Guest state lives in a block per guest thread (see STATE_POINTERS): `%R`
+//! (x0–x30 and SP), `%F` (N Z C V), `%V` (v0–v31) and `%TP` (TPIDR_EL0).
 //! Within a block, registers are
 //! loaded on first use, kept as SSA values, and stored back when the block
 //! ends. Guest memory is the
@@ -228,7 +228,7 @@ impl<'a> Block<'a> {
         if let Some(v) = &self.gpr[i] {
             return v.clone();
         }
-        let p = self.val(format!("getelementptr [32 x i64], ptr @R, i64 0, i64 {i}"));
+        let p = self.val(format!("getelementptr [32 x i64], ptr %R, i64 0, i64 {i}"));
         let v = self.val(format!("load i64, ptr {p}{REG}"));
         self.gpr[i] = Some(v.clone());
         v
@@ -246,7 +246,7 @@ impl<'a> Block<'a> {
         if !self.flags_set {
             self.flags_read_first = true;
         }
-        let p = self.val(format!("getelementptr [4 x i8], ptr @F, i64 0, i64 {f}"));
+        let p = self.val(format!("getelementptr [4 x i8], ptr %F, i64 0, i64 {f}"));
         let b = self.val(format!("load i8, ptr {p}{REG}"));
         let v = self.val(format!("trunc i8 {b} to i1"));
         self.flags[f] = Some(v.clone());
@@ -266,7 +266,7 @@ impl<'a> Block<'a> {
         if let Some(v) = &self.vec[i] {
             return v.clone();
         }
-        let p = self.val(format!("getelementptr [32 x i128], ptr @V, i64 0, i64 {i}"));
+        let p = self.val(format!("getelementptr [32 x i128], ptr %V, i64 0, i64 {i}"));
         let v = self.val(format!("load i128, ptr {p}, align 16{REG}"));
         self.vec[i] = Some(v.clone());
         v
@@ -282,13 +282,13 @@ impl<'a> Block<'a> {
         for i in 0..32 {
             if self.gpr_dirty[i] {
                 let v = self.gpr[i].clone().unwrap();
-                let p = self.val(format!("getelementptr [32 x i64], ptr @R, i64 0, i64 {i}"));
+                let p = self.val(format!("getelementptr [32 x i64], ptr %R, i64 0, i64 {i}"));
                 self.line(format!("store i64 {v}, ptr {p}{REG}"));
                 self.gpr_dirty[i] = false;
             }
             if self.vec_dirty[i] {
                 let v = self.vec[i].clone().unwrap();
-                let p = self.val(format!("getelementptr [32 x i128], ptr @V, i64 0, i64 {i}"));
+                let p = self.val(format!("getelementptr [32 x i128], ptr %V, i64 0, i64 {i}"));
                 self.line(format!("store i128 {v}, ptr {p}, align 16{REG}"));
                 self.vec_dirty[i] = false;
             }
@@ -303,7 +303,7 @@ impl<'a> Block<'a> {
             if self.flags_dirty[f] {
                 let v = self.flags[f].clone().unwrap();
                 let b = self.val(format!("zext i1 {v} to i8"));
-                let p = self.val(format!("getelementptr [4 x i8], ptr @F, i64 0, i64 {f}"));
+                let p = self.val(format!("getelementptr [4 x i8], ptr %F, i64 0, i64 {f}"));
                 self.line(format!("store i8 {b}, ptr {p}{REG}"));
                 self.flags_dirty[f] = false;
             }
@@ -313,9 +313,9 @@ impl<'a> Block<'a> {
         }
         self.resolve_fp_checks();
         if let Some(raised) = self.fpsr_raised.take() {
-            let old = self.val("load i32, ptr @FPSR");
+            let old = self.val("load i32, ptr %FPSR");
             let new = self.val(format!("or i32 {old}, {raised}"));
-            self.line(format!("store i32 {new}, ptr @FPSR"));
+            self.line(format!("store i32 {new}, ptr %FPSR"));
         }
     }
 
@@ -809,14 +809,14 @@ impl<'a> Block<'a> {
         let high = self.val(format!("lshr i64 {region}, 12"));
         let mixed = self.val(format!("xor i64 {region}, {high}"));
         let slot = self.val(format!("and i64 {mixed}, 4095"));
-        let tag_at = self.val(format!("getelementptr [4096 x {{ i64, ptr }}], ptr @__wasm_env_dispatch_cache, i64 0, i64 {slot}, i32 0"));
+        let tag_at = self.val(format!("getelementptr [4096 x {{ i64, ptr }}], ptr %DC, i64 0, i64 {slot}, i32 0"));
         let tag = self.val(format!("load i64, ptr {tag_at}"));
         let want = self.val(format!("add i64 {region}, 1"));
         let hit = self.val(format!("icmp eq i64 {tag}, {want}"));
         let (cached, miss) = (self.label(), self.label());
         self.line(format!("br i1 {hit}, label %{cached}, label %{miss}"));
         self.place_label(&cached);
-        let fn_at = self.val(format!("getelementptr [4096 x {{ i64, ptr }}], ptr @__wasm_env_dispatch_cache, i64 0, i64 {slot}, i32 1"));
+        let fn_at = self.val(format!("getelementptr [4096 x {{ i64, ptr }}], ptr %DC, i64 0, i64 {slot}, i32 1"));
         let f = self.val(format!("load ptr, ptr {fn_at}"));
         self.line(format!("musttail call void {f}(i64 {target})"));
         self.line("ret void");
@@ -955,7 +955,7 @@ impl Lifted {
 /// Lifts every block. Control flow goes through `@dispatch` (defined in the
 /// support code as a binary search over the block table), so block
 /// functions are independent and split across modules for compilation.
-pub fn lift(image: &Image, prog: &Program) -> Lifted {
+pub fn lift(image: &Image, prog: &Program, library: bool) -> Lifted {
     let mut unsupported = BTreeMap::new();
     let mut regions: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for &leader in &prog.leaders {
@@ -1074,7 +1074,7 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
 
     let mut lifted = Vec::new();
     for (region, leaders, l) in lifted1 {
-        let mut text = format!("define void @R_{region:x}(i64 %pc) {{\nentry:\n  switch i64 %pc, label %bad [\n");
+        let mut text = format!("define void @R_{region:x}(i64 %pc) {{\nentry:\n{STATE_POINTERS}  switch i64 %pc, label %bad [\n");
         for &a in leaders.iter().filter(|a| entries.contains(a)) {
             let _ = writeln!(text, "    i64 {}, label %b_{a:x}", a as i64);
         }
@@ -1105,7 +1105,7 @@ pub fn lift(image: &Image, prog: &Program) -> Lifted {
     }
 
     let chunks = build_chunks(&lifted);
-    let data = build_data(image, prog);
+    let data = if library { library_data(prog) } else { build_data(image, prog) };
     Lifted { data, chunks, unsupported, blocks: prog.leaders.len() }
 }
 
@@ -1122,7 +1122,33 @@ const TBAA: &str = "!900 = !{!\"wasm-env\"}\n\
                     !901 = !{!\"guest register\", !900, i64 0}\n\
                     !902 = !{!901, !901, i64 0}\n\
                     !903 = !{!\"guest memory\", !900, i64 0}\n\
-                    !904 = !{!903, !903, i64 0}\n";
+                    !904 = !{!903, !903, i64 0}\n\
+                    !906 = !{}\n";
+/// Guest state is a block per thread (`struct guest_state` in
+/// support/runtime.c, whose layout this matches) at the address in the
+/// WebAssembly global `__wasm_env_state`, which the support code sets when a
+/// thread starts and which every module of the program shares. Each region
+/// function reads it once, on entry (it never changes while code runs), and
+/// names the fields.
+const STATE_POINTERS: &str = "  %st = load i64, ptr addrspace(1) @__wasm_env_state, align 8, !invariant.load !906\n\
+                              \x20 %R = inttoptr i64 %st to ptr\n\
+                              \x20 %F = getelementptr i8, ptr %R, i64 256\n\
+                              \x20 %FPSR = getelementptr i8, ptr %R, i64 260\n\
+                              \x20 %TP = getelementptr i8, ptr %R, i64 264\n\
+                              \x20 %MONITOR = getelementptr i8, ptr %R, i64 272\n\
+                              \x20 %V = getelementptr i8, ptr %R, i64 288\n\
+                              \x20 %DC = getelementptr i8, ptr %R, i64 800\n";
+
+/// The global holding this thread's guest state address (see
+/// STATE_POINTERS), defined by the program's data module, and how the
+/// support code (C, which can't name a WebAssembly global) sets it.
+pub const STATE_GLOBAL: &str = "@__wasm_env_state = addrspace(1) global i64 0\n\
+                                define void @__wasm_env_set_state(ptr %p) {\n\
+                                \x20 %a = ptrtoint ptr %p to i64\n\
+                                \x20 store i64 %a, ptr addrspace(1) @__wasm_env_state\n\
+                                \x20 ret void\n\
+                                }\n\n";
+
 /// Access tags (see TBAA).
 pub const REG: &str = ", !tbaa !902";
 pub const MEM: &str = ", !tbaa !904";
@@ -1130,13 +1156,7 @@ pub const MEM: &str = ", !tbaa !904";
 fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
     let preamble = format!(
         "target triple = \"wasm64-unknown-unknown\"\n\
-         @R = external thread_local(localexec) global [32 x i64]\n\
-         @F = external thread_local(localexec) global [4 x i8]\n\
-         @V = external thread_local(localexec) global [32 x i128]\n\
-         @TP = external thread_local(localexec) global i64\n\
-         @FPSR = external thread_local(localexec) global i32\n\
-         @MONITOR = external thread_local(localexec) global i64\n\
-         @__wasm_env_dispatch_cache = external thread_local(localexec) global [4096 x {{ i64, ptr }}]\n\
+         @__wasm_env_state = external addrspace(1) global i64\n\
          declare void @dispatch(i64)\n\
          declare void @__wasm_env_svc()\n\
          declare i64 @__wasm_env_svc_at(i64)\n\
@@ -1177,16 +1197,7 @@ fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
 /// table mapping each block address to its function.
 fn build_data(image: &Image, prog: &Program) -> String {
     let mut ir = String::from("target triple = \"wasm64-unknown-unknown\"\n");
-    // Guest state is per thread: each guest thread runs its own instance of
-    // the module, with its own thread-local block (docs/abi.md, "Threads").
-    ir.push_str("@R = thread_local(localexec) global [32 x i64] zeroinitializer, align 8\n");
-    ir.push_str("@F = thread_local(localexec) global [4 x i8] zeroinitializer\n");
-    ir.push_str("@V = thread_local(localexec) global [32 x i128] zeroinitializer, align 16\n");
-    ir.push_str("@TP = thread_local(localexec) global i64 0\n");
-    ir.push_str("@FPSR = thread_local(localexec) global i32 0\n");
-    // The exclusive monitor: the value the last load-exclusive read (see
-    // "stxr" in insn.rs).
-    ir.push_str("@MONITOR = thread_local(localexec) global i64 0\n\n");
+    ir.push_str(STATE_GLOBAL);
 
     // The segments' bytes aren't here: they go in the linked module's
     // guest image section (link::add_image), so the data pointers are null.
@@ -1239,27 +1250,40 @@ fn build_data(image: &Image, prog: &Program) -> String {
     let _ = writeln!(ir, "@guest_object_count = constant i64 {}", image.objects.len());
     let _ = writeln!(ir, "@guest_phnum = constant i64 {}\n", image.phnum);
 
+    dispatch_table(&mut ir, prog);
+    ir
+}
+
+/// The data module of a library translated as its own module (docs/abi.md,
+/// "Libraries"): only its dispatch table, which the runtime finds through
+/// the module's exports and registers with the program's `dispatch`.
+fn library_data(prog: &Program) -> String {
+    let mut ir = String::from("target triple = \"wasm64-unknown-unknown\"\n");
+    dispatch_table(&mut ir, prog);
+    ir
+}
+
+fn dispatch_table(ir: &mut String, prog: &Program) {
     // Declare every region function, then build the dispatch table: parallel
     // arrays of sorted region addresses and their functions, searched by the
     // support code's `dispatch`. A region function checks that the address
     // it's entered at is one of its blocks.
     let regions: std::collections::BTreeSet<u64> = prog.leaders.iter().map(|&a| region_of(a)).collect();
     for r in &regions {
-        let _ = writeln!(ir, "declare void @R_{r:x}(i64)");
+        let _ = writeln!(*ir, "declare void @R_{r:x}(i64)");
     }
     let n = regions.len();
-    let _ = write!(ir, "@dispatch_addrs = constant [{n} x i64] [");
+    let _ = write!(*ir, "@dispatch_addrs = constant [{n} x i64] [");
     for (i, &r) in regions.iter().enumerate() {
-        let _ = write!(ir, "{}i64 {}", if i == 0 { "" } else { ", " }, r as i64);
+        let _ = write!(*ir, "{}i64 {}", if i == 0 { "" } else { ", " }, r as i64);
     }
     ir.push_str("]\n");
-    let _ = write!(ir, "@dispatch_fns = constant [{n} x ptr] [");
+    let _ = write!(*ir, "@dispatch_fns = constant [{n} x ptr] [");
     for (i, &r) in regions.iter().enumerate() {
-        let _ = write!(ir, "{}ptr @R_{r:x}", if i == 0 { "" } else { ", " });
+        let _ = write!(*ir, "{}ptr @R_{r:x}", if i == 0 { "" } else { ", " });
     }
     ir.push_str("]\n");
-    let _ = writeln!(ir, "@dispatch_count = constant i64 {n}");
-    ir
+    let _ = writeln!(*ir, "@dispatch_count = constant i64 {n}");
 }
 
 /// The LLVM intrinsic declarations the lifted code may call.

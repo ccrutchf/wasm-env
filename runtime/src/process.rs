@@ -31,6 +31,11 @@ pub struct ExecImage {
     /// Raw bytes, as on Linux.
     pub argv: Vec<Vec<u8>>,
     pub env: Vec<Vec<u8>>,
+    /// A translated program's dynamic linker (on the host), which the
+    /// runtime loads and starts first, as the kernel would, when the
+    /// program's libraries are modules of their own (docs/abi.md,
+    /// "Libraries").
+    pub interp: Option<PathBuf>,
 }
 
 /// What survives execve (and what a new process starts with).
@@ -106,6 +111,9 @@ pub struct Process {
     /// For a thread being started: told once it has its registers (see
     /// thread::spawn).
     pub started: Option<std::sync::mpsc::Sender<()>>,
+    /// This thread's main instance, when the program's libraries are modules
+    /// of their own (see modules.rs).
+    pub main: Option<crate::modules::Main>,
 }
 
 impl Process {
@@ -295,7 +303,7 @@ pub fn resolve_exec(fs: &Fs, path: &str, mut argv: Vec<Vec<u8>>, env: Vec<Vec<u8
             .map_err(|e| crate::fs::errno(&e))?;
         let head = &head[..n];
         if head.starts_with(b"\0asm") {
-            return Ok(ExecImage { host, path: guest, argv, env });
+            return Ok(ExecImage { host, path: guest, argv, env, interp: None });
         }
         if crate::translate::is_arm64_elf(head) {
             // Translate the arm64 binary to WebAssembly; it targets the same
@@ -303,7 +311,8 @@ pub fn resolve_exec(fs: &Fs, path: &str, mut argv: Vec<Vec<u8>>, env: Vec<Vec<u8
             // guest path.
             let name = guest.rsplit('/').next().unwrap_or_default();
             let wasm = crate::translate::ensure_translated(&host, &fs.host("/"), name, trace)?;
-            return Ok(ExecImage { host: wasm, path: guest, argv, env });
+            let interp = interpreter(fs, &host);
+            return Ok(ExecImage { host: wasm, path: guest, argv, env, interp });
         }
         let Some(line) = head.strip_prefix(b"#!") else {
             // Not WebAssembly, not a shebang, not an arm64 ELF.
@@ -327,6 +336,62 @@ pub fn resolve_exec(fs: &Fs, path: &str, mut argv: Vec<Vec<u8>>, env: Vec<Vec<u8
         path = interp;
     }
     Err(ELOOP)
+}
+
+/// The dynamic linker (PT_INTERP) of the arm64 executable at `elf`, found
+/// in the environment's root, when the program's libraries are modules of
+/// their own; None for a static executable or a monolithic translation.
+pub fn interpreter(fs: &Fs, elf: &std::path::Path) -> Option<PathBuf> {
+    if crate::translate::monolithic() {
+        return None;
+    }
+    let bytes = std::fs::read(elf).ok()?;
+    let word = |at: usize, n: usize| -> Option<u64> {
+        let b = bytes.get(at..at + n)?;
+        Some(b.iter().rev().fold(0u64, |v, &x| v << 8 | x as u64))
+    };
+    let (phoff, phentsize, phnum) = (word(32, 8)? as usize, word(54, 2)? as usize, word(56, 2)? as usize);
+    for k in 0..phnum {
+        let ph = phoff + k * phentsize;
+        if word(ph, 4)? == 3 {
+            // PT_INTERP: a NUL-terminated path
+            let (off, size) = (word(ph + 8, 8)? as usize, word(ph + 32, 8)? as usize);
+            let raw = bytes.get(off..off + size)?;
+            let path = std::str::from_utf8(raw.split(|&b| b == 0).next()?).ok()?;
+            let guest = fs.resolve("/", path, true).ok()?;
+            return Some(fs.host(&guest));
+        }
+    }
+    None
+}
+
+/// Loads a program's dynamic linker as the kernel does: its segments at the
+/// base its translation expects (a library module of its own, see
+/// modules.rs). Returns the auxiliary vector entries that tell the program
+/// where it is (AT_BASE) and to start there (the support code's
+/// WASM_ENV_AT_START).
+fn load_interpreter(store: &mut Store<Process>, path: &std::path::Path) -> Result<Vec<(u64, u64)>> {
+    let lib = crate::modules::load(&mut *store, path)?;
+    let bytes = std::fs::read(path)?;
+    let word = |at: usize, n: usize| -> Result<u64> {
+        let b = bytes.get(at..at + n).ok_or_else(|| anyhow::anyhow!("{}: truncated ELF", path.display()))?;
+        Ok(b.iter().rev().fold(0u64, |v, &x| v << 8 | x as u64))
+    };
+    let data = crate::syscall::memory_bytes(store);
+    let (phoff, phentsize, phnum) = (word(32, 8)? as usize, word(54, 2)? as usize, word(56, 2)? as usize);
+    for k in 0..phnum {
+        let ph = phoff + k * phentsize;
+        if word(ph, 4)? != 1 {
+            continue; // PT_LOAD only
+        }
+        let (off, vaddr, filesz, memsz) = (word(ph + 8, 8)?, word(ph + 16, 8)?, word(ph + 32, 8)?, word(ph + 40, 8)?);
+        let file = bytes.get(off as usize..(off + filesz) as usize).ok_or_else(|| anyhow::anyhow!("bad segment"))?;
+        let at = lib.base + vaddr;
+        mem::write(data, at, file).map_err(|e| anyhow::anyhow!("errno {e}"))?;
+        mem::slice_mut(data, at + filesz, memsz - filesz).map_err(|e| anyhow::anyhow!("errno {e}"))?.fill(0);
+    }
+    const WASM_ENV_AT_START: u64 = 0x7700;
+    Ok(vec![(at::BASE, lib.base), (WASM_ENV_AT_START, lib.base + word(24, 8)?)])
 }
 
 pub enum Outcome {
@@ -370,6 +435,7 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
         module: image.host.clone(),
         clear_tid: 0,
         started: None,
+        main: None,
     };
     let mut store = Store::new(&kernel.engine, process);
     set_deadline(&mut store);
@@ -469,6 +535,7 @@ fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Resu
         None => None,
     };
     let instance = instantiate(store, module, shared.as_ref())?;
+    store.data_mut().main = crate::modules::Main::new(&mut *store, instance);
     if let Some(memory) = shared {
         let _ = store.data().group.threading.set(crate::thread::Threading { module: module.clone(), memory });
     }
@@ -481,8 +548,14 @@ fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Resu
     let brk = mem::page_align(heap_base);
     *store.data().group.mm.lock().unwrap() =
         crate::thread::Mm { space: AddressSpace::new(brk + mem::BRK_MAX), brk, brk_start: brk };
+    // A dynamically-linked program whose libraries are modules of their own
+    // starts in its dynamic linker, which the runtime loads first.
+    let extra = match &image.interp {
+        Some(path) if store.data().main.is_some() => load_interpreter(store, path)?,
+        _ => Vec::new(),
+    };
 
-    let sp = write_initial_stack(crate::syscall::memory_bytes(store), sp, image)?;
+    let sp = write_initial_stack(crate::syscall::memory_bytes(store), sp, image, &extra)?;
     stack_pointer.set(&mut *store, Val::I64(sp as i64))?;
 
     let start = instance.get_typed_func::<i64, ()>(&mut *store, "_start")?;
@@ -526,7 +599,7 @@ fn global_i64(v: Val) -> Result<u64> {
 
 /// Writes argc, argv, envp and the auxiliary vector below `top` in the
 /// Linux layout, and returns the new stack pointer (16-byte aligned).
-fn write_initial_stack(data: &mut [u8], top: u64, image: &ExecImage) -> Result<u64> {
+fn write_initial_stack(data: &mut [u8], top: u64, image: &ExecImage, extra: &[(u64, u64)]) -> Result<u64> {
     let fault = |_| anyhow::anyhow!("initial stack doesn't fit in memory");
 
     // Strings and AT_RANDOM bytes go at the very top.
@@ -546,7 +619,7 @@ fn write_initial_stack(data: &mut [u8], top: u64, image: &ExecImage) -> Result<u
 
     let argc = image.argv.len();
     let envc = image.env.len();
-    let auxv = [
+    let mut auxv = vec![
         (at::PAGESZ, PAGE_SIZE),
         (at::RANDOM, strings_at + random_off),
         (at::UID, 0),
@@ -556,8 +629,9 @@ fn write_initial_stack(data: &mut [u8], top: u64, image: &ExecImage) -> Result<u
         (at::SECURE, 0),
         (at::HWCAP, 0),
         (at::EXECFN, strings_at + offsets[argc + envc]),
-        (at::NULL, 0),
     ];
+    auxv.extend_from_slice(extra);
+    auxv.push((at::NULL, 0));
     let mut words: Vec<u64> = vec![argc as u64];
     words.extend(offsets[..argc].iter().map(|o| strings_at + o));
     words.push(0);
@@ -686,8 +760,9 @@ mod tests {
             path: "/bin/prog".into(),
             argv: args(&["prog", "arg with spaces"]),
             env: vec![b"A=1".to_vec(), vec![0xff, b'=', 0x80]], // not UTF-8
+            interp: None,
         };
-        let sp = write_initial_stack(&mut data, 8000, &image).unwrap();
+        let sp = write_initial_stack(&mut data, 8000, &image, &[]).unwrap();
         assert_eq!(sp % 16, 0, "16-byte aligned");
         assert!(sp < 8000);
 
@@ -721,8 +796,8 @@ mod tests {
     #[test]
     fn initial_stack_that_doesnt_fit_is_an_error() {
         let mut data = vec![0u8; 64];
-        let image = ExecImage { host: PathBuf::new(), path: "/p".into(), argv: args(&["p"]), env: vec![] };
-        assert!(write_initial_stack(&mut data, 64, &image).is_err());
+        let image = ExecImage { host: PathBuf::new(), path: "/p".into(), argv: args(&["p"]), env: vec![], interp: None };
+        assert!(write_initial_stack(&mut data, 64, &image, &[]).is_err());
     }
 
     #[test]

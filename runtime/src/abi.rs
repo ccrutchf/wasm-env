@@ -47,6 +47,11 @@ pub mod nr {
     /// Made by a new thread of a translated program once it has taken its
     /// registers from the clone frame (see thread::spawn).
     pub const WASM_ENV_THREAD_STARTED: i64 = (1 << 32) + 1;
+    /// Made by translated programs' support code when the dynamic linker maps
+    /// a library, and when a thread reaches one its instance hasn't loaded
+    /// yet (see modules.rs).
+    pub const WASM_ENV_LOAD_LIBRARY: i64 = (1 << 32) + 2;
+    pub const WASM_ENV_SYNC_MODULES: i64 = (1 << 32) + 3;
     pub const SET_TID_ADDRESS: i64 = 96;
     pub const SET_ROBUST_LIST: i64 = 99;
     pub const FUTEX: i64 = 98;
@@ -194,6 +199,7 @@ pub const AT_EMPTY_PATH: i64 = 0x1000;
 pub mod at {
     pub const NULL: u64 = 0;
     pub const PAGESZ: u64 = 6;
+    pub const BASE: u64 = 7;
     pub const UID: u64 = 11;
     pub const EUID: u64 = 12;
     pub const GID: u64 = 13;

@@ -117,14 +117,14 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         "mrs" => {
             let (d, _) = b.reg_op(i, 0)?;
             let v = match sysreg(&ops[1])?.as_str() {
-                "tpidr_el0" => b.val("load i64, ptr @TP"),
+                "tpidr_el0" => b.val("load i64, ptr %TP"),
                 // Cache line 64 bytes; DC ZVA prohibited (bit 4 set), so
                 // musl's memset takes its plain-store path.
                 "ctr_el0" => konst(0x8444_c004, 64),
                 "dczid_el0" => konst(0x10, 64),
                 "fpsr" => {
                     b.flush();
-                    let v = b.val("load i32, ptr @FPSR");
+                    let v = b.val("load i32, ptr %FPSR");
                     b.val(format!("zext i32 {v} to i64"))
                 }
                 "midr_el1" | "fpcr" | "cntfrq_el0" | "cntvct_el0" => konst(0, 64),
@@ -136,12 +136,12 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let name = sysreg(&ops[0])?;
             let v = b.operand(&ops[1], 64)?;
             match name.as_str() {
-                "tpidr_el0" => b.line(format!("store i64 {v}, ptr @TP")),
+                "tpidr_el0" => b.line(format!("store i64 {v}, ptr %TP")),
                 "fpsr" => {
                     // Flags raised earlier in the block are overwritten too.
                     b.flush();
                     let v = b.val(format!("trunc i64 {v} to i32"));
-                    b.line(format!("store i32 {v}, ptr @FPSR"));
+                    b.line(format!("store i32 {v}, ptr %FPSR"));
                 }
                 "fpcr" => {}
                 other => bail!("system register {other}"),
@@ -540,7 +540,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let v = b.load_atomic(&addr, mem_bits);
             if m.contains("xr") {
                 let wide = b.resize(v.clone(), mem_bits, 64, false);
-                b.line(format!("store i64 {wide}, ptr @MONITOR{REG}"));
+                b.line(format!("store i64 {wide}, ptr %MONITOR{REG}"));
             }
             let v = b.resize(v, mem_bits, r.1, false);
             b.write(r.0, v, r.1)?;
@@ -565,7 +565,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let addr = b.address(&ops[2])?;
             let v = b.read(r.0, r.1)?;
             let v = b.resize(v, r.1, mem_bits, false);
-            let seen = b.val(format!("load i64, ptr @MONITOR{REG}"));
+            let seen = b.val(format!("load i64, ptr %MONITOR{REG}"));
             let seen = b.resize(seen, 64, mem_bits, false);
             let (_, ok) = b.cmpxchg(&addr, &seen, &v, mem_bits);
             let failed = b.val(format!("xor i1 {ok}, true"));

@@ -57,6 +57,8 @@ pub struct Group {
     pub mm: Mutex<Mm>,
     pub futex: Futexes,
     pub threading: OnceLock<Threading>,
+    /// Libraries loaded as modules of their own (see modules.rs).
+    pub libraries: crate::modules::Libraries,
     state: Mutex<GroupState>,
     changed: Condvar,
 }
@@ -67,6 +69,7 @@ impl Group {
             mm: Mutex::new(Mm { space: AddressSpace::new(0), brk: 0, brk_start: 0 }),
             futex: Futexes::default(),
             threading: OnceLock::new(),
+            libraries: Default::default(),
             state: Mutex::new(GroupState { live: 1, end: None, ended: false }),
             changed: Condvar::new(),
         })
@@ -314,6 +317,7 @@ fn run(process: Process, frame: u64) {
     let mut block = None;
     let result = (|| -> anyhow::Result<()> {
         let instance = crate::process::instantiate(&mut store, &threading.module, Some(&threading.memory))?;
+        store.data_mut().main = crate::modules::Main::new(&mut store, instance);
         let global = |store: &mut Store<Process>, name: &str| match instance.get_global(&mut *store, name).map(|g| g.get(&mut *store)) {
             Some(Val::I64(v)) => Ok(v as u64),
             Some(Val::I32(v)) => Ok(v as u32 as u64),
@@ -329,6 +333,8 @@ fn run(process: Process, frame: u64) {
         init_tls.call(&mut store, tls as i64)?;
         let sp = instance.get_global(&mut store, "__stack_pointer").unwrap();
         sp.set(&mut store, Val::I64((base + len) as i64))?;
+        // The libraries the process has loaded so far.
+        crate::modules::sync(&mut store)?;
         let start = instance.get_typed_func::<i64, ()>(&mut store, "__wasm_env_thread_start")?;
         Ok(start.call(&mut store, frame as i64)?)
     })();

@@ -42,6 +42,24 @@ fn ld_args(image_end: u64) -> Vec<String> {
     for export in ["__stack_pointer", "__heap_base", "__wasm_init_tls", "__tls_size", "__tls_align"] {
         args.push(format!("--export={export}"));
     }
+    // What library modules link against (docs/abi.md, "Libraries"): the
+    // function table, guest state, the support code's entry points and the
+    // module directory `dispatch` searches.
+    args.extend(["--export-table", "--growable-table"].map(String::from));
+    for export in [
+        "__wasm_env_state",
+        "dispatch",
+        "__wasm_env_svc",
+        "__wasm_env_svc_at",
+        "__wasm_env_fp_flags",
+        "__wasm_env_fatal",
+        "__wasm_env_bad_target",
+        "__wasm_env_crc32",
+        "__wasm_env_modules",
+        "__wasm_env_module_count",
+    ] {
+        args.push(format!("--export={export}"));
+    }
     args
 }
 
@@ -102,6 +120,24 @@ fn raise_memory_limit(body: &[u8]) -> Result<Vec<u8>> {
                 out.push(flags | 1);
                 write_uleb(&mut out, min);
                 write_uleb(&mut out, MAX_PAGES);
+            }
+            1 => {
+                // table: reference type, limits (flags, min, [max])
+                let flags = body[p + 1];
+                let mut q = p + 2;
+                let (_, n) = read_uleb(&body[q..])?;
+                q += n;
+                if flags & 1 != 0 {
+                    let (_, n) = read_uleb(&body[q..])?;
+                    q += n;
+                }
+                out.extend_from_slice(&body[p..q]);
+                p = q;
+            }
+            3 => {
+                // global: value type, mutability
+                out.extend_from_slice(&body[p..p + 2]);
+                p += 2;
             }
             _ => bail!("unexpected import kind {kind} in a translated program"),
         }
@@ -245,11 +281,29 @@ fn content_key(parts: &[&[u8]]) -> String {
     format!("{a:016x}{b:016x}")
 }
 
+/// How many units to compile at once: one per core, but no more than
+/// memory allows (a large unit can take a couple of GB in clang), so a
+/// translation doesn't exhaust a busy machine. `WASM_ENV_JOBS` overrides.
+fn compile_jobs() -> usize {
+    if let Some(n) = std::env::var("WASM_ENV_JOBS").ok().and_then(|s| s.parse().ok()) {
+        return std::cmp::max(n, 1);
+    }
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    // MemAvailable, in kB (Linux); elsewhere, trust the core count.
+    let available_kb = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        m.lines().find_map(|l| l.strip_prefix("MemAvailable:")?.trim().trim_end_matches(" kB").parse::<u64>().ok())
+    });
+    match available_kb {
+        Some(kb) => cores.min((kb / (2 << 20)).max(1) as usize),
+        None => cores,
+    }
+}
+
 /// Compiles a chunked program (a data module plus several code modules) and
 /// the support code into one WebAssembly module. Each module compiles
 /// separately, in parallel, so memory stays bounded no matter how large the
 /// translated program is.
-pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u64, work: &Path) -> Result<Vec<u8>> {
+pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u64, work: &Path, library: bool) -> Result<Vec<u8>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     std::fs::create_dir_all(work)?;
 
@@ -278,10 +332,15 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
         units.push((src, obj, opt));
         Ok(())
     };
-    unit("data.ll", data.as_bytes(), "-O0".into())?;
-    unit("support.c", SUPPORT_C.as_bytes(), "-O2".into())?;
+    // A library is position-independent code: the runtime chooses where its
+    // data and table entries go when it loads it.
+    let pic = if library { " -fPIC" } else { "" };
+    unit("data.ll", data.as_bytes(), format!("-O0{pic}"))?;
+    if !library {
+        unit("support.c", SUPPORT_C.as_bytes(), "-O2".into())?;
+    }
     for (i, chunk) in chunks.iter().enumerate() {
-        unit(&format!("chunk{i}.ll"), chunk.as_bytes(), lift_opt())?;
+        unit(&format!("chunk{i}.ll"), chunk.as_bytes(), format!("{}{pic}", lift_opt()))?;
     }
     if let Some(dir) = &cache {
         std::fs::create_dir_all(dir)?;
@@ -291,7 +350,7 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
     let todo: Vec<&(PathBuf, PathBuf, String)> = units.iter().filter(|u| !u.1.exists()).collect();
     let next = AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let threads = compile_jobs();
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
@@ -299,7 +358,7 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
                     let is_c = src.extension().is_some_and(|e| e == "c");
                     let tmp = obj.with_extension(format!("{}.tmp", std::process::id()));
                     let mut cmd = Command::new(&tc.cc);
-                    cmd.args(WASM_FLAGS).arg(opt);
+                    cmd.args(WASM_FLAGS).args(opt.split_whitespace());
                     if is_c {
                         cmd.args(["-ffreestanding", "-nostdlib"]);
                     }
@@ -343,15 +402,40 @@ pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u6
     }
     let wasm = work.join("program.wasm");
     let mut ld = Command::new(&tc.wasm_ld);
-    ld.args(ld_args(image_end))
-        // For the runtime's report when a translated program faults.
-        .args(["--export=wasm_env_recent", "--export=wasm_env_recent_count"]);
+    if library {
+        ld.args(["-m", "wasm64", "--experimental-pic", "-shared", "--shared-memory", "--unresolved-symbols=import-dynamic"])
+            .args(["--export=dispatch_addrs", "--export=dispatch_fns", "--export=dispatch_count"]);
+    } else {
+        ld.args(ld_args(image_end))
+            // For the runtime's report when a translated program faults.
+            .args(["--export=wasm_env_recent", "--export=wasm_env_recent_count"]);
+    }
     for (_, obj, _) in &units {
         ld.arg(obj);
     }
     ld.args(tc.builtins.iter()).arg("-o").arg(&wasm);
     run(&mut ld)?;
     finish(std::fs::read(&wasm)?)
+}
+
+/// The name of the custom section identifying a translated library (see
+/// `add_library_info`).
+pub const LIBRARY_SECTION: &str = "wasm-env.library";
+
+/// Marks a linked library module with the guest address range it was
+/// translated for (two little-endian u64s, start and end), which the
+/// runtime checks before loading it.
+pub fn add_library_info(wasm: &[u8], base: u64, end: u64) -> Result<Vec<u8>> {
+    let name = LIBRARY_SECTION.as_bytes();
+    let mut body = vec![name.len() as u8];
+    body.extend_from_slice(name);
+    body.extend_from_slice(&base.to_le_bytes());
+    body.extend_from_slice(&end.to_le_bytes());
+    let mut out = wasm.to_vec();
+    out.push(0);
+    write_uleb(&mut out, body.len() as u64);
+    out.extend_from_slice(&body);
+    Ok(out)
 }
 
 /// The name of the custom section holding a translated program's guest
@@ -471,11 +555,12 @@ mod tests {
     /// Declarations every lifted module has (see lift/mod.rs).
     const PRELUDE: &str = r#"
 target triple = "wasm64-unknown-unknown"
-@R = thread_local(localexec) global [32 x i64] zeroinitializer, align 8
-@F = thread_local(localexec) global [4 x i8] zeroinitializer
-@V = thread_local(localexec) global [32 x i128] zeroinitializer, align 16
-@TP = thread_local(localexec) global i64 0
-@FPSR = thread_local(localexec) global i32 0
+@__wasm_env_state = addrspace(1) global i64 0
+define void @__wasm_env_set_state(ptr %p) {
+  %a = ptrtoint ptr %p to i64
+  store i64 %a, ptr addrspace(1) @__wasm_env_state
+  ret void
+}
 %seg = type { i64, i64, i64, ptr }
 declare void @__wasm_env_svc()
 declare void @__wasm_env_fatal(ptr, i64)
@@ -504,7 +589,7 @@ declare void @dispatch(i64)
 
     /// Sets guest register `n` to the constant `v`.
     fn set(n: u32, v: i64) -> String {
-        format!("  %p{n}_{v} = getelementptr [32 x i64], ptr @R, i64 0, i64 {n}\n  store i64 {v}, ptr %p{n}_{v}\n")
+        format!("  %p{n}_{v} = getelementptr [32 x i64], ptr %R, i64 0, i64 {n}\n  store i64 {v}, ptr %p{n}_{v}\n")
     }
 
     /// The dispatch table for a program whose only block is at guest_entry
@@ -521,6 +606,8 @@ declare void @dispatch(i64)
         format!(
             "{PRELUDE}{IMAGE}{TABLE}
 define void @B_400000(i64 %_) {{
+  %st = load i64, ptr addrspace(1) @__wasm_env_state
+  %R = inttoptr i64 %st to ptr
 {body}{}  call void @__wasm_env_svc()
   unreachable
 }}
@@ -744,8 +831,8 @@ define void @B_400000(i64 %_) {{
     fn svc_passes_arguments_and_returns_x0() {
         let body = set(8, 64) + &set(0, 1) + &set(1, 0x400000) + &set(2, 16)
             + "  call void @__wasm_env_svc()\n"
-            + "  %x0 = load i64, ptr @R\n"
-            + "  %p20 = getelementptr [32 x i64], ptr @R, i64 0, i64 20\n"
+            + "  %x0 = load i64, ptr %R\n"
+            + "  %p20 = getelementptr [32 x i64], ptr %R, i64 0, i64 20\n"
             + "  store i64 %x0, ptr %p20\n";
         let Some(mut r) = run(&program(&body), |_| {}) else { return };
         assert_eq!(r.store.data().calls[0], (64, [1, 0x400000, 16]));
@@ -757,8 +844,8 @@ define void @B_400000(i64 %_) {{
     fn clone_is_refused_without_reaching_the_host() {
         let body = set(8, 220)
             + "  call void @__wasm_env_svc()\n"
-            + "  %x0 = load i64, ptr @R\n"
-            + "  %p20 = getelementptr [32 x i64], ptr @R, i64 0, i64 20\n"
+            + "  %x0 = load i64, ptr %R\n"
+            + "  %p20 = getelementptr [32 x i64], ptr %R, i64 0, i64 20\n"
             + "  store i64 %x0, ptr %p20\n";
         let Some(mut r) = run(&program(&body), |_| {}) else { return };
         assert_eq!(r.reg(20) as i64, -38, "ENOSYS");

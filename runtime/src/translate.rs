@@ -7,14 +7,17 @@
 //! runs it unchanged. Results are cached by content hash, so each binary is
 //! translated once.
 //!
-//! A dynamically-linked binary is translated together with its dynamic linker
-//! and libraries, which the translator finds inside the environment's root
-//! (`--root`). Libraries a program only `dlopen`s can't be found from the
-//! binary, so the environment may list them in `/etc/wasm-env/dlopen`: lines of
-//! `PROGRAM LIBRARY-OR-DIRECTORY...`, where PROGRAM is a file name pattern
-//! (`*` matches anything) such as `python3*`. A cache entry records every file
-//! the translation read, with its size and modification time, and is redone
-//! if any of them changes.
+//! A dynamically-linked binary's libraries (and its dynamic linker) are
+//! translated separately, each once for all programs, when the program
+//! loads them (docs/abi.md, "Libraries"; see `ensure_library` and
+//! modules.rs). With `WASM_ENV_MONOLITHIC=1`, a binary is instead translated
+//! together with its dynamic linker and libraries, which the translator finds
+//! inside the environment's root (`--root`); libraries a program only
+//! `dlopen`s can't be found from the binary, so the environment may list them
+//! in `/etc/wasm-env/dlopen`: lines of `PROGRAM LIBRARY-OR-DIRECTORY...`,
+//! where PROGRAM is a file name pattern (`*` matches anything) such as
+//! `python3*`. Such an entry records every file the translation read, with
+//! its size and modification time, and is redone if any of them changes.
 //!
 //! Translation needs the toolchain (clang, wasm-ld) and the translator
 //! binary, which are present in the dev shell. When they aren't, execution
@@ -160,6 +163,9 @@ fn still_valid(deps: &Path) -> bool {
 /// translation actually runs.
 pub fn ensure_translated(elf: &Path, root: &Path, program: &str, trace: bool) -> SysResult<PathBuf> {
     let bytes = std::fs::read(elf).map_err(|e| crate::fs::errno(&e))?;
+    if !monolithic() {
+        return ensure_program(elf, &bytes, trace);
+    }
     // The cache key covers the binary and the translator's build, so a
     // rebuilt translator retranslates.
     let translator = translator();
@@ -223,6 +229,143 @@ pub fn ensure_translated(elf: &Path, root: &Path, program: &str, trace: bool) ->
     Ok(out)
 }
 
+
+/// Whether programs are translated with their libraries in one module (the
+/// older way, `WASM_ENV_MONOLITHIC=1`) rather than a module per library
+/// (docs/abi.md, "Libraries").
+pub fn monolithic() -> bool {
+    std::env::var_os("WASM_ENV_MONOLITHIC").is_some_and(|v| v != "0")
+}
+
+/// The translator's build, for cache keys: a rebuilt translator translates
+/// again.
+fn tool_hash() -> u64 {
+    let stamp = std::fs::metadata(translator()).and_then(|m| m.modified()).ok();
+    stamp.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// Runs the translator on `input` with `args`, writing `out` (through a
+/// temporary file, so a concurrent run never sees a half-written module).
+fn run_translator(input: &Path, out: &Path, args: &[String], trace: bool) -> SysResult<()> {
+    if trace {
+        eprintln!("[wasm-env] translating {}", input.display());
+    }
+    let tmp = out.with_extension(format!("{}.tmp", std::process::id()));
+    let mut cmd = Command::new(translator());
+    cmd.arg("translate").arg(input).arg(&tmp).args(args);
+    // Addresses earlier runs found missing (see record_missed_target).
+    let roots = out.with_extension("roots");
+    if roots.exists() {
+        cmd.arg("--roots").arg(&roots);
+    }
+    if !trace {
+        // Keep the translator's diagnostics out of the program's output.
+        cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    }
+    let status = cmd.status().map_err(|_| ENOEXEC)?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ENOEXEC);
+    }
+    std::fs::rename(&tmp, out).map_err(|e| crate::fs::errno(&e))
+}
+
+/// Returns the cached main module for the executable `elf` (just the
+/// executable; its libraries are modules of their own), translating it the
+/// first time.
+fn ensure_program(elf: &Path, bytes: &[u8], trace: bool) -> SysResult<PathBuf> {
+    let key = hash(bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ bytes.len() as u64 ^ 0x6f626a;
+    let dir = cache_dir().ok_or(ENOENT)?;
+    std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
+    let out = dir.join(format!("{key:016x}.wasm"));
+    if !out.exists() {
+        run_translator(elf, &out, &["--object".into()], trace)?;
+    }
+    Ok(out)
+}
+
+/// The guest addresses libraries are translated for: each library gets a
+/// range of its own here, kept from one translation to the next, so any set
+/// of libraries a program loads fits together, and a library's translation
+/// serves every program.
+const LIB_START: u64 = 0x10_0000_0000;
+const LIB_LIMIT: u64 = 0x3f_0000_0000;
+
+/// The address space a shared object's PT_LOAD segments span from 0, if it
+/// is an arm64 shared object.
+pub fn library_extent(bytes: &[u8]) -> Option<u64> {
+    if !is_arm64_elf(bytes) || bytes.len() < 64 || u16::from_le_bytes([bytes[16], bytes[17]]) != 3 {
+        return None; // not ET_DYN
+    }
+    let word = |at: usize, n: usize| -> Option<u64> {
+        let b = bytes.get(at..at + n)?;
+        Some(b.iter().rev().fold(0u64, |v, &x| v << 8 | x as u64))
+    };
+    let (phoff, phentsize, phnum) = (word(32, 8)? as usize, word(54, 2)? as usize, word(56, 2)? as usize);
+    let mut end = 0;
+    for k in 0..phnum {
+        let ph = phoff + k * phentsize;
+        if word(ph, 4)? == 1 {
+            // PT_LOAD: p_vaddr + p_memsz
+            end = end.max(word(ph + 16, 8)? + word(ph + 40, 8)?);
+        }
+    }
+    (end > 0).then_some(end)
+}
+
+/// The range kept for the library at `path` (a canonical host path) in
+/// the registry file `bases` ("base<TAB>end<TAB>path" lines): its own if it
+/// still fits `extent` bytes, else the first free one.
+fn library_range(bases: &Path, path: &Path, extent: u64) -> SysResult<(u64, u64)> {
+    use std::io::Write;
+    // Room to grow: a new version of the library usually still fits.
+    let size = (extent + extent / 4).next_multiple_of(1 << 20);
+    let lock = std::fs::OpenOptions::new().create(true).append(true).open(bases.with_extension("lock")).map_err(|e| crate::fs::errno(&e))?;
+    lock.lock().map_err(|e| crate::fs::errno(&e))?;
+    let text = std::fs::read_to_string(bases).unwrap_or_default();
+    let mut taken: Vec<(u64, u64)> = Vec::new();
+    for line in text.lines() {
+        let mut f = line.splitn(3, '\t');
+        let (Some(b), Some(e), Some(p)) = (f.next(), f.next(), f.next()) else { continue };
+        let (Ok(b), Ok(e)) = (u64::from_str_radix(b.trim_start_matches("0x"), 16), u64::from_str_radix(e.trim_start_matches("0x"), 16)) else { continue };
+        if Path::new(p) == path && e - b >= extent {
+            return Ok((b, b + extent));
+        }
+        taken.push((b, e));
+    }
+    taken.sort();
+    let mut at = LIB_START;
+    for (b, e) in taken {
+        if at + size <= b {
+            break;
+        }
+        at = at.max(e);
+    }
+    if at + size > LIB_LIMIT {
+        return Err(ENOMEM);
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(bases).map_err(|e| crate::fs::errno(&e))?;
+    writeln!(f, "{at:#x}\t{:#x}\t{}", at + size, path.display()).map_err(|e| crate::fs::errno(&e))?;
+    Ok((at, at + extent))
+}
+
+/// Returns the translated module for the shared library at `path` (a
+/// canonical host path) and the guest range it's translated for, translating
+/// it the first time (docs/abi.md, "Libraries"). ENOEXEC if it isn't an
+/// arm64 shared object.
+pub fn ensure_library(path: &Path, trace: bool) -> SysResult<(PathBuf, u64, u64)> {
+    let bytes = std::fs::read(path).map_err(|e| crate::fs::errno(&e))?;
+    let extent = library_extent(&bytes).ok_or(ENOEXEC)?;
+    let dir = cache_dir().ok_or(ENOENT)?;
+    std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
+    let (base, end) = library_range(&dir.join("library-bases"), path, extent)?;
+    let key = hash(&bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ base.rotate_left(7) ^ bytes.len() as u64;
+    let out = dir.join(format!("{key:016x}.wasm"));
+    if !out.exists() {
+        run_translator(path, &out, &["--object".into(), "--base".into(), format!("{base:x}")], trace)?;
+    }
+    Ok((out, base, end))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

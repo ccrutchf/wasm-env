@@ -9,9 +9,48 @@
 long __wasm_env_host_syscall(long, long, long, long, long, long, long)
 	__attribute__((__import_module__("linux"), __import_name__("syscall")));
 
-// Guest state, defined by the lifted code.
-extern _Thread_local uint64_t R[32]; // x0–x30, SP
-extern _Thread_local uint64_t TP;    // TPIDR_EL0
+typedef void (*block_fn)(long);
+
+// Guest state: one block per thread, which the lifted code finds through
+// the WebAssembly global __wasm_env_state (set by __wasm_env_set_state,
+// defined with it in the lifted data module). Its layout must match the
+// translator's STATE_POINTERS (translator/src/lift/mod.rs).
+//
+// The dispatch cache is a direct-mapped cache of region lookups, tagged with
+// region number + 1 so the zeroed initial entries match nothing. The lifted
+// code probes it inline at every indirect branch (see Block::jump_to) and
+// calls `dispatch` only on a miss; the layout and hash must match. With
+// WASM_ENV_DEBUG=1 nothing is cached, so every indirect branch comes through
+// `dispatch` and is recorded for error reports.
+#define DISPATCH_CACHE 4096
+struct dispatch_entry {
+	uint64_t tag;
+	block_fn fn;
+};
+struct guest_state {
+	uint64_t r[32];   // x0–x30, SP
+	uint8_t f[4];     // N, Z, C, V
+	uint32_t fpsr;
+	uint64_t tp;      // TPIDR_EL0
+	uint64_t monitor; // the value the last load-exclusive read
+	__uint128_t v[32];
+	struct dispatch_entry cache[DISPATCH_CACHE];
+	uint64_t modules_seen; // see dispatch
+};
+_Static_assert(__builtin_offsetof(struct guest_state, f) == 256, "STATE_POINTERS");
+_Static_assert(__builtin_offsetof(struct guest_state, fpsr) == 260, "STATE_POINTERS");
+_Static_assert(__builtin_offsetof(struct guest_state, tp) == 264, "STATE_POINTERS");
+_Static_assert(__builtin_offsetof(struct guest_state, monitor) == 272, "STATE_POINTERS");
+_Static_assert(__builtin_offsetof(struct guest_state, v) == 288, "STATE_POINTERS");
+_Static_assert(__builtin_offsetof(struct guest_state, cache) == 800, "STATE_POINTERS");
+static _Thread_local struct guest_state guest;
+void __wasm_env_set_state(struct guest_state *);
+#define R guest.r
+#define F guest.f
+#define V guest.v
+#define TP guest.tp
+#define __wasm_env_dispatch_cache guest.cache
+
 
 // The guest image, emitted by the lifter.
 struct seg { uint64_t vaddr, filesz, memsz; const uint8_t *data; };
@@ -30,7 +69,6 @@ extern const uint64_t guest_app_entry, guest_interp_base;
 extern const uint64_t dispatch_addrs[];
 extern void *const dispatch_fns[];
 extern const uint64_t dispatch_count;
-typedef void (*block_fn)(long);
 
 void dispatch(long pc);
 
@@ -120,11 +158,17 @@ void __wasm_env_fatal(const char *why, uint64_t pc)
 
 void __wasm_env_bad_target(uint64_t pc)
 {
+	int known = 0;
 	for (uint64_t k = 0; k < guest_object_count; k++) {
 		const struct lib *o = &guest_objects[k];
-		if (pc >= o->base && pc < o->end)
+		if (pc >= o->base && pc < o->end) {
 			__wasm_env_host_syscall(WASM_ENV_MISSED_TARGET, (long)pc, (long)o->path, (long)(pc - o->base), 0, 0, 0);
+			known = 1;
+		}
 	}
+	// Elsewhere (a library loaded as its own module): the runtime knows which.
+	if (!known)
+		__wasm_env_host_syscall(WASM_ENV_MISSED_TARGET, (long)pc, 0, 0, 0, 0, 0);
 	die("jump to an address that wasn't translated", pc);
 }
 
@@ -169,22 +213,45 @@ uint32_t __wasm_env_crc32(uint32_t crc, uint64_t data, uint32_t bytes, uint32_t 
 
 // Must match the translator's REGION_SPAN (translator/src/lift/mod.rs).
 #define REGION_SHIFT 12
-// A direct-mapped cache of region lookups, tagged with region number + 1 so
-// the zeroed initial entries match nothing; each thread has its own.
-// The lifted code probes it inline at every indirect branch (see
-// Block::jump_to) and calls `dispatch` only on a miss; the layout and hash
-// must match. With WASM_ENV_DEBUG=1 nothing is cached, so every indirect
-// branch comes through `dispatch` and is recorded for error reports.
-#define DISPATCH_CACHE 4096
-struct dispatch_entry {
-	uint64_t tag;
-	block_fn fn;
+
+// Libraries translated as modules of their own (docs/abi.md, "Libraries"):
+// the runtime appends each to this directory when it loads it into the
+// process (the guest addresses it covers and its region table), then
+// publishes the new count. Each thread's instance of the program has
+// instances of the modules it has seen (guest_state.modules_seen); a thread
+// that reaches a newer one asks the runtime to catch up first.
+#define MODULES 1024
+struct module {
+	uint64_t lo, hi;
+	const uint64_t *addrs;
+	void *const *fns;
+	uint64_t count;
 };
-_Thread_local struct dispatch_entry __wasm_env_dispatch_cache[DISPATCH_CACHE];
+struct module __wasm_env_modules[MODULES];
+uint64_t __wasm_env_module_count;
+#define WASM_ENV_SYNC_MODULES ((1L << 32) + 3)
+
+// The function of the region starting at `start` in a region table, or 0.
+static block_fn lookup(const uint64_t *addrs, void *const *fns, uint64_t count, uint64_t start)
+{
+	uint64_t lo = 0, hi = count;
+	while (lo < hi) {
+		uint64_t mid = lo + (hi - lo) / 2;
+		uint64_t a = addrs[mid];
+		if (a == start)
+			return (block_fn)fns[mid];
+		if (a < start)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return 0;
+}
 
 // Find `pc`'s region function and tail-call it (a WebAssembly return_call,
 // so the host stack doesn't grow): from the cache, else by binary search of
-// the region table. An address in no region was never translated.
+// the program's region table or a library module's. An address in no
+// region was never translated.
 void dispatch(long pc)
 {
 	uint64_t target = (uint64_t)pc;
@@ -196,47 +263,62 @@ void dispatch(long pc)
 		__attribute__((musttail)) return f(pc); // the region function enters at pc
 	}
 	uint64_t start = region << REGION_SHIFT;
-	uint64_t lo = 0, hi = dispatch_count;
-	while (lo < hi) {
-		uint64_t mid = lo + (hi - lo) / 2;
-		uint64_t a = dispatch_addrs[mid];
-		if (a == start) {
-			block_fn f = (block_fn)dispatch_fns[mid];
-			if (!debug) {
-				e->tag = region + 1;
-				e->fn = f;
+	block_fn f = lookup(dispatch_addrs, dispatch_fns, dispatch_count, start);
+	if (!f) {
+		uint64_t n = __atomic_load_n(&__wasm_env_module_count, __ATOMIC_ACQUIRE);
+		for (uint64_t k = 0; k < n; k++) {
+			const struct module *m = &__wasm_env_modules[k];
+			if (target < m->lo || target >= m->hi)
+				continue;
+			if (k >= guest.modules_seen) {
+				__wasm_env_host_syscall(WASM_ENV_SYNC_MODULES, 0, 0, 0, 0, 0, 0);
+				guest.modules_seen = n;
 			}
-			__attribute__((musttail)) return f(pc);
+			f = lookup(m->addrs, m->fns, m->count, start);
+			break;
 		}
-		if (a < start)
-			lo = mid + 1;
-		else
-			hi = mid;
 	}
-	__wasm_env_bad_target(target);
+	if (!f)
+		__wasm_env_bad_target(target);
+	if (!debug) {
+		e->tag = region + 1;
+		e->fn = f;
+	}
+	__attribute__((musttail)) return f(pc);
 }
 
 // Shared libraries the translated dynamic linker loads at run time. Each
-// was translated with the program at a fixed base, so its code already
-// exists as translated blocks there. When the dynamic linker opens one and
-// maps it, place the mapping at that base; it then relocates the library as
-// usual, and every address it computes matches the translation.
+// was translated for a fixed base, so its code exists as translated blocks
+// there: either in this module (translated with the program, listed in
+// guest_libs) or as a module of its own, which the runtime translates and
+// loads when the dynamic linker maps the library (docs/abi.md,
+// "Libraries"). When the dynamic linker maps one, place the mapping at that
+// base; it then relocates the library as usual, and every address it
+// computes matches the translation.
 extern const struct lib guest_libs[];
 extern const uint64_t guest_lib_count;
 
 enum { SYS_openat = 56, SYS_close = 57, SYS_pread64 = 67, SYS_munmap = 215, SYS_mmap = 222 };
 enum { MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20 };
+// wasm-env's call to load a library's module: (fd, where to write its base
+// and end). Returns 0, or -errno if the file isn't a library it translates.
+#define WASM_ENV_LOAD_LIBRARY ((1L << 32) + 2)
 
-// For each file descriptor, 1 + the library it has open (0: none).
+// Libraries placed so far: guest_libs first, then those the runtime loads.
+#define LIBS 1024
+static struct { uint64_t base, end; } libs[LIBS];
+static uint64_t lib_count;
+
+// For each file descriptor: 0 not yet known, NOT_LIB, or 1 + its library.
 #define LIB_FDS 1024
+#define NOT_LIB 0xffff
 static uint16_t fd_lib[LIB_FDS];
 
-// The library most recently opened and not yet mapped (1 + index, or 0).
-// glibc maps a library whose segments are aligned beyond the page size by
-// first reserving an anonymous, inaccessible region, then mapping the file
-// at an aligned address inside it; that reservation must be the library's
-// prelinked base.
-static uint64_t pending_lib;
+// The file most recently opened (1 + fd), until it's mapped. glibc maps a
+// library whose segments are aligned beyond the page size by first
+// reserving an anonymous, inaccessible region, then mapping the file at an
+// aligned address inside it; that reservation must be the library's base.
+static long pending_fd;
 
 // Reservations made that way: unmapping parts of them is a no-op.
 #define RESERVATIONS 256
@@ -257,9 +339,10 @@ static const char *base_name(const char *p)
 	return b;
 }
 
-// The library a path names: the exact path the translator found, or else
-// the same file name (the dynamic linker may reach it through another
-// directory, such as one from LD_LIBRARY_PATH).
+// The library a path names among those translated with the program: the
+// exact path the translator found, or else the same file name (the dynamic
+// linker may reach it through another directory, such as one from
+// LD_LIBRARY_PATH).
 static long lib_for_path(const char *path)
 {
 	for (uint64_t k = 0; k < guest_lib_count; k++)
@@ -269,10 +352,29 @@ static long lib_for_path(const char *path)
 	return -1;
 }
 
+// The library open as `fd` (its index in libs), or -1: asks the runtime
+// the first time, which loads the library's module if it is one.
+static long lib_of_fd(long fd)
+{
+	if (fd < 0 || fd >= LIB_FDS || fd_lib[fd] == NOT_LIB)
+		return -1;
+	if (!fd_lib[fd]) {
+		uint64_t range[2];
+		if (lib_count == LIBS || __wasm_env_host_syscall(WASM_ENV_LOAD_LIBRARY, fd, (long)range, 0, 0, 0, 0) != 0) {
+			fd_lib[fd] = NOT_LIB;
+			return -1;
+		}
+		libs[lib_count].base = range[0];
+		libs[lib_count].end = range[1];
+		fd_lib[fd] = (uint16_t)++lib_count;
+	}
+	return fd_lib[fd] - 1;
+}
+
 static int in_a_lib(uint64_t addr)
 {
-	for (uint64_t k = 0; k < guest_lib_count; k++)
-		if (addr >= guest_libs[k].base && addr < ((guest_libs[k].end + 4095) & ~(uint64_t)4095)) return 1;
+	for (uint64_t k = 0; k < lib_count; k++)
+		if (addr >= libs[k].base && addr < ((libs[k].end + 4095) & ~(uint64_t)4095)) return 1;
 	for (uint64_t k = 0; k < reservation_count; k++)
 		if (addr >= reserved[k].start && addr < reserved[k].end) return 1;
 	return 0;
@@ -295,37 +397,43 @@ static void place(long fd, uint64_t at, uint64_t len, uint64_t off)
 // did (the result is in x0).
 static int library_syscall(long nr)
 {
-	if (!guest_lib_count) return 0;
 	switch (nr) {
 	case SYS_openat: {
 		long fd = __wasm_env_host_syscall(nr, (long)R[0], (long)R[1], (long)R[2], (long)R[3], 0, 0);
 		if (fd >= 0 && fd < LIB_FDS) {
-			fd_lib[fd] = (uint16_t)(lib_for_path((const char *)(uintptr_t)R[1]) + 1);
-			pending_lib = fd_lib[fd];
+			long k = lib_for_path((const char *)(uintptr_t)R[1]);
+			fd_lib[fd] = (uint16_t)(k + 1); // 0 (unknown) if not translated with the program
+			pending_fd = fd + 1;
 		}
 		R[0] = (uint64_t)fd;
 		return 1;
 	}
 	case SYS_close:
 		if (R[0] < LIB_FDS) fd_lib[R[0]] = 0;
+		if ((long)R[0] + 1 == pending_fd) pending_fd = 0;
 		return 0;
 	case SYS_mmap: {
 		uint64_t addr = R[0], len = R[1], flags = R[3], off = R[5];
 		long fd = (long)R[4];
-		if ((flags & MAP_ANONYMOUS) && !(flags & MAP_FIXED) && addr == 0 && R[2] == 0 && pending_lib
+		if ((flags & MAP_ANONYMOUS) && !(flags & MAP_FIXED) && addr == 0 && R[2] == 0 && pending_fd
 		    && reservation_count < RESERVATIONS) {
-			// glibc's reservation for an aligned library (see pending_lib).
-			uint64_t base = guest_libs[pending_lib - 1].base;
-			reserved[reservation_count].start = base;
-			reserved[reservation_count++].end = base + len;
-			R[0] = base;
+			// glibc's reservation for an aligned library (see pending_fd).
+			long k = lib_of_fd(pending_fd - 1);
+			if (k < 0)
+				return 0;
+			reserved[reservation_count].start = libs[k].base;
+			reserved[reservation_count++].end = libs[k].base + len;
+			R[0] = libs[k].base;
 			return 1;
 		}
-		if (!(flags & MAP_ANONYMOUS) && fd >= 0 && fd < LIB_FDS && fd_lib[fd]) {
-			pending_lib = 0;
+		if (!(flags & MAP_ANONYMOUS)) {
+			long k = lib_of_fd(fd);
+			if (k < 0)
+				return 0;
+			pending_fd = 0;
 			// The first mapping of a library passes its lowest segment
 			// address as a hint (0 for a shared object): map at base + hint.
-			uint64_t at = (flags & MAP_FIXED) ? addr : guest_libs[fd_lib[fd] - 1].base + addr;
+			uint64_t at = (flags & MAP_FIXED) ? addr : libs[k].base + addr;
 			place(fd, at, len, off);
 			R[0] = at;
 			return 1;
@@ -358,8 +466,6 @@ static int library_syscall(long nr)
 // __wasm_env_svc_at's return value. The child may run on the parent's stack
 // (glibc's vfork) or a new one (glibc's posix_spawn); either way the parent
 // was waiting at its clone, as with a real CLONE_VFORK.
-extern _Thread_local uint8_t F[4];
-extern _Thread_local __uint128_t V[32];
 struct vfork_frame {
 	uint64_t r[32], tp, resume;
 	uint8_t f[4];
@@ -440,6 +546,7 @@ static void thread_clone(void)
 __attribute__((__export_name__("__wasm_env_thread_start")))
 void __wasm_env_thread_start(const struct vfork_frame *f)
 {
+	__wasm_env_set_state(&guest);
 	__builtin_memcpy(R, f->r, sizeof f->r);
 	__builtin_memcpy(F, f->f, sizeof f->f);
 	__builtin_memcpy(V, f->v, sizeof f->v);
@@ -515,6 +622,12 @@ enum { HWCAP_FP = 1 << 0, HWCAP_ASIMD = 1 << 1, HWCAP_CRC32 = 1 << 7, HWCAP_ATOM
 // guest stack, adding the ELF entries the kernel would (AT_PHDR for TLS
 // setup and the dynamic linker, AT_ENTRY, and AT_BASE when a dynamic linker
 // runs). The strings stay where they are.
+// When the program's libraries are modules of their own, the runtime loads
+// the dynamic linker (as the kernel would) and adds its load address
+// (AT_BASE) and where to start (its entry) to the auxiliary vector.
+enum { WASM_ENV_AT_START = 0x7700 };
+static uint64_t start_pc;
+
 static uint64_t guest_initial_stack(const uint64_t *sp)
 {
 	uint64_t argc = sp[0];
@@ -544,10 +657,12 @@ static uint64_t guest_initial_stack(const uint64_t *sp)
 		*a++ = AT_BASE; *a++ = guest_interp_base;
 	}
 	*a++ = AT_NULL;  *a++ = 0;
-	// Report the features the translation supports (the runtime says none).
+	// Report the features the translation supports (the runtime says none),
+	// and note where the runtime says to start (see WASM_ENV_AT_START).
 	for (uint64_t *p = out + (auxv - sp); p[0] != AT_NULL; p += 2) {
 		if (p[0] == AT_HWCAP) p[1] = GUEST_HWCAP;
 		if (p[0] == AT_HWCAP2) p[1] = 0;
+		if (p[0] == WASM_ENV_AT_START) start_pc = p[1];
 	}
 	return (uint64_t)out;
 }
@@ -555,6 +670,7 @@ static uint64_t guest_initial_stack(const uint64_t *sp)
 __attribute__((__export_name__("_start")))
 void _start(uint64_t sp)
 {
+	__wasm_env_set_state(&guest);
 	// Map the guest image at its original addresses. The translator places
 	// segments there as the module's own data segments (data is null), and
 	// memory starts zeroed; otherwise copy them.
@@ -568,7 +684,12 @@ void _start(uint64_t sp)
 	}
 	// Linux starts arm64 processes with every register zero except SP.
 	R[31] = guest_initial_stack((const uint64_t *)(uintptr_t)sp);
-	dispatch(guest_entry);
+	for (uint64_t k = 0; k < guest_lib_count; k++) {
+		libs[k].base = guest_libs[k].base;
+		libs[k].end = guest_libs[k].end;
+	}
+	lib_count = guest_lib_count;
+	dispatch(start_pc ? (long)start_pc : (long)guest_entry);
 }
 
 // This thread's guest registers, for tests and debugging.

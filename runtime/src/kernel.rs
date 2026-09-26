@@ -227,8 +227,17 @@ impl Kernel {
         self.procs.lock().unwrap().table.get_mut(&pid).and_then(|e| e.signal.take())
     }
 
+    /// Loads (or reuses) a compiled library module (see modules.rs).
+    pub fn module_any(&self, host: &Path) -> Result<Module, String> {
+        self.load(host, false)
+    }
+
     /// Loads (or reuses) the compiled program at a host path.
     pub fn module(&self, host: &Path) -> Result<Module, String> {
+        self.load(host, true)
+    }
+
+    fn load(&self, host: &Path, program: bool) -> Result<Module, String> {
         let meta = std::fs::metadata(host).map_err(|e| e.to_string())?;
         let stamp = (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len());
         if let Some((mtime, len, module)) = self.modules.lock().unwrap().get(host)
@@ -236,7 +245,9 @@ impl Kernel {
                 return Ok(module.clone());
             }
         let module = process::load_module(&self.engine, host).map_err(|e| format!("{e:?}"))?;
-        process::check_shape(&module).map_err(|e| e.to_string())?;
+        if program {
+            process::check_shape(&module).map_err(|e| e.to_string())?;
+        }
         self.modules.lock().unwrap().insert(host.to_path_buf(), (stamp.0, stamp.1, module.clone()));
         Ok(module)
     }

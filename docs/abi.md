@@ -96,6 +96,21 @@ What threads share: memory, the descriptor table, the address space (`mmap`, `br
 
 `futex` supports `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` (private or not: processes don't share memory); a wait returns `-EINTR` when a signal arrives or the process is ending. `exit` ends the calling thread (clearing its tid word and waking a waiter on it, for `pthread_join`); when the last thread exits, the process exits with its status. `exit_group`, a fatal signal, a trap in any thread or `execve` end the whole process: the other threads stop at their next syscall, and blocking calls return early. (A thread that never makes another syscall keeps running until the environment exits.)
 
+## Libraries
+
+A translated program's shared libraries are **modules of their own**, translated once per library and shared by every program that uses it, as on Linux. (`WASM_ENV_MONOLITHIC=1` translates a program together with its libraries in one module instead, the earlier way.)
+
+- The **main module** is the executable alone, with the translator's support code. It exports, besides the items under "Threads": `__indirect_function_table`, the guest-state global `__wasm_env_state`, the support code's entry points (`dispatch`, `__wasm_env_svc`, `__wasm_env_svc_at`, `__wasm_env_fp_flags`, `__wasm_env_fatal`, `__wasm_env_bad_target`, `__wasm_env_crc32`) and the module directory (`__wasm_env_modules`, `__wasm_env_module_count`).
+- A **library module** is a position-independent side module in wasm-ld's dynamic-linking convention (`dylink.0`; `--experimental-pic -shared`). It imports the shared memory, the function table, `__stack_pointer`, `__memory_base`, `__table_base`, `__wasm_env_state` and the support code's entry points from `env`, and a `GOT.func` global per function whose address its data holds (its region functions). It exports its region table (`dispatch_addrs`, `dispatch_fns`, `dispatch_count`, relative to `__memory_base`), and a custom section `wasm-env.library` records the guest range it was translated for (two u64s, start and end).
+
+**Guest state** is a block per thread (`struct guest_state` in the support code: registers, flags, the exclusive monitor and the dispatch cache), at the address in the WebAssembly global `__wasm_env_state`, which every module of a thread shares. Each region function reads it once.
+
+**Addresses.** Each library is translated for a fixed guest range, which the runtime keeps from one translation to the next in its cache (`library-bases`), from 64 GB upward: every library has its own range, so any set of them fits in one process. The executable keeps its own addresses.
+
+**Loading.** At start, the runtime loads the program's dynamic linker (PT_INTERP) as the kernel would: it maps its segments at its range and loads its module, and adds `AT_BASE` and a wasm-env entry `0x7700` (where to start: the dynamic linker's entry) to the auxiliary vector. When the dynamic linker then maps a library, the support code asks the runtime with the wasm-env call `load_library(fd, range)`: if the file is an arm64 shared object, the runtime translates it if it hasn't yet, loads its module and writes its guest range to `range` (else `-ENOEXEC`, and the file is mapped as data). The support code places the dynamic linker's mappings of the library in that range, as with the monolithic translation's prelinked bases.
+
+Loading a module into a process: the runtime allocates its data (`dylink.0`'s size and alignment) in the mmap region and its function-table slots after the main module's, instantiates it against the main instance's exports (filling each `GOT.func` global with its slot, and the slot with the exported function), runs `__wasm_apply_data_relocs` once, and adds an entry `{start, end, region addresses, region functions, count}` to the module directory, publishing it by incrementing the count. `dispatch` searches the directory for addresses outside the main module. Each thread has instances of the modules in its own store, with the same placements; a thread that reaches a module its store hasn't instantiated yet asks the runtime to catch up (the wasm-env call `sync_modules`), and a new thread instantiates all loaded modules before it starts. Libraries stay loaded until the process exits (`dlclose` unmaps nothing).
+
 ## `setjmp` and `longjmp`
 
 The compiler rewrites `setjmp`/`longjmp` using WebAssembly exception handling (`-mllvm -wasm-enable-sjlj`): `longjmp` throws the C tag `__c_longjmp`, and functions that call `setjmp` catch it and check whether it's theirs. libc supplies the three helpers the compiler calls (`__wasm_setjmp`, `__wasm_setjmp_test`, `__wasm_longjmp`). Everything linked into a program must be compiled with the same flags.
@@ -141,7 +156,7 @@ Translated (arm64) programs use the same protocol through the translator's suppo
 
 ## Planned versions
 
-- **Version 1: dynamic linking** (PLAN.md, M3). Several modules in one process, sharing one memory and one function table, loaded and linked by the runtime at run time, including `dlopen`. Needed so translated programs can load shared libraries such as Python extension modules. Translated modules use glibc's symbol versions.
+- **Version 1: dynamic linking** (PLAN.md, M3). Several modules in one process, sharing one memory and one function table, loaded and linked by the runtime at run time, including `dlopen`. Needed so translated programs can load shared libraries such as Python extension modules. Translated modules use glibc's symbol versions. (Translated programs already have them; see "Libraries".)
 - **Version 2: threads** (PLAN.md, M6). Shared memory, atomics and `clone(CLONE_THREAD)`, with real thread-local storage, for programs built with the toolchain. (Translated programs already have them; see "Threads".)
 
 ## wasm-env's own calls
@@ -152,6 +167,8 @@ Syscall numbers from 2^32 up are wasm-env's, not Linux's; unknown ones return `-
 |---|---|---|
 | 2^32 | `missed_target` | (address, object name, offset in the object). Made by a translated program's support code when it jumps to code the translation missed. The runtime records the address, and the next translation of that program includes it. |
 | 2^32 + 1 | `thread_started` | (). Made by a new thread of a translated program once it has taken its registers from its clone frame (see "Threads"). |
+| 2^32 + 2 | `load_library` | (fd, range). Made by a translated program's support code when the dynamic linker maps a file: loads it as a library module if it is one, writing its guest start and end at `range` (see "Libraries"); else `-ENOEXEC`. |
+| 2^32 + 3 | `sync_modules` | (). Made when a thread reaches a library module its instance hasn't loaded yet (see "Libraries"). |
 
 ## Versioning
 

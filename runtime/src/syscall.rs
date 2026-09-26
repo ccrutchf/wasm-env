@@ -31,6 +31,11 @@ pub fn syscall(
         nr::MMAP => mmap(&mut caller, &args),
         nr::MREMAP => mremap(&mut caller, &args),
         nr::BRK => brk(&mut caller, args[0] as u64),
+        nr::WASM_ENV_LOAD_LIBRARY => load_library(&mut caller, a, b as u64),
+        nr::WASM_ENV_SYNC_MODULES => crate::modules::sync(&mut caller).map(|()| 0).map_err(|e| {
+            eprintln!("wasm-env: loading libraries: {e:#}");
+            EIO
+        }),
         _ => {
             let (data, process) = data_and_process(&mut caller);
             process.call(data, n, &args)
@@ -91,6 +96,38 @@ pub fn memory_bytes(store: &mut wasmtime::Store<Process>) -> &mut [u8] {
     }
 }
 
+/// wasm-env's `load_library(fd, range)`: the support code asks whether the
+/// file open as `fd` is a library to load as a module of its own
+/// (docs/abi.md, "Libraries"); if so, loads it (translating it the first
+/// time) and writes its guest base and end at `range`. ENOEXEC if it isn't
+/// an arm64 shared object (the file is mapped as data).
+fn load_library(caller: &mut Caller<'_, Process>, fd: i64, range: u64) -> SysResult<i64> {
+    let p = caller.data();
+    if p.main.is_none() {
+        return Err(ENOSYS); // the program's libraries are translated with it
+    }
+    let open = p.fds.get(fd)?.open.clone();
+    let path = match &*open.lock().unwrap() {
+        Open::File { path, .. } => p.fs.host(path),
+        _ => return Err(ENOEXEC),
+    };
+    let mut head = [0u8; 20];
+    let is_lib = std::fs::File::open(&path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok_and(|()| crate::translate::is_arm64_elf(&head) && u16::from_le_bytes([head[16], head[17]]) == 3);
+    if !is_lib {
+        return Err(ENOEXEC);
+    }
+    let lib = crate::modules::load(&mut *caller, &path).map_err(|e| {
+        eprintln!("wasm-env: {}: {e:#}", path.display());
+        ENOEXEC
+    })?;
+    let (data, _) = data_and_process(caller);
+    mem::write_u64(data, range, lib.base)?;
+    mem::write_u64(data, range + 8, lib.end)?;
+    Ok(0)
+}
+
 const MAP_FIXED: i64 = 0x10;
 const MAP_ANONYMOUS: i64 = 0x20;
 const MREMAP_MAYMOVE: i64 = 1;
@@ -110,7 +147,7 @@ fn grow_to(caller: &mut Caller<'_, Process>, top: u64) -> SysResult<()> {
     Ok(())
 }
 
-fn grow_shared(m: &SharedMemory, top: u64) -> SysResult<()> {
+pub fn grow_shared(m: &SharedMemory, top: u64) -> SysResult<()> {
     // Another thread may grow it first: then this grows by less, or not at
     // all.
     loop {
@@ -130,7 +167,7 @@ pub fn alloc_shared(group: &crate::thread::Group, memory: &SharedMemory, len: u6
         (mm.space.alloc(len), mm.space.top)
     };
     grow_shared(memory, top)?;
-    mem::slice_mut(shared_bytes(memory), addr, len)?.fill(0);
+    mem::zero(shared_bytes(memory), addr, len)?;
     Ok(addr)
 }
 
@@ -157,8 +194,8 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
     };
     grow_to(caller, top)?;
     let (data, process) = data_and_process(caller);
+    mem::zero(data, addr, len)?;
     let range = mem::slice_mut(data, addr, len)?;
-    range.fill(0);
     if flags & MAP_ANONYMOUS == 0 {
         // File mapping: copy the contents in (docs/abi.md; read-only for now).
         let open = process.fds.get(fd)?.open.clone();
@@ -194,7 +231,7 @@ fn brk(caller: &mut Caller<'_, Process>, want: u64) -> SysResult<i64> {
     }
     if want > old {
         let (data, _) = data_and_process(caller);
-        mem::slice_mut(data, old, want - old)?.fill(0);
+        mem::zero(data, old, want - old)?;
     }
     mm.brk = want;
     Ok(want as i64)
@@ -217,7 +254,7 @@ fn mremap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
     let (data, process) = data_and_process(caller);
     let keep = old_len.min(new_len) as usize;
     data.copy_within(old as usize..old as usize + keep, new as usize);
-    data[new as usize + keep..(new + new_len) as usize].fill(0);
+    mem::zero(data, new + keep as u64, new_len - keep as u64)?;
     process.group.mm.lock().unwrap().space.release(old, old_len);
     Ok(new as i64)
 }
@@ -444,6 +481,13 @@ impl Process {
                 Ok(0)
             }
             nr::EXIT | nr::EXIT_GROUP => Ok(self.exit(a as i32 & 0xff)),
+            nr::WASM_ENV_MISSED_TARGET if ub == 0 => {
+                // In a library loaded as its own module: record it there.
+                if let Some(lib) = self.group.libraries.at(ua) {
+                    crate::translate::record_missed_target(&lib.wasm, &lib.path.display().to_string(), ua - lib.base);
+                }
+                Ok(0)
+            }
             nr::WASM_ENV_MISSED_TARGET => {
                 crate::translate::record_missed_target(&self.module, &mem::cstr(data, ub)?, uc);
                 Ok(0)
@@ -588,7 +632,9 @@ impl Process {
                 Ok(0)
             }
             nr::PRLIMIT64 => {
-                if c != 0 {
+                // prlimit64(pid, resource, new, old): the current limits go to
+                // `old`; new limits are accepted and ignored.
+                if d != 0 {
                     const RLIMIT_STACK: i64 = 3;
                     const RLIMIT_NOFILE: i64 = 7;
                     let (cur, max) = match b {
@@ -596,8 +642,8 @@ impl Process {
                         RLIMIT_NOFILE => (1024, 1024),
                         _ => (u64::MAX, u64::MAX),
                     };
-                    mem::write_u64(data, uc, cur)?;
-                    mem::write_u64(data, uc + 8, max)?;
+                    mem::write_u64(data, d as u64, cur)?;
+                    mem::write_u64(data, d as u64 + 8, max)?;
                 }
                 Ok(0)
             }
@@ -770,6 +816,7 @@ impl Process {
             module: self.module.clone(),
             clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid as u64 } else { 0 },
             started: None,
+            main: None,
         };
         crate::thread::spawn(thread, frame as u64)?;
         Ok(tid as i64)

@@ -59,6 +59,34 @@ pub fn iovecs(data: &[u8], addr: u64, count: u64) -> SysResult<Vec<(u64, u64)>> 
         .collect()
 }
 
+/// Zeroes [addr, addr + len) of guest memory without touching it where it
+/// can: whole pages are handed back to the host (they read as zero again,
+/// and take no memory until used), the partial pages at the ends are
+/// cleared. Only for anonymous memory (the mmap region and the break), not
+/// the guest image, whose pages would read back as the file's.
+pub fn zero(data: &mut [u8], addr: u64, len: u64) -> SysResult<()> {
+    let range = slice_mut(data, addr, len)?;
+    #[cfg(target_os = "linux")]
+    {
+        let page = PAGE_SIZE as usize;
+        let start = range.as_ptr() as usize;
+        let (first, last) = (start.next_multiple_of(page), (start + range.len()) / page * page);
+        if last > first {
+            // SAFETY: [first, last) lies within `range`, memory this process
+            // owns; MADV_DONTNEED on private anonymous memory makes it read
+            // as zero.
+            let r = unsafe { libc::madvise(first as *mut libc::c_void, last - first, libc::MADV_DONTNEED) };
+            if r == 0 {
+                range[..first - start].fill(0);
+                range[last - start..].fill(0);
+                return Ok(());
+            }
+        }
+    }
+    range.fill(0);
+    Ok(())
+}
+
 /// How far the program break may grow (the region between the heap base and
 /// the mmap area). Beyond it brk fails, and allocators fall back to mmap.
 pub const BRK_MAX: u64 = 64 << 20;
@@ -151,6 +179,16 @@ impl AddressSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_clears_whole_and_partial_pages() {
+        let mut data = vec![7u8; 5 * PAGE_SIZE as usize];
+        zero(&mut data, 100, 3 * PAGE_SIZE).unwrap();
+        assert!(data[..100].iter().all(|&b| b == 7), "before the range");
+        assert!(data[100..100 + 3 * PAGE_SIZE as usize].iter().all(|&b| b == 0), "the range");
+        assert!(data[100 + 3 * PAGE_SIZE as usize..].iter().all(|&b| b == 7), "after it");
+        assert_eq!(zero(&mut data, 4 * PAGE_SIZE, 2 * PAGE_SIZE), Err(EFAULT));
+    }
 
     #[test]
     fn bounds_are_checked() {
