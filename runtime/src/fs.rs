@@ -37,13 +37,27 @@ pub fn errno(e: &io::Error) -> i64 {
 #[derive(Clone)]
 pub struct Fs {
     root: PathBuf,
-    /// Current directory: a normalized absolute guest path.
-    pub cwd: String,
+    /// Current directory: a normalized absolute guest path, shared by a
+    /// process's threads (clones of an Fs share it; `copy` doesn't).
+    cwd: Arc<Mutex<String>>,
 }
 
 impl Fs {
     pub fn new(root: PathBuf) -> Self {
-        Fs { root, cwd: "/".into() }
+        Fs { root, cwd: Arc::new(Mutex::new("/".into())) }
+    }
+
+    /// An Fs with its own current directory (for a new process).
+    pub fn copy(&self) -> Self {
+        Fs { root: self.root.clone(), cwd: Arc::new(Mutex::new(self.cwd())) }
+    }
+
+    pub fn cwd(&self) -> String {
+        self.cwd.lock().unwrap().clone()
+    }
+
+    pub fn set_cwd(&self, cwd: String) {
+        *self.cwd.lock().unwrap() = cwd;
     }
 
     /// The host path for a resolved guest path.

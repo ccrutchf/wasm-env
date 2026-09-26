@@ -36,6 +36,11 @@ struct guest_state {
 	__uint128_t v[32];
 	struct dispatch_entry cache[DISPATCH_CACHE];
 	uint64_t modules_seen; // see dispatch
+	// A signal to deliver when the current syscall returns, as the runtime
+	// fills it in (runtime/src/syscall.rs, deliver_to_guest); sig 0: none.
+	struct signal_delivery {
+		uint64_t sig, handler, flags, restorer, old_mask, alt_sp, alt_flags, alt_size;
+	} signal;
 };
 _Static_assert(__builtin_offsetof(struct guest_state, f) == 256, "STATE_POINTERS");
 _Static_assert(__builtin_offsetof(struct guest_state, fpsr) == 260, "STATE_POINTERS");
@@ -43,6 +48,7 @@ _Static_assert(__builtin_offsetof(struct guest_state, tp) == 264, "STATE_POINTER
 _Static_assert(__builtin_offsetof(struct guest_state, monitor) == 272, "STATE_POINTERS");
 _Static_assert(__builtin_offsetof(struct guest_state, v) == 288, "STATE_POINTERS");
 _Static_assert(__builtin_offsetof(struct guest_state, cache) == 800, "STATE_POINTERS");
+_Static_assert(__builtin_offsetof(struct guest_state, signal) == 66344, "SIGNAL_DELIVERY in syscall.rs");
 static _Thread_local struct guest_state guest;
 void __wasm_env_set_state(struct guest_state *);
 #define R guest.r
@@ -248,6 +254,15 @@ static block_fn lookup(const uint64_t *addrs, void *const *fns, uint64_t count, 
 	return 0;
 }
 
+// Signal handlers without a restorer return to SIGRETURN_PC, which dispatch
+// takes as rt_sigreturn (see "Signal handlers" below).
+#define SIGRETURN_PC 0xfffffffffffff000ull
+enum { SYS_rt_sigreturn = 139 };
+static void sigreturn(void);
+// Where the guest continues after a syscall, when not after its svc (see
+// __wasm_env_svc_at).
+static _Thread_local uint64_t svc_redirect;
+
 // Find `pc`'s region function and tail-call it (a WebAssembly return_call,
 // so the host stack doesn't grow): from the cache, else by binary search of
 // the program's region table or a library module's. An address in no
@@ -255,6 +270,10 @@ static block_fn lookup(const uint64_t *addrs, void *const *fns, uint64_t count, 
 void dispatch(long pc)
 {
 	uint64_t target = (uint64_t)pc;
+	if (target == SIGRETURN_PC) {
+		sigreturn();
+		__attribute__((musttail)) return dispatch((long)svc_redirect);
+	}
 	wasm_env_recent[wasm_env_recent_count++ % RECENT] = target;
 	uint64_t region = target >> REGION_SHIFT;
 	struct dispatch_entry *e = &__wasm_env_dispatch_cache[(region ^ (region >> 12)) % DISPATCH_CACHE];
@@ -474,7 +493,7 @@ struct vfork_frame {
 #define VFORK_DEPTH 4
 static _Thread_local struct vfork_frame vfork_frames[VFORK_DEPTH];
 static _Thread_local int vfork_depth;
-static _Thread_local uint64_t svc_next, svc_redirect;
+static _Thread_local uint64_t svc_next;
 
 enum { SYS_uname = 160, SYS_exit = 93, SYS_execve = 221, CLONE_VM = 0x100, CLONE_VFORK = 0x4000 };
 
@@ -581,9 +600,15 @@ void __wasm_env_fork_start(const struct vfork_frame *f)
 	dispatch((long)f->resume);
 }
 
+
+
 void __wasm_env_svc(void)
 {
 	long nr = (long)R[8];
+	if (nr == SYS_rt_sigreturn) {
+		sigreturn();
+		return;
+	}
 	if (nr == SYS_clone) {
 		if (R[0] & CLONE_THREAD)
 			thread_clone();
@@ -619,6 +644,106 @@ void __wasm_env_svc(void)
 	}
 }
 
+// Signal handlers (docs/abi.md, "Signals"). When a syscall returns with a
+// signal to deliver (guest.signal, which the runtime fills in), the support
+// code does what the arm64 kernel does: it pushes a struct rt_sigframe on
+// the guest stack (or the alternate stack, for SA_ONSTACK), holding the
+// siginfo and a ucontext with the interrupted state (registers, flags, the
+// FP/SIMD record, the old signal mask), and enters the handler with x0 =
+// the signal, x1 = &siginfo, x2 = &ucontext and x30 = the restorer
+// (SA_RESTORER), which calls rt_sigreturn; that restores the state from
+// the frame and resumes where the signal interrupted.
+enum { SYS_rt_sigprocmask = 135, SA_ONSTACK = 0x08000000, SA_RESTORER = 0x04000000, SS_DISABLE = 2 };
+#define FPSIMD_MAGIC 0x46508001u
+
+struct sigframe {
+	struct {
+		int32_t signo, errno_, code, pad;
+		uint8_t rest[112];
+	} info;
+	struct {
+		uint64_t flags, link;
+		uint64_t ss_sp;
+		int32_t ss_flags, ss_pad;
+		uint64_t ss_size;
+		uint64_t sigmask;
+		uint8_t unused[120];
+		uint64_t pad; // mcontext is 16-byte aligned
+		struct {
+			uint64_t fault_address, regs[31], sp, pc, pstate;
+			uint64_t pad;
+			// __reserved[4096]: an fpsimd_context record, then a terminator.
+			struct {
+				uint32_t magic, size, fpsr, fpcr;
+				__uint128_t vregs[32];
+			} fpsimd;
+			uint32_t end_magic, end_size;
+			uint8_t reserved_rest[4096 - 528 - 8];
+		} mcontext;
+	} uc;
+};
+_Static_assert(__builtin_offsetof(struct sigframe, uc) == 128, "rt_sigframe");
+_Static_assert(__builtin_offsetof(struct sigframe, uc.mcontext) == 128 + 176, "ucontext");
+_Static_assert(__builtin_offsetof(struct sigframe, uc.mcontext.fpsimd) == 128 + 176 + 288, "sigcontext");
+_Static_assert(sizeof(struct sigframe) == 128 + 176 + 288 + 4096, "rt_sigframe size");
+
+// Enters the handler for guest.signal; `resume` is where the interrupted
+// code goes on (after the syscall).
+static void enter_handler(uint64_t resume)
+{
+	struct signal_delivery d = guest.signal;
+	guest.signal.sig = 0;
+	uint64_t sp = R[31];
+	int on_alt = d.alt_size && sp > d.alt_sp && sp <= d.alt_sp + d.alt_size;
+	if ((d.flags & SA_ONSTACK) && !(d.alt_flags & SS_DISABLE) && d.alt_size && !on_alt)
+		sp = d.alt_sp + d.alt_size;
+	sp = (sp - sizeof(struct sigframe)) & ~(uint64_t)15;
+	struct sigframe *f = (struct sigframe *)(uintptr_t)sp;
+	__builtin_memset(f, 0, sizeof *f);
+	f->info.signo = (int32_t)d.sig; // si_code SI_USER (0)
+	f->uc.ss_sp = d.alt_sp;
+	f->uc.ss_flags = (int32_t)d.alt_flags;
+	f->uc.ss_size = d.alt_size;
+	f->uc.sigmask = d.old_mask;
+	__builtin_memcpy(f->uc.mcontext.regs, R, sizeof f->uc.mcontext.regs);
+	f->uc.mcontext.sp = R[31];
+	f->uc.mcontext.pc = resume;
+	f->uc.mcontext.pstate = (uint64_t)F[0] << 31 | (uint64_t)F[1] << 30 | (uint64_t)F[2] << 29 | (uint64_t)F[3] << 28;
+	f->uc.mcontext.fpsimd.magic = FPSIMD_MAGIC;
+	f->uc.mcontext.fpsimd.size = sizeof f->uc.mcontext.fpsimd;
+	f->uc.mcontext.fpsimd.fpsr = guest.fpsr;
+	__builtin_memcpy(f->uc.mcontext.fpsimd.vregs, V, sizeof f->uc.mcontext.fpsimd.vregs);
+	R[0] = d.sig;
+	R[1] = (uint64_t)(uintptr_t)&f->info;
+	R[2] = (uint64_t)(uintptr_t)&f->uc;
+	R[29] = sp;
+	// Without SA_RESTORER the kernel returns through its vDSO trampoline (glibc
+	// relies on it); here, through an address dispatch takes as rt_sigreturn.
+	R[30] = (d.flags & SA_RESTORER) ? d.restorer : SIGRETURN_PC;
+	R[31] = sp;
+	svc_redirect = d.handler;
+}
+
+// rt_sigreturn: the handler returned (through the restorer) with SP at the
+// frame. Restore what it saved, including the signal mask.
+static void sigreturn(void)
+{
+	const struct sigframe *f = (const struct sigframe *)(uintptr_t)R[31];
+	__wasm_env_host_syscall(SYS_rt_sigprocmask, 2 /* SIG_SETMASK */, (long)&f->uc.sigmask, 0, 8, 0, 0);
+	__builtin_memcpy(R, f->uc.mcontext.regs, sizeof f->uc.mcontext.regs);
+	R[31] = f->uc.mcontext.sp;
+	uint64_t pstate = f->uc.mcontext.pstate;
+	F[0] = pstate >> 31 & 1;
+	F[1] = pstate >> 30 & 1;
+	F[2] = pstate >> 29 & 1;
+	F[3] = pstate >> 28 & 1;
+	if (f->uc.mcontext.fpsimd.magic == FPSIMD_MAGIC) {
+		guest.fpsr = f->uc.mcontext.fpsimd.fpsr;
+		__builtin_memcpy(V, f->uc.mcontext.fpsimd.vregs, sizeof V);
+	}
+	svc_redirect = f->uc.mcontext.pc;
+}
+
 // The lifted code's SVC: `next` is the address after it. Returns where to
 // continue instead, or 0 to go on (see vfork_clone).
 int64_t __wasm_env_svc_at(int64_t next)
@@ -626,6 +751,8 @@ int64_t __wasm_env_svc_at(int64_t next)
 	svc_next = (uint64_t)next;
 	svc_redirect = 0;
 	__wasm_env_svc();
+	if (guest.signal.sig)
+		enter_handler(svc_redirect ? svc_redirect : svc_next);
 	return (int64_t)svc_redirect;
 }
 

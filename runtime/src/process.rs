@@ -47,13 +47,54 @@ pub struct Inherit {
     /// ignored signals stay ignored.
     pub ignored: u64,
     pub creds: Creds,
+    /// Blocked signals (kept across exec, as on Linux).
+    pub sigmask: u64,
 }
 
 impl Inherit {
     pub fn initial() -> Self {
-        Inherit { fds: FdTable::with_stdio(), cwd: "/".into(), umask: 0o022, ignored: 0, creds: Creds::default() }
+        Inherit { fds: FdTable::with_stdio(), cwd: "/".into(), umask: 0o022, ignored: 0, creds: Creds::default(), sigmask: 0 }
     }
 }
+/// A process's signal dispositions: the raw `struct k_sigaction` (handler,
+/// flags, restorer, mask) set for each signal. A handle, shared by the
+/// process's threads (`share`); a vfork child or forked process gets its own
+/// copy (`copy`).
+pub struct SigActions(Arc<std::sync::Mutex<Vec<[u8; 32]>>>);
+
+impl SigActions {
+    pub fn new(actions: Vec<[u8; 32]>) -> Self {
+        SigActions(Arc::new(std::sync::Mutex::new(actions)))
+    }
+    pub fn share(&self) -> Self {
+        SigActions(self.0.clone())
+    }
+    pub fn copy(&self) -> Self {
+        SigActions::new(self.0.lock().unwrap().clone())
+    }
+    pub fn get(&self, sig: usize) -> [u8; 32] {
+        self.0.lock().unwrap().get(sig).copied().unwrap_or([0; 32])
+    }
+    pub fn set(&self, sig: usize, action: [u8; 32]) {
+        if let Some(a) = self.0.lock().unwrap().get_mut(sig) {
+            *a = action;
+        }
+    }
+}
+
+/// A thread's signal state: which signals it blocks (a Linux sigset: bit
+/// N-1 for signal N), its alternate signal stack, and a signal to deliver
+/// when the current syscall returns (docs/abi.md, "Signals").
+#[derive(Clone, Default)]
+pub struct Signals {
+    pub mask: u64,
+    /// sigaltstack: (ss_sp, ss_flags, ss_size); SS_DISABLE when unset.
+    pub altstack: (u64, u32, u64),
+    pub deliver: Option<i32>,
+    /// During rt_sigsuspend: the mask to restore afterwards.
+    pub suspended: Option<u64>,
+}
+
 
 /// A process's user and group ids (real, effective, saved) and
 /// supplementary groups. Everything starts as root. These are numbers the
@@ -71,10 +112,11 @@ pub struct Creds {
 pub struct VforkFrame {
     pub parent_pid: i32,
     pub fds: FdTable,
-    pub cwd: String,
+    pub fs: Fs,
     pub umask: u32,
-    pub sigactions: Vec<[u8; 32]>,
+    pub sigactions: SigActions,
     pub creds: Creds,
+    pub sigmask: u64,
 }
 
 /// Something a syscall asks the dispatcher to do instead of returning.
@@ -94,10 +136,11 @@ pub enum Mem {
     Local(Memory),
     Shared(SharedMemory),
 }
-
 /// Per-thread state, owned by the thread's wasmtime store. What the
-/// threads of a process share is in `group`, and `fds` is a shared table.
-/// The working directory, umask and signal dispositions are per thread (a
+/// threads of a process share is in `group`, or behind shared handles
+/// (`fds`, `fs`'s working directory, `sigactions`); the umask, signal mask
+/// and alternate signal stack are per thread (a new thread starts with its
+/// creator's).
 /// new thread starts with its creator's).
 pub struct Process {
     pub kernel: Arc<Kernel>,
@@ -112,8 +155,9 @@ pub struct Process {
     /// The raw `struct k_sigaction` last set for each signal. No handler
     /// is ever run yet; this records dispositions (SIG_IGN) and reports
     /// them back to the program.
-    pub sigactions: Vec<[u8; 32]>,
+    pub sigactions: SigActions,
     pub creds: Creds,
+    pub signals: Signals,
     pub vfork: Vec<VforkFrame>,
     pub pending: Option<Pending>,
     pub trace: bool,
@@ -133,7 +177,7 @@ pub struct Process {
 
 impl Process {
     pub fn handler(&self, sig: usize) -> u64 {
-        self.sigactions.get(sig).map_or(0, |a| u64::from_le_bytes(a[..8].try_into().unwrap()))
+        u64::from_le_bytes(self.sigactions.get(sig)[..8].try_into().unwrap())
     }
 
     /// What a signal would do to this process: None if it's ignored
@@ -151,7 +195,7 @@ impl Process {
         let fds = self.fds.copy();
         fds.close_on_exec();
         let ignored = (1..NSIG).filter(|&s| self.handler(s) == SIG_IGN).fold(0u64, |m, s| m | 1 << s);
-        Inherit { fds, cwd: self.fs.cwd.clone(), umask: self.umask, ignored, creds: self.creds.clone() }
+        Inherit { fds, cwd: self.fs.cwd(), umask: self.umask, ignored, creds: self.creds.clone(), sigmask: self.signals.mask }
     }
 }
 
@@ -252,10 +296,10 @@ pub fn load_module(engine: &Engine, host: &std::path::Path) -> Result<Module> {
     // Best effort: a cache that can't be written just means compiling again.
     let _ = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
-        let tmp = dir.join(format!("{key:016x}.{}.tmp", std::process::id()));
+        let tmp = dir.join(format!("{key:016x}.{}.tmp", crate::translate::unique()));
         std::fs::write(&tmp, module.serialize().map_err(std::io::Error::other)?)?;
         std::fs::rename(&tmp, &entry)?;
-        let tmp = dir.join(format!("{key:016x}.{}.stamp.tmp", std::process::id()));
+        let tmp = dir.join(format!("{key:016x}.{}.stamp.tmp", crate::translate::unique()));
         std::fs::write(&tmp, &stamp)?;
         std::fs::rename(&tmp, &stamp_file)
     })();
@@ -307,7 +351,7 @@ pub fn shared_memory_type(module: &Module) -> Option<MemoryType> {
 pub fn resolve_exec(fs: &Fs, path: &str, mut argv: Vec<Vec<u8>>, env: Vec<Vec<u8>>, trace: bool) -> SysResult<ExecImage> {
     let mut path = path.to_string();
     for _ in 0..4 {
-        let guest = fs.resolve(&fs.cwd, &path, true)?;
+        let guest = fs.resolve(&fs.cwd(), &path, true)?;
         let host = fs.host(&guest);
         let meta = std::fs::metadata(&host).map_err(|e| crate::fs::errno(&e))?;
         if !meta.is_file() {
@@ -444,8 +488,8 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
             action[..8].copy_from_slice(&SIG_IGN.to_le_bytes());
         }
     }
-    let mut fs = Fs::new(kernel.root.clone());
-    fs.cwd = inherit.cwd;
+    let fs = Fs::new(kernel.root.clone());
+    fs.set_cwd(inherit.cwd);
     let group = Group::new();
     let process = Process {
         kernel: kernel.clone(),
@@ -457,7 +501,8 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
         fs,
         umask: inherit.umask,
         creds: inherit.creds,
-        sigactions,
+        signals: Signals { mask: inherit.sigmask, altstack: (0, 2, 0), deliver: None, suspended: None },
+        sigactions: SigActions::new(sigactions),
         vfork: Vec::new(),
         pending: None,
         trace: kernel.trace,

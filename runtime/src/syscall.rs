@@ -11,7 +11,7 @@ use crate::abi::{self, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLO
 use crate::fs::{self, DevPath, Device, Fd, Open};
 use crate::kernel::Termination;
 use crate::memory::{self as mem, SysResult, page_align};
-use crate::process::{self, NSIG, Pending, Process, Unwind, VforkFrame};
+use crate::process::{self, NSIG, Pending, Process, Signals, Unwind, VforkFrame};
 
 /// Entry point for every syscall the program makes.
 #[allow(clippy::too_many_arguments)]
@@ -26,7 +26,7 @@ pub fn syscall(
     f: i64,
 ) -> wasmtime::Result<i64> {
     let args = [a, b, c, d, e, f];
-    deliver_signal(caller.data_mut())?;
+    deliver_signal(caller.data_mut(), false)?;
     let result = match n {
         nr::MMAP => mmap(&mut caller, &args),
         nr::MREMAP => mremap(&mut caller, &args),
@@ -55,25 +55,88 @@ pub fn syscall(
     if process.pending.is_some() {
         return Err(wasmtime::Error::new(Unwind));
     }
-    deliver_signal(process)?;
+    deliver_signal(process, true)?;
+    if process.signals.deliver.is_none()
+        && let Some(old) = process.signals.suspended.take()
+    {
+        // sigsuspend ended without a handler to run: back to the old mask.
+        process.signals.mask = old;
+    }
+    if let Some(sig) = caller.data_mut().signals.deliver.take() {
+        // The support code sees it when this call returns.
+        let _ = deliver_to_guest(&mut caller, sig);
+    }
     Ok(ret)
 }
 
-/// Acts on a signal sent to this process: its default action ends the
-/// process (unless the signal is ignored). Also stops this thread if
-/// another has ended the process.
-fn deliver_signal(p: &mut Process) -> wasmtime::Result<()> {
+/// Acts on the signals sent to this process that this thread doesn't
+/// block: a default action that ends the process ends it; ignored ones are
+/// dropped. At the end of a syscall (`at_exit`), a signal with a handler is
+/// set to be delivered (see Signals::deliver and deliver_to_guest); at its
+/// start, it's left for then. Also stops this thread if another has ended
+/// the process.
+fn deliver_signal(p: &mut Process, at_exit: bool) -> wasmtime::Result<()> {
     if p.group.ended() && p.vfork.is_empty() {
         p.pending = Some(Pending::GroupEnded);
         return Err(wasmtime::Error::new(Unwind));
     }
-    if let Some(sig) = p.kernel.take_signal(p.pid)
-        && let Some(how) = p.signal_effect(sig) {
+    while let Some(sig) = p.kernel.peek_signal(p.pid, p.signals.mask) {
+        let handler = p.handler(sig as usize);
+        let handled = handler > process::SIG_IGN && sig != 9;
+        if handled && p.main.is_some() {
+            // Handlers run in translated programs (the support code builds
+            // the signal frame).
+            if at_exit && p.signals.deliver.is_none() {
+                p.kernel.take_signal(p.pid, p.signals.mask);
+                p.signals.deliver = Some(sig);
+            }
+            return Ok(());
+        }
+        p.kernel.take_signal(p.pid, p.signals.mask);
+        if let Some(how) = p.signal_effect(sig) {
             p.pending = Some(Pending::Terminate(how));
             return Err(wasmtime::Error::new(Unwind));
         }
+    }
     Ok(())
 }
+
+/// Hands a signal to be delivered to the translated program's support code:
+/// the handler's details go in this thread's guest-state block (support/
+/// runtime.c, `struct signal_delivery`), which builds the signal frame on
+/// the guest's stack and enters the handler when the syscall returns. The
+/// thread then blocks what the handler's sa_mask says (and the signal
+/// itself, without SA_NODEFER); SA_RESETHAND restores the default action.
+fn deliver_to_guest(caller: &mut Caller<'_, Process>, sig: i32) -> SysResult<()> {
+    const SA_NODEFER: u64 = 0x40000000;
+    const SA_RESETHAND: u64 = 0x80000000;
+    let main = caller.data().main.clone().ok_or(ENOSYS)?;
+    let state = match main.instance.get_global(&mut *caller, "__wasm_env_state").map(|g| g.get(&mut *caller)) {
+        Some(wasmtime::Val::I64(v)) => v as u64,
+        _ => return Err(ENOSYS),
+    };
+    let (data, p) = data_and_process(caller);
+    let action = p.sigactions.get(sig as usize);
+    let word = |k: usize| u64::from_le_bytes(action[8 * k..8 * k + 8].try_into().unwrap());
+    let (handler, flags, restorer, sa_mask) = (word(0), word(1), word(2), word(3));
+    let (alt_sp, alt_flags, alt_size) = p.signals.altstack;
+    // After sigsuspend, the handler returns to the mask from before it.
+    let old_mask = p.signals.suspended.take().unwrap_or(p.signals.mask);
+    let record = [sig as u64, handler, flags, restorer, old_mask, alt_sp, alt_flags as u64, alt_size];
+    for (k, v) in record.iter().enumerate() {
+        mem::write_u64(data, state + SIGNAL_DELIVERY + 8 * k as u64, *v)?;
+    }
+    p.signals.mask |= sa_mask | if flags & SA_NODEFER == 0 { 1 << (sig - 1) } else { 0 };
+    p.signals.mask &= !((1 << 8) | (1 << 18)); // SIGKILL, SIGSTOP
+    if flags & SA_RESETHAND != 0 {
+        p.sigactions.set(sig as usize, [0; 32]);
+    }
+    Ok(())
+}
+
+/// Where `struct signal_delivery` is in `struct guest_state` (support/
+/// runtime.c, which checks it).
+const SIGNAL_DELIVERY: u64 = 66344;
 
 /// A shared memory's bytes. Other threads of the process use them at the
 /// same time, as the guest's own threads do: the runtime only touches what a
@@ -361,7 +424,7 @@ impl Process {
                 std::fs::metadata(self.fs.host(&guest)).map(|_| 0).map_err(|e| fs::errno(&e))
             }
             nr::GETCWD => {
-                let mut cwd = self.fs.cwd.clone().into_bytes();
+                let mut cwd = self.fs.cwd().into_bytes();
                 cwd.push(0);
                 if (cwd.len() as u64) > ub {
                     return Err(ERANGE);
@@ -370,18 +433,18 @@ impl Process {
             }
             nr::CHDIR => {
                 let path = mem::cstr(data, ua)?;
-                let guest = self.fs.resolve(&self.fs.cwd.clone(), &path, true)?;
+                let guest = self.fs.resolve(&self.fs.cwd(), &path, true)?;
                 let meta = std::fs::metadata(self.fs.host(&guest)).map_err(|e| fs::errno(&e))?;
                 if !meta.is_dir() {
                     return Err(ENOTDIR);
                 }
-                self.fs.cwd = guest;
+                self.fs.set_cwd(guest);
                 Ok(0)
             }
             nr::FCHDIR => {
                 let fd = self.fds.get(a)?;
                 let Open::Dir { path, .. } = &*fd.open.lock().unwrap() else { return Err(ENOTDIR) };
-                self.fs.cwd = path.clone();
+                self.fs.set_cwd(path.clone());
                 Ok(0)
             }
             nr::FCNTL if matches!(b, 5 | 6 | 7 | 36 | 37 | 38) => self.lock(data, a, b, uc),
@@ -581,6 +644,13 @@ impl Process {
             }
             nr::KILL => self.kernel.kill(self.pid, a as i32, b as i32).map(|_| 0),
             nr::TGKILL => self.kernel.kill(self.pid, a as i32, c as i32).map(|_| 0),
+            // tkill(tid, sig): signals are per process here; a thread of this
+            // one (raise() in musl) means this process, else the process with
+            // that id.
+            nr::TKILL => {
+                let target = if a as i32 == self.tid || a as i32 == self.pid { self.pid } else { a as i32 };
+                self.kernel.kill(self.pid, target, b as i32).map(|_| 0)
+            }
             nr::CLONE if a & CLONE_THREAD != 0 => self.clone_thread(data, a, b, c, d, e, g),
             nr::CLONE => self.clone_vfork(a, b),
             nr::WASM_ENV_THREAD_STARTED => {
@@ -608,7 +678,7 @@ impl Process {
             }
             nr::WAIT4 => {
                 const WNOHANG: i64 = 1;
-                match self.kernel.wait(self.pid, a as i32, c & WNOHANG != 0)? {
+                match self.kernel.wait(self.pid, a as i32, c & WNOHANG != 0, self.interrupting())? {
                     None => Ok(0),
                     Some((child, how)) => {
                         if b != 0 {
@@ -644,25 +714,98 @@ impl Process {
             nr::GETPGID => self.kernel.pgid(if a == 0 { self.pid } else { a as i32 }).map(i64::from),
             nr::SETSID => self.kernel.setsid(self.pid).map(i64::from),
             nr::GETSID => self.kernel.sid(if a == 0 { self.pid } else { a as i32 }).map(i64::from),
-            nr::SET_ROBUST_LIST | nr::SIGALTSTACK | nr::MPROTECT | nr::MADVISE => Ok(0),
+            nr::SET_ROBUST_LIST | nr::MPROTECT | nr::MADVISE => Ok(0),
             nr::RT_SIGACTION => {
                 // Handlers are recorded and reported back, but not yet run;
                 // SIG_IGN takes effect (see Process::signal_effect).
                 let sig = usize::try_from(a).ok().filter(|s| (1..NSIG).contains(s)).ok_or(EINVAL)?;
                 if c != 0 {
-                    mem::write(data, uc, &self.sigactions[sig])?;
+                    mem::write(data, uc, &self.sigactions.get(sig))?;
                 }
                 if b != 0 {
                     if sig == 9 || sig == 19 {
                         return Err(EINVAL); // SIGKILL and SIGSTOP can't be changed
                     }
-                    self.sigactions[sig].copy_from_slice(mem::slice(data, ub, 32)?);
+                    self.sigactions.set(sig, mem::slice(data, ub, 32)?.try_into().unwrap());
                 }
                 Ok(0)
             }
             nr::RT_SIGPROCMASK => {
+                // rt_sigprocmask(how, set, oldset, size): SIGKILL and SIGSTOP
+                // can't be blocked.
+                const SIG_BLOCK: i64 = 0;
+                const SIG_UNBLOCK: i64 = 1;
+                const SIG_SETMASK: i64 = 2;
                 if c != 0 {
-                    mem::slice_mut(data, uc, (d as u64).min(128))?.fill(0);
+                    mem::write_u64(data, uc, self.signals.mask)?;
+                }
+                if b != 0 {
+                    let set = mem::read_u64(data, ub)?;
+                    self.signals.mask = match a {
+                        SIG_BLOCK => self.signals.mask | set,
+                        SIG_UNBLOCK => self.signals.mask & !set,
+                        SIG_SETMASK => set,
+                        _ => return Err(EINVAL),
+                    } & !((1 << 8) | (1 << 18));
+                }
+                Ok(0)
+            }
+            nr::SETITIMER | nr::GETITIMER => {
+                // struct itimerval { interval, value }, each { sec, usec }.
+                // Only ITIMER_REAL (SIGALRM, in real time).
+                if a != 0 {
+                    return Err(EINVAL);
+                }
+                let tv = |d: Duration| [d.as_secs(), d.subsec_micros() as u64].map(u64::to_le_bytes).concat();
+                let read_tv = |data: &[u8], at: u64| -> SysResult<Duration> {
+                    let (s, us) = (mem::read_u64(data, at)?, mem::read_u64(data, at + 8)?);
+                    Ok(Duration::from_secs(s) + Duration::from_micros(us))
+                };
+                let (left, interval) = if n == nr::GETITIMER {
+                    self.kernel.timer(self.pid)
+                } else if ub != 0 {
+                    let (interval, value) = (read_tv(data, ub)?, read_tv(data, ub + 16)?);
+                    self.kernel.set_timer(self.pid, value, interval)
+                } else {
+                    self.kernel.timer(self.pid)
+                };
+                let out = if n == nr::GETITIMER { ub } else { uc };
+                if out != 0 {
+                    mem::write(data, out, &[tv(interval), tv(left)].concat())?;
+                }
+                Ok(0)
+            }
+            // Programs built with the toolchain can't run handlers, which is what
+            // sigsuspend waits for: they fall back to other ways of waiting.
+            nr::RT_SIGSUSPEND if self.main.is_none() => Err(ENOSYS),
+            nr::RT_SIGSUSPEND => {
+                // Wait, with the given mask, for a signal that does something.
+                // The old mask is restored once it's delivered (the handler's
+                // frame saves it; see deliver_to_guest).
+                let new = mem::read_u64(data, ua)? & !((1 << 8) | (1 << 18));
+                self.signals.suspended = Some(std::mem::replace(&mut self.signals.mask, new));
+                while !self.interrupted()() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(EINTR)
+            }
+            nr::RT_SIGPENDING => {
+                let pending = self.kernel.pending(self.pid) & self.signals.mask;
+                mem::write_u64(data, ua, pending).map(|_| 0)
+            }
+            nr::SIGALTSTACK => {
+                // sigaltstack(ss, old): stack_t { ss_sp, ss_flags (int), ss_size }.
+                if ub != 0 {
+                    let (sp, flags, size) = self.signals.altstack;
+                    mem::write_u64(data, ub, sp)?;
+                    mem::write(data, ub + 8, &(flags as i32).to_le_bytes())?;
+                    mem::write_u64(data, ub + 16, size)?;
+                }
+                if ua != 0 {
+                    let sp = mem::read_u64(data, ua)?;
+                    let flags = u32::from_le_bytes(mem::slice(data, ua + 8, 4)?.try_into().unwrap());
+                    let size = mem::read_u64(data, ua + 16)?;
+                    self.signals.altstack = (sp, flags, size);
                 }
                 Ok(0)
             }
@@ -755,7 +898,7 @@ impl Process {
         // A descriptor is an int: AT_FDCWD may arrive without sign extension.
         let dirfd = dirfd as i32 as i64;
         if dirfd == AT_FDCWD {
-            return Ok(self.fs.cwd.clone());
+            return Ok(self.fs.cwd());
         }
         let fd = self.fds.get(dirfd)?;
         match &*fd.open.lock().unwrap() {
@@ -791,13 +934,16 @@ impl Process {
         // The child gets its own descriptor table (the parent's may be shared
         // with its other threads).
         let own_fds = self.fds.copy();
+        let own_sigactions = self.sigactions.copy();
+        let own_fs = self.fs.copy();
         self.vfork.push(VforkFrame {
             parent_pid: self.pid,
             fds: std::mem::replace(&mut self.fds, own_fds),
-            cwd: self.fs.cwd.clone(),
+            fs: std::mem::replace(&mut self.fs, own_fs),
             umask: self.umask,
-            sigactions: self.sigactions.clone(),
+            sigactions: std::mem::replace(&mut self.sigactions, own_sigactions),
             creds: self.creds.clone(),
+            sigmask: self.signals.mask,
         });
         self.pid = child;
         Ok(0)
@@ -809,10 +955,11 @@ impl Process {
         let frame = self.vfork.pop().expect("in a vfork child");
         let child = std::mem::replace(&mut self.pid, frame.parent_pid);
         self.fds = frame.fds;
-        self.fs.cwd = frame.cwd;
+        self.fs = frame.fs;
         self.umask = frame.umask;
         self.sigactions = frame.sigactions;
         self.creds = frame.creds;
+        self.signals.mask = frame.sigmask;
         child
     }
 
@@ -900,8 +1047,9 @@ impl Process {
             fds: self.fds.share(),
             fs: self.fs.clone(),
             umask: self.umask,
-            sigactions: self.sigactions.clone(),
+            sigactions: self.sigactions.share(),
             creds: self.creds.clone(),
+            signals: Signals { deliver: None, suspended: None, ..self.signals.clone() },
             vfork: Vec::new(),
             pending: None,
             trace: self.trace,
@@ -923,7 +1071,7 @@ impl Process {
             if now >= deadline {
                 return Ok(());
             }
-            if self.kernel.peek_signal(self.pid).is_some() || self.group.ended() {
+            if self.kernel.peek_signal(self.pid, !self.interrupting()).is_some() || self.group.ended() {
                 return Err((EINTR, deadline - now));
             }
             std::thread::sleep((deadline - now).min(SLICE));
@@ -942,10 +1090,24 @@ impl Process {
         }
     }
 
+    /// The signals that interrupt a blocking call (with EINTR): those this
+    /// thread doesn't block and that do something (end the process, or run a
+    /// handler), not ignored ones.
+    pub(crate) fn interrupting(&self) -> u64 {
+        let mut set = 0u64;
+        for sig in 1..NSIG as i32 {
+            let handled = self.handler(sig as usize) > process::SIG_IGN && self.main.is_some();
+            if handled || process::signal_effect(sig, self.handler(sig as usize)).is_some() {
+                set |= 1 << (sig - 1);
+            }
+        }
+        set & !self.signals.mask
+    }
+
     /// Whether a blocking call should give up with EINTR.
     pub(crate) fn interrupted(&self) -> impl Fn() -> bool + use<> {
-        let (kernel, pid, group) = (self.kernel.clone(), self.pid, self.group.clone());
-        move || kernel.peek_signal(pid).is_some() || group.ended()
+        let (kernel, pid, group, interrupting) = (self.kernel.clone(), self.pid, self.group.clone(), self.interrupting());
+        move || kernel.peek_signal(pid, !interrupting).is_some() || group.ended()
     }
 
     fn read(&mut self, fd: i64, buf: &mut [u8]) -> SysResult<i64> {

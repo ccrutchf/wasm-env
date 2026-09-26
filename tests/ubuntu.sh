@@ -47,6 +47,8 @@ done
 # default outline atomics, which pick LSE by AT_HWCAP).
 "${cc[@]}" -O2 -pthread -mno-outline-atomics -o "$R/opt/tests/threads" tests/arm64/threads.c && t /opt/tests/threads
 "${cc[@]}" -O2 -pthread -o "$R/opt/tests/threads-lse" tests/arm64/threads.c && t /opt/tests/threads-lse
+# Signal handlers (frames, masks, sigsuspend, siglongjmp, EINTR, SIGCHLD).
+"${cc[@]}" -O2 -o "$R/opt/tests/signals" tests/arm64/signals.c && t /opt/tests/signals
 # Atomics (LSE) and dlopen through glibc's dynamic linker.
 "${cc[@]}" -O2 -march=armv8.1-a -o "$R/opt/tests/atomics" tests/arm64/atomics.c && t /opt/tests/atomics
 "${cc[@]}" -O2 -shared -fPIC -o "$R/usr/lib/libgreet.so" tests/arm64/libgreet.c
@@ -92,6 +94,9 @@ fi
 grep -q '^python3' "$R/etc/wasm-env/dlopen" || echo "python3* /usr/lib/python3.12/lib-dynload" >> "$R/etc/wasm-env/dlopen"
 cp tests/python/threads_demo.py "$R/root/"
 t /usr/bin/python3.12 /root/threads_demo.py
+# Python signal handlers, KeyboardInterrupt, a handler ending a blocking read, setitimer.
+cp tests/python/signals_demo.py "$R/root/"
+t /usr/bin/python3.12 -u /root/signals_demo.py
 
 # Networking, if PyPI is reachable: DNS (glibc's resolver, over the host's
 # resolv.conf), HTTPS (Ubuntu's OpenSSL with its CA certificates), and pip

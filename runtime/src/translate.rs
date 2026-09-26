@@ -29,6 +29,14 @@ use std::process::Command;
 use crate::abi::errno::*;
 use crate::memory::SysResult;
 
+/// A name for a temporary file no other writer uses: the environment's
+/// processes share one host process, so its id alone isn't unique (two
+/// guest processes may translate or compile at once).
+pub fn unique() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!("{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// A 64-bit FNV-1a hash of some bytes, for naming cache entries.
 pub fn hash(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
@@ -195,8 +203,8 @@ pub fn ensure_translated(elf: &Path, root: &Path, program: &str, trace: bool) ->
     }
     // Translate to a unique temp file, then rename, so a concurrent run
     // never sees a half-written module.
-    let tmp = dir.join(format!("{key:016x}.{}.tmp", std::process::id()));
-    let tmp_deps = dir.join(format!("{key:016x}.{}.deps.tmp", std::process::id()));
+    let tmp = dir.join(format!("{key:016x}.{}.tmp", unique()));
+    let tmp_deps = dir.join(format!("{key:016x}.{}.deps.tmp", unique()));
     let mut cmd = Command::new(&translator);
     cmd.arg("translate").arg(elf).arg(&tmp).arg("--root").arg(root).arg("--deps-out").arg(&tmp_deps);
     for lib in &dlopen {
@@ -258,7 +266,7 @@ fn run_translator(input: &Path, out: &Path, args: &[String], trace: bool) -> Sys
     if trace {
         eprintln!("[wasm-env] translating {}", input.display());
     }
-    let tmp = out.with_extension(format!("{}.tmp", std::process::id()));
+    let tmp = out.with_extension(format!("{}.tmp", unique()));
     let mut cmd = Command::new(translator());
     cmd.arg("translate").arg(input).arg(&tmp).args(args);
     // Addresses earlier runs found missing (see record_missed_target).

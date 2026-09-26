@@ -43,6 +43,9 @@ fixtures=(
 	# Threads: exclusives (the default), then LSE atomics.
 	"threads:tests/arm64/threads.c:-static -pthread"
 	"threads-lse:tests/arm64/threads.c:-static -pthread -march=armv8.1-a"
+	"signals:tests/arm64/signals.c:-static"
+	# C++ exceptions (landing pads found through .eh_frame and the LSDAs).
+	"exceptions:tests/arm64/exceptions.cc:-static -pthread"
 	# Static PIE (loaded at a chosen base, relocations applied on translate).
 	"hello-pie:tests/c/hello.c:-static-pie"
 	"control-pie:tests/arm64/control.c:-static-pie"
@@ -61,7 +64,9 @@ for f in "${fixtures[@]}"; do
 	IFS=: read -r name src flags <<<"$f"
 	if [ $# -gt 0 ] && [[ " $* " != *" $name "* ]]; then continue; fi
 	# shellcheck disable=SC2086
-	$cc -O2 $flags -o "$out/$name" "$src"
+	compiler=$cc
+	[[ $src == *.cc ]] && compiler=aarch64-unknown-linux-musl-g++
+	$compiler -O2 $flags -o "$out/$name" "$src"
 
 	set +e
 	# Give qemu the same environment wasm-env supplies by default, so only

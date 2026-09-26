@@ -296,6 +296,18 @@ fn parse_object(bytes: &[u8], base: u64) -> Result<Parsed> {
     // resolvers the dynamic linker calls, aren't typed as functions);
     // discovery keeps only those in code.
     roots.extend(file.dynamic_symbols().filter(|s| !s.is_undefined() && s.address() != 0).map(|s| base + s.address()));
+    // Landing pads (catch blocks, cleanups), which only the unwinder reaches.
+    struct FileBytes<'a>(&'a [u8], &'a [(u64, u64, u64)]);
+    impl crate::ehframe::Bytes for FileBytes<'_> {
+        fn at(&self, addr: u64, len: usize) -> Option<&[u8]> {
+            let &(va, off, _) = self.1.iter().find(|&&(va, _, sz)| addr >= va && addr + len as u64 <= va + sz)?;
+            self.0.get((off + addr - va) as usize..(off + addr - va) as usize + len)
+        }
+    }
+    if let Some(eh) = file.section_by_name(".eh_frame") {
+        let pads = crate::ehframe::landing_pads(&FileBytes(bytes, &loads), eh.address(), eh.size());
+        roots.extend(pads.into_iter().map(|p| base + p));
+    }
     // IRELATIVE relocations name IFUNC resolvers by address.
     roots.extend(relocs.iter().filter(|r| r.r_type == 1032).map(|r| base.wrapping_add(r.addend as u64)));
     functions.sort();
@@ -420,6 +432,18 @@ fn write_word(segments: &mut [Segment], addr: u64, value: u64) -> Result<()> {
     Ok(())
 }
 
+/// Decodes one instruction. Hint-space instructions the decoder doesn't know
+/// (newer ones, such as CHKFEAT from the Guarded Control Stack extension)
+/// execute as NOPs on a CPU without their feature, which is what translated
+/// code runs as, so they decode as NOP.
+fn decode(word: u32, addr: u64) -> Option<bad64::Instruction> {
+    bad64::decode(word, addr).ok().or_else(|| {
+        const HINT_MASK: u32 = 0xffff_f01f;
+        const HINT: u32 = 0xd503_201f;
+        (word & HINT_MASK == HINT).then(|| bad64::decode(HINT, addr).ok()).flatten()
+    })
+}
+
 impl Image {
     /// Loads a single statically-linked or position-independent executable.
     pub fn load(bytes: &[u8]) -> Result<Image> {
@@ -495,7 +519,7 @@ impl Image {
                 let off = (addr - seg.vaddr) as usize;
                 let Some(bytes) = seg.data.get(off..off + 4) else { break };
                 let word = u32::from_le_bytes(bytes.try_into().unwrap());
-                out.push((addr, word, bad64::decode(word, addr).ok()));
+                out.push((addr, word, decode(word, addr)));
                 addr += 4;
             }
         }

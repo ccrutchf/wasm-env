@@ -48,8 +48,9 @@ struct Entry {
     sid: i32,
     /// Set when the process has exited but hasn't been waited for.
     status: Option<Termination>,
-    /// A signal sent to the process, delivered at its next syscall.
-    signal: Option<i32>,
+    /// Signals sent to the process and not yet delivered (bit N-1: signal N),
+    /// delivered at one of its threads' next syscalls, lowest first.
+    signal: u64,
 }
 
 struct Procs {
@@ -71,6 +72,9 @@ pub struct Kernel {
     /// compiled from. wasmtime's disk cache makes the first compile in a
     /// run cheap too; this avoids even reading the file again.
     modules: Mutex<HashMap<PathBuf, (SystemTime, u64, Module)>>,
+    /// Each process's ITIMER_REAL: (generation, when it next fires, its
+    /// interval). A timer thread sends SIGALRM while its generation is current.
+    timers: Mutex<HashMap<i32, (u64, std::time::Instant, Duration)>>,
 }
 
 /// How often a blocked wait4 checks for signals.
@@ -86,6 +90,7 @@ impl Kernel {
             foreground: std::sync::atomic::AtomicI32::new(1),
             changed: Condvar::new(),
             modules: Mutex::new(HashMap::new()),
+            timers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -95,7 +100,7 @@ impl Kernel {
         let pid = p.next_pid;
         p.next_pid += 1;
         let (pgid, sid) = p.table.get(&ppid).map_or((pid, pid), |e| (e.pgid, e.sid));
-        p.table.insert(pid, Entry { ppid, pgid, sid, status: None, signal: None });
+        p.table.insert(pid, Entry { ppid, pgid, sid, status: None, signal: 0 });
         pid
     }
 
@@ -110,6 +115,7 @@ impl Kernel {
 
     /// Records that `pid` ended, and wakes anyone waiting for it.
     pub fn exit(&self, pid: i32, how: Termination) {
+        self.timers.lock().unwrap().remove(&pid);
         let mut p = self.procs.lock().unwrap();
         // Orphans: forget exited children, and let running ones clean up
         // after themselves when they exit.
@@ -118,7 +124,14 @@ impl Kernel {
             e.ppid = 0;
         }
         match p.table.get_mut(&pid) {
-            Some(e) if e.ppid != 0 => e.status = Some(how),
+            Some(e) if e.ppid != 0 => {
+                e.status = Some(how);
+                // The parent gets SIGCHLD (ignored unless it has a handler).
+                let ppid = e.ppid;
+                if let Some(parent) = p.table.get_mut(&ppid) {
+                    parent.signal |= 1 << (17 - 1);
+                }
+            }
             _ => {
                 p.table.remove(&pid);
             }
@@ -155,8 +168,9 @@ impl Kernel {
     /// wait4: waits for a child of `pid` matching `target` (Linux rules:
     /// -1 any child, >0 that pid, 0 our process group, <-1 that group).
     /// Returns None with WNOHANG if no matching child has exited yet, and
-    /// EINTR if a signal arrives for `pid` while waiting.
-    pub fn wait(&self, pid: i32, target: i32, nohang: bool) -> SysResult<Option<(i32, Termination)>> {
+    /// EINTR if a signal in `interrupting` (a sigset) arrives for `pid` while
+    /// waiting.
+    pub fn wait(&self, pid: i32, target: i32, nohang: bool, interrupting: u64) -> SysResult<Option<(i32, Termination)>> {
         let mut p = self.procs.lock().unwrap();
         let own_pgid = p.table.get(&pid).map_or(pid, |e| e.pgid);
         loop {
@@ -191,7 +205,7 @@ impl Kernel {
                 return Ok(None);
             }
             // Checked here, under the lock we already hold.
-            if p.table.get(&pid).is_some_and(|e| e.signal.is_some()) {
+            if p.table.get(&pid).is_some_and(|e| e.signal & interrupting != 0) {
                 return Err(EINTR);
             }
             p = self.changed.wait_timeout(p, SIGNAL_POLL).unwrap().0;
@@ -201,6 +215,9 @@ impl Kernel {
     /// kill: queues `sig` for the target process(es). Signal 0 only checks
     /// that the target exists.
     pub fn kill(&self, sender: i32, target: i32, sig: i32) -> SysResult<()> {
+        if !(0..=64).contains(&sig) {
+            return Err(EINVAL);
+        }
         let mut p = self.procs.lock().unwrap();
         let sender_pgid = p.table.get(&sender).map_or(sender, |e| e.pgid);
         let mut found = false;
@@ -214,7 +231,7 @@ impl Kernel {
             if hit && e.status.is_none() {
                 found = true;
                 if sig != 0 {
-                    e.signal = Some(sig);
+                    e.signal |= 1 << (sig - 1);
                 }
             }
         }
@@ -222,13 +239,73 @@ impl Kernel {
         if found { Ok(()) } else { Err(ESRCH) }
     }
 
-    /// The pending signal for `pid`, if any, without consuming it.
-    pub fn peek_signal(&self, pid: i32) -> Option<i32> {
-        self.procs.lock().unwrap().table.get(&pid).and_then(|e| e.signal)
+    /// The lowest pending signal for `pid` not in `blocked` (a Linux sigset:
+    /// bit N-1 for signal N), if any, without consuming it.
+    pub fn peek_signal(&self, pid: i32, blocked: u64) -> Option<i32> {
+        let pending = self.procs.lock().unwrap().table.get(&pid).map_or(0, |e| e.signal & !blocked);
+        (pending != 0).then(|| pending.trailing_zeros() as i32 + 1)
     }
 
-    pub fn take_signal(&self, pid: i32) -> Option<i32> {
-        self.procs.lock().unwrap().table.get_mut(&pid).and_then(|e| e.signal.take())
+    /// The signals pending for `pid` (a sigset).
+    pub fn pending(&self, pid: i32) -> u64 {
+        self.procs.lock().unwrap().table.get(&pid).map_or(0, |e| e.signal)
+    }
+
+    /// Takes the lowest pending signal for `pid` not in `blocked`.
+    pub fn take_signal(&self, pid: i32, blocked: u64) -> Option<i32> {
+        let mut p = self.procs.lock().unwrap();
+        let e = p.table.get_mut(&pid)?;
+        let pending = e.signal & !blocked;
+        let sig = (pending != 0).then(|| pending.trailing_zeros() as i32 + 1)?;
+        e.signal &= !(1 << (sig - 1));
+        Some(sig)
+    }
+
+    /// setitimer(ITIMER_REAL): SIGALRM to `pid` after `value`, then every
+    /// `interval` (if nonzero); a zero `value` disarms it. Returns what was
+    /// left of the previous one: (value, interval).
+    pub fn set_timer(self: &Arc<Self>, pid: i32, value: Duration, interval: Duration) -> (Duration, Duration) {
+        let mut timers = self.timers.lock().unwrap();
+        let now = std::time::Instant::now();
+        let old = timers.get(&pid).map_or((Duration::ZERO, Duration::ZERO), |&(_, at, iv)| (at.saturating_duration_since(now), iv));
+        let generation = timers.get(&pid).map_or(0, |t| t.0) + 1;
+        if value.is_zero() {
+            timers.remove(&pid);
+            return old;
+        }
+        timers.insert(pid, (generation, now + value, interval));
+        let kernel = self.clone();
+        std::thread::spawn(move || {
+            loop {
+                let at = match kernel.timers.lock().unwrap().get(&pid) {
+                    Some(&(g, at, _)) if g == generation => at,
+                    _ => return, // replaced or disarmed
+                };
+                std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+                let mut timers = kernel.timers.lock().unwrap();
+                let Some(t) = timers.get_mut(&pid).filter(|t| t.0 == generation) else { return };
+                if std::time::Instant::now() < t.1 {
+                    continue;
+                }
+                if t.2.is_zero() {
+                    timers.remove(&pid);
+                } else {
+                    t.1 += t.2;
+                }
+                let over = !timers.contains_key(&pid);
+                drop(timers);
+                if kernel.kill(pid, pid, 14).is_err() || over {
+                    return;
+                }
+            }
+        });
+        old
+    }
+
+    /// getitimer(ITIMER_REAL): what's left, and the interval.
+    pub fn timer(&self, pid: i32) -> (Duration, Duration) {
+        let now = std::time::Instant::now();
+        self.timers.lock().unwrap().get(&pid).map_or((Duration::ZERO, Duration::ZERO), |&(_, at, iv)| (at.saturating_duration_since(now), iv))
     }
 
     /// Loads (or reuses) a compiled library module (see modules.rs).
@@ -329,17 +406,17 @@ mod tests {
         let k = kernel();
         let parent = k.create(0);
         let child = k.create(parent);
-        assert_eq!(k.wait(parent, -1, true), Ok(None), "WNOHANG while the child runs");
+        assert_eq!(k.wait(parent, -1, true, u64::MAX), Ok(None), "WNOHANG while the child runs");
         k.exit(child, Termination::Exit(7));
-        assert_eq!(k.wait(parent, -1, false), Ok(Some((child, Termination::Exit(7)))));
-        assert_eq!(k.wait(parent, -1, true), Err(ECHILD), "reaped: no children left");
+        assert_eq!(k.wait(parent, -1, false, u64::MAX), Ok(Some((child, Termination::Exit(7)))));
+        assert_eq!(k.wait(parent, -1, true, u64::MAX), Err(ECHILD), "reaped: no children left");
     }
 
     #[test]
     fn wait_without_children_is_echild() {
         let k = kernel();
         let pid = k.create(0);
-        assert_eq!(k.wait(pid, -1, false), Err(ECHILD));
+        assert_eq!(k.wait(pid, -1, false, u64::MAX), Err(ECHILD));
     }
 
     #[test]
@@ -351,9 +428,9 @@ mod tests {
         k.setpgid(b, b).unwrap();
         k.exit(a, Termination::Exit(1));
         k.exit(b, Termination::Exit(2));
-        assert_eq!(k.wait(parent, b, false), Ok(Some((b, Termination::Exit(2)))), "specific pid");
-        assert_eq!(k.wait(parent, -b, true), Err(ECHILD), "group of b is now empty");
-        assert_eq!(k.wait(parent, 0, false), Ok(Some((a, Termination::Exit(1)))), "own group");
+        assert_eq!(k.wait(parent, b, false, u64::MAX), Ok(Some((b, Termination::Exit(2)))), "specific pid");
+        assert_eq!(k.wait(parent, -b, true, u64::MAX), Err(ECHILD), "group of b is now empty");
+        assert_eq!(k.wait(parent, 0, false, u64::MAX), Ok(Some((a, Termination::Exit(1)))), "own group");
     }
 
     #[test]
@@ -366,7 +443,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             k2.exit(child, Termination::Signal(9));
         });
-        assert_eq!(k.wait(parent, child, false), Ok(Some((child, Termination::Signal(9)))));
+        assert_eq!(k.wait(parent, child, false, u64::MAX), Ok(Some((child, Termination::Signal(9)))));
         t.join().unwrap();
     }
 
@@ -376,8 +453,8 @@ mod tests {
         let parent = k.create(0);
         let _child = k.create(parent);
         k.kill(parent, parent, 15).unwrap();
-        assert_eq!(k.wait(parent, -1, false), Err(EINTR));
-        assert_eq!(k.take_signal(parent), Some(15), "wait leaves the signal pending");
+        assert_eq!(k.wait(parent, -1, false, u64::MAX), Err(EINTR));
+        assert_eq!(k.take_signal(parent, 0), Some(15), "wait leaves the signal pending");
     }
 
     #[test]
@@ -403,12 +480,12 @@ mod tests {
         k.setpgid(c, c).unwrap();
         assert_eq!(k.kill(a, 99, 15), Err(ESRCH), "no such pid");
         assert_eq!(k.kill(a, b, 0), Ok(()), "signal 0 checks existence only");
-        assert_eq!(k.peek_signal(b), None);
+        assert_eq!(k.peek_signal(b, 0), None);
         k.kill(a, 0, 1).unwrap(); // a's group: a and b
-        assert_eq!((k.peek_signal(a), k.peek_signal(b), k.peek_signal(c)), (Some(1), Some(1), None));
+        assert_eq!((k.peek_signal(a, 0), k.peek_signal(b, 0), k.peek_signal(c, 0)), (Some(1), Some(1), None));
         k.kill(a, -c, 2).unwrap(); // group c
-        assert_eq!(k.take_signal(c), Some(2));
-        assert_eq!(k.take_signal(c), None, "taking consumes it");
+        assert_eq!(k.take_signal(c, 0), Some(2));
+        assert_eq!(k.take_signal(c, 0), None, "taking consumes it");
         k.exit(b, Termination::Exit(0));
         assert_eq!(k.kill(a, b, 0), Err(ESRCH), "exited processes can't be signalled");
     }

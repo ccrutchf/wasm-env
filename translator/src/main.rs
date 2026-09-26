@@ -14,6 +14,7 @@
 #[cfg(feature = "lift")]
 mod deps;
 mod discover;
+mod ehframe;
 mod elf;
 #[cfg(feature = "lift")]
 mod lift;

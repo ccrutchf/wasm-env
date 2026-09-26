@@ -60,10 +60,15 @@ pub mod nr {
     pub const CLOCK_GETTIME: i64 = 113;
     pub const SCHED_GETAFFINITY: i64 = 123;
     pub const KILL: i64 = 129;
+    pub const TKILL: i64 = 130;
     pub const TGKILL: i64 = 131;
     pub const SIGALTSTACK: i64 = 132;
     pub const RT_SIGACTION: i64 = 134;
     pub const RT_SIGPROCMASK: i64 = 135;
+    pub const RT_SIGPENDING: i64 = 136;
+    pub const RT_SIGSUSPEND: i64 = 133;
+    pub const GETITIMER: i64 = 102;
+    pub const SETITIMER: i64 = 103;
     pub const SETPGID: i64 = 154;
     pub const GETPGID: i64 = 155;
     pub const GETSID: i64 = 156;

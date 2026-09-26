@@ -15,7 +15,7 @@ use wasmtime::{Caller, SharedMemory, Store, Val};
 
 use crate::abi::errno::*;
 use crate::memory::{self as mem, SysResult};
-use crate::process::{self, Outcome, Process};
+use crate::process::{self, Outcome, Process, Signals};
 
 const PAGE: usize = 4096;
 
@@ -86,10 +86,11 @@ pub fn fork(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64>
         memory: None,
         group: p.group.fork(memory),
         fds: p.fds.copy(),
-        fs: p.fs.clone(),
+        fs: p.fs.copy(),
         umask: p.umask,
-        sigactions: p.sigactions.clone(),
+        sigactions: p.sigactions.copy(),
         creds: p.creds.clone(),
+        signals: Signals { deliver: None, suspended: None, ..p.signals.clone() },
         vfork: Vec::new(),
         pending: None,
         trace: p.trace,
