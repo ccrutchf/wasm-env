@@ -436,7 +436,7 @@ fn write_word(segments: &mut [Segment], addr: u64, value: u64) -> Result<()> {
 /// (newer ones, such as CHKFEAT from the Guarded Control Stack extension)
 /// execute as NOPs on a CPU without their feature, which is what translated
 /// code runs as, so they decode as NOP.
-fn decode(word: u32, addr: u64) -> Option<bad64::Instruction> {
+pub fn decode(word: u32, addr: u64) -> Option<bad64::Instruction> {
     bad64::decode(word, addr).ok().or_else(|| {
         const HINT_MASK: u32 = 0xffff_f01f;
         const HINT: u32 = 0xd503_201f;

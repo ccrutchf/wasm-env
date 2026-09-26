@@ -316,123 +316,149 @@ fn compile_jobs() -> usize {
     }
 }
 
-/// Compiles a chunked program (a data module plus several code modules) and
-/// the support code into one WebAssembly module. Each module compiles
-/// separately, in parallel, so memory stays bounded no matter how large the
-/// translated program is.
-pub fn link_chunked(tc: &Toolchain, data: &str, chunks: &[String], image_end: u64, work: &Path, library: bool) -> Result<Vec<u8>> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    std::fs::create_dir_all(work)?;
+/// A chunked program being built: a data module plus code modules (and for
+/// a program, the support code), each compiled separately and in parallel,
+/// so memory stays bounded however large the program is, then linked into
+/// one WebAssembly module. Code modules are added as the lifter produces
+/// them and written to disk right away, so a huge library's IR is never all
+/// in memory; `finish` adds the data module and support code, compiles what
+/// isn't cached and links.
+pub struct Build<'a> {
+    tc: &'a Toolchain,
+    work: PathBuf,
+    library: bool,
+    cache: Option<PathBuf>,
+    /// (source path, output object, compiler options) for every unit. With
+    /// an object cache, the object's name is a hash of everything that
+    /// determines it, so an unchanged unit (most chunks, when retranslating)
+    /// isn't rebuilt.
+    units: Vec<(PathBuf, PathBuf, String)>,
+    chunks: usize,
+}
 
-    // The data module and support code compile like any other unit; the data
-    // module is only declarations and tables, so it needs no optimization.
-    let support_c = work.join("support.c");
-    std::fs::write(&support_c, SUPPORT_C)?;
-    let data_ll = work.join("data.ll");
-    std::fs::write(&data_ll, data)?;
+impl<'a> Build<'a> {
+    pub fn new(tc: &'a Toolchain, work: &Path, library: bool) -> Result<Self> {
+        std::fs::create_dir_all(work)?;
+        let cache = object_cache();
+        if let Some(dir) = &cache {
+            std::fs::create_dir_all(dir)?;
+        }
+        Ok(Build { tc, work: work.to_path_buf(), library, cache, units: Vec::new(), chunks: 0 })
+    }
 
-    // (source path, output object, opt level) for every unit. With an object
-    // cache, the object's name is a hash of everything that determines it,
-    // so an unchanged unit (most chunks, when retranslating) isn't rebuilt.
-    let cache = object_cache();
-    let mut units: Vec<(PathBuf, PathBuf, String)> = Vec::new();
-    let mut unit = |name: &str, source: &[u8], opt: String| -> Result<()> {
-        let src = work.join(name);
+    fn unit(&mut self, name: &str, source: &[u8], opt: String) -> Result<()> {
+        let src = self.work.join(name);
         std::fs::write(&src, source)?;
-        let obj = match &cache {
+        let obj = match &self.cache {
             Some(dir) => dir.join(format!(
                 "{}.o",
-                content_key(&[source, opt.as_bytes(), WASM_FLAGS.join(" ").as_bytes(), tc.cc.as_os_str().as_encoded_bytes()])
+                content_key(&[source, opt.as_bytes(), WASM_FLAGS.join(" ").as_bytes(), self.tc.cc.as_os_str().as_encoded_bytes()])
             )),
             None => src.with_extension("o"),
         };
-        units.push((src, obj, opt));
+        self.units.push((src, obj, opt));
         Ok(())
-    };
-    // A library is position-independent code: the runtime chooses where its
-    // data and table entries go when it loads it.
-    let pic = if library { " -fPIC" } else { "" };
-    unit("data.ll", data.as_bytes(), format!("-O0{pic}"))?;
-    if !library {
-        unit("support.c", SUPPORT_C.as_bytes(), "-O2".into())?;
-    }
-    for (i, chunk) in chunks.iter().enumerate() {
-        unit(&format!("chunk{i}.ll"), chunk.as_bytes(), format!("{}{pic}", lift_opt()))?;
-    }
-    if let Some(dir) = &cache {
-        std::fs::create_dir_all(dir)?;
     }
 
-    // Compile what isn't cached, in parallel across the available cores.
-    let todo: Vec<&(PathBuf, PathBuf, String)> = units.iter().filter(|u| !u.1.exists()).collect();
-    let next = AtomicUsize::new(0);
-    let errors = std::sync::Mutex::new(Vec::<String>::new());
-    let threads = compile_jobs();
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                while let Some((src, obj, opt)) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    let is_c = src.extension().is_some_and(|e| e == "c");
-                    let tmp = obj.with_extension(format!("{}.tmp", std::process::id()));
-                    let mut cmd = Command::new(&tc.cc);
-                    cmd.args(WASM_FLAGS).args(opt.split_whitespace());
-                    if is_c {
-                        cmd.args(["-ffreestanding", "-nostdlib"]);
-                    }
-                    cmd.arg("-c").arg(src).arg("-o").arg(&tmp);
-                    // A unit that compiles pathologically slowly (LLVM's
-                    // WebAssembly backend can all but hang on vectors its SLP
-                    // vectorizer formed) is compiled again without that
-                    // vectorizer: one unit's code gets slower, never the
-                    // whole translation stuck.
-                    let compiled = run_limited(&mut cmd, compile_limit()).and_then(|done| {
-                        if !done {
-                            eprintln!(
-                                "warning: compiling {} took over {} s; again without the SLP vectorizer",
-                                src.display(),
-                                compile_limit().as_secs()
-                            );
-                            run(cmd.arg("-fno-slp-vectorize"))?;
-                        }
-                        Ok(())
-                    });
-                    // Compile to a temporary name, then rename: concurrent
-                    // translations never see a partial object.
-                    match compiled.and_then(|()| Ok(std::fs::rename(&tmp, obj)?)) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            let _ = std::fs::remove_file(&tmp);
-                            errors.lock().unwrap().push(e.to_string());
-                        }
-                    }
-                }
-            });
+    /// A library is position-independent code: the runtime chooses where its
+    /// data and table entries go when it loads it.
+    fn pic(&self) -> &'static str {
+        if self.library { " -fPIC" } else { "" }
+    }
+
+    /// Adds a code module.
+    pub fn chunk(&mut self, source: &str) -> Result<()> {
+        let name = format!("chunk{}.ll", self.chunks);
+        self.chunks += 1;
+        let opt = format!("{}{}", lift_opt(), self.pic());
+        self.unit(&name, source.as_bytes(), opt)
+    }
+
+    /// Adds the data module (and, for a program, the support code), then
+    /// compiles and links.
+    pub fn finish(mut self, data: &str, image_end: u64) -> Result<Vec<u8>> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // The data module and support code compile like any other unit; the
+        // data module is only declarations and tables, so it needs no
+        // optimization.
+        let pic = self.pic();
+        self.unit("data.ll", data.as_bytes(), format!("-O0{pic}"))?;
+        if !self.library {
+            self.unit("support.c", SUPPORT_C.as_bytes(), "-O2".into())?;
         }
-    });
-    let errors = errors.into_inner().unwrap();
-    if !errors.is_empty() {
-        bail!("compiling modules failed:\n{}", errors.join("\n"));
-    }
+        let (tc, work, library, units) = (self.tc, self.work.as_path(), self.library, &self.units);
 
-    if std::env::var_os("WASM_ENV_TIMINGS").is_some() {
-        eprintln!("[timing] compiled {} of {} units", todo.len(), units.len());
+        // Compile what isn't cached, in parallel across the available cores.
+        let todo: Vec<&(PathBuf, PathBuf, String)> = units.iter().filter(|u| !u.1.exists()).collect();
+        let next = AtomicUsize::new(0);
+        let errors = std::sync::Mutex::new(Vec::<String>::new());
+        let threads = compile_jobs();
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    while let Some((src, obj, opt)) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let is_c = src.extension().is_some_and(|e| e == "c");
+                        let tmp = obj.with_extension(format!("{}.tmp", std::process::id()));
+                        let mut cmd = Command::new(&tc.cc);
+                        cmd.args(WASM_FLAGS).args(opt.split_whitespace());
+                        if is_c {
+                            cmd.args(["-ffreestanding", "-nostdlib"]);
+                        }
+                        cmd.arg("-c").arg(src).arg("-o").arg(&tmp);
+                        // A unit that compiles pathologically slowly (LLVM's
+                        // WebAssembly backend can all but hang on vectors its SLP
+                        // vectorizer formed) is compiled again without that
+                        // vectorizer: one unit's code gets slower, never the
+                        // whole translation stuck.
+                        let compiled = run_limited(&mut cmd, compile_limit()).and_then(|done| {
+                            if !done {
+                                eprintln!(
+                                    "warning: compiling {} took over {} s; again without the SLP vectorizer",
+                                    src.display(),
+                                    compile_limit().as_secs()
+                                );
+                                run(cmd.arg("-fno-slp-vectorize"))?;
+                            }
+                            Ok(())
+                        });
+                        // Compile to a temporary name, then rename: concurrent
+                        // translations never see a partial object.
+                        match compiled.and_then(|()| Ok(std::fs::rename(&tmp, obj)?)) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&tmp);
+                                errors.lock().unwrap().push(e.to_string());
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let errors = errors.into_inner().unwrap();
+        if !errors.is_empty() {
+            bail!("compiling modules failed:\n{}", errors.join("\n"));
+        }
+    
+        if std::env::var_os("WASM_ENV_TIMINGS").is_some() {
+            eprintln!("[timing] compiled {} of {} units", todo.len(), units.len());
+        }
+        let wasm = work.join("program.wasm");
+        let mut ld = Command::new(&tc.wasm_ld);
+        if library {
+            ld.args(["-m", "wasm64", "--experimental-pic", "-shared", "--shared-memory", "--unresolved-symbols=import-dynamic"])
+                .args(["--export=dispatch_addrs", "--export=dispatch_fns", "--export=dispatch_count"]);
+        } else {
+            ld.args(ld_args(image_end))
+                // For the runtime's report when a translated program faults.
+                .args(["--export=wasm_env_recent", "--export=wasm_env_recent_count"]);
+        }
+        for (_, obj, _) in units {
+            ld.arg(obj);
+        }
+        ld.args(tc.builtins.iter()).arg("-o").arg(&wasm);
+        run(&mut ld)?;
+        finish(std::fs::read(&wasm)?)
     }
-    let wasm = work.join("program.wasm");
-    let mut ld = Command::new(&tc.wasm_ld);
-    if library {
-        ld.args(["-m", "wasm64", "--experimental-pic", "-shared", "--shared-memory", "--unresolved-symbols=import-dynamic"])
-            .args(["--export=dispatch_addrs", "--export=dispatch_fns", "--export=dispatch_count"]);
-    } else {
-        ld.args(ld_args(image_end))
-            // For the runtime's report when a translated program faults.
-            .args(["--export=wasm_env_recent", "--export=wasm_env_recent_count"]);
-    }
-    for (_, obj, _) in &units {
-        ld.arg(obj);
-    }
-    ld.args(tc.builtins.iter()).arg("-o").arg(&wasm);
-    run(&mut ld)?;
-    finish(std::fs::read(&wasm)?)
 }
 
 /// The name of the custom section identifying a translated library (see

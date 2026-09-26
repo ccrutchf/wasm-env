@@ -44,14 +44,22 @@ pub fn syscall(
         }
     };
     let ret = result.unwrap_or_else(|e| -e);
-    let process = caller.data_mut();
-    if process.trace {
+    if caller.data().trace {
+        let process = caller.data();
         let name = match abi::name(n) {
             "?" => format!("syscall {n}"),
             known => known.to_string(),
         };
-        eprintln!("[wasm-env] pid {}: {name}({a:#x}, {b:#x}, {c:#x}) = {ret}", process.tid);
+        let tid = process.tid;
+        let path = if n == nr::OPENAT {
+            let (data, _) = data_and_process(&mut caller);
+            mem::cstr(data, b as u64).map(|p| format!(" {p:?}")).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        eprintln!("[wasm-env] pid {tid}: {name}({a:#x}, {b:#x}, {c:#x}) = {ret}{path}");
     }
+    let process = caller.data_mut();
     if process.pending.is_some() {
         return Err(wasmtime::Error::new(Unwind));
     }

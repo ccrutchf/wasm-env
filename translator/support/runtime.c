@@ -434,15 +434,17 @@ static int library_syscall(long nr)
 	case SYS_mmap: {
 		uint64_t addr = R[0], len = R[1], flags = R[3], off = R[5];
 		long fd = (long)R[4];
-		if ((flags & MAP_ANONYMOUS) && !(flags & MAP_FIXED) && addr == 0 && R[2] == 0 && pending_fd
+		if ((flags & MAP_ANONYMOUS) && !(flags & MAP_FIXED) && R[2] == 0 && pending_fd
 		    && reservation_count < RESERVATIONS) {
-			// glibc's reservation for an aligned library (see pending_fd).
+			// glibc's reservation for an aligned library (see pending_fd),
+			// at the library's base plus its first segment's address, which
+			// it passes as a hint (0 for most shared objects).
 			long k = lib_of_fd(pending_fd - 1);
 			if (k < 0)
 				return 0;
-			reserved[reservation_count].start = libs[k].base;
-			reserved[reservation_count++].end = libs[k].base + len;
-			R[0] = libs[k].base;
+			reserved[reservation_count].start = libs[k].base + addr;
+			reserved[reservation_count++].end = libs[k].base + addr + len;
+			R[0] = libs[k].base + addr;
 			return 1;
 		}
 		if (!(flags & MAP_ANONYMOUS)) {

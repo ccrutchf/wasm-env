@@ -920,132 +920,127 @@ fn flags_live_out(facts: &std::collections::HashMap<u64, FlagFacts>) -> std::col
 /// (link.rs) reuses the rest.
 const CHUNK_SPAN: u64 = 0x8000;
 
-/// A lifted region: the text of its function, the private string constants
-/// (fatal messages) its blocks use, and the other regions it tail-calls.
-struct LiftedRegion {
-    start: u64,
-    text: String,
-    strings: Vec<(String, String)>,
-    calls: std::collections::BTreeSet<u64>,
-}
-
 pub struct Lifted {
     /// The data module: guest state, the guest image, block-function
     /// declarations, and the dispatch table (block address -> function).
     pub data: String,
-    /// Code modules, each defining a subset of the block functions.
-    pub chunks: Vec<String>,
+    /// How many code modules (chunks) went to the sink.
+    pub chunks: usize,
     /// Instructions that couldn't be translated, by mnemonic.
     pub unsupported: BTreeMap<String, (usize, String)>,
     pub blocks: usize,
 }
 
-impl Lifted {
-    /// All modules joined, for `emit`/debugging (not separately compilable).
-    pub fn ir(&self) -> String {
-        let mut s = self.data.clone();
-        for c in &self.chunks {
-            s.push_str("\n; ---- chunk ----\n");
-            s.push_str(c);
-        }
-        s
-    }
+/// A block lifted: its IR body, flag liveness facts, and whether it stores
+/// to guest memory.
+struct LiftedBlock {
+    start: u64,
+    body: String,
+    facts: FlagFacts,
+    stores: bool,
 }
 
-/// Lifts every block. Control flow goes through `@dispatch` (defined in the
-/// support code as a binary search over the block table), so block
-/// functions are independent and split across modules for compilation.
-pub fn lift(image: &Image, prog: &Program, library: bool) -> Lifted {
+/// A region's blocks, lifted, with what its function needs besides.
+struct RegionIr {
+    blocks: Vec<LiftedBlock>,
+    strings: Vec<(String, String)>,
+    calls: std::collections::BTreeSet<u64>,
+    /// Blocks other regions branch to directly (entries of their regions).
+    cross: Vec<u64>,
+    /// Backward branches within the region: (target, block, end of block).
+    loop_edges: Vec<(u64, u64, u64)>,
+}
+
+/// Lifts a region's blocks (the same text every time: the lifting is
+/// deterministic). Instructions it can't lift are counted in `unsupported`.
+fn lift_region(prog: &Program, region: u64, leaders: &[u64], unsupported: &mut BTreeMap<String, (usize, String)>) -> RegionIr {
+    let mut out = RegionIr {
+        blocks: Vec::new(),
+        strings: Vec::new(),
+        calls: Default::default(),
+        cross: Vec::new(),
+        loop_edges: Vec::new(),
+    };
+    let mut tmp = 0;
+    for &start in leaders {
+        let mut b = Block::new(start, tmp, &prog.leaders);
+        let mut pc = start;
+        let mut last = "";
+        loop {
+            let Some(i) = prog.insns.get(&pc) else {
+                b.fail(pc, "undecodable instruction");
+                break;
+            };
+            last = i.op().mnem();
+            match insn::lift(&mut b, &i) {
+                Ok(true) => break,
+                // FP exception checks resolve every few instructions (one
+                // branch for all of them), and at the block's end: often
+                // enough that their values needn't stay live across a large
+                // block (clang's time grows fast with that), rarely enough
+                // not to split an unrolled kernel into tiny blocks.
+                Ok(false) => {
+                    if b.pending_fp_checks() >= 16 {
+                        b.resolve_fp_checks();
+                    }
+                }
+                Err(e) => {
+                    unsupported.entry(i.op().mnem().to_string()).or_insert_with(|| (0, format!("`{i}`: {e}"))).0 += 1;
+                    b.fail(pc, &format!("unsupported instruction `{i}`: {e}"));
+                    break;
+                }
+            }
+            pc += 4;
+            if prog.leaders.contains(&pc) || is_control(&i) {
+                b.jump(pc);
+                break;
+            }
+        }
+        tmp = b.next_tmp;
+        out.cross.extend(b.succs.iter().copied().filter(|&s| region_of(s) != region));
+        out.loop_edges.extend(b.succs.iter().filter(|&&s| region_of(s) == region && s <= start).map(|&s| (s, start, pc)));
+        // Calls and returns don't carry flags (the arm64 procedure call
+        // standard leaves NZCV undefined across them, and compiled code
+        // never reads them on entry), so they don't propagate liveness;
+        // other indirect jumps (jump tables) might, so they're assumed to.
+        let (succs, unknown) = match last {
+            "bl" | "blr" | "blraa" | "blrab" | "ret" | "retaa" | "retab" => (Vec::new(), false),
+            _ => (std::mem::take(&mut b.succs), b.indirect),
+        };
+        let body = std::mem::take(&mut b.body);
+        let stores = body.lines().any(|l| {
+            let l = l.trim_start();
+            (l.starts_with("store ") && l.ends_with(MEM)) || l.contains("atomicrmw ") || l.contains("cmpxchg ")
+        });
+        out.blocks.push(LiftedBlock {
+            start,
+            body,
+            facts: FlagFacts { read_first: b.flags_read_first, set: b.flags_set, succs, unknown },
+            stores,
+        });
+        out.strings.append(&mut b.strings);
+        out.calls.append(&mut b.calls);
+    }
+    out
+}
+
+/// Lifts the program. The code modules ("chunks") go to `sink` one at a
+/// time, so a huge library (libtorch has tens of millions of instructions)
+/// never has all its IR in memory: a first pass lifts every block for its
+/// flag liveness facts and region entries, keeping no IR; a second lifts
+/// each chunk's regions again and assembles them.
+pub fn lift(image: &Image, prog: &Program, library: bool, sink: &mut dyn FnMut(String)) -> Lifted {
     let mut unsupported = BTreeMap::new();
     let mut regions: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for &leader in &prog.leaders {
         regions.entry(region_of(leader)).or_default().push(leader);
     }
 
-    // Lift every block, keeping its text and flag liveness facts.
-    struct Lifted1 {
-        bodies: Vec<(u64, String)>,
-        strings: Vec<(String, String)>,
-        calls: std::collections::BTreeSet<u64>,
-    }
+    // Pass 1. Blocks entered other than by a branch or fall-through within
+    // their region: those discovery found, plus targets of other regions'
+    // branches.
     let mut facts: std::collections::HashMap<u64, FlagFacts> = std::collections::HashMap::new();
-    // Blocks entered other than by a branch or fall-through within their
-    // region: those discovery found, plus targets of other regions' branches.
     let mut entries = prog.entries.clone();
-    let mut lifted1 = Vec::new();
-    // Backward branches within a region: (target, block, end of block).
-    let mut loop_edges: Vec<(u64, u64, u64)> = Vec::new();
-    for (&region, leaders) in &regions {
-        let (mut tmp, mut strings, mut calls) = (0, Vec::new(), std::collections::BTreeSet::new());
-        let mut bodies = Vec::new();
-        for &start in leaders {
-            let mut b = Block::new(start, tmp, &prog.leaders);
-            let mut pc = start;
-            let mut last = "";
-            loop {
-                let Some(i) = prog.insns.get(&pc) else {
-                    b.fail(pc, "undecodable instruction");
-                    break;
-                };
-                last = i.op().mnem();
-                match insn::lift(&mut b, i) {
-                    Ok(true) => break,
-                    // FP exception checks resolve every few instructions (one
-                    // branch for all of them), and at the block's end: often
-                    // enough that their values needn't stay live across a
-                    // large block (clang's time grows fast with that), rarely
-                    // enough not to split an unrolled kernel into tiny blocks.
-                    Ok(false) => {
-                        if b.pending_fp_checks() >= 16 {
-                            b.resolve_fp_checks();
-                        }
-                    }
-                    Err(e) => {
-                        unsupported.entry(i.op().mnem().to_string()).or_insert_with(|| (0, format!("`{i}`: {e}"))).0 +=
-                            1;
-                        b.fail(pc, &format!("unsupported instruction `{i}`: {e}"));
-                        break;
-                    }
-                }
-                pc += 4;
-                if prog.leaders.contains(&pc) || is_control(i) {
-                    b.jump(pc);
-                    break;
-                }
-            }
-            tmp = b.next_tmp;
-            // Calls and returns don't carry flags (the arm64 procedure call
-            // standard leaves NZCV undefined across them, and compiled code
-            // never reads them on entry), so they don't propagate liveness;
-            // other indirect jumps (jump tables) might, so they're assumed to.
-            // Entries from other regions (see the region switch below).
-            for &s in &b.succs {
-                if region_of(s) != region {
-                    entries.insert(s);
-                }
-            }
-            loop_edges.extend(b.succs.iter().filter(|&&s| region_of(s) == region && s <= start).map(|&s| (s, start, pc)));
-            let (succs, unknown) = match last {
-                "bl" | "blr" | "blraa" | "blrab" | "ret" | "retaa" | "retab" => (Vec::new(), false),
-                _ => (std::mem::take(&mut b.succs), b.indirect),
-            };
-            facts.insert(start, FlagFacts { read_first: b.flags_read_first, set: b.flags_set, succs, unknown });
-            bodies.push((start, std::mem::take(&mut b.body)));
-            strings.append(&mut b.strings);
-            calls.append(&mut b.calls);
-        }
-        lifted1.push((region, leaders, Lifted1 { bodies, strings, calls }));
-    }
-
-    let live_out = flags_live_out(&facts);
-
-    // Assemble each region's function: entered at its entry blocks (the
-    // dispatcher and other regions pass the block's address), then branching
-    // within. Only real entries are cases of the switch, so LLVM can keep
-    // registers in SSA across the region's other blocks. (A jump to any other
-    // block reaches `bad`, which reports it as a missed target, learned by
-    // the next translation.) Blocks whose flags no successor reads drop their
-    // flag stores.
     // Small loops that load guest memory but never store to it are how
     // compiled code polls a word another thread writes (a `volatile` flag,
     // a relaxed atomic): their loads are made volatile, or LLVM, which knows
@@ -1053,58 +1048,88 @@ pub fn lift(image: &Image, prog: &Program, library: bool) -> Lifted {
     // once, before the loop. Larger store-free loops (a reduction, a search)
     // keep ordinary loads.
     const POLL_LOOP_BYTES: u64 = 64;
-    let stores = |body: &str| {
-        body.lines().any(|l| {
-            let l = l.trim_start();
-            (l.starts_with("store ") && l.ends_with(MEM)) || l.contains("atomicrmw ") || l.contains("cmpxchg ")
-        })
-    };
     let mut polling = std::collections::HashSet::new();
-    for (region, _, l) in &lifted1 {
-        for &(target, _, end) in loop_edges.iter().filter(|e| region_of(e.1) == *region) {
+    for (&region, leaders) in &regions {
+        let r = lift_region(prog, region, leaders, &mut unsupported);
+        entries.extend(r.cross);
+        for &(target, _, end) in &r.loop_edges {
             if end + 4 - target > POLL_LOOP_BYTES {
                 continue;
             }
-            let in_loop: Vec<&(u64, String)> = l.bodies.iter().filter(|(s, _)| (target..=end).contains(s)).collect();
-            if !in_loop.iter().any(|(_, body)| stores(body)) {
-                polling.extend(in_loop.iter().map(|(s, _)| *s));
+            let in_loop: Vec<&LiftedBlock> = r.blocks.iter().filter(|b| (target..=end).contains(&b.start)).collect();
+            if !in_loop.iter().any(|b| b.stores) {
+                polling.extend(in_loop.iter().map(|b| b.start));
             }
         }
-    }
-
-    let mut lifted = Vec::new();
-    for (region, leaders, l) in lifted1 {
-        let mut text = format!("define void @R_{region:x}(i64 %pc) {{\nentry:\n{STATE_POINTERS}  switch i64 %pc, label %bad [\n");
-        for &a in leaders.iter().filter(|a| entries.contains(a)) {
-            let _ = writeln!(text, "    i64 {}, label %b_{a:x}", a as i64);
+        for b in r.blocks {
+            facts.insert(b.start, b.facts);
         }
-        text.push_str("  ]\n");
-        for (start, body) in &l.bodies {
-            let _ = writeln!(text, "b_{start:x}:");
-            let keep = live_out.contains(start);
-            let polls = polling.contains(start);
-            let mut in_flags = false;
-            for line in body.lines() {
-                match line.trim() {
-                    ";FLAGS" => in_flags = true,
-                    ";ENDFLAGS" => in_flags = false,
-                    _ if in_flags && !keep => {}
-                    l if polls && l.ends_with(MEM) && l.contains(" = load ") && !l.contains(" = load atomic ") => {
-                        text.push_str(&line.replacen(" = load ", " = load volatile ", 1));
-                        text.push('\n');
-                    }
-                    _ => {
-                        text.push_str(line);
-                        text.push('\n');
+    }
+    let live_out = flags_live_out(&facts);
+    drop(facts);
+
+    // Pass 2: each region's function, entered at its entry blocks (the
+    // dispatcher and other regions pass the block's address), then
+    // branching within. Only real entries are cases of the switch, so LLVM
+    // can keep registers in SSA across the region's other blocks. (A jump to
+    // any other block reaches `bad`, which reports it as a missed target,
+    // learned by the next translation.) Blocks whose flags no successor
+    // reads drop their flag stores.
+    let preamble = chunk_preamble();
+    let mut groups: BTreeMap<u64, Vec<(u64, &Vec<u64>)>> = BTreeMap::new();
+    for (&region, leaders) in &regions {
+        groups.entry(region / CHUNK_SPAN).or_default().push((region, leaders));
+    }
+    let mut chunks = 0;
+    for group in groups.into_values() {
+        let (mut text, mut strings, mut calls) = (String::new(), Vec::new(), std::collections::BTreeSet::new());
+        let mut defined = std::collections::BTreeSet::new();
+        for (region, leaders) in group {
+            let mut r = lift_region(prog, region, leaders, &mut BTreeMap::new());
+            defined.insert(region);
+            let _ = write!(text, "define void @R_{region:x}(i64 %pc) {{\nentry:\n{STATE_POINTERS}  switch i64 %pc, label %bad [\n");
+            for &a in leaders.iter().filter(|a| entries.contains(a)) {
+                let _ = writeln!(text, "    i64 {}, label %b_{a:x}", a as i64);
+            }
+            text.push_str("  ]\n");
+            for b in &r.blocks {
+                let _ = writeln!(text, "b_{:x}:", b.start);
+                let keep = live_out.contains(&b.start);
+                let polls = polling.contains(&b.start);
+                let mut in_flags = false;
+                for line in b.body.lines() {
+                    match line.trim() {
+                        ";FLAGS" => in_flags = true,
+                        ";ENDFLAGS" => in_flags = false,
+                        _ if in_flags && !keep => {}
+                        l if polls && l.ends_with(MEM) && l.contains(" = load ") && !l.contains(" = load atomic ") => {
+                            text.push_str(&line.replacen(" = load ", " = load volatile ", 1));
+                            text.push('\n');
+                        }
+                        _ => {
+                            text.push_str(line);
+                            text.push('\n');
+                        }
                     }
                 }
             }
+            text.push_str("bad:\n  call void @__wasm_env_bad_target(i64 %pc)\n  unreachable\n}\n\n");
+            strings.append(&mut r.strings);
+            calls.append(&mut r.calls);
         }
-        text.push_str("bad:\n  call void @__wasm_env_bad_target(i64 %pc)\n  unreachable\n}\n\n");
-        lifted.push(LiftedRegion { start: region, text, strings: l.strings, calls: l.calls });
+        let mut m = preamble.clone();
+        // Regions this chunk calls but doesn't define.
+        for c in calls.difference(&defined) {
+            let _ = writeln!(m, "declare void @R_{c:x}(i64)");
+        }
+        for (name, s) in &strings {
+            let _ = writeln!(m, "{name} = private constant {s}");
+        }
+        m.push_str(&text);
+        sink(m);
+        chunks += 1;
     }
 
-    let chunks = build_chunks(&lifted);
     let data = if library { library_data(prog) } else { build_data(image, prog) };
     Lifted { data, chunks, unsupported, blocks: prog.leaders.len() }
 }
@@ -1153,8 +1178,10 @@ pub const STATE_GLOBAL: &str = "@__wasm_env_state = addrspace(1) global i64 0\n\
 pub const REG: &str = ", !tbaa !902";
 pub const MEM: &str = ", !tbaa !904";
 
-fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
-    let preamble = format!(
+/// What every code module starts with: the target, guest state, the
+/// support code's entry points, TBAA metadata and intrinsics.
+fn chunk_preamble() -> String {
+    format!(
         "target triple = \"wasm64-unknown-unknown\"\n\
          @__wasm_env_state = external addrspace(1) global i64\n\
          declare void @dispatch(i64)\n\
@@ -1167,30 +1194,7 @@ fn build_chunks(regions: &[LiftedRegion]) -> Vec<String> {
          {}{}",
         TBAA,
         intrinsics()
-    );
-    let mut groups: BTreeMap<u64, Vec<&LiftedRegion>> = BTreeMap::new();
-    for r in regions {
-        groups.entry(r.start / CHUNK_SPAN).or_default().push(r);
-    }
-    groups
-        .into_values()
-        .map(|group| {
-            let mut m = preamble.clone();
-            // Regions this chunk calls but doesn't define.
-            let defined: std::collections::BTreeSet<u64> = group.iter().map(|r| r.start).collect();
-            let called: std::collections::BTreeSet<u64> = group.iter().flat_map(|r| r.calls.iter().copied()).collect();
-            for c in called.difference(&defined) {
-                let _ = writeln!(m, "declare void @R_{c:x}(i64)");
-            }
-            for r in group {
-                for (name, text) in &r.strings {
-                    let _ = writeln!(m, "{name} = private constant {text}");
-                }
-                m.push_str(&r.text);
-            }
-            m
-        })
-        .collect()
+    )
 }
 
 /// Builds the data module: guest state, the guest image, and the dispatch

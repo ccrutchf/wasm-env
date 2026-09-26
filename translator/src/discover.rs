@@ -22,9 +22,50 @@ use bad64::{Instruction, Operand};
 
 use crate::elf::Image;
 
-pub struct Program {
+/// The image's instructions, decoded when asked for. Keeping every decoded
+/// instruction would cost hundreds of bytes each, too much for a library
+/// with tens of millions of them (libtorch), and decoding is cheap.
+#[derive(Clone, Copy)]
+pub struct Insns<'a> {
+    image: &'a Image,
+}
+
+impl<'a> Insns<'a> {
+    pub fn new(image: &'a Image) -> Self {
+        Insns { image }
+    }
+
+    /// The instruction at `addr`, if it's in code and decodes.
+    pub fn get(&self, addr: &u64) -> Option<Instruction> {
+        if !self.image.is_code(*addr) {
+            return None;
+        }
+        let word = self.image.read_uint(*addr, 4)? as u32;
+        crate::elf::decode(word, *addr)
+    }
+
+    pub fn contains_key(&self, addr: &u64) -> bool {
+        self.get(addr).is_some()
+    }
+
+    /// The decoded instructions in `range` (of code addresses), in order.
+    pub fn range(&self, range: std::ops::Range<u64>) -> impl DoubleEndedIterator<Item = (u64, Instruction)> + '_ {
+        let start = range.start.next_multiple_of(4);
+        (0..range.end.saturating_sub(start).div_ceil(4)).filter_map(move |k| {
+            let a = start + 4 * k;
+            self.get(&a).map(|i| (a, i))
+        })
+    }
+
+    /// Every decoded instruction, in address order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, Instruction)> + '_ {
+        self.image.code.iter().flat_map(move |r| self.range(r.clone()))
+    }
+}
+
+pub struct Program<'a> {
     /// Every decoded instruction by address.
-    pub insns: BTreeMap<u64, Instruction>,
+    pub insns: Insns<'a>,
     /// Block start addresses reachable from the roots.
     pub leaders: BTreeSet<u64>,
     /// Blocks that may be entered other than by a direct branch or falling
@@ -70,34 +111,32 @@ pub fn is_terminal(i: &Instruction) -> bool {
     matches!(i.op().mnem(), "b" | "br" | "ret" | "braa" | "brab" | "retaa" | "retab" | "brk" | "udf" | "hlt")
 }
 
-pub fn discover(image: &Image) -> Program {
-    let mut insns = BTreeMap::new();
-    for (addr, _, insn) in image.decode_all() {
-        if let Some(i) = insn {
-            insns.insert(addr, i);
-        }
-    }
-    let in_code = |a: u64| a.is_multiple_of(4) && insns.contains_key(&a);
+pub fn discover(image: &Image) -> Program<'_> {
+    let insns = Insns::new(image);
+    let in_code = |a: u64| insns.contains_key(&a);
 
     let mut roots = BTreeSet::new();
     roots.insert(image.entry);
     roots.extend(image.functions.iter().map(|f| f.0));
     roots.extend(&image.roots);
 
-    // Branch Target Identification landing pads (bti; paciasp/pacibsp at
-    // function entries act as one): in binaries built with branch
-    // protection, as Ubuntu's are, every legal indirect-branch target has
-    // one, so they name the targets of jump tables and computed gotos.
-    for (&a, i) in &insns {
-        if matches!(i.op().mnem(), "bti" | "paciasp" | "pacibsp") {
-            roots.insert(a);
-        }
-    }
-
-    // Code addresses built in registers: ADR, or ADRP followed by ADD.
+    // One pass over the code (each decodes every instruction again):
+    // - Branch Target Identification landing pads (bti; paciasp/pacibsp at
+    //   function entries act as one): in binaries built with branch
+    //   protection, as Ubuntu's are, every legal indirect-branch target has
+    //   one, so they name the targets of jump tables and computed gotos;
+    // - code addresses built in registers: ADR, or ADRP followed by ADD;
+    // - every direct branch, indexed by its target (see Code).
     let mut prev_adrp: BTreeMap<u32, u64> = BTreeMap::new();
-    for i in insns.values() {
+    let mut incoming: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+    for (a, i) in insns.iter() {
+        if let Some(t) = direct_target(&i) {
+            incoming.entry(t).or_default().push(a);
+        }
         match (i.op().mnem(), i.operands()) {
+            ("bti" | "paciasp" | "pacibsp", _) => {
+                roots.insert(a);
+            }
             ("adr", [_, Operand::Label(imm)]) => {
                 roots.insert(imm_u64(imm));
             }
@@ -123,7 +162,7 @@ pub fn discover(image: &Image) -> Program {
     }
     roots.retain(|&a| in_code(a));
 
-    let code = Code::new(&insns);
+    let code = Code { insns, incoming };
     // Follow control flow from the roots.
     let mut leaders = roots.clone();
     let mut entries = roots.clone();
@@ -134,9 +173,8 @@ pub fn discover(image: &Image) -> Program {
             continue;
         }
         let mut pc = start;
-        let mut block: Vec<(u64, &Instruction)> = Vec::new();
         while let Some(i) = insns.get(&pc) {
-            block.push((pc, i));
+            let i = &i;
             if is_control(i) {
                 let mut add = |a: u64| {
                     if in_code(a) && leaders.insert(a) {
@@ -158,10 +196,10 @@ pub fn discover(image: &Image) -> Program {
                     // The idiom is straight-line code ending at the br, but other
                     // leaders may split it into blocks, so look at the preceding
                     // instructions directly, back to one that doesn't fall through.
-                    let mut window = vec![(pc, i)];
+                    let mut window = vec![(pc, i.clone())];
                     while window.len() < 32 {
                         let Some(prev) = window[0].0.checked_sub(4).and_then(|a| insns.get(&a).map(|p| (a, p))) else { break };
-                        if is_terminal(prev.1) {
+                        if is_terminal(&prev.1) {
                             break;
                         }
                         window.insert(0, prev);
@@ -196,20 +234,8 @@ pub fn discover(image: &Image) -> Program {
 /// The decoded code, with every direct branch indexed by its target, for
 /// tracing values back through the paths that reach an instruction.
 struct Code<'a> {
-    insns: &'a BTreeMap<u64, Instruction>,
+    insns: Insns<'a>,
     incoming: std::collections::HashMap<u64, Vec<u64>>,
-}
-
-impl<'a> Code<'a> {
-    fn new(insns: &'a BTreeMap<u64, Instruction>) -> Self {
-        let mut incoming: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
-        for (&a, i) in insns {
-            if let Some(t) = direct_target(i) {
-                incoming.entry(t).or_default().push(a);
-            }
-        }
-        Code { insns, incoming }
-    }
 }
 
 /// A canonical general-register id (x and w of the same number share one),
@@ -254,10 +280,10 @@ struct Table {
 ///
 /// Register absolute values (from adr/adrp/add-imm/mov) are tracked across
 /// the block. Table entries are read until one points outside the code.
-fn jump_table(image: &Image, code: &Code, block: &[(u64, &Instruction)]) -> Vec<u64> {
+fn jump_table(image: &Image, code: &Code, block: &[(u64, Instruction)]) -> Vec<u64> {
     let insns = code.insns;
     use bad64::{Operand::*, Shift};
-    let br = block.last().unwrap().1;
+    let br = &block.last().unwrap().1;
     let Some(target_reg) = br.operands().first().and_then(gpr_id) else { return vec![] };
 
     // Track absolute register values built by adr/adrp/add-imm/mov.
@@ -267,7 +293,7 @@ fn jump_table(image: &Image, code: &Code, block: &[(u64, &Instruction)]) -> Vec<
     let mut load: std::collections::HashMap<u32, (u64, u32, bool, Option<u32>)> = std::collections::HashMap::new();
     let mut table: Option<Table> = None;
 
-    for &(addr, i) in block {
+    for (addr, i) in block.iter().map(|(a, i)| (*a, i)) {
         let ops = i.operands();
         let d = ops.first().and_then(gpr_id);
         match i.op().mnem() {
@@ -407,7 +433,7 @@ fn jump_table(image: &Image, code: &Code, block: &[(u64, &Instruction)]) -> Vec<
 /// A jump table's length from its bounds check: `cmp wI, #max` on the index
 /// register just before a conditional branch that either falls into the
 /// dispatch sequence (`b.hi default`) or jumps to it (`b.ls dispatch`).
-fn table_length(insns: &BTreeMap<u64, Instruction>, window: &[(u64, &Instruction)], idx: u32) -> Option<u64> {
+fn table_length(insns: Insns, window: &[(u64, Instruction)], idx: u32) -> Option<u64> {
     use bad64::Operand::*;
     let cmp_before = |branch: u64| -> Option<u64> {
         let i = insns.get(&branch.checked_sub(4)?)?;
@@ -421,7 +447,7 @@ fn table_length(insns: &BTreeMap<u64, Instruction>, window: &[(u64, &Instruction
     // A guard on the straight-line path, or just before it: the one nearest
     // the dispatch (earlier compares of the same register guard other code).
     let first = start.saturating_sub(4);
-    for (&a, i) in insns.range(first..=end).rev() {
+    for (a, i) in insns.range(first..end + 4).rev() {
         if i.op().mnem().starts_with("b.")
             && let Some(n) = cmp_before(a)
         {
@@ -429,9 +455,9 @@ fn table_length(insns: &BTreeMap<u64, Instruction>, window: &[(u64, &Instruction
         }
     }
     // A guard elsewhere that branches into the sequence.
-    for (&a, i) in insns.range(start.saturating_sub(0x10000)..end + 0x10000) {
+    for (a, i) in insns.range(start.saturating_sub(0x10000)..end + 0x10000) {
         if i.op().mnem().starts_with("b.")
-            && direct_target(i).is_some_and(|t| (start..=end).contains(&t))
+            && direct_target(&i).is_some_and(|t| (start..=end).contains(&t))
             && let Some(n) = cmp_before(a)
         {
             return Some(n);
@@ -483,7 +509,7 @@ fn register_value_before(code: &Code, at: u64, r: u32, depth: u32) -> Option<u64
         }
         let prev = pc.checked_sub(4)?;
         let i = insns.get(&prev)?;
-        if is_terminal(i) {
+        if is_terminal(&i) {
             // Only entered by branches, which were tried above.
             return None;
         }
@@ -509,10 +535,10 @@ mod tests {
     use super::*;
     use crate::testutil;
 
-    fn program(bytes: &[u8]) -> (Image, Program) {
-        let image = Image::load(bytes).unwrap();
-        let prog = discover(&image);
-        (image, prog)
+    fn program(bytes: &[u8]) -> (&'static Image, Program<'static>) {
+        // A program borrows its image; tests keep both (leaking the image).
+        let image: &'static Image = Box::leak(Box::new(Image::load(bytes).unwrap()));
+        (image, discover(image))
     }
 
     fn symbol(image: &Image, name: &str) -> u64 {
@@ -539,11 +565,11 @@ mod tests {
         for &start in &prog.leaders {
             let mut pc = start;
             while let Some(i) = prog.insns.get(&pc) {
-                if is_control(i) {
-                    if let Some(t) = direct_target(i).filter(|t| prog.insns.contains_key(t)) {
+                if is_control(&i) {
+                    if let Some(t) = direct_target(&i).filter(|t| prog.insns.contains_key(t)) {
                         assert!(prog.leaders.contains(&t), "branch at {pc:#x} to {t:#x}");
                     }
-                    if !is_terminal(i) && prog.insns.contains_key(&(pc + 4)) {
+                    if !is_terminal(&i) && prog.insns.contains_key(&(pc + 4)) {
                         assert!(prog.leaders.contains(&(pc + 4)), "fall-through after {pc:#x}");
                     }
                     checked += 1;
@@ -566,7 +592,7 @@ mod tests {
             while let Some(i) = prog.insns.get(&pc) {
                 out.insert(pc);
                 pc += 4;
-                if is_control(i) || prog.leaders.contains(&pc) {
+                if is_control(&i) || prog.leaders.contains(&pc) {
                     break;
                 }
             }
@@ -579,7 +605,7 @@ mod tests {
         let Some(bytes) = testutil::min() else { return };
         let (_, prog) = program(&bytes);
         let reached = reached(&prog);
-        let calls: Vec<u64> = reached.iter().copied().filter(|a| prog.insns[a].op().mnem() == "bl").collect();
+        let calls: Vec<u64> = reached.iter().copied().filter(|a| prog.insns.get(a).unwrap().op().mnem() == "bl").collect();
         assert!(!calls.is_empty());
         for pc in calls {
             assert!(prog.leaders.contains(&(pc + 4)), "return address after bl at {pc:#x}");
@@ -633,10 +659,10 @@ mod tests {
     fn unreachable_words_are_not_blocks() {
         let Some(bytes) = testutil::static_c("c/hello.c") else { return };
         let (_, prog) = program(&bytes);
-        assert!(prog.leaders.len() < prog.insns.len() / 2, "blocks are a minority of instructions");
+        assert!(prog.leaders.len() < prog.insns.iter().count() / 2, "blocks are a minority of instructions");
         // Words after an unconditional branch that nothing targets stay out.
-        for (&pc, i) in &prog.insns {
-            if is_terminal(i) && !prog.leaders.contains(&(pc + 4)) {
+        for (pc, i) in prog.insns.iter() {
+            if is_terminal(&i) && !prog.leaders.contains(&(pc + 4)) {
                 return;
             }
         }

@@ -159,23 +159,39 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     let phase = std::cell::Cell::new(std::time::Instant::now());
     let lap = |what: &str| {
         if timings {
-            eprintln!("[timing] {what}: {:.2} s", phase.get().elapsed().as_secs_f64());
+            let rss = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).map(|l| l.split_whitespace().nth(1).unwrap_or("0").to_string()))
+                .unwrap_or_default();
+            eprintln!("[timing] {what}: {:.2} s, {rss} kB resident", phase.get().elapsed().as_secs_f64());
         }
         phase.set(std::time::Instant::now());
     };
     lap("load");
     let prog = discover::discover(&image);
     lap("discover");
-    let lifted = lift::lift(&image, &prog, library);
-    lap("lift");
-    for (op, (n, example)) in &lifted.unsupported {
-        eprintln!("warning: {n} × `{op}` not supported yet (traps if executed): {example}");
-    }
     let tc = link::Toolchain::from_env()
         .context("no toolchain found: install wasm-env with its toolchain (nix profile install), set $WASM_ENV_TOOLCHAIN, or run inside `nix develop`")?;
     let image_end = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(0);
     let work = std::env::temp_dir().join(format!("wasm-env-translate-{}", std::process::id()));
-    let wasm = link::link_chunked(&tc, &lifted.data, &lifted.chunks, image_end, &work, library).and_then(|wasm| {
+    // Each code module goes to disk as soon as it's lifted (see lift::lift).
+    let mut build = link::Build::new(&tc, &work, library)?;
+    let mut failed = None;
+    let lifted = lift::lift(&image, &prog, library, &mut |chunk| {
+        if failed.is_none()
+            && let Err(e) = build.chunk(&chunk)
+        {
+            failed = Some(e);
+        }
+    });
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    lap("lift");
+    for (op, (n, example)) in &lifted.unsupported {
+        eprintln!("warning: {n} × `{op}` not supported yet (traps if executed): {example}");
+    }
+    let wasm = build.finish(&lifted.data, image_end).and_then(|wasm| {
         if library {
             return link::add_library_info(&wasm, image.objects[0].1, image.objects[0].2);
         }
@@ -193,7 +209,7 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         let _ = std::fs::remove_dir_all(&work);
     }
     std::fs::write(output, wasm?).with_context(|| format!("writing {output}"))?;
-    eprintln!("{input}: {} blocks in {} module(s) → {output}", lifted.blocks, lifted.chunks.len());
+    eprintln!("{input}: {} blocks in {} module(s) → {output}", lifted.blocks, lifted.chunks);
     Ok(())
 }
 
@@ -202,7 +218,7 @@ fn blocks(path: &str) -> Result<()> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
     let image = elf::Image::load(&bytes)?;
     let prog = discover::discover(&image);
-    println!("{} instructions decoded, {} blocks", prog.insns.len(), prog.leaders.len());
+    println!("{} instructions decoded, {} blocks", prog.insns.iter().count(), prog.leaders.len());
     for a in &prog.leaders {
         match image.function_at(*a) {
             Some(f) => println!("{a:#x} {f}"),
@@ -248,7 +264,12 @@ fn main() -> Result<()> {
             let bytes = std::fs::read(input)?;
             let image = elf::Image::load(&bytes)?;
             let prog = discover::discover(&image);
-            print!("{}", lift::lift(&image, &prog, false).ir());
+            let mut chunks = String::new();
+            let lifted = lift::lift(&image, &prog, false, &mut |c| {
+                chunks.push_str("\n; ---- chunk ----\n");
+                chunks.push_str(&c);
+            });
+            print!("{}{chunks}", lifted.data);
             Ok(())
         }
         _ => bail!("usage: wasm-env-translate census|blocks BINARY | translate BINARY OUT.wasm"),
