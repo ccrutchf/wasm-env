@@ -557,12 +557,38 @@ void __wasm_env_thread_start(const struct vfork_frame *f)
 	dispatch((long)pc);
 }
 
+// fork (clone without CLONE_VM; docs/abi.md, "Processes"). The runtime
+// makes the child a copy of this process, memory and all, and starts it at
+// __wasm_env_fork_start, which resumes after the clone with x0 = 0: the
+// child's copy of this thread's guest state is this one's. The parent gets
+// the child's pid.
+static void fork_clone(void)
+{
+	uint64_t flags = R[0], stack = R[1];
+	struct vfork_frame *f = &clone_frame;
+	f->resume = svc_next;
+	f->r[31] = stack ? stack : R[31];
+	R[0] = (uint64_t)__wasm_env_host_syscall(SYS_clone, (long)flags, (long)stack, (long)R[2], (long)R[3], (long)R[4],
+	                                         (long)f);
+}
+
+__attribute__((__export_name__("__wasm_env_fork_start")))
+void __wasm_env_fork_start(const struct vfork_frame *f)
+{
+	__wasm_env_set_state(&guest);
+	R[0] = 0;
+	R[31] = f->r[31];
+	dispatch((long)f->resume);
+}
+
 void __wasm_env_svc(void)
 {
 	long nr = (long)R[8];
 	if (nr == SYS_clone) {
 		if (R[0] & CLONE_THREAD)
 			thread_clone();
+		else if (!(R[0] & CLONE_VM))
+			fork_clone();
 		else
 			vfork_clone();
 		return;

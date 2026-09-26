@@ -137,6 +137,11 @@ pub enum Synthetic {
     /// fresh image): the host's, so the guest resolves names as the host
     /// does, whose sockets it uses (as Docker gives containers).
     ResolvConf,
+    /// /proc/mounts (and /proc/self/mounts, where /etc/mtab points): the root,
+    /// and /proc.
+    Mounts,
+    /// /proc/self/mountinfo: the same, in its own format.
+    MountInfo,
 }
 
 impl Synthetic {
@@ -156,6 +161,12 @@ impl Synthetic {
                 .into(),
             Synthetic::CpuList if cpus == 1 => b"0\n".as_slice().into(),
             Synthetic::CpuList => format!("0-{}\n", cpus - 1).into_bytes().into(),
+            Synthetic::Mounts => b"/ / ext4 rw,relatime 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n".as_slice().into(),
+            Synthetic::MountInfo => {
+                b"1 0 0:1 / / rw,relatime - ext4 /dev/root rw\n2 1 0:2 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+                    .as_slice()
+                    .into()
+            }
             Synthetic::ResolvConf => match std::fs::read("/etc/resolv.conf") {
                 Ok(host) if !host.is_empty() => host.into(),
                 // No host resolver configuration (Windows, say): public ones.
@@ -196,6 +207,10 @@ impl Fs {
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
         match parts.as_slice() {
             ["proc", "cpuinfo"] => return Some(DevPath::Synthetic(Synthetic::CpuInfo)),
+            ["proc", "self", "mountinfo"] => return Some(DevPath::Synthetic(Synthetic::MountInfo)),
+            ["proc", "mounts"] | ["proc", "self", "mounts"] | ["etc", "mtab"] => {
+                return Some(DevPath::Synthetic(Synthetic::Mounts));
+            }
             ["sys", "devices", "system", "cpu", "possible" | "online" | "present"] => {
                 return Some(DevPath::Synthetic(Synthetic::CpuList));
             }
@@ -221,6 +236,9 @@ impl Fs {
     }
 }
 
+/// The device number of the runtime's own files (/dev entries, stdio).
+const SYNTHETIC_DEV: u64 = 6;
+
 /// `struct stat` for a /dev device (Linux's major 1 memory devices).
 pub fn device_stat_bytes(d: Device) -> [u8; 128] {
     let minor: u64 = match d {
@@ -232,6 +250,10 @@ pub fn device_stat_bytes(d: Device) -> [u8; 128] {
     b[16..20].copy_from_slice(&(S_IFCHR | 0o666).to_le_bytes());
     b[20..24].copy_from_slice(&1u32.to_le_bytes());
     b[32..40].copy_from_slice(&(1 << 8 | minor).to_le_bytes());
+    // Distinct device and inode numbers: programs compare them (GNU grep
+    // writes nothing when stdout is /dev/null, by st_dev and st_ino).
+    b[0..8].copy_from_slice(&SYNTHETIC_DEV.to_le_bytes());
+    b[8..16].copy_from_slice(&(0x100 + minor).to_le_bytes());
     b[56..60].copy_from_slice(&4096u32.to_le_bytes());
     b
 }
@@ -316,6 +338,9 @@ pub fn stdio_stat_bytes() -> [u8; 128] {
     let mut b = [0u8; 128];
     b[16..20].copy_from_slice(&(S_IFCHR | 0o620).to_le_bytes());
     b[20..24].copy_from_slice(&1u32.to_le_bytes());
+    b[0..8].copy_from_slice(&SYNTHETIC_DEV.to_le_bytes());
+    b[8..16].copy_from_slice(&0x200u64.to_le_bytes());
+    b[32..40].copy_from_slice(&(136u64 << 8).to_le_bytes()); // a pseudo-terminal
     b[56..60].copy_from_slice(&4096u32.to_le_bytes());
     b
 }
@@ -327,6 +352,8 @@ pub fn fifo_stat_bytes() -> [u8; 128] {
     b[16..20].copy_from_slice(&(S_IFIFO | 0o600).to_le_bytes());
     b[20..24].copy_from_slice(&1u32.to_le_bytes());
     b[56..60].copy_from_slice(&4096u32.to_le_bytes());
+    b[0..8].copy_from_slice(&12u64.to_le_bytes()); // pipefs
+    b[8..16].copy_from_slice(&0x300u64.to_le_bytes());
     b
 }
 
@@ -367,7 +394,8 @@ pub struct FdTable {
 
 impl FdTable {
     pub fn with_stdio() -> Self {
-        let fd = |o| Some(Fd { open: Arc::new(Mutex::new(o)), cloexec: false, flags: 0 });
+        // Open read-write, as a terminal's descriptors are.
+        let fd = |o| Some(Fd { open: Arc::new(Mutex::new(o)), cloexec: false, flags: 2 });
         FdTable { fds: Arc::new(Mutex::new(vec![fd(Open::Stdin), fd(Open::Stdout), fd(Open::Stderr)])) }
     }
 
@@ -612,4 +640,36 @@ mod tests {
         }
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+/// `struct statx` (256 bytes) from a `struct stat` (see stat_bytes), with
+/// every basic field valid (STATX_BASIC_STATS).
+pub fn statx_from_stat(st: &[u8; 128]) -> [u8; 256] {
+    let u32_at = |o: usize| u32::from_le_bytes(st[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(st[o..o + 8].try_into().unwrap());
+    let mut x = [0u8; 256];
+    let put = |x: &mut [u8; 256], off: usize, bytes: &[u8]| x[off..off + bytes.len()].copy_from_slice(bytes);
+    put(&mut x, 0, &0x7ffu32.to_le_bytes()); // stx_mask: STATX_BASIC_STATS
+    put(&mut x, 4, &u32_at(56).to_le_bytes()); // stx_blksize
+    put(&mut x, 16, &u32_at(20).to_le_bytes()); // stx_nlink
+    put(&mut x, 20, &u32_at(24).to_le_bytes()); // stx_uid
+    put(&mut x, 24, &u32_at(28).to_le_bytes()); // stx_gid
+    put(&mut x, 28, &(u32_at(16) as u16).to_le_bytes()); // stx_mode
+    put(&mut x, 32, &u64_at(8).to_le_bytes()); // stx_ino
+    put(&mut x, 40, &u64_at(48).to_le_bytes()); // stx_size
+    put(&mut x, 48, &u64_at(64).to_le_bytes()); // stx_blocks
+    // Timestamps { i64 sec, u32 nsec, pad }: atime, btime (0), ctime, mtime.
+    for (off, from) in [(64, 72), (96, 104), (112, 88)] {
+        put(&mut x, off, &u64_at(from).to_le_bytes());
+        put(&mut x, off + 8, &(u64_at(from + 8) as u32).to_le_bytes());
+    }
+    let (rdev, dev) = (u64_at(32), u64_at(0));
+    // Linux's device number encoding: major in bits 8–19 (and 32+), minor
+    // in bits 0–7 and 20–31.
+    let major = |d: u64| ((d >> 8) & 0xfff) as u32 | ((d >> 32) as u32 & !0xfff);
+    let minor = |d: u64| (d & 0xff) as u32 | ((d >> 12) as u32 & !0xff);
+    for (off, v) in [(128, major(rdev)), (132, minor(rdev)), (136, major(dev)), (140, minor(dev))] {
+        put(&mut x, off, &v.to_le_bytes());
+    }
+    x
 }

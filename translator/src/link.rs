@@ -39,7 +39,7 @@ fn ld_args(image_end: u64) -> Vec<String> {
     args.push(format!("--global-base={}", global_base(image_end)));
     // wasm-ld caps a 64-bit memory at 16 GB; `finish` raises the limit.
     args.extend(["--shared-memory", "--import-memory", "--max-memory=17179869184"].map(String::from));
-    for export in ["__stack_pointer", "__heap_base", "__wasm_init_tls", "__tls_size", "__tls_align"] {
+    for export in ["__stack_pointer", "__heap_base", "__wasm_init_tls", "__tls_size", "__tls_align", "__tls_base"] {
         args.push(format!("--export={export}"));
     }
     // What library modules link against (docs/abi.md, "Libraries"): the
@@ -841,8 +841,9 @@ define void @B_400000(i64 %_) {{
     }
 
     #[test]
-    fn clone_is_refused_without_reaching_the_host() {
-        let body = set(8, 220)
+    fn unsupported_clones_are_refused_without_reaching_the_host() {
+        // CLONE_VM alone: neither vfork, nor a thread, nor fork.
+        let body = set(8, 220) + &set(0, 0x100)
             + "  call void @__wasm_env_svc()\n"
             + "  %x0 = load i64, ptr %R\n"
             + "  %p20 = getelementptr [32 x i64], ptr %R, i64 0, i64 20\n"
@@ -850,6 +851,14 @@ define void @B_400000(i64 %_) {{
         let Some(mut r) = run(&program(&body), |_| {}) else { return };
         assert_eq!(r.reg(20) as i64, -38, "ENOSYS");
         assert!(r.store.data().calls.iter().all(|c| c.0 != 220));
+    }
+
+    #[test]
+    fn fork_reaches_the_host_with_a_clone_frame() {
+        // SIGCHLD only: fork. The host gets the flags (and the frame, sixth).
+        let body = set(8, 220) + &set(0, 17) + "  call void @__wasm_env_svc()\n";
+        let Some(r) = run(&program(&body), |_| {}) else { return };
+        assert_eq!(r.store.data().calls.iter().find(|c| c.0 == 220).map(|c| c.1[0]), Some(17));
     }
 
     #[test]

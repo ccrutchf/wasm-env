@@ -32,6 +32,8 @@ pub fn syscall(
         nr::MREMAP => mremap(&mut caller, &args),
         nr::BRK => brk(&mut caller, args[0] as u64),
         nr::WASM_ENV_LOAD_LIBRARY => load_library(&mut caller, a, b as u64),
+        // fork: a copy of the process (fork.rs).
+        nr::CLONE if a & (0x100 | CLONE_THREAD) == 0 => crate::fork::fork(&mut caller, &args),
         nr::WASM_ENV_SYNC_MODULES => crate::modules::sync(&mut caller).map(|()| 0).map_err(|e| {
             eprintln!("wasm-env: loading libraries: {e:#}");
             EIO
@@ -44,7 +46,11 @@ pub fn syscall(
     let ret = result.unwrap_or_else(|e| -e);
     let process = caller.data_mut();
     if process.trace {
-        eprintln!("[wasm-env] pid {}: {}({a:#x}, {b:#x}, {c:#x}) = {ret}", process.tid, abi::name(n));
+        let name = match abi::name(n) {
+            "?" => format!("syscall {n}"),
+            known => known.to_string(),
+        };
+        eprintln!("[wasm-env] pid {}: {name}({a:#x}, {b:#x}, {c:#x}) = {ret}", process.tid);
     }
     if process.pending.is_some() {
         return Err(wasmtime::Error::new(Unwind));
@@ -300,6 +306,35 @@ impl Process {
                 let st = self.fstatat(a, &path, d)?;
                 mem::write(data, uc, &st).map(|_| 0)
             }
+            nr::STATX => {
+                // statx(dirfd, path, flags, mask, buf): the basic fields, from stat.
+                let path = mem::cstr(data, ub)?;
+                let st = self.fstatat(a, &path, c)?;
+                mem::write(data, e as u64, &fs::statx_from_stat(&st)).map(|_| 0)
+            }
+            nr::STATFS | nr::FSTATFS => mem::write(data, ub, &self.statfs()).map(|_| 0),
+            // No extended attributes: nothing to list or get, and none can
+            // be set.
+            nr::GETXATTR | nr::LGETXATTR | nr::FGETXATTR => Err(ENODATA),
+            nr::LISTXATTR | nr::LLISTXATTR | nr::FLISTXATTR => Ok(0),
+            nr::SETXATTR | nr::LSETXATTR | nr::FSETXATTR | nr::REMOVEXATTR | nr::LREMOVEXATTR | nr::FREMOVEXATTR => {
+                Err(ENOTSUP)
+            }
+            nr::MINCORE => {
+                // mincore(addr, len, vec): pages of the program's memory (the
+                // image, break and mmap region, and libraries) count as
+                // resident; outside them is ENOMEM, as for unmapped memory
+                // (programs probe for their stack's extent this way).
+                let end = ua.checked_add(ub).ok_or(ENOMEM)?;
+                let top = self.group.mm.lock().unwrap().space.top;
+                let in_lib = self.group.libraries.list.lock().unwrap().iter().any(|l| ua >= l.base && end <= l.end);
+                if end > top && !in_lib {
+                    return Err(ENOMEM);
+                }
+                let pages = ub.div_ceil(abi::PAGE_SIZE);
+                mem::slice_mut(data, uc, pages)?.fill(1);
+                Ok(0)
+            }
             nr::FSTAT => {
                 let st = self.fstat(a)?;
                 mem::write(data, ub, &st).map(|_| 0)
@@ -349,7 +384,9 @@ impl Process {
                 self.fs.cwd = path.clone();
                 Ok(0)
             }
+            nr::FCNTL if matches!(b, 5 | 6 | 7 | 36 | 37 | 38) => self.lock(data, a, b, uc),
             nr::FCNTL => self.fcntl(a, b, c),
+            nr::FLOCK => self.flock(a, b),
             // Sockets (net.rs).
             nr::SOCKET => self.socket(a, b, c),
             nr::CONNECT => self.connect(data, a, ub, uc),
@@ -432,7 +469,14 @@ impl Process {
             // changes are accepted and ignored.
             nr::FCHOWNAT | nr::FCHOWN => Ok(0),
             nr::FTRUNCATE => self.with_file(a, |f| f.set_len(ub)).map(|_| 0),
-            nr::FSYNC | nr::FDATASYNC => self.with_file(a, |f| f.sync_all()).map(|_| 0),
+            nr::FSYNC | nr::FDATASYNC => {
+                // Syncing a directory (dpkg does, after renaming into it): its
+                // entries are the host's, already written through.
+                if matches!(&*self.fds.get(a)?.open.lock().unwrap(), Open::Dir { .. }) {
+                    return Ok(0);
+                }
+                self.with_file(a, |f| f.sync_all()).map(|_| 0)
+            }
             nr::UTIMENSAT => {
                 // times: [atime, mtime] timespecs, or NULL for "now".
                 const UTIME_NOW: i64 = (1 << 30) - 1;
@@ -464,7 +508,13 @@ impl Process {
                 let path = mem::cstr(data, ub)?;
                 let dir = self.dir_of(a)?;
                 let guest = self.fs.resolve(&dir, &path, d & AT_SYMLINK_NOFOLLOW == 0)?;
-                let file = std::fs::File::open(self.fs.host(&guest)).map_err(|e| fs::errno(&e))?;
+                let host = self.fs.host(&guest);
+                if d & AT_SYMLINK_NOFOLLOW != 0 && host.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+                    // A symlink's own times (dpkg sets them on links it unpacks,
+                    // whose targets may not exist yet): not kept.
+                    return Ok(0);
+                }
+                let file = std::fs::File::open(host).map_err(|e| fs::errno(&e))?;
                 apply(&file)
             }
             nr::SET_TID_ADDRESS => {
@@ -475,7 +525,44 @@ impl Process {
             // In a vfork child (a process of its own), the thread is the process.
             nr::GETTID => Ok(if self.vfork.is_empty() { self.tid } else { self.pid } as i64),
             nr::GETPPID => Ok(self.kernel.ppid(self.pid) as i64),
-            nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
+            // User and group ids (see process::Creds): [real, effective, saved].
+            nr::GETUID => Ok(self.creds.uid[0] as i64),
+            nr::GETEUID => Ok(self.creds.uid[1] as i64),
+            nr::GETGID => Ok(self.creds.gid[0] as i64),
+            nr::GETEGID => Ok(self.creds.gid[1] as i64),
+            nr::SETUID => Ok(set_ids(&mut self.creds.uid, [a, a, a])),
+            nr::SETGID => Ok(set_ids(&mut self.creds.gid, [a, a, a])),
+            nr::SETREUID => Ok(set_ids(&mut self.creds.uid, [a, b, -1])),
+            nr::SETREGID => Ok(set_ids(&mut self.creds.gid, [a, b, -1])),
+            nr::SETRESUID => Ok(set_ids(&mut self.creds.uid, [a, b, c])),
+            nr::SETRESGID => Ok(set_ids(&mut self.creds.gid, [a, b, c])),
+            nr::GETRESUID | nr::GETRESGID => {
+                let ids = if n == nr::GETRESUID { self.creds.uid } else { self.creds.gid };
+                for (at, id) in [ua, ub, uc].into_iter().zip(ids) {
+                    mem::write(data, at, &id.to_le_bytes())?;
+                }
+                Ok(0)
+            }
+            // The filesystem ids follow the effective ones; report those.
+            nr::SETFSUID => Ok(self.creds.uid[1] as i64),
+            nr::SETFSGID => Ok(self.creds.gid[1] as i64),
+            nr::GETGROUPS => {
+                let groups = &self.creds.groups;
+                if a != 0 {
+                    if (a as usize) < groups.len() {
+                        return Err(EINVAL);
+                    }
+                    let bytes: Vec<u8> = groups.iter().flat_map(|g| g.to_le_bytes()).collect();
+                    mem::write(data, ub, &bytes)?;
+                }
+                Ok(groups.len() as i64)
+            }
+            nr::SETGROUPS => {
+                let n = usize::try_from(a).ok().filter(|&n| n <= 65536).ok_or(EINVAL)?;
+                let bytes = mem::slice(data, ub, n as u64 * 4)?;
+                self.creds.groups = bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+                Ok(0)
+            }
             nr::EXIT if self.vfork.is_empty() && self.group.threads() > 1 => {
                 self.pending = Some(Pending::ThreadExit(a as i32 & 0xff));
                 Ok(0)
@@ -536,10 +623,11 @@ impl Process {
             }
             nr::PIPE2 => {
                 let (r, w) = crate::pipe::new();
-                let fd = |end| Fd {
-                    open: Arc::new(Mutex::new(Open::Pipe(end))),
+                // Each end has its access mode (fdopen checks it with F_GETFL).
+                let fd = |end: crate::pipe::PipeEnd| Fd {
                     cloexec: b & o::CLOEXEC != 0,
-                    flags: b & o::NONBLOCK,
+                    flags: (b & o::NONBLOCK) | if end.write { o::WRONLY } else { 0 },
+                    open: Arc::new(Mutex::new(Open::Pipe(end))),
                 };
                 let r = self.fds.insert(fd(r), 0)?;
                 let w = self.fds.insert(fd(w), 0)?;
@@ -664,6 +752,8 @@ impl Process {
 
     /// The guest directory an *at() call is relative to.
     fn dir_of(&self, dirfd: i64) -> SysResult<String> {
+        // A descriptor is an int: AT_FDCWD may arrive without sign extension.
+        let dirfd = dirfd as i32 as i64;
         if dirfd == AT_FDCWD {
             return Ok(self.fs.cwd.clone());
         }
@@ -707,6 +797,7 @@ impl Process {
             cwd: self.fs.cwd.clone(),
             umask: self.umask,
             sigactions: self.sigactions.clone(),
+            creds: self.creds.clone(),
         });
         self.pid = child;
         Ok(0)
@@ -721,6 +812,7 @@ impl Process {
         self.fs.cwd = frame.cwd;
         self.umask = frame.umask;
         self.sigactions = frame.sigactions;
+        self.creds = frame.creds;
         child
     }
 
@@ -809,6 +901,7 @@ impl Process {
             fs: self.fs.clone(),
             umask: self.umask,
             sigactions: self.sigactions.clone(),
+            creds: self.creds.clone(),
             vfork: Vec::new(),
             pending: None,
             trace: self.trace,
@@ -1085,6 +1178,30 @@ impl Process {
         }
     }
 
+    /// `struct statfs` for the environment's filesystem: the host's figures
+    /// for the root directory, reported as ext4.
+    fn statfs(&self) -> [u8; 120] {
+        let mut b = [0u8; 120];
+        let mut words = [0xef53u64, 4096, 0, 0, 0, 0, 0]; // type, bsize, blocks, bfree, bavail, files, ffree
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(path) = std::ffi::CString::new(self.fs.host("/").as_os_str().as_bytes()) {
+                // SAFETY: statvfs fills the struct it's given.
+                let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+                if unsafe { libc::statvfs(path.as_ptr(), &mut s) } == 0 {
+                    words = [0xef53, s.f_bsize, s.f_blocks, s.f_bfree, s.f_bavail, s.f_files, s.f_ffree];
+                }
+            }
+        }
+        for (i, w) in words.iter().enumerate() {
+            b[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        b[64..72].copy_from_slice(&255u64.to_le_bytes()); // f_namelen
+        b[72..80].copy_from_slice(&words[1].to_le_bytes()); // f_frsize
+        b
+    }
+
     fn fstatat(&mut self, dirfd: i64, path: &str, flags: i64) -> SysResult<[u8; 128]> {
         if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
             return self.fstat(dirfd);
@@ -1102,6 +1219,66 @@ impl Process {
         let guest = self.fs.resolve(&dir, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
         let meta = std::fs::symlink_metadata(self.fs.host(&guest)).map_err(|e| fs::errno(&e))?;
         Ok(fs::stat_bytes(&meta))
+    }
+
+    /// fcntl's record locks (F_GETLK, F_SETLK, F_SETLKW and their F_OFD_
+    /// forms) on the file behind `fd`: the host's open-file-description
+    /// locks, since the environment's processes share one host process (so
+    /// its per-process POSIX locks would never conflict between them). A
+    /// lock on anything but a file succeeds.
+    fn lock(&mut self, data: &mut [u8], fd: i64, cmd: i64, flock: u64) -> SysResult<i64> {
+        let open = self.fds.get(fd)?.open.clone();
+        let guard = open.lock().unwrap();
+        let Open::File { file, .. } = &*guard else { return Ok(0) };
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // struct flock: l_type, l_whence (i16), l_start, l_len (i64),
+            // l_pid (i32): the same layout on every 64-bit Linux.
+            let b = mem::slice(data, flock, 32)?;
+            let mut l: libc::flock = unsafe { std::mem::zeroed() };
+            l.l_type = i16::from_le_bytes([b[0], b[1]]);
+            l.l_whence = i16::from_le_bytes([b[2], b[3]]);
+            l.l_start = i64::from_le_bytes(b[8..16].try_into().unwrap());
+            l.l_len = i64::from_le_bytes(b[16..24].try_into().unwrap());
+            let host_cmd = match cmd {
+                5 | 36 => libc::F_OFD_GETLK,
+                6 | 37 => libc::F_OFD_SETLK,
+                _ => libc::F_OFD_SETLKW,
+            };
+            // SAFETY: a valid descriptor and a flock struct.
+            let r = unsafe { libc::fcntl(file.as_raw_fd(), host_cmd, &mut l) };
+            if r < 0 {
+                return Err(std::io::Error::last_os_error().raw_os_error().map_or(EIO, |e| e as i64));
+            }
+            if host_cmd == libc::F_OFD_GETLK {
+                let b = mem::slice_mut(data, flock, 32)?;
+                b[0..2].copy_from_slice(&l.l_type.to_le_bytes());
+                b[2..4].copy_from_slice(&l.l_whence.to_le_bytes());
+                b[8..16].copy_from_slice(&l.l_start.to_le_bytes());
+                b[16..24].copy_from_slice(&l.l_len.to_le_bytes());
+                b[24..28].copy_from_slice(&(if l.l_type == libc::F_UNLCK as i16 { 0 } else { -1i32 }).to_le_bytes());
+            }
+        }
+        let _ = (data, cmd, flock, file);
+        Ok(0)
+    }
+
+    /// flock: the host's (a lock per open file description, as on Linux).
+    fn flock(&mut self, fd: i64, op: i64) -> SysResult<i64> {
+        let open = self.fds.get(fd)?.open.clone();
+        let guard = open.lock().unwrap();
+        let Open::File { file, .. } = &*guard else { return Ok(0) };
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: a valid descriptor.
+            if unsafe { libc::flock(file.as_raw_fd(), op as i32) } < 0 {
+                return Err(std::io::Error::last_os_error().raw_os_error().map_or(EIO, |e| e as i64));
+            }
+        }
+        let _ = (file, op);
+        Ok(0)
     }
 
     fn fcntl(&mut self, fd: i64, cmd: i64, arg: i64) -> SysResult<i64> {
@@ -1155,18 +1332,56 @@ impl Process {
             && let Some((pipe, _)) = self.pipe_of(fd, false)? {
                 return mem::write(data, arg, &(pipe.available() as i32).to_le_bytes()).map(|_| 0);
             }
-        let tty = match &*self.fds.get(fd)?.open.lock().unwrap() {
-            Open::Stdin => std::io::stdin().is_terminal(),
-            Open::Stdout => std::io::stdout().is_terminal(),
-            Open::Stderr => std::io::stderr().is_terminal(),
-            _ => false,
+        // The host descriptor behind the guest's, when it's a terminal.
+        let host_fd = match &*self.fds.get(fd)?.open.lock().unwrap() {
+            Open::Stdin if std::io::stdin().is_terminal() => Some(0),
+            Open::Stdout if std::io::stdout().is_terminal() => Some(1),
+            Open::Stderr if std::io::stderr().is_terminal() => Some(2),
+            _ => None,
         };
+        let Some(host_fd) = host_fd else { return Err(ENOTTY) };
+        const TCGETS: i64 = 0x5401;
+        const TCSETS: i64 = 0x5402;
+        const TCSETSW: i64 = 0x5403;
+        const TCSETSF: i64 = 0x5404;
+        const TCXONC: i64 = 0x540a;
+        const TCFLSH: i64 = 0x540b;
+        const TIOCSCTTY: i64 = 0x540e;
+        const TIOCGPGRP: i64 = 0x540f;
+        const TIOCSPGRP: i64 = 0x5410;
+        const TIOCNOTTY: i64 = 0x5422;
+        const TIOCGSID: i64 = 0x5429;
+        use std::sync::atomic::Ordering::Relaxed;
         match req {
-            // struct winsize { rows, cols, xpixel, ypixel }. TODO: real size.
-            TIOCGWINSZ if tty => {
-                let ws = [24u16, 80, 0, 0].map(u16::to_le_bytes).concat();
-                mem::write(data, arg, &ws).map(|_| 0)
+            // Terminal settings, window size and flow control are the host
+            // terminal's (struct termios and winsize have the same layout on
+            // every Linux; other hosts would convert them).
+            TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGWINSZ | TCXONC | TCFLSH => {
+                const TERMIOS: usize = 60; // struct termios (36 bytes) and winsize fit
+                let mut buf = [0u8; TERMIOS];
+                let takes_struct = matches!(req, TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGWINSZ);
+                if matches!(req, TCSETS | TCSETSW | TCSETSF) {
+                    buf[..36].copy_from_slice(mem::slice(data, arg, 36)?);
+                }
+                host_tty_ioctl(host_fd, req, if takes_struct { buf.as_mut_ptr() as u64 } else { arg })?;
+                match req {
+                    TCGETS => mem::write(data, arg, &buf[..36]).map(|_| 0),
+                    TIOCGWINSZ => mem::write(data, arg, &buf[..8]).map(|_| 0),
+                    _ => Ok(0),
+                }
             }
+            // Job control: the foreground process group is the runtime's.
+            TIOCGPGRP => mem::write(data, arg, &self.kernel.foreground.load(Relaxed).to_le_bytes()).map(|_| 0),
+            TIOCSPGRP => {
+                let pgrp = i32::from_le_bytes(mem::slice(data, arg, 4)?.try_into().unwrap());
+                self.kernel.foreground.store(pgrp, Relaxed);
+                Ok(0)
+            }
+            TIOCGSID => {
+                let sid = self.kernel.sid(self.pid)?;
+                mem::write(data, arg, &sid.to_le_bytes()).map(|_| 0)
+            }
+            TIOCSCTTY | TIOCNOTTY => Ok(0),
             _ => Err(ENOTTY),
         }
     }
@@ -1181,6 +1396,32 @@ impl Process {
             _ => Err(EINVAL),
         }
     }
+}
+
+/// A terminal ioctl on host descriptor `fd` (0–2), passing `arg` through.
+#[cfg(target_os = "linux")]
+fn host_tty_ioctl(fd: i32, req: i64, arg: u64) -> SysResult<()> {
+    // SAFETY: `req` is one of the terminal requests ioctl() checked, whose
+    // argument is a value or a buffer of the kernel's struct (at least as
+    // large as the caller's).
+    let r = unsafe { libc::ioctl(fd, req as libc::Ioctl, arg as usize) };
+    if r < 0 { Err(std::io::Error::last_os_error().raw_os_error().map_or(EIO, |e| e as i64)) } else { Ok(()) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_tty_ioctl(_fd: i32, _req: i64, _arg: u64) -> SysResult<()> {
+    Err(ENOTTY)
+}
+
+/// Sets `ids` ([real, effective, saved]) to `new`, where -1 leaves one
+/// unchanged, as the set*id calls do (ids are 32 bits).
+fn set_ids(ids: &mut [u32; 3], new: [i64; 3]) -> i64 {
+    for (id, v) in ids.iter_mut().zip(new) {
+        if v as i32 != -1 {
+            *id = v as u32;
+        }
+    }
+    0
 }
 
 /// The CPUs the guest sees: the host's.

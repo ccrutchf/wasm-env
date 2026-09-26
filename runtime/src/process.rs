@@ -46,12 +46,25 @@ pub struct Inherit {
     /// Signals set to SIG_IGN. Handlers reset to the default on exec;
     /// ignored signals stay ignored.
     pub ignored: u64,
+    pub creds: Creds,
 }
 
 impl Inherit {
     pub fn initial() -> Self {
-        Inherit { fds: FdTable::with_stdio(), cwd: "/".into(), umask: 0o022, ignored: 0 }
+        Inherit { fds: FdTable::with_stdio(), cwd: "/".into(), umask: 0o022, ignored: 0, creds: Creds::default() }
     }
+}
+
+/// A process's user and group ids (real, effective, saved) and
+/// supplementary groups. Everything starts as root. These are numbers the
+/// program sees and changes (a daemon dropping privileges, apt running its
+/// downloads as `_apt`); files keep belonging to the host user, and no
+/// permissions are checked.
+#[derive(Clone, Default)]
+pub struct Creds {
+    pub uid: [u32; 3],
+    pub gid: [u32; 3],
+    pub groups: Vec<u32>,
 }
 
 /// Parent state saved while a vfork child runs in the parent's memory.
@@ -61,6 +74,7 @@ pub struct VforkFrame {
     pub cwd: String,
     pub umask: u32,
     pub sigactions: Vec<[u8; 32]>,
+    pub creds: Creds,
 }
 
 /// Something a syscall asks the dispatcher to do instead of returning.
@@ -99,6 +113,7 @@ pub struct Process {
     /// is ever run yet; this records dispositions (SIG_IGN) and reports
     /// them back to the program.
     pub sigactions: Vec<[u8; 32]>,
+    pub creds: Creds,
     pub vfork: Vec<VforkFrame>,
     pub pending: Option<Pending>,
     pub trace: bool,
@@ -136,7 +151,7 @@ impl Process {
         let fds = self.fds.copy();
         fds.close_on_exec();
         let ignored = (1..NSIG).filter(|&s| self.handler(s) == SIG_IGN).fold(0u64, |m, s| m | 1 << s);
-        Inherit { fds, cwd: self.fs.cwd.clone(), umask: self.umask, ignored }
+        Inherit { fds, cwd: self.fs.cwd.clone(), umask: self.umask, ignored, creds: self.creds.clone() }
     }
 }
 
@@ -338,6 +353,20 @@ pub fn resolve_exec(fs: &Fs, path: &str, mut argv: Vec<Vec<u8>>, env: Vec<Vec<u8
     Err(ELOOP)
 }
 
+/// Whether an ELF file (its first bytes, through the program headers) has
+/// a PT_INTERP: a dynamically-linked executable.
+pub fn has_interpreter(bytes: &[u8]) -> bool {
+    let word = |at: usize, n: usize| -> Option<u64> {
+        let b = bytes.get(at..at + n)?;
+        Some(b.iter().rev().fold(0u64, |v, &x| v << 8 | x as u64))
+    };
+    let headers = || -> Option<bool> {
+        let (phoff, phentsize, phnum) = (word(32, 8)? as usize, word(54, 2)? as usize, word(56, 2)? as usize);
+        Some((0..phnum).any(|k| word(phoff + k * phentsize, 4) == Some(3)))
+    };
+    headers().unwrap_or(false)
+}
+
 /// The dynamic linker (PT_INTERP) of the arm64 executable at `elf`, found
 /// in the environment's root, when the program's libraries are modules of
 /// their own; None for a static executable or a monolithic translation.
@@ -427,6 +456,7 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
         fds: inherit.fds,
         fs,
         umask: inherit.umask,
+        creds: inherit.creds,
         sigactions,
         vfork: Vec::new(),
         pending: None,
@@ -440,9 +470,15 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
     let mut store = Store::new(&kernel.engine, process);
     set_deadline(&mut store);
     let result = start(&mut store, &module, &image);
+    finish(&mut store, result, &image.path)
+}
+
+/// How a process ends once its first thread stops (with `result`): as that
+/// thread says, or, if another thread ended the process, as that one says.
+/// `name` names the program in error messages.
+pub fn finish(store: &mut Store<Process>, result: Result<()>, name: &str) -> Outcome {
     let p = store.data_mut();
-    // How the process ends: as this thread says, or, if another thread
-    // ended it, as that one says.
+    let (group, pid) = (p.group.clone(), p.pid);
     let from_group = |end: Option<GroupEnd>| match end {
         Some(GroupEnd::Exec(next, inherit)) => Outcome::Exec(next, inherit),
         Some(GroupEnd::Terminate(how)) => Outcome::Done(how),
@@ -462,7 +498,7 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
         }
         (None, Err(e)) => {
             // A trap ends the process like the matching Linux signal would.
-            eprintln!("wasm-env: {} (pid {pid}): {e}", image.path);
+            eprintln!("wasm-env: {name} (pid {pid}): {e}");
             Outcome::Done(Termination::Signal(trap_signal(&e)))
         }
     };

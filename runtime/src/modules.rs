@@ -142,7 +142,7 @@ pub fn load(mut store: impl AsContextMut<Data = Process>, path: &Path) -> Result
     if let Some(lib) = libraries.list.lock().unwrap().iter().find(|l| l.path == path) {
         return Ok(lib.clone());
     }
-    let (wasm, base, end) = crate::translate::ensure_library(&path, trace).map_err(|e| anyhow::anyhow!("translating {}: errno {e}", path.display()))?;
+    let (wasm, base, end) = crate::translate::ensure_library(&path, &kernel.root, trace).map_err(|e| anyhow::anyhow!("translating {}: errno {e}", path.display()))?;
     let module = kernel.module_any(&wasm).map_err(anyhow::Error::msg)?;
     let info = dylink(&wasm)?;
     // The module's data goes in the process's mmap region.
@@ -269,4 +269,15 @@ fn register(mut store: impl AsContextMut<Data = Process>, instance: &Instance, l
     let counter = unsafe { std::sync::atomic::AtomicU64::from_ptr(slice.as_ptr() as *mut u64) };
     counter.store(k as u64 + 1, std::sync::atomic::Ordering::Release);
     Ok(())
+}
+
+impl Libraries {
+    /// A forked child's copy: the same libraries at the same places (its
+    /// memory is a copy of the parent's).
+    pub fn fork(&self) -> Libraries {
+        Libraries {
+            list: Mutex::new(self.list.lock().unwrap().clone()),
+            next_slot: Mutex::new(*self.next_slot.lock().unwrap()),
+        }
+    }
 }

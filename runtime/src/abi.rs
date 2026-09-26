@@ -108,6 +108,35 @@ pub mod nr {
     pub const RECVMSG: i64 = 212;
     pub const ACCEPT4: i64 = 242;
     pub const SENDMMSG: i64 = 269;
+    pub const SETXATTR: i64 = 5;
+    pub const LSETXATTR: i64 = 6;
+    pub const FSETXATTR: i64 = 7;
+    pub const GETXATTR: i64 = 8;
+    pub const LGETXATTR: i64 = 9;
+    pub const FGETXATTR: i64 = 10;
+    pub const LISTXATTR: i64 = 11;
+    pub const LLISTXATTR: i64 = 12;
+    pub const FLISTXATTR: i64 = 13;
+    pub const REMOVEXATTR: i64 = 14;
+    pub const LREMOVEXATTR: i64 = 15;
+    pub const FREMOVEXATTR: i64 = 16;
+    pub const STATFS: i64 = 43;
+    pub const FSTATFS: i64 = 44;
+    pub const MINCORE: i64 = 232;
+    pub const STATX: i64 = 291;
+    pub const FLOCK: i64 = 32;
+    pub const SETREGID: i64 = 143;
+    pub const SETGID: i64 = 144;
+    pub const SETREUID: i64 = 145;
+    pub const SETUID: i64 = 146;
+    pub const SETRESUID: i64 = 147;
+    pub const GETRESUID: i64 = 148;
+    pub const SETRESGID: i64 = 149;
+    pub const GETRESGID: i64 = 150;
+    pub const SETFSUID: i64 = 151;
+    pub const SETFSGID: i64 = 152;
+    pub const GETGROUPS: i64 = 158;
+    pub const SETGROUPS: i64 = 159;
 }
 
 /// Syscall name for tracing.
@@ -139,7 +168,9 @@ pub fn name(n: i64) -> &'static str {
         CONNECT => "connect", GETSOCKNAME => "getsockname", GETPEERNAME => "getpeername",
         SENDTO => "sendto", RECVFROM => "recvfrom", SETSOCKOPT => "setsockopt",
         GETSOCKOPT => "getsockopt", SHUTDOWN => "shutdown", SENDMSG => "sendmsg",
-        RECVMSG => "recvmsg", ACCEPT4 => "accept4", SENDMMSG => "sendmmsg",
+        RECVMSG => "recvmsg", ACCEPT4 => "accept4", SENDMMSG => "sendmmsg", STATX => "statx",
+        STATFS => "statfs", FSTATFS => "fstatfs", MINCORE => "mincore", GETXATTR => "getxattr", FLOCK => "flock",
+        LGETXATTR => "lgetxattr", FGETXATTR => "fgetxattr", LISTXATTR => "listxattr", LLISTXATTR => "llistxattr",
         _ => "?",
     }
 }
@@ -174,6 +205,8 @@ pub mod errno {
     pub const ENOSYS: i64 = 38;
     pub const ENOTEMPTY: i64 = 39;
     pub const ELOOP: i64 = 40;
+    pub const ENODATA: i64 = 61;
+    pub const ENOTSUP: i64 = 95;
 }
 
 /// openat flags (arm64 values, arch/aarch64/bits/fcntl.h).

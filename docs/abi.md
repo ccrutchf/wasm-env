@@ -117,7 +117,7 @@ The compiler rewrites `setjmp`/`longjmp` using WebAssembly exception handling (`
 
 ## Processes
 
-Processes are created with **`vfork` + `execve`**, which covers `posix_spawn`, `system`, `popen` and shells. There is no `fork` yet (see the end of this section).
+Processes are created with **`vfork` + `execve`**, which covers `posix_spawn`, `system`, `popen` and shells; translated programs can also `fork` (see "fork (translated programs)" below).
 
 **vfork.** `clone(CLONE_VM | CLONE_VFORK | SIGCHLD, 0)` (no new stack) enters a *vfork child*:
 
@@ -137,10 +137,19 @@ Translated (arm64) programs use the same protocol through the translator's suppo
 **Signals (version 0).** `kill` and `tgkill` queue a signal; it's acted on at the target's next syscall, and blocking calls (`read` on a pipe, `wait4`, `nanosleep`) wake up with `-EINTR`. Default actions apply (terminate, or ignore for SIGCHLD, SIGCONT, SIGURG and SIGWINCH), and `SIG_IGN` is honored. **Signal handlers are recorded by `rt_sigaction` but never run**: a signal with a handler is ignored. Running handlers is future work.
 
 **Devices.** The runtime provides `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd/N`, whatever the root directory contains.
+It also generates `/proc/cpuinfo`, `/sys/devices/system/cpu/{online,possible,present}` (the host's CPUs), `/proc/mounts`, `/proc/self/mounts`, `/etc/mtab` and `/proc/self/mountinfo` (the root, and `/proc`).
 
 **Networking.** Sockets are the host's: a program reaches the network, and binds ports, as the host would. Supported: `AF_INET` and `AF_INET6` sockets, stream and datagram (`SOCK_NONBLOCK` and `SOCK_CLOEXEC` too); `connect` (a non-blocking one reports `-EINPROGRESS`, then its result through `SO_ERROR`), `bind`, `listen`, `accept`/`accept4`, `getsockname`, `getpeername`, `sendto`, `recvfrom`, `sendmsg` and `recvmsg` (no control messages), `sendmmsg`, `shutdown`, `read`/`write` on sockets, and `setsockopt`/`getsockopt` for the common options (others are accepted and ignored). Blocking follows the descriptor's `O_NONBLOCK` (`fcntl` or `ioctl(FIONBIO)`). `ppoll` and `pselect6` work across sockets, pipes and files (files are always ready). Other address families (`AF_UNIX`, `AF_NETLINK`) return `-EAFNOSUPPORT`; glibc copes (no nscd; `getaddrinfo` assumes both IP families). Names resolve as the guest's libc does, from the root's `/etc/hosts` and `/etc/resolv.conf`; if the root's `/etc/resolv.conf` is missing or empty, as in a fresh image, the runtime provides the host's (as Docker does for containers). Writing to a broken connection returns `-EPIPE` without raising `SIGPIPE`.
 
-**fork**, for programs that fork without exec, remains open. The options:
+**fork (translated programs).** A translated program's state at a syscall is all in its memory: the guest registers are in the thread's guest-state block, and nothing on the host stack matters (the lifted code reaches the syscall through tail calls). So `clone` without `CLONE_VM` or `CLONE_THREAD` makes the child a copy: a new process whose memory holds the parent's pages (those in use: the image, break and mmap region, and libraries; untouched pages stay unallocated), with copies of the descriptor table, working directory, credentials and signal dispositions, running new instances of the program and its libraries with the same placements. The support code passes a clone frame (see "Threads"); the runtime points the child's instance at the forking thread's thread-local block and C stack (`__tls_base`, `__stack_pointer`, both exported) and calls `__wasm_env_fork_start(frame)`, which resumes after the `clone` with x0 = 0. `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` apply. Only the forking thread exists in the child, as on Linux. A fork takes a few milliseconds.
+
+**Credentials.** A process has user and group ids (real, effective, saved) and supplementary groups, starting as root; the `set*id`, `get*id`, `setgroups` and `getgroups` calls change and report them, and they pass through fork, vfork and exec. They are only numbers: files belong to the host user, and permissions aren't checked.
+
+**Terminals.** When the runtime's stdin, stdout or stderr is a terminal, `TCGETS`, `TCSETS*`, `TIOCGWINSZ`, `TCXONC` and `TCFLSH` on them go to the host terminal (on Linux hosts: the structures have the same layout), and `TIOCGPGRP`/`TIOCSPGRP` read and set the environment's foreground process group. Ctrl-C and Ctrl-\ at the host terminal send SIGINT and SIGQUIT to that group; the terminal's settings are restored when wasm-env exits.
+
+**Locks.** `fcntl`'s record locks (`F_GETLK`, `F_SETLK`, `F_SETLKW` and the `F_OFD_` forms) and `flock` are the host's open-file-description locks: the environment's processes share one host process, whose per-process POSIX locks would never conflict between them.
+
+**fork (programs built with the toolchain)**, which keep C state on the host stack, remains open (they have vfork). The options:
 
 | Option | How it works | Trade-off |
 |---|---|---|

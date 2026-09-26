@@ -98,6 +98,7 @@ pub fn page_align(n: u64) -> u64 {
 /// The mmap region: everything from `start` (the page-aligned heap base)
 /// upward. Allocations come from a first-fit free list, else from `top`,
 /// which the caller backs by growing linear memory.
+#[derive(Clone)]
 pub struct AddressSpace {
     pub start: u64,
     pub top: u64,

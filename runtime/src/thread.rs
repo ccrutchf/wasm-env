@@ -75,6 +75,23 @@ impl Group {
         })
     }
 
+    /// A forked child's group: a copy of this one's address space and
+    /// libraries, running the same module on `memory`, with one thread.
+    pub fn fork(&self, memory: SharedMemory) -> Arc<Group> {
+        let mm = self.mm.lock().unwrap();
+        let child = Arc::new(Group {
+            mm: Mutex::new(Mm { space: mm.space.clone(), brk: mm.brk, brk_start: mm.brk_start }),
+            futex: Futexes::default(),
+            threading: OnceLock::new(),
+            libraries: self.libraries.fork(),
+            state: Mutex::new(GroupState { live: 1, end: None, ended: false }),
+            changed: Condvar::new(),
+        });
+        let module = self.threading.get().expect("a translated program").module.clone();
+        let _ = child.threading.set(Threading { module, memory });
+        child
+    }
+
     /// Whether the process is ending (another thread exited it or exec'd).
     pub fn ended(&self) -> bool {
         self.state.lock().unwrap().ended

@@ -62,6 +62,9 @@ pub struct Kernel {
     pub root: PathBuf,
     pub trace: bool,
     procs: Mutex<Procs>,
+    /// The terminal's foreground process group (TIOCGPGRP, TIOCSPGRP): the
+    /// first process's at first. Ctrl-C at the host terminal goes to it.
+    pub foreground: std::sync::atomic::AtomicI32,
     /// Signalled whenever a process exits or receives a signal.
     changed: Condvar,
     /// Compiled programs by host path, with the (mtime, size) they were
@@ -80,6 +83,7 @@ impl Kernel {
             root,
             trace,
             procs: Mutex::new(Procs { next_pid: 1, table: HashMap::new() }),
+            foreground: std::sync::atomic::AtomicI32::new(1),
             changed: Condvar::new(),
             modules: Mutex::new(HashMap::new()),
         })
@@ -254,14 +258,18 @@ impl Kernel {
 
     /// Runs process `pid` on the current thread until it ends (following
     /// any execve), records its status, and returns it.
-    pub fn run(self: &Arc<Self>, pid: i32, mut image: ExecImage, mut inherit: Inherit) -> Termination {
+    pub fn run(self: &Arc<Self>, pid: i32, image: ExecImage, inherit: Inherit) -> Termination {
+        self.run_from(pid, move || process::run_image(self, pid, image, inherit))
+    }
+
+    /// Runs process `pid` from `first` (a program, or a forked child) and
+    /// whatever it execs, records its status, and returns it.
+    fn run_from(self: &Arc<Self>, pid: i32, first: impl FnOnce() -> process::Outcome) -> Termination {
+        let mut outcome = first();
         let how = loop {
-            match process::run_image(self, pid, image, inherit) {
+            match outcome {
                 process::Outcome::Done(how) => break how,
-                process::Outcome::Exec(next, state) => {
-                    image = next;
-                    inherit = state;
-                }
+                process::Outcome::Exec(next, state) => outcome = process::run_image(self, pid, next, state),
             }
         };
         self.exit(pid, how);
@@ -271,11 +279,17 @@ impl Kernel {
     /// Starts process `pid` on a new thread.
     pub fn spawn(self: &Arc<Self>, pid: i32, image: ExecImage, inherit: Inherit) {
         let kernel = self.clone();
+        self.spawn_from(pid, move || process::run_image(&kernel, pid, image, inherit));
+    }
+
+    /// Starts process `pid` on a new thread, from `first` (see run_from).
+    pub fn spawn_from(self: &Arc<Self>, pid: i32, first: impl FnOnce() -> process::Outcome + Send + 'static) {
+        let kernel = self.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("pid {pid}"))
             // wasmtime runs guest code on the host stack.
             .stack_size(8 << 20)
-            .spawn(move || kernel.run(pid, image, inherit));
+            .spawn(move || kernel.run_from(pid, first));
         if spawned.is_err() {
             self.exit(pid, Termination::Exit(127));
         }

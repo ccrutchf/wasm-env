@@ -53,6 +53,14 @@ fn translator() -> PathBuf {
     PathBuf::from("wasm-env-translate")
 }
 
+/// A converted image's own translation cache (see convert.rs), where its
+/// programs and libraries were translated when it was converted, if the
+/// root has one: `/var/cache/wasm-env/translated` inside it.
+pub fn image_cache(root: &Path) -> Option<PathBuf> {
+    let dir = root.join("var/cache/wasm-env/translated");
+    dir.is_dir().then_some(dir)
+}
+
 /// Where translated modules are cached.
 fn cache_dir() -> Option<PathBuf> {
     let base = std::env::var_os("WASM_ENV_CACHE").map(PathBuf::from).or_else(|| {
@@ -164,7 +172,7 @@ fn still_valid(deps: &Path) -> bool {
 pub fn ensure_translated(elf: &Path, root: &Path, program: &str, trace: bool) -> SysResult<PathBuf> {
     let bytes = std::fs::read(elf).map_err(|e| crate::fs::errno(&e))?;
     if !monolithic() {
-        return ensure_program(elf, &bytes, trace);
+        return ensure_program(elf, &bytes, root, trace);
     }
     // The cache key covers the binary and the translator's build, so a
     // rebuilt translator retranslates.
@@ -273,9 +281,9 @@ fn run_translator(input: &Path, out: &Path, args: &[String], trace: bool) -> Sys
 /// Returns the cached main module for the executable `elf` (just the
 /// executable; its libraries are modules of their own), translating it the
 /// first time.
-fn ensure_program(elf: &Path, bytes: &[u8], trace: bool) -> SysResult<PathBuf> {
+pub fn ensure_program(elf: &Path, bytes: &[u8], root: &Path, trace: bool) -> SysResult<PathBuf> {
     let key = hash(bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ bytes.len() as u64 ^ 0x6f626a;
-    let dir = cache_dir().ok_or(ENOENT)?;
+    let dir = image_cache(root).or_else(cache_dir).ok_or(ENOENT)?;
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
     let out = dir.join(format!("{key:016x}.wasm"));
     if !out.exists() {
@@ -353,10 +361,10 @@ fn library_range(bases: &Path, path: &Path, extent: u64) -> SysResult<(u64, u64)
 /// canonical host path) and the guest range it's translated for, translating
 /// it the first time (docs/abi.md, "Libraries"). ENOEXEC if it isn't an
 /// arm64 shared object.
-pub fn ensure_library(path: &Path, trace: bool) -> SysResult<(PathBuf, u64, u64)> {
+pub fn ensure_library(path: &Path, root: &Path, trace: bool) -> SysResult<(PathBuf, u64, u64)> {
     let bytes = std::fs::read(path).map_err(|e| crate::fs::errno(&e))?;
     let extent = library_extent(&bytes).ok_or(ENOEXEC)?;
-    let dir = cache_dir().ok_or(ENOENT)?;
+    let dir = image_cache(root).or_else(cache_dir).ok_or(ENOENT)?;
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
     let (base, end) = library_range(&dir.join("library-bases"), path, extent)?;
     let key = hash(&bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ base.rotate_left(7) ^ bytes.len() as u64;
@@ -481,7 +489,7 @@ pub fn record_missed_target(module: &Path, object: &str, offset: u64) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&roots) {
         let _ = writeln!(f, "{object}\t{offset:#x}");
     }
-    let cached = cache_dir().is_some_and(|d| module.parent() == Some(d.as_path()));
+    let cached = module.parent().and_then(|d| d.file_name()).is_some_and(|n| n == "translated");
     if cached {
         let _ = std::fs::remove_file(module);
         eprintln!("wasm-env: recorded the missed address; the next run translates it");
