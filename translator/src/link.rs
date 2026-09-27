@@ -58,6 +58,7 @@ fn ld_args(image_end: u64) -> Vec<String> {
         "__wasm_env_counter",
         "__wasm_env_modules",
         "__wasm_env_module_count",
+        "__wasm_env_code_epoch",
     ] {
         args.push(format!("--export={export}"));
     }

@@ -456,6 +456,27 @@ impl Image {
     /// object at `base`, or the executable at its own base. References to
     /// other objects stay unresolved; the dynamic linker binds them at run
     /// time, and the translated code reaches them through `dispatch`.
+    /// Machine code a program generated at run time (a JIT's), as the bytes
+    /// of the executable mapping at `base` that holds it: no headers, no
+    /// symbols, so blocks are found from the roots given (the addresses it
+    /// was entered at) and what discovery finds from there.
+    pub fn raw(bytes: &[u8], name: &str, base: u64) -> Image {
+        let end = base + bytes.len() as u64;
+        Image {
+            entry: base,
+            segments: vec![Segment { vaddr: base, data: bytes.to_vec(), memsz: bytes.len() as u64, exec: true, write: false }],
+            phdr: None,
+            phnum: 0,
+            functions: Vec::new(),
+            code: vec![base..end],
+            app_entry: base,
+            interp_base: 0,
+            roots: Vec::new(),
+            libs: Vec::new(),
+            objects: vec![(name.to_string(), base, end)],
+        }
+    }
+
     pub fn load_object(bytes: &[u8], name: &str, base: Option<u64>) -> Result<Image> {
         let base = match base {
             Some(b) => b,

@@ -34,6 +34,7 @@ pub fn syscall(
         nr::WASM_ENV_LOAD_LIBRARY => load_library(&mut caller, a, b as u64),
         // fork: a copy of the process (fork.rs).
         nr::CLONE if a & (0x100 | CLONE_THREAD) == 0 => crate::fork::fork(&mut caller, &args),
+        nr::WASM_ENV_TRANSLATE_CODE => crate::modules::translate_code(&mut caller, a as u64),
         nr::WASM_ENV_SYNC_MODULES => crate::modules::sync(&mut caller).map(|()| 0).map_err(|e| {
             eprintln!("wasm-env: loading libraries: {e:#}");
             EIO
@@ -207,6 +208,8 @@ fn load_library(caller: &mut Caller<'_, Process>, fd: i64, range: u64) -> SysRes
 
 const MAP_FIXED: i64 = 0x10;
 const MAP_ANONYMOUS: i64 = 0x20;
+const PROT_WRITE: i64 = 0x2;
+const PROT_EXEC: i64 = 0x4;
 const MREMAP_MAYMOVE: i64 = 1;
 
 /// Grows linear memory so it covers `top` (the whole mmap region, or the
@@ -249,7 +252,7 @@ pub fn alloc_shared(group: &crate::thread::Group, memory: &SharedMemory, len: u6
 }
 
 fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
-    let [addr, len, _prot, flags, fd, off] = *args;
+    let [addr, len, prot, flags, fd, off] = *args;
     if len <= 0 {
         return Err(EINVAL);
     }
@@ -269,6 +272,11 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
         };
         (addr, space.top)
     };
+    // Executable anonymous memory is where a JIT puts its code; a new
+    // mapping replaces whatever code was translated from the old one.
+    let exec = prot & PROT_EXEC != 0 && flags & MAP_ANONYMOUS != 0;
+    caller.data().group.mm.lock().unwrap().set_code(addr, addr + len, exec);
+    crate::modules::retire_code(&caller.data().group, addr, addr + len);
     grow_to(caller, top)?;
     let (data, process) = data_and_process(caller);
     mem::zero(data, addr, len)?;
@@ -722,7 +730,18 @@ impl Process {
             nr::GETPGID => self.kernel.pgid(if a == 0 { self.pid } else { a as i32 }).map(i64::from),
             nr::SETSID => self.kernel.setsid(self.pid).map(i64::from),
             nr::GETSID => self.kernel.sid(if a == 0 { self.pid } else { a as i32 }).map(i64::from),
-            nr::SET_ROBUST_LIST | nr::MPROTECT | nr::MADVISE => Ok(0),
+            nr::SET_ROBUST_LIST | nr::MADVISE => Ok(0),
+            // Protection isn't enforced, but executable memory is where a JIT
+            // puts its code (see modules::translate_code): code made writable
+            // again (to change it) or not executable retires its translation.
+            nr::MPROTECT => {
+                let end = ua.checked_add(page_align(ub)).ok_or(EINVAL)?;
+                self.group.mm.lock().unwrap().set_code(ua, end, c & PROT_EXEC != 0);
+                if c & PROT_EXEC == 0 || c & PROT_WRITE != 0 {
+                    crate::modules::retire_code(&self.group, ua, end);
+                }
+                Ok(0)
+            }
             nr::RT_SIGACTION => {
                 // Handlers are recorded and reported back, but not yet run;
                 // SIG_IGN takes effect (see Process::signal_effect).
@@ -868,6 +887,9 @@ impl Process {
                 if mm.space.contains(ua, len) {
                     mm.space.release(ua, len);
                 }
+                mm.set_code(ua, ua + len, false);
+                drop(mm);
+                crate::modules::retire_code(&self.group, ua, ua + len);
                 Ok(0)
             }
             nr::PRLIMIT64 => {

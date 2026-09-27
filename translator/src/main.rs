@@ -83,6 +83,8 @@ struct Inputs {
     /// executable, or with `--base` a shared library placed there.
     object: bool,
     base: Option<u64>,
+    /// The input is code generated at run time (`--raw`), at `base`.
+    raw: bool,
 }
 
 /// Translates an arm64 executable (with any shared libraries) into a
@@ -117,7 +119,9 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         libs.push(read(l, l.as_ref())?);
     }
     let library = inputs.base.is_some();
-    let mut image = if inputs.object {
+    let mut image = if inputs.raw {
+        elf::Image::raw(&bytes, input, inputs.base.context("--raw needs --base")?)
+    } else if inputs.object {
         elf::Image::load_object(&bytes, input, inputs.base)?
     } else if libs.is_empty() && interp.is_none() {
         elf::Image::load(&bytes)?
@@ -249,6 +253,7 @@ fn main() -> Result<()> {
                     "--roots" => inputs.roots = Some(value()?),
                     "--layout" => inputs.layout = Some(value()?),
                     "--object" => inputs.object = true,
+                    "--raw" => inputs.raw = true,
                     "--base" => {
                         let v = value()?;
                         let base = u64::from_str_radix(v.trim_start_matches("0x"), 16).with_context(|| format!("--base {v}"))?;

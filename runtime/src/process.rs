@@ -628,7 +628,7 @@ fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Resu
     // mem::BRK_MAX; mmap allocations start above that (docs/abi.md, "Memory").
     let brk = mem::page_align(heap_base);
     *store.data().group.mm.lock().unwrap() =
-        crate::thread::Mm { space: AddressSpace::new(brk + mem::BRK_MAX), brk, brk_start: brk };
+        crate::thread::Mm { space: AddressSpace::new(brk + mem::BRK_MAX), brk, brk_start: brk, code: Default::default() };
     // A dynamically-linked program whose libraries are modules of their own
     // starts in its dynamic linker, which the runtime loads first.
     let extra = match &image.interp {

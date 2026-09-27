@@ -14,7 +14,8 @@
 //! up on libraries loaded since it last looked (`sync`).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use wasmtime::{AsContextMut, Extern, Global, GlobalType, Instance, Linker, Module, Mutability, Ref, SharedMemory, Table, Val, ValType};
@@ -35,6 +36,13 @@ pub struct Library {
     memory_base: u64,
     table_base: u64,
     got: Vec<String>,
+    /// Code the program generated at run time (see translate_code), not a
+    /// shared object; `path` just names it.
+    pub code: bool,
+    /// Its entry in the module directory, in guest memory (see register).
+    entry: u64,
+    /// Retired: its code was unmapped or rewritten (see retire_code).
+    dead: std::sync::atomic::AtomicBool,
 }
 
 /// The libraries a process has loaded, in load order.
@@ -43,12 +51,16 @@ pub struct Libraries {
     pub list: Mutex<Vec<Arc<Library>>>,
     /// The next free function-table slot (after the main module's).
     next_slot: Mutex<u64>,
+    /// The address of the support code's `__wasm_env_code_epoch`, once a
+    /// module is loaded.
+    epoch: OnceLock<u64>,
 }
 
 impl Libraries {
-    /// The library covering a guest address, if any.
+    /// The library covering a guest address, if any (the newest, and not a
+    /// retired one).
     pub fn at(&self, addr: u64) -> Option<Arc<Library>> {
-        self.list.lock().unwrap().iter().find(|l| addr >= l.base && addr < l.end).cloned()
+        self.list.lock().unwrap().iter().rev().find(|l| addr >= l.base && addr < l.end && !l.dead.load(Ordering::Relaxed)).cloned()
     }
 }
 
@@ -132,7 +144,6 @@ fn dylink(wasm: &Path) -> Result<DylinkInfo> {
 pub fn load(mut store: impl AsContextMut<Data = Process>, path: &Path) -> Result<Arc<Library>> {
     let process = store.as_context().data();
     let (kernel, group, trace) = (process.kernel.clone(), process.group.clone(), process.trace);
-    let threading = group.threading.get().context("not a translated program")?;
     let libraries = &group.libraries;
     let path = std::fs::canonicalize(path)?;
     // One library loads at a time (glibc's dynamic linker holds a lock too).
@@ -143,6 +154,25 @@ pub fn load(mut store: impl AsContextMut<Data = Process>, path: &Path) -> Result
         return Ok(lib.clone());
     }
     let (wasm, base, end) = crate::translate::ensure_library(&path, &kernel.root, trace).map_err(|e| anyhow::anyhow!("translating {}: errno {e}", path.display()))?;
+    add(&mut store, &mut next_slot, path, wasm, base, end, false)
+}
+
+/// Adds a translated module covering guest [base, end) to the process and
+/// instantiates it in this thread's store (the caller holds `next_slot`
+/// and has synced the store).
+fn add(
+    mut store: impl AsContextMut<Data = Process>,
+    next_slot: &mut u64,
+    path: PathBuf,
+    wasm: PathBuf,
+    base: u64,
+    end: u64,
+    code: bool,
+) -> Result<Arc<Library>> {
+    let process = store.as_context().data();
+    let (kernel, group) = (process.kernel.clone(), process.group.clone());
+    let threading = group.threading.get().context("not a translated program")?;
+    let libraries = &group.libraries;
     let module = kernel.module_any(&wasm).map_err(anyhow::Error::msg)?;
     let info = dylink(&wasm)?;
     // The module's data goes in the process's mmap region.
@@ -154,26 +184,116 @@ pub fn load(mut store: impl AsContextMut<Data = Process>, path: &Path) -> Result
         .filter(|i| i.module() == "GOT.func")
         .map(|i| i.name().to_string())
         .collect();
+    let main = store.as_context().data().main.clone().context("no main instance")?;
     if *next_slot == 0 {
-        let main = store.as_context().data().main.clone().context("no main instance")?;
         *next_slot = main.table.size(&store);
     }
     let table_base = *next_slot;
     *next_slot += info.table_size + got.len() as u64;
-    let lib = Arc::new(Library { path, wasm, module, base, end, memory_base, table_base, got });
-    // The guest range: the dynamic linker maps the library there.
+    let k = libraries.list.lock().unwrap().len();
+    const MODULES: usize = 1024;
+    if k >= MODULES {
+        bail!("too many libraries");
+    }
+    let entry = global(&mut store, &main.instance, "__wasm_env_modules")? + 40 * k as u64;
+    if libraries.epoch.get().is_none() {
+        let _ = libraries.epoch.set(global(&mut store, &main.instance, "__wasm_env_code_epoch")?);
+    }
+    let lib = Arc::new(Library { path, wasm, module, base, end, memory_base, table_base, got, code, entry, dead: false.into() });
+    // The guest range: the dynamic linker maps a library there.
     crate::syscall::grow_shared(&threading.memory, end).map_err(|e| anyhow::anyhow!("errno {e}"))?;
     let instance = instantiate(&mut store, &lib, &threading.memory)?;
     // Relocate its data (function pointers become table slots) once.
     if let Some(f) = instance.get_func(&mut store, "__wasm_apply_data_relocs") {
         f.typed::<(), ()>(&store)?.call(&mut store, ())?;
     }
-    register(&mut store, &instance, &lib, &threading.memory, libraries.list.lock().unwrap().len())?;
+    register(&mut store, &instance, &lib, &threading.memory, k)?;
     libraries.list.lock().unwrap().push(lib.clone());
     if let Some(main) = store.as_context_mut().data_mut().main.as_mut() {
         main.loaded += 1;
     }
     Ok(lib)
+}
+
+/// A global's value (an i64) in an instance.
+fn global(mut store: impl AsContextMut, inst: &Instance, name: &str) -> Result<u64> {
+    match inst.get_global(&mut store, name).map(|g| g.get(&mut store)) {
+        Some(Val::I64(v)) => Ok(v as u64),
+        _ => bail!("missing export {name}"),
+    }
+}
+
+/// Code the program generated at run time (a JIT's), reached at `pc`: the
+/// wasm-env private call behind the support code's `translate_code`.
+/// Translates the executable mapping holding `pc` (as it is now) and adds
+/// it to the process. For an entry into code already translated that
+/// wasn't one of its blocks, translates that code again with `pc` as a
+/// root, retiring the old module. ENOEXEC if `pc` isn't in such memory (a
+/// library's missed target, say) or this entry was tried already.
+pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64) -> crate::memory::SysResult<i64> {
+    use crate::abi::errno::*;
+    let process = store.as_context().data();
+    let (kernel, group, trace) = (process.kernel.clone(), process.group.clone(), process.trace);
+    let threading = group.threading.get().ok_or(ENOEXEC)?;
+    let libraries = &group.libraries;
+    let mut next_slot = libraries.next_slot.lock().unwrap();
+    sync(&mut store).map_err(|_| EIO)?;
+    let old = libraries.at(pc);
+    let (lo, hi) = match &old {
+        Some(lib) if lib.code => (lib.base, lib.end),
+        Some(_) => return Err(ENOEXEC),
+        None => group.mm.lock().unwrap().code_at(pc).ok_or(ENOEXEC)?,
+    };
+    const MAX_CODE: u64 = 256 << 20;
+    if hi - lo > MAX_CODE {
+        return Err(ENOEXEC);
+    }
+    let bytes = crate::memory::slice(crate::syscall::shared_bytes(&threading.memory), lo, hi - lo)?.to_vec();
+    let (wasm, new) = crate::translate::ensure_code(&bytes, lo, pc, &kernel.root, trace)?;
+    if old.is_some() && !new {
+        return Err(ENOEXEC);
+    }
+    if trace {
+        eprintln!("[wasm-env] translated code at {lo:#x}..{hi:#x} (entered at {pc:#x})");
+    }
+    if let Some(old) = &old {
+        retire(old, &threading.memory, libraries);
+    }
+    let name = PathBuf::from(format!("[code {lo:#x}]"));
+    add(&mut store, &mut next_slot, name, wasm, lo, hi, true).map_err(|e| {
+        eprintln!("wasm-env: loading code translated from {lo:#x}: {e:#}");
+        EIO
+    })?;
+    Ok(0)
+}
+
+/// Retires translated code: empties its directory entry, so dispatch no
+/// longer finds it, and bumps the code epoch, so every thread clears its
+/// dispatch cache (which may name its regions) before it next dispatches.
+fn retire(lib: &Library, memory: &SharedMemory, libraries: &Libraries) {
+    lib.dead.store(true, Ordering::Relaxed);
+    let data = crate::syscall::shared_bytes(memory);
+    let _ = crate::memory::write_u64(data, lib.entry, 0);
+    let _ = crate::memory::write_u64(data, lib.entry + 8, 0);
+    if let Some(&epoch) = libraries.epoch.get()
+        && let Ok(slice) = crate::memory::slice(data, epoch, 8)
+    {
+        // SAFETY: in bounds (checked) and 8-byte aligned (a u64 global).
+        let counter = unsafe { std::sync::atomic::AtomicU64::from_ptr(slice.as_ptr() as *mut u64) };
+        counter.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Retires the translations of generated code in [start, end): the program
+/// unmapped it or made it writable again (to change it).
+pub fn retire_code(group: &crate::thread::Group, start: u64, end: u64) {
+    let Some(threading) = group.threading.get() else { return };
+    let libraries = &group.libraries;
+    for lib in libraries.list.lock().unwrap().iter() {
+        if lib.code && !lib.dead.load(Ordering::Relaxed) && lib.base < end && start < lib.end {
+            retire(lib, &threading.memory, libraries);
+        }
+    }
 }
 
 /// Instantiates the libraries this store hasn't yet.
@@ -242,12 +362,6 @@ fn instantiate(mut store: impl AsContextMut<Data = Process>, lib: &Library, memo
 /// `dispatch` searches (support/runtime.c, `struct module`), as entry `k`.
 fn register(mut store: impl AsContextMut<Data = Process>, instance: &Instance, lib: &Library, memory: &SharedMemory, k: usize) -> Result<()> {
     let main = store.as_context().data().main.clone().context("no main instance")?;
-    fn global(mut store: impl AsContextMut, inst: &Instance, name: &str) -> Result<u64> {
-        match inst.get_global(&mut store, name).map(|g| g.get(&mut store)) {
-            Some(Val::I64(v)) => Ok(v as u64),
-            _ => bail!("missing export {name}"),
-        }
-    }
     let data = crate::syscall::shared_bytes(memory);
     let word = |at: u64| -> Result<u64> { crate::memory::read_u64(data, at).map_err(|e| anyhow::anyhow!("errno {e}")) };
     // The library's exported data symbols are relative to its memory base.
@@ -279,6 +393,7 @@ impl Libraries {
         Libraries {
             list: Mutex::new(self.list.lock().unwrap().clone()),
             next_slot: Mutex::new(*self.next_slot.lock().unwrap()),
+            epoch: self.epoch.clone(),
         }
     }
 }

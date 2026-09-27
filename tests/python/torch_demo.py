@@ -1,13 +1,15 @@
 # PyTorch on CPU: a small model's forward pass, a convolutional network,
 # and a few training steps (autograd, SGD), with fixed seeds so the output
-# is the same everywhere. oneDNN generates machine code at run time, which
-# translated programs can't run (PLAN.md, M6), so ATen's own kernels are
-# used.
+# is the same everywhere. With --onednn, oneDNN runs the convolutions and
+# matmuls, with kernels it generates at run time (Xbyak), which wasm-env
+# translates when they're first called; without, ATen's own kernels.
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-torch.backends.mkldnn.enabled = False
+torch.backends.mkldnn.enabled = "--onednn" in sys.argv
 torch.manual_seed(0)
 torch.set_num_threads(1)
 

@@ -41,6 +41,9 @@ struct guest_state {
 	struct signal_delivery {
 		uint64_t sig, handler, flags, restorer, old_mask, alt_sp, alt_flags, alt_size;
 	} signal;
+	// The code epoch this thread's dispatch cache is from (see
+	// __wasm_env_code_epoch).
+	uint64_t code_epoch;
 };
 _Static_assert(__builtin_offsetof(struct guest_state, f) == 256, "STATE_POINTERS");
 _Static_assert(__builtin_offsetof(struct guest_state, fpsr) == 260, "STATE_POINTERS");
@@ -162,8 +165,17 @@ void __wasm_env_fatal(const char *why, uint64_t pc)
 // translate.rs): the next translation adds it as a block root.
 #define WASM_ENV_MISSED_TARGET (1L << 32)
 
+static int translate_code(uint64_t pc);
+void dispatch(long pc);
+
 void __wasm_env_bad_target(uint64_t pc)
 {
+	// Code the program generated at run time, not translated yet (or not
+	// this entry into it): translate it and go on there.
+	if (translate_code(pc)) {
+		dispatch((long)pc);
+		__builtin_unreachable();
+	}
 	int known = 0;
 	for (uint64_t k = 0; k < guest_object_count; k++) {
 		const struct lib *o = &guest_objects[k];
@@ -249,6 +261,37 @@ struct module __wasm_env_modules[MODULES];
 uint64_t __wasm_env_module_count;
 #define WASM_ENV_SYNC_MODULES ((1L << 32) + 3)
 
+// Code a program generates at run time (a JIT's): when control reaches an
+// address no module covers, the runtime translates the executable mapping
+// holding it (or, for a missed block in code it already translated, that
+// code again with the new entry) and adds the module to the directory; 0
+// if it did. When the program unmaps or rewrites such code, the runtime
+// empties its directory entry and bumps the epoch, and each thread clears
+// its dispatch cache, which may name the old code, when it next sees that
+// (after a system call, or in dispatch).
+#define WASM_ENV_TRANSLATE_CODE ((1L << 32) + 4)
+uint64_t __wasm_env_code_epoch;
+
+static void check_code_epoch(void)
+{
+	uint64_t epoch = __atomic_load_n(&__wasm_env_code_epoch, __ATOMIC_ACQUIRE);
+	if (guest.code_epoch != epoch) {
+		for (int i = 0; i < DISPATCH_CACHE; i++)
+			guest.cache[i].tag = 0;
+		guest.code_epoch = epoch;
+	}
+}
+
+static int translate_code(uint64_t pc)
+{
+	if (__wasm_env_host_syscall(WASM_ENV_TRANSLATE_CODE, (long)pc, 0, 0, 0, 0, 0) != 0)
+		return 0;
+	// The new module may replace one this thread's cache names.
+	for (int i = 0; i < DISPATCH_CACHE; i++)
+		guest.cache[i].tag = 0;
+	return 1;
+}
+
 // The function of the region starting at `start` in a region table, or 0.
 static block_fn lookup(const uint64_t *addrs, void *const *fns, uint64_t count, uint64_t start)
 {
@@ -286,6 +329,7 @@ void dispatch(long pc)
 		sigreturn();
 		__attribute__((musttail)) return dispatch((long)svc_redirect);
 	}
+	check_code_epoch();
 	wasm_env_recent[wasm_env_recent_count++ % RECENT] = target;
 	uint64_t region = target >> REGION_SHIFT;
 	struct dispatch_entry *e = &__wasm_env_dispatch_cache[(region ^ (region >> 12)) % DISPATCH_CACHE];
@@ -309,8 +353,11 @@ void dispatch(long pc)
 			break;
 		}
 	}
-	if (!f)
+	if (!f) {
+		if (translate_code(target))
+			__attribute__((musttail)) return dispatch(pc);
 		__wasm_env_bad_target(target);
+	}
 	if (!debug) {
 		e->tag = region + 1;
 		e->fn = f;
@@ -765,6 +812,7 @@ int64_t __wasm_env_svc_at(int64_t next)
 	svc_next = (uint64_t)next;
 	svc_redirect = 0;
 	__wasm_env_svc();
+	check_code_epoch();
 	if (guest.signal.sig)
 		enter_handler(svc_redirect ? svc_redirect : svc_next);
 	return (int64_t)svc_redirect;

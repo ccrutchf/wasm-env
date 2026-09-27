@@ -52,6 +52,8 @@ pub mod nr {
     /// yet (see modules.rs).
     pub const WASM_ENV_LOAD_LIBRARY: i64 = (1 << 32) + 2;
     pub const WASM_ENV_SYNC_MODULES: i64 = (1 << 32) + 3;
+    /// Translate code the program generated at run time (see modules::translate_code).
+    pub const WASM_ENV_TRANSLATE_CODE: i64 = (1 << 32) + 4;
     pub const SET_TID_ADDRESS: i64 = 96;
     pub const SET_ROBUST_LIST: i64 = 99;
     pub const FUTEX: i64 = 98;

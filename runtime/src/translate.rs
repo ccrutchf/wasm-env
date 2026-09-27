@@ -370,6 +370,38 @@ fn library_range(bases: &Path, path: &Path, extent: u64) -> SysResult<(u64, u64)
 /// canonical host path) and the guest range it's translated for, translating
 /// it the first time (docs/abi.md, "Libraries"). ENOEXEC if it isn't an
 /// arm64 shared object.
+/// The module for code a program generated at run time: `bytes`, the
+/// executable mapping at `base`, entered at `entry`. Cached by contents and
+/// base (a JIT generates the same code run after run), with the addresses
+/// it has been entered at as block roots (its `.roots` file, as for a
+/// missed target): an entry not seen yet translates it again. Returns the
+/// module and whether `entry` is new.
+pub fn ensure_code(bytes: &[u8], base: u64, entry: u64, root: &Path, trace: bool) -> SysResult<(PathBuf, bool)> {
+    let dir = image_cache(root).or_else(cache_dir).ok_or(ENOENT)?;
+    std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
+    let key = hash(bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ base.rotate_left(7) ^ 0x6a6974;
+    let stem = dir.join(format!("{key:016x}"));
+    let (code, roots, out) = (stem.with_extension("code"), stem.with_extension("roots"), stem.with_extension("wasm"));
+    // The translator names the object by the path it's given.
+    let line = format!("{}\t{:#x}", code.display(), entry - base);
+    let known = std::fs::read_to_string(&roots).is_ok_and(|t| t.lines().any(|l| l == line));
+    if known && out.exists() {
+        return Ok((out, false));
+    }
+    if !known {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&roots).map_err(|e| crate::fs::errno(&e))?;
+        writeln!(f, "{line}").map_err(|e| crate::fs::errno(&e))?;
+    }
+    if !code.exists() {
+        let tmp = code.with_extension(format!("{}.tmp", unique()));
+        std::fs::write(&tmp, bytes).map_err(|e| crate::fs::errno(&e))?;
+        std::fs::rename(&tmp, &code).map_err(|e| crate::fs::errno(&e))?;
+    }
+    run_translator(&code, &out, &["--raw".into(), "--base".into(), format!("{base:x}")], trace)?;
+    Ok((out, !known))
+}
+
 /// A library's content hash, length and extent. Reading and hashing a
 /// large library (libtorch_cpu is hundreds of MB) on every load costs a
 /// noticeable part of starting up, so the result is remembered in `dir`

@@ -27,6 +27,41 @@ pub struct Mm {
     /// The program break, and where it started.
     pub brk: u64,
     pub brk_start: u64,
+    /// Memory the program made executable (an anonymous mapping, or
+    /// `mprotect` with PROT_EXEC): where a JIT puts the code it generates,
+    /// translated when it's first jumped to (see translate::ensure_code).
+    /// Start → end.
+    pub code: std::collections::BTreeMap<u64, u64>,
+}
+
+impl Mm {
+    /// The executable range holding `addr`, if any.
+    pub fn code_at(&self, addr: u64) -> Option<(u64, u64)> {
+        self.code.range(..=addr).next_back().filter(|&(_, &end)| addr < end).map(|(&s, &e)| (s, e))
+    }
+
+    /// Records [start, end) as executable (`exec`) or not, merging ranges.
+    pub fn set_code(&mut self, start: u64, end: u64, exec: bool) {
+        // Cut [start, end) out of the ranges it overlaps, keeping the rest.
+        let overlapping: Vec<(u64, u64)> = self.code.range(..end).filter(|&(_, &e)| e > start).map(|(&s, &e)| (s, e)).collect();
+        let (mut lo, mut hi) = (start, end);
+        for (s, e) in overlapping {
+            self.code.remove(&s);
+            if exec {
+                (lo, hi) = (lo.min(s), hi.max(e));
+            } else {
+                if s < start {
+                    self.code.insert(s, start);
+                }
+                if e > end {
+                    self.code.insert(end, e);
+                }
+            }
+        }
+        if exec {
+            self.code.insert(lo, hi);
+        }
+    }
 }
 
 /// How a process with several threads ends, when a thread other than the
@@ -66,7 +101,7 @@ pub struct Group {
 impl Group {
     pub fn new() -> Arc<Group> {
         Arc::new(Group {
-            mm: Mutex::new(Mm { space: AddressSpace::new(0), brk: 0, brk_start: 0 }),
+            mm: Mutex::new(Mm { space: AddressSpace::new(0), brk: 0, brk_start: 0, code: Default::default() }),
             futex: Futexes::default(),
             threading: OnceLock::new(),
             libraries: Default::default(),
@@ -80,7 +115,7 @@ impl Group {
     pub fn fork(&self, memory: SharedMemory) -> Arc<Group> {
         let mm = self.mm.lock().unwrap();
         let child = Arc::new(Group {
-            mm: Mutex::new(Mm { space: mm.space.clone(), brk: mm.brk, brk_start: mm.brk_start }),
+            mm: Mutex::new(Mm { space: mm.space.clone(), brk: mm.brk, brk_start: mm.brk_start, code: mm.code.clone() }),
             futex: Futexes::default(),
             threading: OnceLock::new(),
             libraries: self.libraries.fork(),
