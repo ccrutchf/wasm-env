@@ -435,21 +435,40 @@ fn jump_table(image: &Image, code: &Code, block: &[(u64, Instruction)]) -> Vec<u
 /// dispatch sequence (`b.hi default`) or jumps to it (`b.ls dispatch`).
 fn table_length(insns: Insns, window: &[(u64, Instruction)], idx: u32) -> Option<u64> {
     use bad64::Operand::*;
-    let cmp_before = |branch: u64| -> Option<u64> {
+    let (start, end) = (window[0].0, window[window.len() - 1].0);
+    // The bound may be checked on the register the index was copied from
+    // (`mov w2, w1; cmp w1, #max; b.ls ...; ldrh w0, [x0, w2, uxtw #1]`).
+    let mut index = vec![idx];
+    for (_, i) in insns.range(start.saturating_sub(64)..end + 4) {
+        let ops = i.operands();
+        if i.op().mnem() == "mov"
+            && ops.first().and_then(gpr_id) == Some(idx)
+            && let Some(src) = ops.get(1).and_then(gpr_id)
+        {
+            index.push(src);
+        }
+    }
+    // Only a range check bounds the table: `cmp wI, #8; b.eq` in front of
+    // a switch picks out one case (and may branch into the sequence too).
+    let cmp_before = |branch: u64, cond: &str| -> Option<u64> {
+        let extra = match cond {
+            "b.ls" | "b.hi" | "b.le" | "b.gt" => 1, // index <= imm
+            "b.lo" | "b.hs" | "b.cc" | "b.cs" | "b.lt" | "b.ge" => 0, // index < imm
+            _ => return None,
+        };
         let i = insns.get(&branch.checked_sub(4)?)?;
         let ops = i.operands();
         match (i.op().mnem(), ops.first().and_then(gpr_id), ops.get(1)) {
-            ("cmp", Some(r), Some(Imm32 { imm, .. } | Imm64 { imm, .. })) if r == idx => Some(imm_u64(imm) + 1),
+            ("cmp", Some(r), Some(Imm32 { imm, .. } | Imm64 { imm, .. })) if index.contains(&r) => Some(imm_u64(imm) + extra),
             _ => None,
         }
     };
-    let (start, end) = (window[0].0, window[window.len() - 1].0);
     // A guard on the straight-line path, or just before it: the one nearest
     // the dispatch (earlier compares of the same register guard other code).
     let first = start.saturating_sub(4);
     for (a, i) in insns.range(first..end + 4).rev() {
         if i.op().mnem().starts_with("b.")
-            && let Some(n) = cmp_before(a)
+            && let Some(n) = cmp_before(a, i.op().mnem())
         {
             return Some(n);
         }
@@ -458,7 +477,7 @@ fn table_length(insns: Insns, window: &[(u64, Instruction)], idx: u32) -> Option
     for (a, i) in insns.range(start.saturating_sub(0x10000)..end + 0x10000) {
         if i.op().mnem().starts_with("b.")
             && direct_target(&i).is_some_and(|t| (start..=end).contains(&t))
-            && let Some(n) = cmp_before(a)
+            && let Some(n) = cmp_before(a, i.op().mnem())
         {
             return Some(n);
         }
