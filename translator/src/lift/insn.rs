@@ -579,7 +579,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let r2 = b.reg_op(i, 1)?;
             let (mem_bits, signed) = if m == "ldpsw" { (32, true) } else { (r1.1, false) };
             let addr = b.address(&ops[2])?;
-            let addr2 = b.val(format!("add i64 {addr}, {}", mem_bits / 8));
+            let addr2 = b.val(format!("add nuw i64 {addr}, {}", mem_bits / 8));
             for (r, a) in [(r1, addr), (r2, addr2)] {
                 if m.starts_with("st") {
                     let v = b.read_any(r)?;
@@ -602,7 +602,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let (regs, elem, _) = reg_list(&ops[0])?;
             let addr = structure_address(b, i)?;
             for (r, &n) in regs.iter().enumerate() {
-                let a = b.val(format!("add i64 {addr}, {}", r as u32 * elem / 8));
+                let a = b.val(format!("add nuw i64 {addr}, {}", r as u32 * elem / 8));
                 if m.starts_with("ld") {
                     let v = b.load(&a, elem);
                     insert_lane(b, n, elem, k, v);
@@ -619,7 +619,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let (regs, _, total) = reg_list(&ops[0])?;
             let addr = structure_address(b, i)?;
             for (r, &n) in regs.iter().enumerate() {
-                let a = b.val(format!("add i64 {addr}, {}", r as u32 * total / 8));
+                let a = b.val(format!("add nuw i64 {addr}, {}", r as u32 * total / 8));
                 if m == "ld1" {
                     let v = b.load(&a, total);
                     b.write_v(n, v, total);

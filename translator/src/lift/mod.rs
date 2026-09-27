@@ -228,7 +228,7 @@ impl<'a> Block<'a> {
         if let Some(v) = &self.gpr[i] {
             return v.clone();
         }
-        let p = self.val(format!("getelementptr [32 x i64], ptr %R, i64 0, i64 {i}"));
+        let p = self.val(format!("getelementptr inbounds nuw [32 x i64], ptr %R, i64 0, i64 {i}"));
         let v = self.val(format!("load i64, ptr {p}{REG}"));
         self.gpr[i] = Some(v.clone());
         v
@@ -246,7 +246,7 @@ impl<'a> Block<'a> {
         if !self.flags_set {
             self.flags_read_first = true;
         }
-        let p = self.val(format!("getelementptr [4 x i8], ptr %F, i64 0, i64 {f}"));
+        let p = self.val(format!("getelementptr inbounds nuw [4 x i8], ptr %F, i64 0, i64 {f}"));
         let b = self.val(format!("load i8, ptr {p}{REG}"));
         let v = self.val(format!("trunc i8 {b} to i1"));
         self.flags[f] = Some(v.clone());
@@ -266,7 +266,7 @@ impl<'a> Block<'a> {
         if let Some(v) = &self.vec[i] {
             return v.clone();
         }
-        let p = self.val(format!("getelementptr [32 x i128], ptr %V, i64 0, i64 {i}"));
+        let p = self.val(format!("getelementptr inbounds nuw [32 x i128], ptr %V, i64 0, i64 {i}"));
         let v = self.val(format!("load i128, ptr {p}, align 16{REG}"));
         self.vec[i] = Some(v.clone());
         v
@@ -282,13 +282,13 @@ impl<'a> Block<'a> {
         for i in 0..32 {
             if self.gpr_dirty[i] {
                 let v = self.gpr[i].clone().unwrap();
-                let p = self.val(format!("getelementptr [32 x i64], ptr %R, i64 0, i64 {i}"));
+                let p = self.val(format!("getelementptr inbounds nuw [32 x i64], ptr %R, i64 0, i64 {i}"));
                 self.line(format!("store i64 {v}, ptr {p}{REG}"));
                 self.gpr_dirty[i] = false;
             }
             if self.vec_dirty[i] {
                 let v = self.vec[i].clone().unwrap();
-                let p = self.val(format!("getelementptr [32 x i128], ptr %V, i64 0, i64 {i}"));
+                let p = self.val(format!("getelementptr inbounds nuw [32 x i128], ptr %V, i64 0, i64 {i}"));
                 self.line(format!("store i128 {v}, ptr {p}, align 16{REG}"));
                 self.vec_dirty[i] = false;
             }
@@ -303,7 +303,7 @@ impl<'a> Block<'a> {
             if self.flags_dirty[f] {
                 let v = self.flags[f].clone().unwrap();
                 let b = self.val(format!("zext i1 {v} to i8"));
-                let p = self.val(format!("getelementptr [4 x i8], ptr %F, i64 0, i64 {f}"));
+                let p = self.val(format!("getelementptr inbounds nuw [4 x i8], ptr %F, i64 0, i64 {f}"));
                 self.line(format!("store i8 {b}, ptr {p}{REG}"));
                 self.flags_dirty[f] = false;
             }
@@ -695,8 +695,13 @@ impl<'a> Block<'a> {
             Operand::MemReg(r) => base(self, r)?,
             Operand::MemOffset { reg: r, offset, .. } => {
                 let b = base(self, r)?;
+                // `nuw` lets the offset become the WebAssembly access's
+                // offset immediate, so accesses off one base register share
+                // its masked index. (An access that wraps past 2^64 is
+                // outside the masked address space anyway.)
                 match imm_i64(offset) {
                     0 => b,
+                    off if off > 0 => self.val(format!("add nuw i64 {b}, {off}")),
                     off => self.val(format!("add i64 {b}, {off}")),
                 }
             }
@@ -809,14 +814,14 @@ impl<'a> Block<'a> {
         let high = self.val(format!("lshr i64 {region}, 12"));
         let mixed = self.val(format!("xor i64 {region}, {high}"));
         let slot = self.val(format!("and i64 {mixed}, 4095"));
-        let tag_at = self.val(format!("getelementptr [4096 x {{ i64, ptr }}], ptr %DC, i64 0, i64 {slot}, i32 0"));
+        let tag_at = self.val(format!("getelementptr inbounds nuw [4096 x {{ i64, ptr }}], ptr %DC, i64 0, i64 {slot}, i32 0"));
         let tag = self.val(format!("load i64, ptr {tag_at}"));
         let want = self.val(format!("add i64 {region}, 1"));
         let hit = self.val(format!("icmp eq i64 {tag}, {want}"));
         let (cached, miss) = (self.label(), self.label());
         self.line(format!("br i1 {hit}, label %{cached}, label %{miss}"));
         self.place_label(&cached);
-        let fn_at = self.val(format!("getelementptr [4096 x {{ i64, ptr }}], ptr %DC, i64 0, i64 {slot}, i32 1"));
+        let fn_at = self.val(format!("getelementptr inbounds nuw [4096 x {{ i64, ptr }}], ptr %DC, i64 0, i64 {slot}, i32 1"));
         let f = self.val(format!("load ptr, ptr {fn_at}"));
         self.line(format!("musttail call void {f}(i64 {target})"));
         self.line("ret void");
@@ -1157,12 +1162,12 @@ const TBAA: &str = "!900 = !{!\"wasm-env\"}\n\
 /// names the fields.
 const STATE_POINTERS: &str = "  %st = load i64, ptr addrspace(1) @__wasm_env_state, align 8, !invariant.load !906\n\
                               \x20 %R = inttoptr i64 %st to ptr\n\
-                              \x20 %F = getelementptr i8, ptr %R, i64 256\n\
-                              \x20 %FPSR = getelementptr i8, ptr %R, i64 260\n\
-                              \x20 %TP = getelementptr i8, ptr %R, i64 264\n\
-                              \x20 %MONITOR = getelementptr i8, ptr %R, i64 272\n\
-                              \x20 %V = getelementptr i8, ptr %R, i64 288\n\
-                              \x20 %DC = getelementptr i8, ptr %R, i64 800\n";
+                              \x20 %F = getelementptr inbounds nuw i8, ptr %R, i64 256\n\
+                              \x20 %FPSR = getelementptr inbounds nuw i8, ptr %R, i64 260\n\
+                              \x20 %TP = getelementptr inbounds nuw i8, ptr %R, i64 264\n\
+                              \x20 %MONITOR = getelementptr inbounds nuw i8, ptr %R, i64 272\n\
+                              \x20 %V = getelementptr inbounds nuw i8, ptr %R, i64 288\n\
+                              \x20 %DC = getelementptr inbounds nuw i8, ptr %R, i64 800\n";
 
 /// The global holding this thread's guest state address (see
 /// STATE_POINTERS), defined by the program's data module, and how the
