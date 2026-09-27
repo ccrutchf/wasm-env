@@ -205,6 +205,18 @@ uint32_t __wasm_env_fp_flags(double x, double y, double z, double r, uint32_t ki
 	return in_nan || in_inf ? 0 : FPSR_OFC;
 }
 
+// CNTVCT_EL0, the virtual counter: CLOCK_MONOTONIC in nanoseconds, so
+// CNTFRQ_EL0 reads 1 GHz (as ARMv8.6 requires). Spin loops time out on it
+// (OpenBLAS's idle threads go to sleep after 2^28 ticks), so it must move.
+uint64_t __wasm_env_counter(void)
+{
+	struct {
+		int64_t sec, nsec;
+	} ts = {0, 0};
+	__wasm_env_host_syscall(113 /* clock_gettime */, 1 /* CLOCK_MONOTONIC */, (long)&ts, 0, 0, 0, 0);
+	return (uint64_t)ts.sec * 1000000000u + (uint64_t)ts.nsec;
+}
+
 // The CRC32* instructions: CRC-32 (or CRC-32C, by polynomial) of the low
 // `bytes` bytes of `data`, least significant first.
 uint32_t __wasm_env_crc32(uint32_t crc, uint64_t data, uint32_t bytes, uint32_t poly)

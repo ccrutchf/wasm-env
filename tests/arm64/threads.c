@@ -20,6 +20,7 @@ static long locked_counter;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_flag spin = ATOMIC_FLAG_INIT;
 static long spun_counter;
+static volatile int go_again; // never set: the spin below must time out
 static __thread long mine = 1;
 static __thread char name[16];
 
@@ -186,6 +187,16 @@ int main(void)
 		;
 	pthread_join(g, NULL);
 	puts("volatile flag: seen");
+
+	// A spin loop with a timeout on the virtual counter (OpenBLAS's idle
+	// threads wait like this): the counter must advance at its frequency.
+	uint64_t freq, start, now;
+	asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+	asm volatile("isb; mrs %0, cntvct_el0" : "=r"(start));
+	do
+		asm volatile("isb; mrs %0, cntvct_el0" : "=r"(now));
+	while (!go_again && now - start < freq / 50);
+	printf("counter timeout: %s\n", freq && !go_again ? "reached" : "broken");
 
 	// A detached thread still running when main returns doesn't hold up exit.
 	pthread_t d;

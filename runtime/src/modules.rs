@@ -195,6 +195,8 @@ fn instantiate(mut store: impl AsContextMut<Data = Process>, lib: &Library, memo
     let main = store.as_context().data().main.clone().context("no main instance")?;
     let mut linker: Linker<Process> = Linker::new(store.as_context().engine());
     let mut got_globals = Vec::new();
+    // GOT.func imports come in the order of `lib.got`: the k-th is slot k.
+    let mut slots = lib.table_base..;
     for import in lib.module.imports() {
         let (module, name) = (import.module(), import.name());
         let ext: Extern = match (module, name) {
@@ -211,8 +213,7 @@ fn instantiate(mut store: impl AsContextMut<Data = Process>, lib: &Library, memo
                 .get_export(&mut store, other)
                 .with_context(|| format!("{}: the program doesn't provide `{other}`", lib.wasm.display()))?,
             ("GOT.func", sym) => {
-                let k = lib.got.iter().position(|g| g == sym).unwrap();
-                let slot = lib.table_base + k as u64;
+                let slot = slots.next().unwrap();
                 let g = Global::new(&mut store, GlobalType::new(ValType::I64, Mutability::Var), Val::I64(slot as i64))?;
                 got_globals.push((sym.to_string(), slot));
                 g.into()

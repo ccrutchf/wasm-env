@@ -1191,6 +1191,7 @@ fn chunk_preamble() -> String {
          declare void @__wasm_env_fatal(ptr, i64)\n\
          declare void @__wasm_env_bad_target(i64)\n\
          declare i32 @__wasm_env_crc32(i32, i64, i32, i32) memory(none)\n\
+         declare i64 @__wasm_env_counter()\n\
          {}{}",
         TBAA,
         intrinsics()

@@ -127,7 +127,9 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                     let v = b.val("load i32, ptr %FPSR");
                     b.val(format!("zext i32 {v} to i64"))
                 }
-                "midr_el1" | "fpcr" | "cntfrq_el0" | "cntvct_el0" => konst(0, 64),
+                "midr_el1" | "fpcr" => konst(0, 64),
+                "cntfrq_el0" => konst(1_000_000_000, 64),
+                "cntvct_el0" => b.val("call i64 @__wasm_env_counter()"),
                 other => bail!("system register {other}"),
             };
             b.write(d, v, 64)?;

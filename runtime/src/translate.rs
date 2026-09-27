@@ -370,11 +370,38 @@ fn library_range(bases: &Path, path: &Path, extent: u64) -> SysResult<(u64, u64)
 /// canonical host path) and the guest range it's translated for, translating
 /// it the first time (docs/abi.md, "Libraries"). ENOEXEC if it isn't an
 /// arm64 shared object.
-pub fn ensure_library(path: &Path, root: &Path, trace: bool) -> SysResult<(PathBuf, u64, u64)> {
+/// A library's content hash, length and extent. Reading and hashing a
+/// large library (libtorch_cpu is hundreds of MB) on every load costs a
+/// noticeable part of starting up, so the result is remembered in `dir`
+/// against the file's size, mtime and inode, and recomputed when they change.
+fn library_identity(path: &Path, dir: &Path) -> SysResult<(u64, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).map_err(|e| crate::fs::errno(&e))?;
+    let stamp = format!("{} {} {} {}", meta.size(), meta.mtime(), meta.mtime_nsec(), meta.ino());
+    let memo = dir.join(format!("{:016x}.identity", hash(path.as_os_str().as_encoded_bytes())));
+    if let Ok(text) = std::fs::read_to_string(&memo)
+        && let Some((recorded, rest)) = text.trim_end().rsplit_once(' ').and_then(|(a, extent)| {
+            let (stamp, contents) = a.rsplit_once(' ')?;
+            Some((stamp.to_string(), (u64::from_str_radix(contents, 16).ok()?, extent.parse::<u64>().ok()?)))
+        })
+        && recorded == stamp
+    {
+        return Ok((rest.0, meta.size(), rest.1));
+    }
     let bytes = std::fs::read(path).map_err(|e| crate::fs::errno(&e))?;
     let extent = library_extent(&bytes).ok_or(ENOEXEC)?;
+    let contents = hash(&bytes);
+    let tmp = memo.with_extension(format!("{}.tmp", unique()));
+    if std::fs::write(&tmp, format!("{stamp} {contents:016x} {extent}\n")).is_ok() {
+        let _ = std::fs::rename(&tmp, &memo);
+    }
+    Ok((contents, bytes.len() as u64, extent))
+}
+
+pub fn ensure_library(path: &Path, root: &Path, trace: bool) -> SysResult<(PathBuf, u64, u64)> {
     let dir = image_cache(root).or_else(cache_dir).ok_or(ENOENT)?;
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
+    let (contents, len, extent) = library_identity(path, &dir)?;
     // A library in the root is recorded by its path there, so the image can
     // move (and be copied to another machine) without translating again.
     let name = match path.strip_prefix(root.canonicalize().unwrap_or_else(|_| root.to_path_buf())) {
@@ -382,7 +409,7 @@ pub fn ensure_library(path: &Path, root: &Path, trace: bool) -> SysResult<(PathB
         Err(_) => path.to_path_buf(),
     };
     let (base, end) = library_range(&dir.join("library-bases"), &name, extent)?;
-    let key = hash(&bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ base.rotate_left(7) ^ bytes.len() as u64;
+    let key = contents ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ base.rotate_left(7) ^ len;
     let out = dir.join(format!("{key:016x}.wasm"));
     if !out.exists() {
         run_translator(path, &out, &["--object".into(), "--base".into(), format!("{base:x}")], trace)?;
