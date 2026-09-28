@@ -151,6 +151,11 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
             let Ok(offset) = u64::from_str_radix(offset.trim().trim_start_matches("0x"), 16) else { continue };
             if let Some((_, base, _)) = image.objects.iter().find(|o| o.0 == object) {
                 image.roots.push(base + offset);
+                // (Generated code is entered where the JIT says; its roots
+                // aren't missed targets of code discovery read poorly.)
+                if !inputs.raw {
+                    image.missed.push(base + offset);
+                }
             }
         }
     }
@@ -180,6 +185,9 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     let work = std::env::temp_dir().join(format!("wasm-env-translate-{}", std::process::id()));
     // Each code module goes to disk as soon as it's lifted (see lift::lift).
     let mut build = link::Build::new(&tc, &work, library)?;
+    if inputs.raw {
+        build.quick();
+    }
     let mut failed = None;
     let lifted = lift::lift(&image, &prog, library, &mut |chunk| {
         if failed.is_none()
@@ -196,6 +204,13 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         eprintln!("warning: {n} × `{op}` not supported yet (traps if executed): {example}");
     }
     let wasm = build.finish(&lifted.data, image_end).and_then(|wasm| {
+        if inputs.raw {
+            // Generated code: the module covers the whole pages its blocks
+            // are in, not the whole mapping (see the runtime's
+            // modules::translate_code).
+            let (lo, hi) = code_extent(&prog);
+            return link::add_library_info(&wasm, lo, hi);
+        }
         if library {
             return link::add_library_info(&wasm, image.objects[0].1, image.objects[0].2);
         }
@@ -215,6 +230,22 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     std::fs::write(output, wasm?).with_context(|| format!("writing {output}"))?;
     eprintln!("{input}: {} blocks in {} module(s) → {output}", lifted.blocks, lifted.chunks);
     Ok(())
+}
+
+/// The pages holding a program's blocks: from the first block's page to
+/// the end of the page where the last block ends.
+#[cfg(feature = "lift")]
+fn code_extent(prog: &discover::Program) -> (u64, u64) {
+    const PAGE: u64 = 0x1000;
+    let (Some(&first), Some(&last)) = (prog.leaders.first(), prog.leaders.last()) else { return (0, 0) };
+    let mut end = last;
+    while let Some(i) = prog.insns.get(&end) {
+        end += 4;
+        if discover::is_control(&i) || prog.leaders.contains(&end) {
+            break;
+        }
+    }
+    (first / PAGE * PAGE, end.max(last + 4).next_multiple_of(PAGE))
 }
 
 /// Reports the blocks discovery found.

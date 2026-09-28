@@ -58,6 +58,7 @@ fn ld_args(image_end: u64) -> Vec<String> {
         "__wasm_env_counter",
         "__wasm_env_modules",
         "__wasm_env_module_count",
+        "__wasm_env_modules_added",
         "__wasm_env_code_epoch",
     ] {
         args.push(format!("--export={export}"));
@@ -336,6 +337,8 @@ pub struct Build<'a> {
     /// isn't rebuilt.
     units: Vec<(PathBuf, PathBuf, String)>,
     chunks: usize,
+    /// The optimization level for code modules (see lift_opt).
+    opt: String,
 }
 
 impl<'a> Build<'a> {
@@ -345,7 +348,7 @@ impl<'a> Build<'a> {
         if let Some(dir) = &cache {
             std::fs::create_dir_all(dir)?;
         }
-        Ok(Build { tc, work: work.to_path_buf(), library, cache, units: Vec::new(), chunks: 0 })
+        Ok(Build { tc, work: work.to_path_buf(), library, cache, units: Vec::new(), chunks: 0, opt: lift_opt() })
     }
 
     fn unit(&mut self, name: &str, source: &[u8], opt: String) -> Result<()> {
@@ -368,11 +371,20 @@ impl<'a> Build<'a> {
         if self.library { " -fPIC" } else { "" }
     }
 
+    /// Code translated while its program waits (generated at run time):
+    /// `-O1`, which compiles in half the time of `-O2` with nearly the same
+    /// code, unless WASM_ENV_LIFT_OPT says otherwise.
+    pub fn quick(&mut self) {
+        if std::env::var_os("WASM_ENV_LIFT_OPT").is_none() {
+            self.opt = "-O1".into();
+        }
+    }
+
     /// Adds a code module.
     pub fn chunk(&mut self, source: &str) -> Result<()> {
         let name = format!("chunk{}.ll", self.chunks);
         self.chunks += 1;
-        let opt = format!("{}{}", lift_opt(), self.pic());
+        let opt = format!("{}{}", self.opt, self.pic());
         self.unit(&name, source.as_bytes(), opt)
     }
 

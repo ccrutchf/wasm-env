@@ -182,18 +182,17 @@ pub fn ensure_translated(elf: &Path, root: &Path, program: &str, trace: bool) ->
     if !monolithic() {
         return ensure_program(elf, &bytes, root, trace);
     }
-    // The cache key covers the binary and the translator's build, so a
-    // rebuilt translator retranslates.
+    // The cache key covers the binary, the root and the libraries it may
+    // load (and module_path the translator's build).
     let translator = translator();
-    let tool_hash = tool_hash();
     let dlopen = dlopen_list(root, program);
     let root_hash = hash(root.as_os_str().as_encoded_bytes()) ^ hash(dlopen.join("\n").as_bytes()).rotate_left(3);
-    let key = hash(&bytes) ^ hash(&tool_hash.to_le_bytes()).rotate_left(1) ^ root_hash.rotate_left(2) ^ bytes.len() as u64;
+    let key = hash(&bytes) ^ root_hash.rotate_left(2) ^ bytes.len() as u64;
 
     let dir = cache_dir().ok_or(ENOENT)?;
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
-    let out = dir.join(format!("{key:016x}.wasm"));
-    let deps = dir.join(format!("{key:016x}.deps"));
+    let out = module_path(&dir, key);
+    let deps = out.with_extension("deps");
     if out.exists() && still_valid(&deps) {
         return Ok(out);
     }
@@ -219,7 +218,7 @@ pub fn ensure_translated(elf: &Path, root: &Path, program: &str, trace: bool) ->
     ));
     cmd.arg("--layout").arg(&layout);
     // Addresses earlier runs found missing (see record_missed_target).
-    let roots = out.with_extension("roots");
+    let roots = roots_of(&out);
     if roots.exists() {
         cmd.arg("--roots").arg(&roots);
     }
@@ -262,6 +261,20 @@ fn tool_hash() -> u64 {
 
 /// Runs the translator on `input` with `args`, writing `out` (through a
 /// temporary file, so a concurrent run never sees a half-written module).
+/// Where a translated module is cached: named by its content key and the
+/// translator's version, so a rebuilt translator translates again, while
+/// its roots file (see record_missed_target) is named by the content key
+/// alone, so what earlier runs learned outlives the translator.
+fn module_path(dir: &Path, content: u64) -> PathBuf {
+    dir.join(format!("{content:016x}-{:016x}.wasm", tool_hash()))
+}
+
+/// A cached module's roots file (see module_path).
+fn roots_of(module: &Path) -> PathBuf {
+    let stem = module.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    module.with_file_name(format!("{}.roots", stem.split('-').next().unwrap_or(stem)))
+}
+
 fn run_translator(input: &Path, out: &Path, args: &[String], trace: bool) -> SysResult<()> {
     if trace {
         eprintln!("[wasm-env] translating {}", input.display());
@@ -270,7 +283,7 @@ fn run_translator(input: &Path, out: &Path, args: &[String], trace: bool) -> Sys
     let mut cmd = Command::new(translator());
     cmd.arg("translate").arg(input).arg(&tmp).args(args);
     // Addresses earlier runs found missing (see record_missed_target).
-    let roots = out.with_extension("roots");
+    let roots = roots_of(&out);
     if roots.exists() {
         cmd.arg("--roots").arg(&roots);
     }
@@ -290,10 +303,10 @@ fn run_translator(input: &Path, out: &Path, args: &[String], trace: bool) -> Sys
 /// executable; its libraries are modules of their own), translating it the
 /// first time.
 pub fn ensure_program(elf: &Path, bytes: &[u8], root: &Path, trace: bool) -> SysResult<PathBuf> {
-    let key = hash(bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ bytes.len() as u64 ^ 0x6f626a;
+    let key = hash(bytes) ^ bytes.len() as u64 ^ 0x6f626a;
     let dir = image_cache(root).or_else(cache_dir).ok_or(ENOENT)?;
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
-    let out = dir.join(format!("{key:016x}.wasm"));
+    let out = module_path(&dir, key);
     if !out.exists() {
         run_translator(elf, &out, &["--object".into()], trace)?;
     }
@@ -371,35 +384,33 @@ fn library_range(bases: &Path, path: &Path, extent: u64) -> SysResult<(u64, u64)
 /// it the first time (docs/abi.md, "Libraries"). ENOEXEC if it isn't an
 /// arm64 shared object.
 /// The module for code a program generated at run time: `bytes`, the
-/// executable mapping at `base`, entered at `entry`. Cached by contents and
-/// base (a JIT generates the same code run after run), with the addresses
-/// it has been entered at as block roots (its `.roots` file, as for a
-/// missed target): an entry not seen yet translates it again. Returns the
-/// module and whether `entry` is new.
-pub fn ensure_code(bytes: &[u8], base: u64, entry: u64, root: &Path, trace: bool) -> SysResult<(PathBuf, bool)> {
+/// executable mapping at `base`, entered at `roots` (the translation's
+/// block roots). Cached by all three (a JIT generates the same code run
+/// after run, at the same addresses if it chose them).
+pub fn ensure_code(bytes: &[u8], base: u64, roots: &[u64], root: &Path, trace: bool) -> SysResult<PathBuf> {
     let dir = image_cache(root).or_else(cache_dir).ok_or(ENOENT)?;
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
-    let key = hash(bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ base.rotate_left(7) ^ 0x6a6974;
+    let listed: Vec<u8> = roots.iter().flat_map(|r| r.to_le_bytes()).collect();
+    let key = hash(bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ base.rotate_left(7) ^ hash(&listed).rotate_left(13) ^ 0x6a6974;
     let stem = dir.join(format!("{key:016x}"));
-    let (code, roots, out) = (stem.with_extension("code"), stem.with_extension("roots"), stem.with_extension("wasm"));
+    let (code, roots_file, out) = (stem.with_extension("code"), stem.with_extension("roots"), stem.with_extension("wasm"));
+    if out.exists() {
+        return Ok(out);
+    }
     // The translator names the object by the path it's given.
-    let line = format!("{}\t{:#x}", code.display(), entry - base);
-    let known = std::fs::read_to_string(&roots).is_ok_and(|t| t.lines().any(|l| l == line));
-    if known && out.exists() {
-        return Ok((out, false));
-    }
-    if !known {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&roots).map_err(|e| crate::fs::errno(&e))?;
-        writeln!(f, "{line}").map_err(|e| crate::fs::errno(&e))?;
-    }
-    if !code.exists() {
-        let tmp = code.with_extension(format!("{}.tmp", unique()));
-        std::fs::write(&tmp, bytes).map_err(|e| crate::fs::errno(&e))?;
-        std::fs::rename(&tmp, &code).map_err(|e| crate::fs::errno(&e))?;
-    }
+    let text: String = roots.iter().map(|r| format!("{}\t{:#x}\n", code.display(), r - base)).collect();
+    let write = |path: &Path, data: &[u8]| -> SysResult<()> {
+        let tmp = path.with_extension(format!("{}.tmp", unique()));
+        std::fs::write(&tmp, data).map_err(|e| crate::fs::errno(&e))?;
+        std::fs::rename(&tmp, path).map_err(|e| crate::fs::errno(&e))
+    };
+    write(&roots_file, text.as_bytes())?;
+    write(&code, bytes)?;
     run_translator(&code, &out, &["--raw".into(), "--base".into(), format!("{base:x}")], trace)?;
-    Ok((out, !known))
+    // The bytes and roots only matter to the translator.
+    let _ = std::fs::remove_file(&code);
+    let _ = std::fs::remove_file(&roots_file);
+    Ok(out)
 }
 
 /// A library's content hash, length and extent. Reading and hashing a
@@ -441,8 +452,8 @@ pub fn ensure_library(path: &Path, root: &Path, trace: bool) -> SysResult<(PathB
         Err(_) => path.to_path_buf(),
     };
     let (base, end) = library_range(&dir.join("library-bases"), &name, extent)?;
-    let key = contents ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ base.rotate_left(7) ^ len;
-    let out = dir.join(format!("{key:016x}.wasm"));
+    let key = contents ^ base.rotate_left(7) ^ len;
+    let out = module_path(&dir, key);
     if !out.exists() {
         run_translator(path, &out, &["--object".into(), "--base".into(), format!("{base:x}")], trace)?;
     }
@@ -559,7 +570,7 @@ mod dlopen_tests {
 /// translation converges.
 pub fn record_missed_target(module: &Path, object: &str, offset: u64) {
     use std::io::Write;
-    let roots = module.with_extension("roots");
+    let roots = roots_of(module);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&roots) {
         let _ = writeln!(f, "{object}\t{offset:#x}");
     }

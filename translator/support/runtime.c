@@ -245,11 +245,14 @@ uint32_t __wasm_env_crc32(uint32_t crc, uint64_t data, uint32_t bytes, uint32_t 
 #define REGION_SHIFT 12
 
 // Libraries translated as modules of their own (docs/abi.md, "Libraries"):
-// the runtime appends each to this directory when it loads it into the
-// process (the guest addresses it covers and its region table), then
-// publishes the new count. Each thread's instance of the program has
-// instances of the modules it has seen (guest_state.modules_seen); a thread
-// that reaches a newer one asks the runtime to catch up first.
+// the runtime adds each to this directory when it loads it into the
+// process (the guest addresses it covers and its region table, the range
+// written last), in a free slot (one a retired module left, see "Code a
+// program generates", or a new one: the count is the number of slots used),
+// and counts it in __wasm_env_modules_added. Each thread's instance of the
+// program has instances of the modules added when it last caught up
+// (guest_state.modules_seen); a thread that finds a module after more were
+// added asks the runtime to catch up first.
 #define MODULES 1024
 struct module {
 	uint64_t lo, hi;
@@ -258,7 +261,7 @@ struct module {
 	uint64_t count;
 };
 struct module __wasm_env_modules[MODULES];
-uint64_t __wasm_env_module_count;
+uint64_t __wasm_env_module_count, __wasm_env_modules_added;
 #define WASM_ENV_SYNC_MODULES ((1L << 32) + 3)
 
 // Code a program generates at run time (a JIT's): when control reaches an
@@ -343,11 +346,13 @@ void dispatch(long pc)
 		uint64_t n = __atomic_load_n(&__wasm_env_module_count, __ATOMIC_ACQUIRE);
 		for (uint64_t k = 0; k < n; k++) {
 			const struct module *m = &__wasm_env_modules[k];
-			if (target < m->lo || target >= m->hi)
+			uint64_t lo = __atomic_load_n(&m->lo, __ATOMIC_ACQUIRE);
+			if (target < lo || target >= __atomic_load_n(&m->hi, __ATOMIC_ACQUIRE))
 				continue;
-			if (k >= guest.modules_seen) {
+			uint64_t added = __atomic_load_n(&__wasm_env_modules_added, __ATOMIC_ACQUIRE);
+			if (guest.modules_seen != added) {
 				__wasm_env_host_syscall(WASM_ENV_SYNC_MODULES, 0, 0, 0, 0, 0, 0);
-				guest.modules_seen = n;
+				guest.modules_seen = added;
 			}
 			f = lookup(m->addrs, m->fns, m->count, start);
 			break;

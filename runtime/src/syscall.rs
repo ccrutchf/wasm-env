@@ -208,7 +208,6 @@ fn load_library(caller: &mut Caller<'_, Process>, fd: i64, range: u64) -> SysRes
 
 const MAP_FIXED: i64 = 0x10;
 const MAP_ANONYMOUS: i64 = 0x20;
-const PROT_WRITE: i64 = 0x2;
 const PROT_EXEC: i64 = 0x4;
 const MREMAP_MAYMOVE: i64 = 1;
 
@@ -259,18 +258,20 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
     let len = page_align(len as u64);
     let (addr, top) = {
         let mut mm = caller.data().group.mm.lock().unwrap();
-        let space = &mut mm.space;
         let addr = if flags & MAP_FIXED != 0 {
             let addr = addr as u64;
-            if addr < space.start || !addr.is_multiple_of(abi::PAGE_SIZE) {
+            if addr < mm.space.start || !addr.is_multiple_of(abi::PAGE_SIZE) {
                 return Err(EINVAL);
             }
-            space.alloc_at(addr, len);
+            mm.space.alloc_at(addr, len);
             addr
+        } else if mm.map_at_hint(addr as u64, len) {
+            // Where the program asked, that being free (as Linux does).
+            addr as u64
         } else {
-            space.alloc(len)
+            mm.space.alloc(len)
         };
-        (addr, space.top)
+        (addr, mm.space.top.max(addr + len))
     };
     // Executable anonymous memory is where a JIT puts its code; a new
     // mapping replaces whatever code was translated from the old one.
@@ -308,7 +309,7 @@ fn brk(caller: &mut Caller<'_, Process>, want: u64) -> SysResult<i64> {
     let group = caller.data().group.clone();
     let mut mm = group.mm.lock().unwrap();
     let (old, start) = (mm.brk, mm.brk_start);
-    if want < start || want > start + mem::BRK_MAX {
+    if want < start || want > start + mem::BRK_MAX || !mm.brk_fits(want) {
         return Ok(old as i64);
     }
     if grow_to(caller, want).is_err() {
@@ -732,13 +733,15 @@ impl Process {
             nr::GETSID => self.kernel.sid(if a == 0 { self.pid } else { a as i32 }).map(i64::from),
             nr::SET_ROBUST_LIST | nr::MADVISE => Ok(0),
             // Protection isn't enforced, but executable memory is where a JIT
-            // puts its code (see modules::translate_code): code made writable
-            // again (to change it) or not executable retires its translation.
+            // puts its code (see modules::translate_code). A JIT makes it
+            // writable to add or change code, then executable again: then
+            // translations of code that changed are retired.
             nr::MPROTECT => {
                 let end = ua.checked_add(page_align(ub)).ok_or(EINVAL)?;
-                self.group.mm.lock().unwrap().set_code(ua, end, c & PROT_EXEC != 0);
-                if c & PROT_EXEC == 0 || c & PROT_WRITE != 0 {
-                    crate::modules::retire_code(&self.group, ua, end);
+                let exec = c & PROT_EXEC != 0;
+                self.group.mm.lock().unwrap().set_code(ua, end, exec);
+                if exec {
+                    crate::modules::check_code(&self.group, ua, end);
                 }
                 Ok(0)
             }
@@ -887,6 +890,7 @@ impl Process {
                 if mm.space.contains(ua, len) {
                     mm.space.release(ua, len);
                 }
+                mm.unmap_low(ua, ua + len);
                 mm.set_code(ua, ua + len, false);
                 drop(mm);
                 crate::modules::retire_code(&self.group, ua, ua + len);

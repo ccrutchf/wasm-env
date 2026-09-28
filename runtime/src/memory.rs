@@ -172,6 +172,19 @@ impl AddressSpace {
         }
     }
 
+    /// Whether [addr, addr+len) is unmapped: free, or past `top`.
+    pub fn is_free(&self, addr: u64, len: u64) -> bool {
+        let Some(end) = addr.checked_add(len) else { return false };
+        if addr < self.start {
+            return false;
+        }
+        if addr >= self.top {
+            return true;
+        }
+        // The part below `top` must lie in one free range.
+        self.free.range(..=addr).next_back().is_some_and(|(&a, &l)| a + l >= end.min(self.top))
+    }
+
     pub fn contains(&self, addr: u64, len: u64) -> bool {
         addr >= self.start && addr.checked_add(len).is_some_and(|end| end <= self.top)
     }

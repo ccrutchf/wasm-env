@@ -123,6 +123,23 @@ else
 	echo "skipped PyTorch: can't fetch the wheels (offline?)"
 fi
 
+# LuaJIT, with its JIT compiling traces as it runs (code generated at run
+# time: docs/abi.md). Its interpreter reaches its bytecode handlers through
+# a table it builds at run time, so a fresh translation misses some: each
+# run records one and the next translates its neighbourhood, so it takes a
+# few runs to converge (see record_missed_target).
+if tests/ubuntu-fetch.sh luajit >/dev/null 2>&1; then
+	cp tests/lua/jit_demo.lua "$R/root/"
+	expected=$(cd "$R" && env -i HOME=/root QEMU_CPU=max,sve=off,sme=off \
+		qemu-aarch64 -L . -0 /usr/bin/luajit ./usr/bin/luajit /root/jit_demo.lua 2>&1)
+	for run in $(seq 15); do
+		actual=$(timeout 1800 "$wasm_env" run --root "$R" /usr/bin/luajit /root/jit_demo.lua 2>&1) && break
+	done
+	compare "LuaJIT (runs to converge: $run)" "$expected" "$actual"
+else
+	echo "skipped LuaJIT: can't fetch the package (offline?)"
+fi
+
 # Networking, if PyPI is reachable: DNS (glibc's resolver, over the host's
 # resolv.conf), HTTPS (Ubuntu's OpenSSL with its CA certificates), and pip
 # installing a package from PyPI. Ubuntu's ca-certificates package builds

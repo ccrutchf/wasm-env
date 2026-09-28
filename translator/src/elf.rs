@@ -46,6 +46,10 @@ pub struct Image {
     /// DT_INIT/DT_FINI, which the dynamic linker calls through addresses it
     /// computes at run time (so no stored pointer reveals them).
     pub roots: Vec<u64>,
+    /// Addresses earlier runs jumped to that the translation missed (see
+    /// `--roots`): roots too, and marks of code discovery reads poorly (see
+    /// discover).
+    pub missed: Vec<u64>,
     /// Libraries the dynamic linker will map at run time: (the path it will
     /// open, prelinked base, end). The support code places them here.
     pub libs: Vec<(String, u64, u64)>,
@@ -414,7 +418,7 @@ fn link(objects: Vec<Parsed>, interp: bool, libs: Vec<(String, u64, u64)>, names
     code.sort_by_key(|r| r.start);
     functions.sort();
     functions.dedup_by_key(|f| f.0);
-    Ok(Image { entry, segments, phdr, phnum, functions, code, app_entry, interp_base, roots, libs, objects: placed })
+    Ok(Image { entry, segments, phdr, phnum, functions, code, app_entry, interp_base, roots, missed: Vec::new(), libs, objects: placed })
 }
 
 /// Writes an 8-byte little-endian value at a guest address, growing the
@@ -472,6 +476,7 @@ impl Image {
             app_entry: base,
             interp_base: 0,
             roots: Vec::new(),
+            missed: Vec::new(),
             libs: Vec::new(),
             objects: vec![(name.to_string(), base, end)],
         }

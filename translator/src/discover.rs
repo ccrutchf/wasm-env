@@ -119,6 +119,21 @@ pub fn discover(image: &Image) -> Program<'_> {
     roots.insert(image.entry);
     roots.extend(image.functions.iter().map(|f| f.0));
     roots.extend(&image.roots);
+    // Where a run jumped to code the translation missed, the code around it
+    // is reached in ways discovery can't follow (an interpreter's handlers,
+    // entered through a table it builds at run time, say), so there the
+    // instruction after each one that doesn't fall through starts a block
+    // too: one missed handler reveals its neighbours. (Data read this way
+    // becomes blocks that fail only if reached.)
+    const SWEEP: u64 = 0x1000;
+    let swept: BTreeSet<u64> = image.missed.iter().map(|&a| a / SWEEP * SWEEP).collect();
+    for &r in &swept {
+        for (a, i) in insns.range(r..r + SWEEP) {
+            if is_terminal(&i) && in_code(a + 4) {
+                roots.insert(a + 4);
+            }
+        }
+    }
 
     // One pass over the code (each decodes every instruction again):
     // - Branch Target Identification landing pads (bti; paciasp/pacibsp at

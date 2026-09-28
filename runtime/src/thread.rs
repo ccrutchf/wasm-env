@@ -27,40 +27,95 @@ pub struct Mm {
     /// The program break, and where it started.
     pub brk: u64,
     pub brk_start: u64,
+    /// Mappings placed in the break's reserve, above the break, because the
+    /// program asked for that address (LuaJIT wants its code near its VM, to
+    /// reach it with direct branches). The break can't grow into them.
+    /// Start → end.
+    pub low: Ranges,
     /// Memory the program made executable (an anonymous mapping, or
     /// `mprotect` with PROT_EXEC): where a JIT puts the code it generates,
     /// translated when it's first jumped to (see translate::ensure_code).
-    /// Start → end.
-    pub code: std::collections::BTreeMap<u64, u64>,
+    pub code: Ranges,
+}
+
+/// Disjoint address ranges, start → end.
+pub type Ranges = std::collections::BTreeMap<u64, u64>;
+
+/// The range of `ranges` holding `addr`, if any.
+fn range_at(ranges: &Ranges, addr: u64) -> Option<(u64, u64)> {
+    ranges.range(..=addr).next_back().filter(|&(_, &end)| addr < end).map(|(&s, &e)| (s, e))
+}
+
+/// Whether any of `ranges` overlaps [start, end).
+fn overlaps(ranges: &Ranges, start: u64, end: u64) -> bool {
+    ranges.range(..end).next_back().is_some_and(|(_, &e)| e > start)
+}
+
+/// Adds [start, end) to `ranges` (merging with those it overlaps), or with
+/// `on` false removes it (keeping the parts of ranges outside it).
+fn set_range(ranges: &mut Ranges, start: u64, end: u64, on: bool) {
+    let overlapping: Vec<(u64, u64)> = ranges.range(..end).filter(|&(_, &e)| e > start).map(|(&s, &e)| (s, e)).collect();
+    let (mut lo, mut hi) = (start, end);
+    for (s, e) in overlapping {
+        ranges.remove(&s);
+        if on {
+            (lo, hi) = (lo.min(s), hi.max(e));
+        } else {
+            if s < start {
+                ranges.insert(s, start);
+            }
+            if e > end {
+                ranges.insert(end, e);
+            }
+        }
+    }
+    if on {
+        ranges.insert(lo, hi);
+    }
 }
 
 impl Mm {
     /// The executable range holding `addr`, if any.
     pub fn code_at(&self, addr: u64) -> Option<(u64, u64)> {
-        self.code.range(..=addr).next_back().filter(|&(_, &end)| addr < end).map(|(&s, &e)| (s, e))
+        range_at(&self.code, addr)
     }
 
-    /// Records [start, end) as executable (`exec`) or not, merging ranges.
+    /// Records [start, end) as executable (`exec`) or not.
     pub fn set_code(&mut self, start: u64, end: u64, exec: bool) {
-        // Cut [start, end) out of the ranges it overlaps, keeping the rest.
-        let overlapping: Vec<(u64, u64)> = self.code.range(..end).filter(|&(_, &e)| e > start).map(|(&s, &e)| (s, e)).collect();
-        let (mut lo, mut hi) = (start, end);
-        for (s, e) in overlapping {
-            self.code.remove(&s);
-            if exec {
-                (lo, hi) = (lo.min(s), hi.max(e));
-            } else {
-                if s < start {
-                    self.code.insert(s, start);
-                }
-                if e > end {
-                    self.code.insert(end, e);
-                }
-            }
+        set_range(&mut self.code, start, end, exec);
+    }
+
+    /// Places a mapping of `len` bytes at `hint`, as Linux does when that
+    /// range is free: in the mmap region, or in the break's reserve above
+    /// the break. Returns whether it did (else the caller maps it elsewhere,
+    /// as Linux does too).
+    pub fn map_at_hint(&mut self, hint: u64, len: u64) -> bool {
+        if hint == 0 || !hint.is_multiple_of(crate::abi::PAGE_SIZE) {
+            return false;
         }
-        if exec {
-            self.code.insert(lo, hi);
+        let Some(end) = hint.checked_add(len) else { return false };
+        // In the mmap region only below its top: a hint elsewhere (LuaJIT's
+        // random ones may be anywhere) must not move the top.
+        if end <= self.space.top && self.space.is_free(hint, len) {
+            self.space.alloc_at(hint, len);
+            return true;
         }
+        let reserve_end = self.brk_start + mem::BRK_MAX;
+        if hint >= mem::page_align(self.brk) && end <= reserve_end && !overlaps(&self.low, hint, end) {
+            set_range(&mut self.low, hint, end, true);
+            return true;
+        }
+        false
+    }
+
+    /// Unmaps [start, end) where it's in the break's reserve.
+    pub fn unmap_low(&mut self, start: u64, end: u64) {
+        set_range(&mut self.low, start, end, false);
+    }
+
+    /// Whether the break can move to `want` (not over a mapping).
+    pub fn brk_fits(&self, want: u64) -> bool {
+        !overlaps(&self.low, self.brk.min(want), self.brk.max(want))
     }
 }
 
@@ -101,7 +156,7 @@ pub struct Group {
 impl Group {
     pub fn new() -> Arc<Group> {
         Arc::new(Group {
-            mm: Mutex::new(Mm { space: AddressSpace::new(0), brk: 0, brk_start: 0, code: Default::default() }),
+            mm: Mutex::new(Mm { space: AddressSpace::new(0), brk: 0, brk_start: 0, low: Default::default(), code: Default::default() }),
             futex: Futexes::default(),
             threading: OnceLock::new(),
             libraries: Default::default(),
@@ -115,7 +170,7 @@ impl Group {
     pub fn fork(&self, memory: SharedMemory) -> Arc<Group> {
         let mm = self.mm.lock().unwrap();
         let child = Arc::new(Group {
-            mm: Mutex::new(Mm { space: mm.space.clone(), brk: mm.brk, brk_start: mm.brk_start, code: mm.code.clone() }),
+            mm: Mutex::new(Mm { space: mm.space.clone(), brk: mm.brk, brk_start: mm.brk_start, low: mm.low.clone(), code: mm.code.clone() }),
             futex: Futexes::default(),
             threading: OnceLock::new(),
             libraries: self.libraries.fork(),
