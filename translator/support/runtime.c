@@ -170,8 +170,8 @@ void dispatch(long pc);
 
 void __wasm_env_bad_target(uint64_t pc)
 {
-	// Code the program generated at run time, not translated yet (or not
-	// this entry into it): translate it and go on there.
+	// A block the translation missed (in the program, a library, or code it
+	// generated at run time): translate it and go on there.
 	if (translate_code(pc)) {
 		dispatch((long)pc);
 		__builtin_unreachable();
@@ -287,7 +287,24 @@ static void check_code_epoch(void)
 
 static int translate_code(uint64_t pc)
 {
-	if (__wasm_env_host_syscall(WASM_ENV_TRANSLATE_CODE, (long)pc, 0, 0, 0, 0, 0) != 0)
+	// The object of the program's own translation holding pc (the
+	// executable, or a library translated with it), for the runtime to
+	// translate that page again; otherwise the runtime knows (a library
+	// module, or generated code).
+	const struct lib *o = 0;
+	for (uint64_t k = 0; k < guest_object_count; k++)
+		if (pc >= guest_objects[k].base && pc < guest_objects[k].end)
+			o = &guest_objects[k];
+	// 0: translated anew; 1: pc was translated already (this thread's cache
+	// named code since replaced), worth one retry, not a loop.
+	static _Thread_local uint64_t last;
+	static _Thread_local int retried;
+	if (pc != last) {
+		last = pc;
+		retried = 0;
+	}
+	long r = __wasm_env_host_syscall(WASM_ENV_TRANSLATE_CODE, (long)pc, o ? (long)o->path : 0, o ? (long)o->base : 0, 0, 0, 0);
+	if (r < 0 || (r == 1 && retried++))
 		return 0;
 	// The new module may replace one this thread's cache names.
 	for (int i = 0; i < DISPATCH_CACHE; i++)
@@ -340,22 +357,25 @@ void dispatch(long pc)
 		block_fn f = e->fn;
 		__attribute__((musttail)) return f(pc); // the region function enters at pc
 	}
+	// Catch up on modules added since: a region table may name one (a page
+	// the runtime translated again, see translate_code).
+	uint64_t added = __atomic_load_n(&__wasm_env_modules_added, __ATOMIC_ACQUIRE);
+	if (guest.modules_seen != added) {
+		__wasm_env_host_syscall(WASM_ENV_SYNC_MODULES, 0, 0, 0, 0, 0, 0);
+		guest.modules_seen = added;
+	}
 	uint64_t start = region << REGION_SHIFT;
 	block_fn f = lookup(dispatch_addrs, dispatch_fns, dispatch_count, start);
 	if (!f) {
+		// (A library module and a page translated again may both cover the
+		// address: the first whose table has the region.)
 		uint64_t n = __atomic_load_n(&__wasm_env_module_count, __ATOMIC_ACQUIRE);
-		for (uint64_t k = 0; k < n; k++) {
+		for (uint64_t k = 0; k < n && !f; k++) {
 			const struct module *m = &__wasm_env_modules[k];
 			uint64_t lo = __atomic_load_n(&m->lo, __ATOMIC_ACQUIRE);
 			if (target < lo || target >= __atomic_load_n(&m->hi, __ATOMIC_ACQUIRE))
 				continue;
-			uint64_t added = __atomic_load_n(&__wasm_env_modules_added, __ATOMIC_ACQUIRE);
-			if (guest.modules_seen != added) {
-				__wasm_env_host_syscall(WASM_ENV_SYNC_MODULES, 0, 0, 0, 0, 0, 0);
-				guest.modules_seen = added;
-			}
 			f = lookup(m->addrs, m->fns, m->count, start);
-			break;
 		}
 	}
 	if (!f) {

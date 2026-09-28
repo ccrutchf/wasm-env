@@ -85,6 +85,9 @@ struct Inputs {
     base: Option<u64>,
     /// The input is code generated at run time (`--raw`), at `base`.
     raw: bool,
+    /// Only this page's region (`--page`): a patch the runtime makes when
+    /// a run reaches a block the translation missed there.
+    page: Option<u64>,
 }
 
 /// Translates an arm64 executable (with any shared libraries) into a
@@ -118,7 +121,7 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     for l in &inputs.libs {
         libs.push(read(l, l.as_ref())?);
     }
-    let library = inputs.base.is_some();
+    let library = inputs.base.is_some() || inputs.page.is_some();
     let mut image = if inputs.raw {
         elf::Image::raw(&bytes, input, inputs.base.context("--raw needs --base")?)
     } else if inputs.object {
@@ -189,7 +192,7 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         build.quick();
     }
     let mut failed = None;
-    let lifted = lift::lift(&image, &prog, library, &mut |chunk| {
+    let lifted = lift::lift(&image, &prog, library, inputs.page, &mut |chunk| {
         if failed.is_none()
             && let Err(e) = build.chunk(&chunk)
         {
@@ -204,6 +207,10 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         eprintln!("warning: {n} × `{op}` not supported yet (traps if executed): {example}");
     }
     let wasm = build.finish(&lifted.data, image_end).and_then(|wasm| {
+        if let Some(page) = inputs.page {
+            let start = lift::region_of(page);
+            return link::add_library_info(&wasm, start, start + lift::REGION_SPAN);
+        }
         if inputs.raw {
             // Generated code: the module covers the whole pages its blocks
             // are in, not the whole mapping (see the runtime's
@@ -285,6 +292,10 @@ fn main() -> Result<()> {
                     "--layout" => inputs.layout = Some(value()?),
                     "--object" => inputs.object = true,
                     "--raw" => inputs.raw = true,
+                    "--page" => {
+                        let v = value()?;
+                        inputs.page = Some(u64::from_str_radix(v.trim_start_matches("0x"), 16).with_context(|| format!("--page {v}"))?);
+                    }
                     "--base" => {
                         let v = value()?;
                         let base = u64::from_str_radix(v.trim_start_matches("0x"), 16).with_context(|| format!("--base {v}"))?;
@@ -301,7 +312,7 @@ fn main() -> Result<()> {
             let image = elf::Image::load(&bytes)?;
             let prog = discover::discover(&image);
             let mut chunks = String::new();
-            let lifted = lift::lift(&image, &prog, false, &mut |c| {
+            let lifted = lift::lift(&image, &prog, false, None, &mut |c| {
                 chunks.push_str("\n; ---- chunk ----\n");
                 chunks.push_str(&c);
             });

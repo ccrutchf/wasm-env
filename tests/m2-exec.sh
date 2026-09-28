@@ -66,15 +66,16 @@ $cc -O2 -shared -fPIC -o "$rootfs/usr/lib/libgreet.so" "$root/build/libgreet-v2.
 out=$("$wasm_env" run --root "$rootfs" /bin/greet again 2>&1 | sed -n 2p)
 check "cache retranslates after a library changes" "HELLO, world (call 1)" "$out"
 
-# 6. Learning from runs: a jump target computed at run time is missed and
-# recorded by the first run; the next exec retranslates and succeeds.
+# 6. A jump target computed at run time, which the translation missed: the
+# run translates its page again and goes on, and records the target, so
+# the next exec's translation has it (and needs no patch).
 $cc -static -nostdlib -o "$rootfs/bin/hidden" tests/arm64/hidden.S
-"$wasm_env" run --root "$rootfs" /bin/hidden a b >"$root/build/hidden.1" 2>&1
-first=$?
-check "missed target: first run stops" "134" "$first"
-check "missed target: recorded" "1" "$(grep -c "recorded the missed address" "$root/build/hidden.1")"
-"$wasm_env" run --root "$rootfs" /bin/hidden a b >/dev/null 2>&1
-check "missed target: next run translates it" "42" "$?"
+"$wasm_env" run --trace --root "$rootfs" /bin/hidden a b >"$root/build/hidden.1" 2>&1
+check "missed target: the run goes on" "42" "$?"
+check "missed target: its page translated again" "1" "$(grep -c "translated page" "$root/build/hidden.1")"
+check "missed target: recorded" "1" "$(cat "$WASM_ENV_CACHE"/translated/*.roots 2>/dev/null | grep -c hidden)"
+"$wasm_env" run --trace --root "$rootfs" /bin/hidden a b >"$root/build/hidden.2" 2>&1
+check "missed target: next run translates it" "42 0" "$? $(grep -c "translated page" "$root/build/hidden.2")"
 
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]

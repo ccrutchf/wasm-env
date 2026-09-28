@@ -40,6 +40,11 @@ pub struct Library {
     /// addresses it was entered at (its translation's roots) and the bytes
     /// of [base, end) it was translated from. `path` just names it.
     pub code: Option<Code>,
+    /// For a page of a program or library translated again at run time, the
+    /// addresses it was made for (see patch); `path` just names it.
+    pub patch: Option<Vec<u64>>,
+    /// Its region table: (addresses, functions, count), in guest memory.
+    regions: OnceLock<(u64, u64, u64)>,
     /// Its slot in the module directory (see register).
     slot: usize,
     /// Retired: its code was unmapped or changed (see retire).
@@ -78,6 +83,12 @@ impl Libraries {
     /// The library covering a guest address, if any (not a retired one).
     pub fn at(&self, addr: u64) -> Option<Arc<Library>> {
         self.list.lock().unwrap().iter().rev().find(|l| addr >= l.base && addr < l.end && !l.dead.load(Ordering::Relaxed)).cloned()
+    }
+
+    /// The shared library (not generated code, not a patch) covering `addr`.
+    pub fn library_at(&self, addr: u64) -> Option<Arc<Library>> {
+        let list = self.list.lock().unwrap();
+        list.iter().find(|l| addr >= l.base && addr < l.end && l.code.is_none() && l.patch.is_none()).cloned()
     }
 }
 
@@ -171,7 +182,7 @@ pub fn load(mut store: impl AsContextMut<Data = Process>, path: &Path) -> Result
         return Ok(lib.clone());
     }
     let (wasm, base, end) = crate::translate::ensure_library(&path, &kernel.root, trace).map_err(|e| anyhow::anyhow!("translating {}: errno {e}", path.display()))?;
-    add(&mut store, &mut next_slot, path, wasm, base, end, None)
+    add(&mut store, &mut next_slot, path, wasm, base, end, None, None)
 }
 
 /// Adds a translated module covering guest [base, end) to the process and
@@ -185,6 +196,7 @@ fn add(
     base: u64,
     end: u64,
     code: Option<Code>,
+    patch: Option<Vec<u64>>,
 ) -> Result<Arc<Library>> {
     let process = store.as_context().data();
     let (kernel, group) = (process.kernel.clone(), process.group.clone());
@@ -231,7 +243,21 @@ fn add(
             }
         }
     };
-    let lib = Arc::new(Library { path, wasm, module, base, end, memory_base, table_base, got, code, slot, dead: false.into() });
+    let lib = Arc::new(Library {
+        path,
+        wasm,
+        module,
+        base,
+        end,
+        memory_base,
+        table_base,
+        got,
+        code,
+        patch,
+        regions: OnceLock::new(),
+        slot,
+        dead: false.into(),
+    });
     // The guest range: the dynamic linker maps a library there.
     crate::syscall::grow_shared(&threading.memory, end).map_err(|e| anyhow::anyhow!("errno {e}"))?;
     let instance = instantiate(&mut store, &lib, &threading.memory)?;
@@ -272,7 +298,7 @@ fn atomic(memory: &SharedMemory, at: u64) -> Option<&std::sync::atomic::AtomicU6
 /// adding code costs a translation of just its pages. ENOEXEC if `pc`
 /// isn't in such memory (a library's missed target, say) or was translated
 /// as an entry already.
-pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64) -> crate::memory::SysResult<i64> {
+pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64, object: u64, object_base: u64) -> crate::memory::SysResult<i64> {
     use crate::abi::errno::*;
     let process = store.as_context().data();
     let (kernel, group, trace) = (process.kernel.clone(), process.group.clone(), process.trace);
@@ -280,12 +306,24 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64) -> 
     let libraries = &group.libraries;
     let mut next_slot = libraries.next_slot.lock().unwrap();
     sync(&mut store).map_err(|_| EIO)?;
-    if let Some(lib) = libraries.at(pc) {
-        match &lib.code {
-            Some(code) if code.roots.contains(&pc) => return Err(ENOEXEC),
-            Some(_) => {}
-            None => return Err(ENOEXEC),
-        }
+    // A block the translation of the program (the support code names the
+    // object), or of a library, missed.
+    let owner = if object != 0 {
+        let name = crate::memory::cstr(crate::syscall::shared_bytes(&threading.memory), object)?.to_string();
+        Some(Owner::Program(name, object_base))
+    } else {
+        libraries.library_at(pc).map(Owner::Library)
+    };
+    if let Some(owner) = owner {
+        return patch(&mut store, &mut next_slot, pc, owner);
+    }
+    // Generated code: translated from pc already, but this thread's cache
+    // named code since replaced.
+    if let Some(lib) = libraries.at(pc)
+        && let Some(code) = &lib.code
+        && code.roots.contains(&pc)
+    {
+        return Ok(1);
     }
     let (lo, hi) = group.mm.lock().unwrap().code_at(pc).ok_or(ENOEXEC)?;
     const MAX_CODE: u64 = 256 << 20;
@@ -324,7 +362,7 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64) -> 
     }
     let name = PathBuf::from(format!("[code {start:#x}]"));
     let code = Code { roots: roots.into_iter().collect(), bytes: bytes[(start - lo) as usize..(end.min(hi) - lo) as usize].to_vec() };
-    add(&mut store, &mut next_slot, name, wasm, start, end, Some(code)).map_err(|e| {
+    add(&mut store, &mut next_slot, name, wasm, start, end, Some(code), None).map_err(|e| {
         eprintln!("wasm-env: loading code translated from {lo:#x}: {e:#}");
         EIO
     })?;
@@ -332,6 +370,114 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64) -> 
         eprintln!(
             "[wasm-env] translated code at {start:#x}..{end:#x} (entered at {pc:#x}, replacing {}): {:.3} s, loaded in {:.3} s",
             replaced.len(),
+            translated.as_secs_f64(),
+            (started.elapsed() - translated).as_secs_f64()
+        );
+    }
+    Ok(0)
+}
+
+/// Whose translation missed a block: the program's own (the object's name
+/// as its translation knows it, and base), or a library module's.
+enum Owner {
+    Program(String, u64),
+    Library(Arc<Library>),
+}
+
+/// A block the translation of the program or a library missed, reached at
+/// `pc` (an address computed at run time that discovery didn't find): the
+/// target is recorded for the next translation, as before, and meanwhile
+/// its page is translated again (translate::translate_page) and takes over
+/// the page's entry in the owner's region table (or, if the translation
+/// had no region there, is found through the module directory). So the run
+/// goes on instead of stopping. ENOEXEC for a program translated together
+/// with its dynamic linker, whose image isn't one object's.
+fn patch(mut store: impl AsContextMut<Data = Process>, next_slot: &mut u64, pc: u64, owner: Owner) -> crate::memory::SysResult<i64> {
+    use crate::abi::errno::*;
+    let process = store.as_context().data();
+    let (kernel, group, trace, program) = (process.kernel.clone(), process.group.clone(), process.trace, process.module.clone());
+    let threading = group.threading.get().ok_or(ENOEXEC)?;
+    let libraries = &group.libraries;
+    let page = pc & !(crate::abi::PAGE_SIZE - 1);
+    let current: Vec<Arc<Library>> = {
+        let list = libraries.list.lock().unwrap();
+        list.iter().filter(|l| l.base == page && l.patch.is_some() && !l.dead.load(Ordering::Relaxed)).cloned().collect()
+    };
+    // Patched for pc already: this thread's cache named the old code.
+    if current.iter().any(|l| l.patch.as_ref().unwrap().contains(&pc)) {
+        return Ok(1);
+    }
+    let started = std::time::Instant::now();
+    let (elf, object, base, module, args) = match &owner {
+        Owner::Program(name, base) => {
+            let path = PathBuf::from(name);
+            let elf = if path.exists() { path } else { kernel.root.join(name.trim_start_matches('/')) };
+            let monolithic = crate::translate::monolithic();
+            if monolithic && std::fs::read(&elf).is_ok_and(|b| crate::process::has_interpreter(&b)) {
+                return Err(ENOEXEC);
+            }
+            let args: Vec<String> = if monolithic { Vec::new() } else { vec!["--object".into()] };
+            (elf, name.clone(), *base, program, args)
+        }
+        Owner::Library(lib) => {
+            let args = vec!["--object".into(), "--base".into(), format!("{:x}", lib.base)];
+            (lib.path.clone(), lib.path.display().to_string(), lib.base, lib.wasm.clone(), args)
+        }
+    };
+    crate::translate::remember_missed(&module, &object, pc - base);
+    let wasm = crate::translate::translate_page(&elf, &module, &args, page, &kernel.root, trace)?;
+    let translated = started.elapsed();
+    let mut targets: Vec<u64> = current.iter().flat_map(|l| l.patch.clone().unwrap()).collect();
+    targets.push(pc);
+    let name = PathBuf::from(format!("[page {page:#x} of {object}]"));
+    let lib = add(&mut store, next_slot, name, wasm, page, page + crate::abi::PAGE_SIZE, None, Some(targets)).map_err(|e| {
+        eprintln!("wasm-env: loading page {page:#x} translated again: {e:#}");
+        EIO
+    })?;
+    // The owner's region table: the program's (the main module exports it)
+    // or the library's.
+    let table = match &owner {
+        Owner::Program(..) => {
+            let main = store.as_context().data().main.clone().ok_or(EIO)?;
+            let data = crate::syscall::shared_bytes(&threading.memory);
+            let mut g = |name| global(&mut store, &main.instance, name).map_err(|_| EIO);
+            let (addrs, fns, count_at) = (g("dispatch_addrs")?, g("dispatch_fns")?, g("dispatch_count")?);
+            Some((addrs, fns, crate::memory::read_u64(data, count_at)?))
+        }
+        Owner::Library(l) => l.regions.get().copied(),
+    };
+    let data = crate::syscall::shared_bytes(&threading.memory);
+    if let (Some((addrs, fns, count)), Some(&(_, new_fns, new_count))) = (table, lib.regions.get())
+        && new_count > 0
+    {
+        // Binary search for the page's region, as dispatch does.
+        let (mut lo, mut hi) = (0, count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match crate::memory::read_u64(data, addrs + 8 * mid)?.cmp(&page) {
+                std::cmp::Ordering::Equal => {
+                    let f = crate::memory::read_u64(data, new_fns)?;
+                    atomic(&threading.memory, fns + 8 * mid).ok_or(EIO)?.store(f, Ordering::Release);
+                    break;
+                }
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+    }
+    // Earlier patches of the page go; every thread's cache drops the page's
+    // old function (retire bumps the epoch).
+    for old in &current {
+        retire(old, &threading.memory, libraries);
+    }
+    if current.is_empty()
+        && let Some(epoch) = libraries.globals.get().and_then(|g| atomic(&threading.memory, g.epoch))
+    {
+        epoch.fetch_add(1, Ordering::Release);
+    }
+    if trace {
+        eprintln!(
+            "[wasm-env] translated page {page:#x} of {object} again (entered at {pc:#x}): {:.3} s, loaded in {:.3} s",
             translated.as_secs_f64(),
             (started.elapsed() - translated).as_secs_f64()
         );
@@ -479,6 +625,7 @@ fn register(mut store: impl AsContextMut<Data = Process>, instance: &Instance, l
     let addrs = lib.memory_base + global(&mut store, instance, "dispatch_addrs")?;
     let fns = lib.memory_base + global(&mut store, instance, "dispatch_fns")?;
     let count = word(lib.memory_base + global(&mut store, instance, "dispatch_count")?)?;
+    let _ = lib.regions.set((addrs, fns, count));
     let entry = g.modules + 40 * lib.slot as u64;
     // The range last, so a thread searching the directory meanwhile sees
     // the entry empty (a reused slot) or complete.

@@ -164,6 +164,10 @@ pub struct Block<'a> {
     pub indirect: bool,
     /// Set while flushing before a system call, whose flag stores are kept.
     keep_flags: bool,
+    /// The region is translated alone (a page patched at run time, see
+    /// `lift`), so other regions' functions aren't in its module: jumps
+    /// to them go through `dispatch`.
+    alone: bool,
     /// Private string constants this block needs (for fatal messages),
     /// emitted in the same module as the block: (name, LLVM constant text).
     pub strings: Vec<(String, String)>,
@@ -172,10 +176,11 @@ pub struct Block<'a> {
 impl<'a> Block<'a> {
     /// A block at `addr`, numbering its temporaries from `first_tmp` (unique
     /// within the region's function).
-    fn new(addr: u64, first_tmp: usize, leaders: &'a std::collections::BTreeSet<u64>) -> Self {
+    fn new(addr: u64, first_tmp: usize, leaders: &'a std::collections::BTreeSet<u64>, alone: bool) -> Self {
         Block {
             body: String::new(),
             addr,
+            alone,
             next_tmp: first_tmp,
             leaders,
             calls: Default::default(),
@@ -789,7 +794,7 @@ impl<'a> Block<'a> {
     pub fn jump(&mut self, target: u64) {
         self.succs.push(target);
         self.flush();
-        if self.leaders.contains(&target) {
+        if self.leaders.contains(&target) && (!self.alone || region_of(target) == region_of(self.addr)) {
             let region = region_of(target);
             if region == region_of(self.addr) {
                 self.line(format!("br label %b_{target:x}"));
@@ -958,7 +963,7 @@ struct RegionIr {
 
 /// Lifts a region's blocks (the same text every time: the lifting is
 /// deterministic). Instructions it can't lift are counted in `unsupported`.
-fn lift_region(prog: &Program, region: u64, leaders: &[u64], unsupported: &mut BTreeMap<String, (usize, String)>) -> RegionIr {
+fn lift_region(prog: &Program, region: u64, leaders: &[u64], alone: bool, unsupported: &mut BTreeMap<String, (usize, String)>) -> RegionIr {
     let mut out = RegionIr {
         blocks: Vec::new(),
         strings: Vec::new(),
@@ -968,7 +973,7 @@ fn lift_region(prog: &Program, region: u64, leaders: &[u64], unsupported: &mut B
     };
     let mut tmp = 0;
     for &start in leaders {
-        let mut b = Block::new(start, tmp, &prog.leaders);
+        let mut b = Block::new(start, tmp, &prog.leaders, alone);
         let mut pc = start;
         let mut last = "";
         loop {
@@ -1034,7 +1039,7 @@ fn lift_region(prog: &Program, region: u64, leaders: &[u64], unsupported: &mut B
 /// never has all its IR in memory: a first pass lifts every block for its
 /// flag liveness facts and region entries, keeping no IR; a second lifts
 /// each chunk's regions again and assembles them.
-pub fn lift(image: &Image, prog: &Program, library: bool, sink: &mut dyn FnMut(String)) -> Lifted {
+pub fn lift(image: &Image, prog: &Program, library: bool, page: Option<u64>, sink: &mut dyn FnMut(String)) -> Lifted {
     let mut unsupported = BTreeMap::new();
     let mut regions: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for &leader in &prog.leaders {
@@ -1055,7 +1060,7 @@ pub fn lift(image: &Image, prog: &Program, library: bool, sink: &mut dyn FnMut(S
     const POLL_LOOP_BYTES: u64 = 64;
     let mut polling = std::collections::HashSet::new();
     for (&region, leaders) in &regions {
-        let r = lift_region(prog, region, leaders, &mut unsupported);
+        let r = lift_region(prog, region, leaders, false, &mut unsupported);
         entries.extend(r.cross);
         for &(target, _, end) in &r.loop_edges {
             if end + 4 - target > POLL_LOOP_BYTES {
@@ -1083,6 +1088,11 @@ pub fn lift(image: &Image, prog: &Program, library: bool, sink: &mut dyn FnMut(S
     let preamble = chunk_preamble();
     let mut groups: BTreeMap<u64, Vec<(u64, &Vec<u64>)>> = BTreeMap::new();
     for (&region, leaders) in &regions {
+        // With `page`, only that page's region: a patch for a program whose
+        // translation missed a block there, made at run time.
+        if page.is_some_and(|p| region_of(p) != region) {
+            continue;
+        }
         groups.entry(region / CHUNK_SPAN).or_default().push((region, leaders));
     }
     let mut chunks = 0;
@@ -1090,7 +1100,7 @@ pub fn lift(image: &Image, prog: &Program, library: bool, sink: &mut dyn FnMut(S
         let (mut text, mut strings, mut calls) = (String::new(), Vec::new(), std::collections::BTreeSet::new());
         let mut defined = std::collections::BTreeSet::new();
         for (region, leaders) in group {
-            let mut r = lift_region(prog, region, leaders, &mut BTreeMap::new());
+            let mut r = lift_region(prog, region, leaders, page.is_some(), &mut BTreeMap::new());
             defined.insert(region);
             let _ = write!(text, "define void @R_{region:x}(i64 %pc) {{\nentry:\n{STATE_POINTERS}  switch i64 %pc, label %bad [\n");
             for &a in leaders.iter().filter(|a| entries.contains(a)) {
@@ -1135,7 +1145,15 @@ pub fn lift(image: &Image, prog: &Program, library: bool, sink: &mut dyn FnMut(S
         chunks += 1;
     }
 
-    let data = if library { library_data(prog) } else { build_data(image, prog) };
+    let data = match page {
+        Some(p) => {
+            let mut ir = String::from("target triple = \"wasm64-unknown-unknown\"\n");
+            dispatch_table(&mut ir, prog, Some(region_of(p)));
+            ir
+        }
+        None if library => library_data(prog),
+        None => build_data(image, prog),
+    };
     Lifted { data, chunks, unsupported, blocks: prog.leaders.len() }
 }
 
@@ -1260,7 +1278,7 @@ fn build_data(image: &Image, prog: &Program) -> String {
     let _ = writeln!(ir, "@guest_object_count = constant i64 {}", image.objects.len());
     let _ = writeln!(ir, "@guest_phnum = constant i64 {}\n", image.phnum);
 
-    dispatch_table(&mut ir, prog);
+    dispatch_table(&mut ir, prog, None);
     ir
 }
 
@@ -1269,16 +1287,17 @@ fn build_data(image: &Image, prog: &Program) -> String {
 /// the module's exports and registers with the program's `dispatch`.
 fn library_data(prog: &Program) -> String {
     let mut ir = String::from("target triple = \"wasm64-unknown-unknown\"\n");
-    dispatch_table(&mut ir, prog);
+    dispatch_table(&mut ir, prog, None);
     ir
 }
 
-fn dispatch_table(ir: &mut String, prog: &Program) {
+/// (With `only`, just that region: see `lift`'s `page`.)
+fn dispatch_table(ir: &mut String, prog: &Program, only: Option<u64>) {
     // Declare every region function, then build the dispatch table: parallel
     // arrays of sorted region addresses and their functions, searched by the
     // support code's `dispatch`. A region function checks that the address
     // it's entered at is one of its blocks.
-    let regions: std::collections::BTreeSet<u64> = prog.leaders.iter().map(|&a| region_of(a)).collect();
+    let regions: std::collections::BTreeSet<u64> = prog.leaders.iter().map(|&a| region_of(a)).filter(|&r| only.is_none_or(|o| o == r)).collect();
     for r in &regions {
         let _ = writeln!(*ir, "declare void @R_{r:x}(i64)");
     }

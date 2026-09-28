@@ -125,17 +125,14 @@ fi
 
 # LuaJIT, with its JIT compiling traces as it runs (code generated at run
 # time: docs/abi.md). Its interpreter reaches its bytecode handlers through
-# a table it builds at run time, so a fresh translation misses some: each
-# run records one and the next translates its neighbourhood, so it takes a
-# few runs to converge (see record_missed_target).
+# a table it builds at run time, so a fresh translation misses some: the
+# run translates their pages again as it reaches them.
 if tests/ubuntu-fetch.sh luajit >/dev/null 2>&1; then
 	cp tests/lua/jit_demo.lua "$R/root/"
 	expected=$(cd "$R" && env -i HOME=/root QEMU_CPU=max,sve=off,sme=off \
 		qemu-aarch64 -L . -0 /usr/bin/luajit ./usr/bin/luajit /root/jit_demo.lua 2>&1)
-	for run in $(seq 15); do
-		actual=$(timeout 1800 "$wasm_env" run --root "$R" /usr/bin/luajit /root/jit_demo.lua 2>&1) && break
-	done
-	compare "LuaJIT (runs to converge: $run)" "$expected" "$actual"
+	actual=$(timeout 1800 "$wasm_env" run --root "$R" /usr/bin/luajit /root/jit_demo.lua 2>&1)
+	compare "LuaJIT" "$expected" "$actual"
 else
 	echo "skipped LuaJIT: can't fetch the package (offline?)"
 fi

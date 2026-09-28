@@ -569,16 +569,48 @@ mod dlopen_tests {
 /// these addresses as block roots: each run can only add real code, so the
 /// translation converges.
 pub fn record_missed_target(module: &Path, object: &str, offset: u64) {
+    if remember_missed(module, object, offset) {
+        eprintln!("wasm-env: recorded the missed address; the next run translates it");
+    } else {
+        eprintln!("wasm-env: recorded the missed address in {} (translate with --roots)", roots_of(module).display());
+    }
+}
+
+/// Records a missed target (see record_missed_target) without a word, as
+/// when the runtime translates its page right away (see translate_page).
+/// Returns whether the module was a cached translation, now dropped.
+pub fn remember_missed(module: &Path, object: &str, offset: u64) -> bool {
     use std::io::Write;
     let roots = roots_of(module);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&roots) {
-        let _ = writeln!(f, "{object}\t{offset:#x}");
+    let line = format!("{object}\t{offset:#x}");
+    let known = std::fs::read_to_string(&roots).is_ok_and(|t| t.lines().any(|l| l == line));
+    if !known && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&roots) {
+        let _ = writeln!(f, "{line}");
     }
     let cached = module.parent().and_then(|d| d.file_name()).is_some_and(|n| n == "translated");
     if cached {
         let _ = std::fs::remove_file(module);
-        eprintln!("wasm-env: recorded the missed address; the next run translates it");
-    } else {
-        eprintln!("wasm-env: recorded the missed address in {} (translate with --roots)", roots.display());
     }
+    cached
+}
+
+/// A module of just the page at `page` of `elf`'s translation `module`,
+/// with every block the translation had there and the targets recorded as
+/// missed since (its `.roots`): the runtime's patch for a page where a run
+/// reached a block the translation missed (see modules::translate_code).
+/// `args` are the translation's own (`--object`, `--base`), so the page's
+/// code is the same but for the new blocks.
+pub fn translate_page(elf: &Path, module: &Path, args: &[String], page: u64, root: &Path, trace: bool) -> SysResult<PathBuf> {
+    let dir = image_cache(root).or_else(cache_dir).ok_or(ENOENT)?;
+    std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
+    let roots = roots_of(module);
+    let listed = std::fs::read(&roots).unwrap_or_default();
+    let key = hash(module.as_os_str().as_encoded_bytes()) ^ page.rotate_left(9) ^ hash(&listed).rotate_left(17) ^ 0x70616765;
+    let out = module_path(&dir, key);
+    if !out.exists() {
+        let mut args = args.to_vec();
+        args.extend(["--page".into(), format!("{page:x}"), "--roots".into(), roots.display().to_string()]);
+        run_translator(elf, &out, &args, trace)?;
+    }
+    Ok(out)
 }

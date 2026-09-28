@@ -60,6 +60,11 @@ fn ld_args(image_end: u64) -> Vec<String> {
         "__wasm_env_module_count",
         "__wasm_env_modules_added",
         "__wasm_env_code_epoch",
+        // The program's region table, which a page translated again at run
+        // time takes over an entry of (see the runtime's modules::patch).
+        "dispatch_addrs",
+        "dispatch_fns",
+        "dispatch_count",
     ] {
         args.push(format!("--export={export}"));
     }

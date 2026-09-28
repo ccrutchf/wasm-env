@@ -34,7 +34,7 @@ pub fn syscall(
         nr::WASM_ENV_LOAD_LIBRARY => load_library(&mut caller, a, b as u64),
         // fork: a copy of the process (fork.rs).
         nr::CLONE if a & (0x100 | CLONE_THREAD) == 0 => crate::fork::fork(&mut caller, &args),
-        nr::WASM_ENV_TRANSLATE_CODE => crate::modules::translate_code(&mut caller, a as u64),
+        nr::WASM_ENV_TRANSLATE_CODE => crate::modules::translate_code(&mut caller, a as u64, args[1] as u64, args[2] as u64),
         nr::WASM_ENV_SYNC_MODULES => crate::modules::sync(&mut caller).map(|()| 0).map_err(|e| {
             eprintln!("wasm-env: loading libraries: {e:#}");
             EIO
@@ -650,7 +650,7 @@ impl Process {
             nr::EXIT | nr::EXIT_GROUP => Ok(self.exit(a as i32 & 0xff)),
             nr::WASM_ENV_MISSED_TARGET if ub == 0 => {
                 // In a library loaded as its own module: record it there.
-                if let Some(lib) = self.group.libraries.at(ua) {
+                if let Some(lib) = self.group.libraries.library_at(ua) {
                     crate::translate::record_missed_target(&lib.wasm, &lib.path.display().to_string(), ua - lib.base);
                 }
                 Ok(0)

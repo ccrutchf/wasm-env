@@ -1,7 +1,7 @@
 // A jump target no static analysis can find: the address is computed from
-// argc at run time. The first run under wasm-env misses it and records it;
-// the next translation includes it (tests/m2-exec.sh). Run with two
-// arguments (argc = 3), it exits with 42.
+// argc at run time. The first run under wasm-env misses it, translates its
+// page again then and records it; the next translation includes it
+// (tests/m2-exec.sh). Run with two arguments (argc = 3), it exits with 42.
 	.text
 	.global _start
 _start:
