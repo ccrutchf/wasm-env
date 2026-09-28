@@ -703,3 +703,47 @@ mod tests {
         panic!("expected some unreached fall-through after a terminal instruction");
     }
 }
+
+/// The blocks of one page, for a page translated again at run time (see
+/// lift's `page`), without discovering the whole program again: the blocks
+/// the program's translation found there (`known`, which it wrote out with
+/// `--leaders-out`), the addresses runs reached that it missed, and, as
+/// discovery does around a missed target, the instruction after each one
+/// that doesn't fall through; followed within the page. Every block is an
+/// entry.
+pub fn page_program<'a>(image: &'a Image, page: u64, known: &[u64], missed: &[u64]) -> Program<'a> {
+    const PAGE: u64 = 0x1000;
+    let insns = Insns::new(image);
+    let in_page = |a: u64| (page..page + PAGE).contains(&a) && insns.contains_key(&a);
+    let mut leaders: BTreeSet<u64> = known.iter().chain(missed).copied().filter(|&a| in_page(a)).collect();
+    for (a, i) in insns.range(page..page + PAGE) {
+        if is_terminal(&i) && in_page(a + 4) {
+            leaders.insert(a + 4);
+        }
+    }
+    let mut work: Vec<u64> = leaders.iter().copied().collect();
+    while let Some(start) = work.pop() {
+        let mut pc = start;
+        while in_page(pc) {
+            let Some(i) = insns.get(&pc) else { break };
+            if is_control(&i) {
+                if let Some(t) = direct_target(&i)
+                    && in_page(t)
+                    && leaders.insert(t)
+                {
+                    work.push(t);
+                }
+                if !is_terminal(&i) && in_page(pc + 4) && leaders.insert(pc + 4) {
+                    work.push(pc + 4);
+                }
+                break;
+            }
+            pc += 4;
+            if leaders.contains(&pc) {
+                break;
+            }
+        }
+    }
+    let entries = leaders.clone();
+    Program { insns, leaders, entries }
+}

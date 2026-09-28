@@ -46,6 +46,8 @@ fixtures=(
 	"signals:tests/arm64/signals.c:-static"
 	# Code generated at run time (translated when first jumped to).
 	"jit:tests/arm64/jit.c:-static"
+	# eventfd, epoll and socketpair (an event loop's calls).
+	"events:tests/arm64/events.c:-static -pthread"
 	# C++ exceptions (landing pads found through .eh_frame and the LSDAs).
 	"exceptions:tests/arm64/exceptions.cc:-static -pthread"
 	# Static PIE (loaded at a chosen base, relocations applied on translate).

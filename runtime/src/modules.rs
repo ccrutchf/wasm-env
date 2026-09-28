@@ -424,8 +424,13 @@ fn patch(mut store: impl AsContextMut<Data = Process>, next_slot: &mut u64, pc: 
             (lib.path.clone(), lib.path.display().to_string(), lib.base, lib.wasm.clone(), args)
         }
     };
-    crate::translate::remember_missed(&module, &object, pc - base);
-    let wasm = crate::translate::translate_page(&elf, &module, &args, page, &kernel.root, trace)?;
+    // The next exec translates a small object again with the target (so it
+    // needs no patch); a large one (libnode, libtorch: minutes) stays, and
+    // runs patch the page from the cache.
+    const RETRANSLATE_BELOW: u64 = 8 << 20;
+    let small = std::fs::metadata(&elf).is_ok_and(|m| m.len() < RETRANSLATE_BELOW);
+    crate::translate::remember_missed(&module, &object, pc - base, small);
+    let wasm = crate::translate::translate_page(&elf, &module, &args, base, page, &kernel.root, trace)?;
     let translated = started.elapsed();
     let mut targets: Vec<u64> = current.iter().flat_map(|l| l.patch.clone().unwrap()).collect();
     targets.push(pc);

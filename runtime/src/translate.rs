@@ -308,7 +308,8 @@ pub fn ensure_program(elf: &Path, bytes: &[u8], root: &Path, trace: bool) -> Sys
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
     let out = module_path(&dir, key);
     if !out.exists() {
-        run_translator(elf, &out, &["--object".into()], trace)?;
+        let leaders = out.with_extension("leaders").display().to_string();
+        run_translator(elf, &out, &["--object".into(), "--leaders-out".into(), leaders], trace)?;
     }
     Ok(out)
 }
@@ -455,7 +456,8 @@ pub fn ensure_library(path: &Path, root: &Path, trace: bool) -> SysResult<(PathB
     let key = contents ^ base.rotate_left(7) ^ len;
     let out = module_path(&dir, key);
     if !out.exists() {
-        run_translator(path, &out, &["--object".into(), "--base".into(), format!("{base:x}")], trace)?;
+        let leaders = out.with_extension("leaders").display().to_string();
+        run_translator(path, &out, &["--object".into(), "--base".into(), format!("{base:x}"), "--leaders-out".into(), leaders], trace)?;
     }
     Ok((out, base, end))
 }
@@ -569,7 +571,7 @@ mod dlopen_tests {
 /// these addresses as block roots: each run can only add real code, so the
 /// translation converges.
 pub fn record_missed_target(module: &Path, object: &str, offset: u64) {
-    if remember_missed(module, object, offset) {
+    if remember_missed(module, object, offset, true) {
         eprintln!("wasm-env: recorded the missed address; the next run translates it");
     } else {
         eprintln!("wasm-env: recorded the missed address in {} (translate with --roots)", roots_of(module).display());
@@ -578,8 +580,12 @@ pub fn record_missed_target(module: &Path, object: &str, offset: u64) {
 
 /// Records a missed target (see record_missed_target) without a word, as
 /// when the runtime translates its page right away (see translate_page).
-/// Returns whether the module was a cached translation, now dropped.
-pub fn remember_missed(module: &Path, object: &str, offset: u64) -> bool {
+/// With `drop`, a cached translation is dropped, so the next exec translates
+/// again; without, it stays (translating a huge library takes minutes), and
+/// runs patch the page again from the cache, until the translation is next
+/// made (a new translator) with every target recorded. Returns whether the
+/// module was dropped.
+pub fn remember_missed(module: &Path, object: &str, offset: u64, drop: bool) -> bool {
     use std::io::Write;
     let roots = roots_of(module);
     let line = format!("{object}\t{offset:#x}");
@@ -588,10 +594,10 @@ pub fn remember_missed(module: &Path, object: &str, offset: u64) -> bool {
         let _ = writeln!(f, "{line}");
     }
     let cached = module.parent().and_then(|d| d.file_name()).is_some_and(|n| n == "translated");
-    if cached {
+    if cached && drop {
         let _ = std::fs::remove_file(module);
     }
-    cached
+    cached && drop
 }
 
 /// A module of just the page at `page` of `elf`'s translation `module`,
@@ -600,16 +606,32 @@ pub fn remember_missed(module: &Path, object: &str, offset: u64) -> bool {
 /// reached a block the translation missed (see modules::translate_code).
 /// `args` are the translation's own (`--object`, `--base`), so the page's
 /// code is the same but for the new blocks.
-pub fn translate_page(elf: &Path, module: &Path, args: &[String], page: u64, root: &Path, trace: bool) -> SysResult<PathBuf> {
+pub fn translate_page(elf: &Path, module: &Path, args: &[String], base: u64, page: u64, root: &Path, trace: bool) -> SysResult<PathBuf> {
     let dir = image_cache(root).or_else(cache_dir).ok_or(ENOENT)?;
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
     let roots = roots_of(module);
-    let listed = std::fs::read(&roots).unwrap_or_default();
+    // Keyed by the targets recorded on this page: those elsewhere hardly
+    // change its blocks, and each new one would miss every page's cache.
+    let listed: Vec<u8> = std::fs::read_to_string(&roots)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| {
+            let offset = l.rsplit('\t').next().and_then(|o| u64::from_str_radix(o.trim_start_matches("0x"), 16).ok());
+            offset.is_some_and(|o| (page..page + crate::abi::PAGE_SIZE).contains(&(base + o)))
+        })
+        .flat_map(|l| l.bytes().chain([b'\n']))
+        .collect();
     let key = hash(module.as_os_str().as_encoded_bytes()) ^ page.rotate_left(9) ^ hash(&listed).rotate_left(17) ^ 0x70616765;
     let out = module_path(&dir, key);
     if !out.exists() {
         let mut args = args.to_vec();
         args.extend(["--page".into(), format!("{page:x}"), "--roots".into(), roots.display().to_string()]);
+        // The blocks the translation found (see run_translator's callers):
+        // only this page is discovered again.
+        let leaders = module.with_extension("leaders");
+        if leaders.exists() {
+            args.extend(["--leaders".into(), leaders.display().to_string()]);
+        }
         run_translator(elf, &out, &args, trace)?;
     }
     Ok(out)

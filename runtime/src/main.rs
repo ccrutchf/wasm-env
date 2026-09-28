@@ -16,6 +16,7 @@
 
 mod abi;
 mod convert;
+mod events;
 mod fork;
 mod fs;
 mod image;

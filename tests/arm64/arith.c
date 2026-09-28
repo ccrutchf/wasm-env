@@ -34,6 +34,8 @@ int main(void)
 			out("smulh", (uint64_t)(((__int128)sa * sb) >> 64));
 			out("umull", (uint64_t)a32 * b32);
 			out("smull", (uint64_t)((int64_t)(int32_t)a32 * (int32_t)b32));
+			out("smnegl", (uint64_t)-((int64_t)(int32_t)a32 * (int32_t)b32));
+			out("umnegl", -((uint64_t)a32 * b32));
 			out("madd", a * b + in64[(i + 1) % N]);
 			out("msub", in64[(i + 1) % N] - a * b);
 			if (b) out("udiv", a / b);

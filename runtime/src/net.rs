@@ -193,6 +193,39 @@ impl Process {
         self.fds.insert(fd, 0)
     }
 
+    /// socketpair(AF_UNIX, type, 0, sv): a connected pair of host Unix
+    /// sockets (libuv connects a child's stdin, stdout and stderr with them).
+    pub fn socketpair(&mut self, data: &mut [u8], domain: i64, ty: i64, sv: u64) -> SysResult<i64> {
+        const AF_UNIX: i64 = 1;
+        const SOCK_SEQPACKET: i64 = 5;
+        if domain != AF_UNIX {
+            return Err(EAFNOSUPPORT);
+        }
+        let kind = ty & 0xf;
+        let host = match kind {
+            SOCK_STREAM => libc::SOCK_STREAM,
+            SOCK_DGRAM => libc::SOCK_DGRAM,
+            SOCK_SEQPACKET => libc::SOCK_SEQPACKET,
+            _ => return Err(EINVAL),
+        };
+        let mut raw = [0i32; 2];
+        // SAFETY: `raw` has room for the two descriptors.
+        if unsafe { libc::socketpair(libc::AF_UNIX, host | libc::SOCK_CLOEXEC, 0, raw.as_mut_ptr()) } < 0 {
+            return Err(errno(&std::io::Error::last_os_error()));
+        }
+        let mut pair = [0u8; 8];
+        for (k, raw) in raw.into_iter().enumerate() {
+            // SAFETY: a descriptor socketpair just made, owned from here on.
+            let sock = unsafe { <Socket as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+            let s = GuestSocket { sock, kind, nonblocking: Mutex::new(false) };
+            let flags = 2 /* O_RDWR */ | if ty & SOCK_NONBLOCK != 0 { o::NONBLOCK } else { 0 };
+            let fd = Fd { open: Arc::new(Mutex::new(Open::Socket(Arc::new(s)))), cloexec: ty & SOCK_CLOEXEC != 0, flags };
+            let fd = self.fds.insert(fd, 0)?;
+            pair[4 * k..4 * k + 4].copy_from_slice(&(fd as i32).to_le_bytes());
+        }
+        mem::write(data, sv, &pair).map(|_| 0)
+    }
+
     pub fn connect(&mut self, data: &[u8], fd: i64, addr: u64, len: u64) -> SysResult<i64> {
         let s = self.ready_socket(fd)?;
         let a = read_sockaddr(data, addr, len)?;
@@ -394,6 +427,12 @@ impl Process {
                 };
                 match &*d.open.lock().unwrap() {
                     Open::Socket(s) => host.push((k, s.clone())),
+                    Open::EventFd(e) => {
+                        let (r, w) = e.readiness();
+                        revents[k] = events & ((if r { POLLIN } else { 0 }) | (if w { POLLOUT } else { 0 }));
+                    }
+                    // (An epoll instance inside another isn't modelled: never ready.)
+                    Open::Epoll(_) => {}
                     Open::Pipe(end) => {
                         let (r, w, no_writers, no_readers) = end.pipe.readiness();
                         let mut ev = 0;
@@ -450,6 +489,57 @@ impl Process {
                 return Err(EINTR);
             }
         }
+    }
+
+    /// The epoll instance behind `fd` (EINVAL if it isn't one).
+    pub fn epoll_of(&self, fd: i64) -> SysResult<Arc<crate::events::Epoll>> {
+        match &*self.fds.get(fd)?.open.lock().unwrap() {
+            Open::Epoll(e) => Ok(e.clone()),
+            _ => Err(EINVAL),
+        }
+    }
+
+    /// epoll_pwait: waits until descriptors of the interest list are ready
+    /// (see events.rs), and writes up to `max` of them to `events_at`.
+    pub fn epoll_wait(&mut self, data: &mut [u8], epfd: i64, events_at: u64, max: i64, timeout: Option<Duration>) -> SysResult<i64> {
+        use crate::events::*;
+        if max <= 0 {
+            return Err(EINVAL);
+        }
+        let epoll = self.epoll_of(epfd)?;
+        // Waited on: open descriptors with something to wait for (a
+        // one-shot one reported already has nothing, until EPOLL_CTL_MOD).
+        let list: Vec<(i64, u32, u64)> = {
+            let mut interest = epoll.interest.lock().unwrap();
+            // Closed since they were added: gone, as on Linux when the last
+            // reference to the file goes.
+            interest.retain(|&fd, _| self.fds.get(fd).is_ok());
+            interest.iter().filter(|(_, (ev, _))| ev & (EPOLLIN | EPOLLOUT | EPOLLPRI | EPOLLRDHUP) != 0).map(|(&fd, &(ev, d))| (fd, ev, d)).collect()
+        };
+        let fds: Vec<(i64, i16)> = list.iter().map(|&(fd, ev, _)| (fd, (ev & (EPOLLIN | EPOLLOUT | EPOLLPRI)) as i16)).collect();
+        let revents = self.poll_fds(&fds, timeout)?;
+        let mut count = 0;
+        let mut interest = epoll.interest.lock().unwrap();
+        for (&(fd, ev, user), &r) in list.iter().zip(&revents) {
+            if r == 0 || count >= max {
+                continue;
+            }
+            // poll's POLLIN, POLLPRI, POLLOUT, POLLERR and POLLHUP are epoll's.
+            let mut out = r as u16 as u32 & (EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLERR | EPOLLHUP);
+            if out & EPOLLHUP != 0 && ev & EPOLLRDHUP != 0 {
+                out |= EPOLLRDHUP;
+            }
+            let at = events_at + count as u64 * EVENT_SIZE;
+            mem::write(data, at, &out.to_le_bytes())?;
+            mem::write(data, at + 8, &user.to_le_bytes())?;
+            count += 1;
+            if ev & EPOLLONESHOT != 0
+                && let Some(entry) = interest.get_mut(&fd)
+            {
+                entry.0 = EPOLLONESHOT;
+            }
+        }
+        Ok(count)
     }
 
     /// ppoll(fds, nfds, timeout, sigmask, sigsetsize).
@@ -510,7 +600,7 @@ impl Process {
 }
 
 /// A `struct timespec *` timeout: None for a null pointer (wait forever).
-fn read_timeout(data: &[u8], at: u64) -> SysResult<Option<Duration>> {
+pub(crate) fn read_timeout(data: &[u8], at: u64) -> SysResult<Option<Duration>> {
     if at == 0 {
         return Ok(None);
     }

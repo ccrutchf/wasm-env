@@ -386,6 +386,8 @@ pub enum Open {
     Pipe(PipeEnd),
     Socket(std::sync::Arc<crate::net::GuestSocket>),
     Device(Device),
+    EventFd(Arc<crate::events::EventFd>),
+    Epoll(Arc<crate::events::Epoll>),
 }
 
 /// A descriptor: the open file description (shared by dup, vfork and

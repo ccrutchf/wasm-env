@@ -469,6 +469,7 @@ impl Process {
             nr::FLOCK => self.flock(a, b),
             // Sockets (net.rs).
             nr::SOCKET => self.socket(a, b, c),
+            nr::SOCKETPAIR => self.socketpair(data, a, b, d as u64),
             nr::CONNECT => self.connect(data, a, ub, uc),
             nr::BIND => self.bind(data, a, ub, uc),
             nr::LISTEN => self.listen(a, b),
@@ -722,6 +723,54 @@ impl Process {
                 pair[..4].copy_from_slice(&(r as i32).to_le_bytes());
                 pair[4..].copy_from_slice(&(w as i32).to_le_bytes());
                 mem::write(data, ua, &pair).map(|_| 0)
+            }
+            // eventfd and epoll (events.rs): libuv's event loop, Node.js's.
+            nr::EVENTFD2 => {
+                const EFD_SEMAPHORE: i64 = 1;
+                let open = Open::EventFd(Arc::new(crate::events::EventFd::new(ua & 0xffff_ffff, b & EFD_SEMAPHORE != 0)));
+                let fd = fs::Fd { cloexec: b & o::CLOEXEC != 0, flags: (b & o::NONBLOCK) | 2, open: Arc::new(Mutex::new(open)) }; // O_RDWR
+                self.fds.insert(fd, 0)
+            }
+            nr::EPOLL_CREATE1 => {
+                if a & !o::CLOEXEC != 0 {
+                    return Err(EINVAL);
+                }
+                let open = Open::Epoll(Arc::new(crate::events::Epoll::default()));
+                let fd = fs::Fd { cloexec: a & o::CLOEXEC != 0, flags: 2, open: Arc::new(Mutex::new(open)) };
+                self.fds.insert(fd, 0)
+            }
+            nr::EPOLL_CTL => {
+                let epoll = self.epoll_of(a)?;
+                if c == a {
+                    return Err(EINVAL);
+                }
+                self.fds.get(c)?;
+                let (events, user) = if b == 2 {
+                    (0, 0) // EPOLL_CTL_DEL ignores the event
+                } else {
+                    (mem::read_u64(data, d as u64)? as u32, mem::read_u64(data, d as u64 + 8)?)
+                };
+                epoll.ctl(b, c, events, user).map(|_| 0)
+            }
+            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => {
+                // epoll_pwait's timeout is milliseconds (-1: forever);
+                // epoll_pwait2's a timespec pointer (null: forever).
+                let timeout = if n == nr::EPOLL_PWAIT2 {
+                    crate::net::read_timeout(data, d as u64)?
+                } else if d < 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(d as u64))
+                };
+                self.epoll_wait(data, a, ub, c, timeout)
+            }
+            nr::CLOCK_GETRES => {
+                // Every clock counts in nanoseconds.
+                if ub != 0 {
+                    mem::write(data, ub, &0u64.to_le_bytes())?;
+                    mem::write(data, ub + 8, &1u64.to_le_bytes())?;
+                }
+                Ok(0)
             }
             nr::SETPGID => {
                 let pid = if a == 0 { self.pid } else { a as i32 };
@@ -1124,6 +1173,16 @@ impl Process {
         }
     }
 
+    /// The eventfd behind `fd`, if it is one, and whether it's non-blocking.
+    fn eventfd_of(&self, fd: i64) -> SysResult<Option<(Arc<crate::events::EventFd>, bool)>> {
+        let fd = self.fds.get(fd)?;
+        let nonblock = fd.flags & o::NONBLOCK != 0;
+        match &*fd.open.lock().unwrap() {
+            Open::EventFd(e) => Ok(Some((e.clone(), nonblock))),
+            _ => Ok(None),
+        }
+    }
+
     /// The signals that interrupt a blocking call (with EINTR): those this
     /// thread doesn't block and that do something (end the process, or run a
     /// handler), not ignored ones.
@@ -1151,6 +1210,9 @@ impl Process {
         if let Some((pipe, nonblock)) = self.pipe_of(fd, false)? {
             return pipe.read(buf, nonblock, &self.interrupted()).map(|n| n as i64);
         }
+        if let Some((e, nonblock)) = self.eventfd_of(fd)? {
+            return e.read(buf, nonblock, &self.interrupted());
+        }
         let open = self.fds.get(fd)?.open.clone();
         let r = match &mut *open.lock().unwrap() {
             Open::Stdin => std::io::stdin().read(buf),
@@ -1166,6 +1228,7 @@ impl Process {
                 Ok(buf.len())
             }
             Open::Stdout | Open::Stderr | Open::Pipe(_) | Open::Socket(_) => return Err(EBADF),
+            Open::EventFd(_) | Open::Epoll(_) => return Err(EINVAL),
         };
         r.map(|n| n as i64).map_err(|e| fs::errno(&e))
     }
@@ -1173,6 +1236,9 @@ impl Process {
     fn write(&mut self, fd: i64, buf: &[u8]) -> SysResult<i64> {
         if let Some(s) = self.maybe_socket(fd)? {
             return crate::net::send(&s, buf);
+        }
+        if let Some((e, nonblock)) = self.eventfd_of(fd)? {
+            return e.write(buf, nonblock, &self.interrupted());
         }
         if let Some((pipe, nonblock)) = self.pipe_of(fd, true)? {
             let r = pipe.write(buf, nonblock, &self.interrupted());
@@ -1201,6 +1267,7 @@ impl Process {
             Open::Dir { .. } => return Err(EISDIR),
             Open::Device(_) => Ok(()), // writes to /dev devices are discarded
             Open::Stdin | Open::Pipe(_) | Open::Socket(_) => return Err(EBADF),
+            Open::EventFd(_) | Open::Epoll(_) => return Err(EINVAL),
         };
         r.map(|_| buf.len() as i64).map_err(|e| fs::errno(&e))
     }

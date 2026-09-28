@@ -212,7 +212,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let p = b.val(format!("mul i64 {x}, {y}"));
             let r = match &m[1..] {
                 "mull" => p,
-                "negl" => b.val(format!("sub i64 0, {p}")),
+                "mnegl" => b.val(format!("sub i64 0, {p}")),
                 rest => {
                     let acc = b.operand(&ops[3], 64)?;
                     let op = if rest == "maddl" { "add" } else { "sub" };

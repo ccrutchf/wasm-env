@@ -137,6 +137,22 @@ else
 	echo "skipped LuaJIT: can't fetch the package (offline?)"
 fi
 
+# Node.js: V8, libuv's event loop (epoll, eventfd), a child process over
+# socket pairs, a worker thread and HTTP over loopback (tests/node/demo.js),
+# with V8's interpreter only (--jitless) and with its JIT (code generated
+# at run time: each new code page costs a translation, so a few minutes).
+if tests/ubuntu-fetch.sh nodejs >/dev/null 2>&1; then
+	cp tests/node/demo.js "$R/root/node_demo.js"
+	for mode in --jitless ""; do
+		expected=$(cd "$R" && env -i HOME=/root PATH=/usr/bin:/bin QEMU_CPU=max,sve=off,sme=off \
+			qemu-aarch64 -L . -0 /usr/bin/node ./usr/bin/node $mode ./root/node_demo.js 2>&1)
+		actual=$(timeout 3600 "$wasm_env" run --root "$R" /usr/bin/node $mode /root/node_demo.js 2>&1)
+		compare "Node.js ${mode:-(JIT)}" "$expected" "$actual"
+	done
+else
+	echo "skipped Node.js: can't fetch the package (offline?)"
+fi
+
 # Networking, if PyPI is reachable: DNS (glibc's resolver, over the host's
 # resolv.conf), HTTPS (Ubuntu's OpenSSL with its CA certificates), and pip
 # installing a package from PyPI. Ubuntu's ca-certificates package builds

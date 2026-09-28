@@ -99,7 +99,14 @@ pub mod nr {
     pub const GETRANDOM: i64 = 278;
     pub const PSELECT6: i64 = 72;
     pub const PPOLL: i64 = 73;
+    pub const EVENTFD2: i64 = 19;
+    pub const EPOLL_CREATE1: i64 = 20;
+    pub const EPOLL_CTL: i64 = 21;
+    pub const EPOLL_PWAIT: i64 = 22;
+    pub const EPOLL_PWAIT2: i64 = 441;
+    pub const CLOCK_GETRES: i64 = 114;
     pub const SOCKET: i64 = 198;
+    pub const SOCKETPAIR: i64 = 199;
     pub const BIND: i64 = 200;
     pub const LISTEN: i64 = 201;
     pub const ACCEPT: i64 = 202;
@@ -171,7 +178,9 @@ pub fn name(n: i64) -> &'static str {
         PRLIMIT64 => "prlimit64", GETRANDOM => "getrandom", PIPE2 => "pipe2", CLONE => "clone",
         EXECVE => "execve", WAIT4 => "wait4", SETPGID => "setpgid", GETPGID => "getpgid",
         GETSID => "getsid", SETSID => "setsid", PSELECT6 => "pselect6", PPOLL => "ppoll",
-        SOCKET => "socket", BIND => "bind", LISTEN => "listen", ACCEPT => "accept",
+        EVENTFD2 => "eventfd2", EPOLL_CREATE1 => "epoll_create1", EPOLL_CTL => "epoll_ctl", EPOLL_PWAIT => "epoll_pwait",
+        EPOLL_PWAIT2 => "epoll_pwait2", CLOCK_GETRES => "clock_getres",
+        SOCKET => "socket", SOCKETPAIR => "socketpair", BIND => "bind", LISTEN => "listen", ACCEPT => "accept",
         CONNECT => "connect", GETSOCKNAME => "getsockname", GETPEERNAME => "getpeername",
         SENDTO => "sendto", RECVFROM => "recvfrom", SETSOCKOPT => "setsockopt",
         GETSOCKOPT => "getsockopt", SHUTDOWN => "shutdown", SENDMSG => "sendmsg",

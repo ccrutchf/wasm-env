@@ -36,6 +36,7 @@ Not allowed in version 0: threads, shared memory, multiple memories. The runtime
 - Structures passed through pointers use arm64 Linux layouts (LP64: `long` and pointers are 8 bytes; `struct stat` is the generic 128-byte layout).
 - A syscall the runtime doesn't implement returns `-ENOSYS` (−38). It never traps.
 - The runtime validates every pointer and length against the program's memory; a bad pointer returns `-EFAULT`.
+- Event loops (libuv's, Node.js's): `eventfd2`, `epoll_create1`, `epoll_ctl` and `epoll_pwait`/`epoll_pwait2` (level-triggered: `EPOLLET` behaves like it, which suits loops that read until `EAGAIN`; `EPOLLONESHOT` is honoured), and `socketpair` for `AF_UNIX` (host socket pairs).
 
 This mirrors the arm64 `svc #0` convention, so translated arm64 binaries can map their syscalls onto this import one-to-one, and x86-64 translation only needs a number-mapping table.
 

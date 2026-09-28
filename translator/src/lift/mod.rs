@@ -1059,9 +1059,15 @@ pub fn lift(image: &Image, prog: &Program, library: bool, page: Option<u64>, sin
     // keep ordinary loads.
     const POLL_LOOP_BYTES: u64 = 64;
     let mut polling = std::collections::HashSet::new();
-    for (&region, leaders) in &regions {
+    // (For one page, only its own region: its blocks are all taken as
+    // entries and as leaving their flags live, which is always correct,
+    // rather than lifting the whole program to find out.)
+    for (&region, leaders) in regions.iter().filter(|(r, _)| page.is_none_or(|p| region_of(p) == **r)) {
         let r = lift_region(prog, region, leaders, false, &mut unsupported);
         entries.extend(r.cross);
+        if page.is_some() {
+            entries.extend(leaders);
+        }
         for &(target, _, end) in &r.loop_edges {
             if end + 4 - target > POLL_LOOP_BYTES {
                 continue;
@@ -1075,7 +1081,10 @@ pub fn lift(image: &Image, prog: &Program, library: bool, page: Option<u64>, sin
             facts.insert(b.start, b.facts);
         }
     }
-    let live_out = flags_live_out(&facts);
+    let live_out = match page {
+        Some(_) => facts.keys().copied().collect(),
+        None => flags_live_out(&facts),
+    };
     drop(facts);
 
     // Pass 2: each region's function, entered at its entry blocks (the

@@ -88,6 +88,11 @@ struct Inputs {
     /// Only this page's region (`--page`): a patch the runtime makes when
     /// a run reaches a block the translation missed there.
     page: Option<u64>,
+    /// Where to write the blocks discovery found (`--leaders-out`), and, with
+    /// `--page`, where to read them (`--leaders`) instead of discovering the
+    /// whole program again.
+    leaders_out: Option<String>,
+    leaders: Option<String>,
 }
 
 /// Translates an arm64 executable (with any shared libraries) into a
@@ -180,8 +185,19 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         phase.set(std::time::Instant::now());
     };
     lap("load");
-    let prog = discover::discover(&image);
+    let prog = match (inputs.page, &inputs.leaders) {
+        (Some(page), Some(path)) => {
+            let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+            let known: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
+            discover::page_program(&image, page / 0x1000 * 0x1000, &known, &image.roots)
+        }
+        _ => discover::discover(&image),
+    };
     lap("discover");
+    if let Some(path) = &inputs.leaders_out {
+        let bytes: Vec<u8> = prog.leaders.iter().flat_map(|a| a.to_le_bytes()).collect();
+        std::fs::write(path, bytes).with_context(|| format!("writing {path}"))?;
+    }
     let tc = link::Toolchain::from_env()
         .context("no toolchain found: install wasm-env with its toolchain (nix profile install), set $WASM_ENV_TOOLCHAIN, or run inside `nix develop`")?;
     let image_end = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(0);
@@ -292,6 +308,8 @@ fn main() -> Result<()> {
                     "--layout" => inputs.layout = Some(value()?),
                     "--object" => inputs.object = true,
                     "--raw" => inputs.raw = true,
+                    "--leaders-out" => inputs.leaders_out = Some(value()?),
+                    "--leaders" => inputs.leaders = Some(value()?),
                     "--page" => {
                         let v = value()?;
                         inputs.page = Some(u64::from_str_radix(v.trim_start_matches("0x"), 16).with_context(|| format!("--page {v}"))?);
