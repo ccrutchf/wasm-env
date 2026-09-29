@@ -232,7 +232,7 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         eprintln!("warning: {n} × `{op}` not supported yet (traps if executed): {example}");
     }
     let compiled = match direct {
-        true => match wasmgen::compile(&chunks) {
+        true => match wasmgen::compile(&chunks, false) {
             Ok(wasm) => Ok(wasm),
             Err(why) => {
                 // WASM_ENV_DEBUG_WASMGEN=1 says why clang compiles it.
@@ -339,7 +339,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "lift")]
         ["wasmgen", output, chunks @ ..] => {
             let chunks: Vec<String> = chunks.iter().map(std::fs::read_to_string).collect::<std::io::Result<_>>()?;
-            let wasm = wasmgen::compile(&chunks).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let wasm = wasmgen::compile(&chunks, false).map_err(|e| anyhow::anyhow!("{e}"))?;
             std::fs::write(output, wasm)?;
             Ok(())
         }

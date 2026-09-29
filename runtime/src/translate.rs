@@ -387,16 +387,24 @@ fn library_range(bases: &Path, path: &Path, extent: u64) -> SysResult<(u64, u64)
 /// The module for code a program generated at run time: `bytes`, the
 /// executable mapping at `base`, entered at `roots` (the translation's
 /// block roots). Cached by all three (a JIT generates the same code run
-/// after run, at the same addresses if it chose them).
-pub fn ensure_code(bytes: &[u8], base: u64, roots: &[u64], root: &Path, trace: bool) -> SysResult<PathBuf> {
+/// after run, at the same addresses if it chose them). With `direct`, it
+/// tries this process's direct compiler first, whose modules chain to older
+/// code on their pages (see modules::translate_code); else, or if that
+/// declines, the translator's process, with clang. Returns the module and
+/// whether it chains.
+pub fn ensure_code(bytes: &[u8], base: u64, roots: &[u64], direct: bool, root: &Path, trace: bool) -> SysResult<(PathBuf, bool)> {
     let dir = image_cache(root).or_else(cache_dir).ok_or(ENOENT)?;
     std::fs::create_dir_all(&dir).map_err(|e| crate::fs::errno(&e))?;
     let listed: Vec<u8> = roots.iter().flat_map(|r| r.to_le_bytes()).collect();
     let key = hash(bytes) ^ hash(&tool_hash().to_le_bytes()).rotate_left(1) ^ base.rotate_left(7) ^ hash(&listed).rotate_left(13) ^ 0x6a6974;
     let stem = dir.join(format!("{key:016x}"));
     let (code, roots_file, out) = (stem.with_extension("code"), stem.with_extension("roots"), stem.with_extension("wasm"));
+    let chained = dir.join(format!("{:016x}.wasm", key ^ 0x636861696e));
+    if direct && chained.exists() {
+        return Ok((chained, true));
+    }
     if out.exists() {
-        return Ok(out);
+        return Ok((out, false));
     }
     let write = |path: &Path, data: &[u8]| -> SysResult<()> {
         let tmp = path.with_extension(format!("{}.tmp", unique()));
@@ -406,13 +414,15 @@ pub fn ensure_code(bytes: &[u8], base: u64, roots: &[u64], root: &Path, trace: b
     // In this process, compiled straight to WebAssembly (milliseconds); what
     // the direct compiler doesn't handle goes to the translator's process,
     // which compiles it with clang.
-    match wasm_env_translate::translate_generated(bytes, base, roots) {
-        Ok(wasm) => {
-            write(&out, &wasm)?;
-            return Ok(out);
+    if direct {
+        match wasm_env_translate::translate_generated(bytes, base, roots) {
+            Ok(wasm) => {
+                write(&chained, &wasm)?;
+                return Ok((chained, true));
+            }
+            Err(why) if trace => eprintln!("[wasm-env] generated code at {base:#x} goes to clang: {why}"),
+            Err(_) => {}
         }
-        Err(why) if trace => eprintln!("[wasm-env] generated code at {base:#x} goes to clang: {why}"),
-        Err(_) => {}
     }
     // The translator names the object by the path it's given.
     let text: String = roots.iter().map(|r| format!("{}\t{:#x}\n", code.display(), r - base)).collect();
@@ -422,7 +432,7 @@ pub fn ensure_code(bytes: &[u8], base: u64, roots: &[u64], root: &Path, trace: b
     // The bytes and roots only matter to the translator.
     let _ = std::fs::remove_file(&code);
     let _ = std::fs::remove_file(&roots_file);
-    Ok(out)
+    Ok((out, false))
 }
 
 /// A library's content hash, length and extent. Reading and hashing a

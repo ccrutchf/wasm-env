@@ -40,9 +40,12 @@ macro_rules! unsupported {
 }
 
 /// Compiles the lifter's chunks (see lift::lift) to a side module, or says
-/// why it can't.
-pub fn compile(chunks: &[String]) -> Res<Vec<u8>> {
-    let mut m = Parsed::default();
+/// why it can't. With `chain`, an address a region function has no block
+/// for goes on to the function of the same region in an older module on
+/// the page (generated code sharing a page), a table slot the module imports
+/// as the global `prev.R_<region>`, instead of `__wasm_env_bad_target`.
+pub fn compile(chunks: &[String], chain: bool) -> Res<Vec<u8>> {
+    let mut m = Parsed { chain, ..Default::default() };
     for c in chunks {
         m.parse(c)?;
     }
@@ -122,6 +125,7 @@ struct Parsed {
     strings: BTreeMap<String, Vec<u8>>,
     /// Region functions: (name, body lines).
     functions: Vec<(String, Vec<String>)>,
+    chain: bool,
 }
 
 impl Parsed {
@@ -215,13 +219,22 @@ impl Parsed {
             func_index.insert(name.clone(), imported_funcs + k as u32);
         }
         let relocs_index = imported_funcs + n as u32;
+        // With `chain`, a global per region function after the GOT.func ones.
+        let prev_base = got_base + n as u32;
+        if self.chain {
+            for (name, _) in &self.functions {
+                imports.import("prev", name, global(false));
+            }
+        }
 
         let ctx = Context { func_index: &func_index, import_sig: &import_sig, string_at: &string_at, region_ty, memory_base: MEMORY_BASE, state: STATE };
         let mut functions = FunctionSection::new();
         let mut code = CodeSection::new();
         let mut addresses = Vec::new();
-        for (name, body) in &self.functions {
-            let f = FuncGen::new(&ctx, body)?.compile().map_err(|e| format!("{name}: {e}"))?;
+        for (k, (name, body)) in self.functions.iter().enumerate() {
+            let mut g = FuncGen::new(&ctx, body)?;
+            g.prev = self.chain.then_some(prev_base + k as u32);
+            let f = g.compile().map_err(|e| format!("{name}: {e}"))?;
             functions.function(region_ty);
             code.function(&f);
             let addr = name.strip_prefix("R_").and_then(|a| u64::from_str_radix(a, 16).ok()).ok_or("region name")?;
@@ -256,7 +269,7 @@ impl Parsed {
 
         let mut globals = GlobalSection::new();
         let mut exports = ExportSection::new();
-        let first_global = got_base + n as u32;
+        let first_global = got_base + n as u32 + if self.chain { n as u32 } else { 0 };
         for (k, (name, offset)) in [("dispatch_addrs", addrs), ("dispatch_fns", fns), ("dispatch_count", count)].into_iter().enumerate() {
             globals.global(GlobalType { val_type: ValType::I64, mutable: false, shared: false }, &ConstExpr::i64_const(offset as i64));
             exports.export(name, ExportKind::Global, first_global + k as u32);
@@ -481,6 +494,9 @@ struct FuncGen<'a> {
     /// its shape, and the constructs enclosing the code being emitted.
     shape: Option<Shape>,
     enclosing: Vec<Ctx>,
+    /// With chaining (see `compile`), the global holding the table slot of
+    /// the older function of this region.
+    prev: Option<u32>,
     current: usize,
 }
 
@@ -513,6 +529,7 @@ impl<'a> FuncGen<'a> {
             extra: 0,
             shape: None,
             enclosing: Vec::new(),
+            prev: None,
             current: 0,
         };
         g.locals.insert("pc".into(), (0, Ty::I64));
@@ -1502,6 +1519,18 @@ impl<'a> FuncGen<'a> {
                 None => Ok(()),
             };
         }
+        // An address this module has no block for: on to the older function
+        // of the region, if chained.
+        if name == "__wasm_env_bad_target"
+            && let Some(prev) = self.prev
+        {
+            for p in &params {
+                self.typed(p)?;
+            }
+            self.emit(I::GlobalGet(prev));
+            self.emit(I::ReturnCallIndirect { type_index: self.ctx.region_ty, table_index: 0 });
+            return Ok(());
+        }
         let Some(&f) = self.ctx.func_index.get(name) else { unsupported!("call {name}") };
         if !self.ctx.import_sig.contains_key(name) {
             unsupported!("call to region {name}");
@@ -2141,7 +2170,7 @@ bad:
 
     #[test]
     fn compiles_a_region_to_a_valid_side_module() {
-        let wasm = compile(&[CHUNK.to_string()]).expect("supported");
+        let wasm = compile(&[CHUNK.to_string()], false).expect("supported");
         let mut config = wasmtime::Config::new();
         config.wasm_threads(true).wasm_memory64(true).wasm_tail_call(true).shared_memory(true);
         let engine = wasmtime::Engine::new(&config).unwrap();
@@ -2154,9 +2183,19 @@ bad:
     }
 
     #[test]
+    fn chains_a_missed_address_to_the_older_function() {
+        let wasm = compile(&[CHUNK.to_string()], true).expect("supported");
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true).wasm_memory64(true).wasm_tail_call(true).shared_memory(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let module = wasmtime::Module::new(&engine, &wasm).expect("valid");
+        assert!(module.imports().any(|i| i.module() == "prev" && i.name() == "R_1000"));
+    }
+
+    #[test]
     fn declines_what_it_does_not_compile() {
         let vector = CHUNK.replace("%t5 = zext i8 %t4 to i128", "%t5 = bitcast <2 x i64> zeroinitializer to i128");
-        assert!(compile(&[vector]).is_err());
+        assert!(compile(&[vector], false).is_err());
     }
 
     #[test]

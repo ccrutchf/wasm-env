@@ -48,7 +48,7 @@ pub fn translate_generated(bytes: &[u8], base: u64, roots: &[u64]) -> Result<Vec
     let mut chunks = Vec::new();
     lift::lift(&image, &prog, true, None, &mut |c| chunks.push(c));
     let lifted = t.elapsed();
-    let wasm = wasmgen::compile(&chunks)?;
+    let wasm = wasmgen::compile(&chunks, true)?;
     if timings {
         eprintln!(
             "[timing] generated code: {} blocks; discover {:.4} s, lift {:.4} s, compile {:.4} s",

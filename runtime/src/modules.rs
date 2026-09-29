@@ -45,6 +45,10 @@ pub struct Library {
     pub patch: Option<Vec<u64>>,
     /// Its region table: (addresses, functions, count), in guest memory.
     regions: OnceLock<(u64, u64, u64)>,
+    /// For generated code that chains (see translate_code): the table slot
+    /// each of its `prev.R_<region>` imports gets, the older function of
+    /// that region on the page, or the fallback (`Libraries::fallback`).
+    prev: Vec<(String, u64)>,
     /// Its slot in the module directory (see register).
     slot: usize,
     /// Retired: its code was unmapped or changed (see retire).
@@ -68,6 +72,9 @@ pub struct Libraries {
     /// Where the support code's directory globals are, once a module is
     /// loaded.
     globals: OnceLock<Globals>,
+    /// A table slot holding the support code's `__wasm_env_bad_target`, where
+    /// a chain of generated code's region functions ends.
+    fallback: OnceLock<u64>,
 }
 
 /// Addresses of the support code's globals for the module directory.
@@ -80,11 +87,6 @@ struct Globals {
 }
 
 impl Libraries {
-    /// The library covering a guest address, if any (not a retired one).
-    pub fn at(&self, addr: u64) -> Option<Arc<Library>> {
-        self.list.lock().unwrap().iter().rev().find(|l| addr >= l.base && addr < l.end && !l.dead.load(Ordering::Relaxed)).cloned()
-    }
-
     /// The shared library (not generated code, not a patch) covering `addr`.
     pub fn library_at(&self, addr: u64) -> Option<Arc<Library>> {
         let list = self.list.lock().unwrap();
@@ -219,6 +221,27 @@ fn add(
     }
     let table_base = *next_slot;
     *next_slot += info.table_size + got.len() as u64;
+    // Generated code that chains: for each region, the table slot of the
+    // newest live function of that region (older code on the page), or the
+    // fallback slot.
+    let chains: Vec<String> = module.imports().filter(|i| i.module() == "prev").map(|i| i.name().to_string()).collect();
+    let mut prev = Vec::new();
+    if !chains.is_empty() {
+        let fallback = *libraries.fallback.get_or_init(|| {
+            *next_slot += 1;
+            *next_slot - 1
+        });
+        let list = libraries.list.lock().unwrap();
+        for name in chains {
+            let slot = list
+                .iter()
+                .rev()
+                .filter(|l| l.code.is_some() && !l.dead.load(Ordering::Relaxed))
+                .find_map(|l| l.got.iter().position(|g| *g == name).map(|k| l.table_base + k as u64))
+                .unwrap_or(fallback);
+            prev.push((name, slot));
+        }
+    }
     if libraries.globals.get().is_none() {
         let globals = Globals {
             modules: global(&mut store, &main.instance, "__wasm_env_modules")?,
@@ -255,6 +278,7 @@ fn add(
         code,
         patch,
         regions: OnceLock::new(),
+        prev,
         slot,
         dead: false.into(),
     });
@@ -291,13 +315,13 @@ fn atomic(memory: &SharedMemory, at: u64) -> Option<&std::sync::atomic::AtomicU6
 
 /// Code the program generated at run time (a JIT's), reached at `pc`: the
 /// wasm-env private call behind the support code's `translate_code`.
-/// Translates the executable mapping holding `pc`, as it is now, from
-/// `pc` and the entries of the modules already on the pages that code
-/// occupies, which the new module replaces: one module per page, as each
-/// thread's dispatch cache maps a page to one region function. So a JIT
-/// adding code costs a translation of just its pages. ENOEXEC if `pc`
-/// isn't in such memory (a library's missed target, say) or was translated
-/// as an entry already.
+/// Translates the code reached from `pc` in the executable mapping holding
+/// it, as it is now, chained to the older code on its pages (docs/abi.md,
+/// "Chaining"), so a JIT adding code costs a translation of just that code.
+/// A block the program's or a library's translation missed has its page
+/// translated again (see patch). 1 if `pc` was translated as an entry
+/// already (the caller's dispatch cache named older code); ENOEXEC if it
+/// can't be translated.
 pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64, object: u64, object_base: u64) -> crate::memory::SysResult<i64> {
     use crate::abi::errno::*;
     let process = store.as_context().data();
@@ -319,10 +343,7 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64, obj
     }
     // Generated code: translated from pc already, but this thread's cache
     // named code since replaced.
-    if let Some(lib) = libraries.at(pc)
-        && let Some(code) = &lib.code
-        && code.roots.contains(&pc)
-    {
+    if code_in(libraries, pc, pc + 1).iter().any(|l| l.code.as_ref().is_some_and(|c| c.roots.contains(&pc))) {
         return Ok(1);
     }
     let (lo, hi) = group.mm.lock().unwrap().code_at(pc).ok_or(ENOEXEC)?;
@@ -332,6 +353,37 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64, obj
     }
     let started = std::time::Instant::now();
     let bytes = crate::memory::slice(crate::syscall::shared_bytes(&threading.memory), lo, hi - lo)?.to_vec();
+    // In this process, from pc alone: the module chains to the older code
+    // on its pages (an address it has no block for goes on to the older
+    // function of that region), which stays, so a JIT adding code costs a
+    // translation of just that code.
+    let (wasm, chained) = crate::translate::ensure_code(&bytes, lo, &[pc], true, &kernel.root, trace)?;
+    if chained {
+        let (start, end) = code_range(&wasm).ok_or(EIO)?;
+        let translated = started.elapsed();
+        let shares = !code_in(libraries, start, end).is_empty();
+        let name = PathBuf::from(format!("[code {start:#x}]"));
+        let code = Code { roots: vec![pc], bytes: bytes[(start - lo) as usize..(end.min(hi) - lo) as usize].to_vec() };
+        add(&mut store, &mut next_slot, name, wasm, start, end, Some(code), None).map_err(|e| {
+            eprintln!("wasm-env: loading code translated from {lo:#x}: {e:#}");
+            EIO
+        })?;
+        // Every thread's dispatch cache may name an older function of these
+        // pages, which doesn't know the new code.
+        if shares {
+            bump_epoch(libraries, &threading.memory);
+        }
+        if trace {
+            eprintln!(
+                "[wasm-env] translated code at {start:#x}..{end:#x} (entered at {pc:#x}, chained): {:.3} s, loaded in {:.3} s",
+                translated.as_secs_f64(),
+                (started.elapsed() - translated).as_secs_f64()
+            );
+        }
+        return Ok(0);
+    }
+    // Compiled by clang (which the direct compiler left it to), it doesn't
+    // chain: it replaces the modules on its pages, taking their entries.
     let mut roots = std::collections::BTreeSet::from([pc]);
     let mut replaced: Vec<Arc<Library>> = Vec::new();
     // The modules on pc's page join from the start (the translation
@@ -343,7 +395,7 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64, obj
     }
     let (wasm, start, end) = loop {
         let list: Vec<u64> = roots.iter().copied().filter(|r| (lo..hi).contains(r)).collect();
-        let wasm = crate::translate::ensure_code(&bytes, lo, &list, &kernel.root, trace)?;
+        let (wasm, _) = crate::translate::ensure_code(&bytes, lo, &list, false, &kernel.root, trace)?;
         let (start, end) = code_range(&wasm).ok_or(EIO)?;
         // Live modules on these pages: their entries join the translation.
         let more: Vec<Arc<Library>> = libraries
@@ -507,6 +559,14 @@ fn code_range(wasm: &Path) -> Option<(u64, u64)> {
     Some((word(0)?, word(1)?))
 }
 
+/// Bumps the code epoch: every thread clears its dispatch cache before it
+/// next dispatches.
+fn bump_epoch(libraries: &Libraries, memory: &SharedMemory) {
+    if let Some(epoch) = libraries.globals.get().and_then(|g| atomic(memory, g.epoch)) {
+        epoch.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// Retires a module: empties its directory entry (freeing the slot), so
 /// dispatch no longer finds it, and bumps the code epoch, so every thread
 /// clears its dispatch cache (which may name its regions) before it next
@@ -516,7 +576,7 @@ fn retire(lib: &Library, memory: &SharedMemory, libraries: &Libraries) {
         return;
     }
     if let Some(g) = libraries.globals.get() {
-        let entry = g.modules + 40 * lib.slot as u64;
+        let entry = g.modules + ENTRY * lib.slot as u64;
         for at in [entry, entry + 8] {
             if let Some(word) = atomic(memory, at) {
                 word.store(0, Ordering::Release);
@@ -580,6 +640,19 @@ pub fn sync(mut store: impl AsContextMut<Data = Process>) -> Result<()> {
 /// main instance, with its table slots filled.
 fn instantiate(mut store: impl AsContextMut<Data = Process>, lib: &Library, memory: &SharedMemory) -> Result<Instance> {
     let main = store.as_context().data().main.clone().context("no main instance")?;
+    // A chain of generated code ends at the fallback: this store's table has
+    // the support code's `__wasm_env_bad_target` there.
+    if !lib.prev.is_empty() {
+        let fallback = store.as_context().data().group.libraries.fallback.get().copied();
+        if let Some(slot) = fallback {
+            let size = main.table.size(&store);
+            if slot >= size {
+                main.table.grow(&mut store, slot + 1 - size, Ref::Func(None))?;
+            }
+            let f = main.instance.get_func(&mut store, "__wasm_env_bad_target").context("no __wasm_env_bad_target")?;
+            main.table.set(&mut store, slot, Ref::Func(Some(f)))?;
+        }
+    }
     let mut linker: Linker<Process> = Linker::new(store.as_context().engine());
     let mut got_globals = Vec::new();
     // GOT.func imports come in the order of `lib.got`: the k-th is slot k.
@@ -605,6 +678,10 @@ fn instantiate(mut store: impl AsContextMut<Data = Process>, lib: &Library, memo
                 got_globals.push((sym.to_string(), slot));
                 g.into()
             }
+            ("prev", region) => {
+                let slot = lib.prev.iter().find(|(r, _)| r == region).map(|&(_, s)| s).context("prev import")?;
+                Global::new(&mut store, GlobalType::new(ValType::I64, Mutability::Const), Val::I64(slot as i64))?.into()
+            }
             _ => bail!("{}: unsupported import {module}.{name}", lib.wasm.display()),
         };
         linker.define(&store, module, name, ext)?;
@@ -625,6 +702,10 @@ fn instantiate(mut store: impl AsContextMut<Data = Process>, lib: &Library, memo
     Ok(instance)
 }
 
+/// A module directory entry's size (`struct module` in the support code:
+/// range, region table, count, generation).
+const ENTRY: u64 = 48;
+
 /// Adds a library to the directory in guest memory that the support code's
 /// `dispatch` searches (support/runtime.c, `struct module`), in its slot,
 /// and counts it as added (threads catch up on added modules before using
@@ -638,11 +719,13 @@ fn register(mut store: impl AsContextMut<Data = Process>, instance: &Instance, l
     let fns = lib.memory_base + global(&mut store, instance, "dispatch_fns")?;
     let count = word(lib.memory_base + global(&mut store, instance, "dispatch_count")?)?;
     let _ = lib.regions.set((addrs, fns, count));
-    let entry = g.modules + 40 * lib.slot as u64;
+    let entry = g.modules + ENTRY * lib.slot as u64;
     // The range last, so a thread searching the directory meanwhile sees
-    // the entry empty (a reused slot) or complete.
+    // the entry empty (a reused slot) or complete. (Adding is serialized:
+    // the caller holds `next_slot`.)
     let atomic = |at: u64| atomic(memory, at).context("module directory out of bounds");
-    for (i, v) in [addrs, fns, count] .into_iter().enumerate() {
+    let generation = atomic(g.added)?.load(Ordering::Acquire) + 1;
+    for (i, v) in [addrs, fns, count, generation].into_iter().enumerate() {
         atomic(entry + 16 + 8 * i as u64)?.store(v, Ordering::Release);
     }
     atomic(entry + 8)?.store(lib.end, Ordering::Release);
@@ -662,6 +745,7 @@ impl Libraries {
             next_slot: Mutex::new(*self.next_slot.lock().unwrap()),
             slots: Mutex::new((slots.0, slots.1.clone())),
             globals: self.globals.clone(),
+            fallback: self.fallback.clone(),
         }
     }
 }

@@ -259,6 +259,9 @@ struct module {
 	const uint64_t *addrs;
 	void *const *fns;
 	uint64_t count;
+	// When it was added: of the modules with a region, the newest has it
+	// (generated code shares pages; see "Code a program generates").
+	uint64_t generation;
 };
 struct module __wasm_env_modules[MODULES];
 uint64_t __wasm_env_module_count, __wasm_env_modules_added;
@@ -367,15 +370,21 @@ void dispatch(long pc)
 	uint64_t start = region << REGION_SHIFT;
 	block_fn f = lookup(dispatch_addrs, dispatch_fns, dispatch_count, start);
 	if (!f) {
-		// (A library module and a page translated again may both cover the
-		// address: the first whose table has the region.)
+		// (Several modules may cover the address: a library and a page of it
+		// translated again, generated code sharing a page. The newest whose
+		// table has the region.)
 		uint64_t n = __atomic_load_n(&__wasm_env_module_count, __ATOMIC_ACQUIRE);
-		for (uint64_t k = 0; k < n && !f; k++) {
+		uint64_t newest = 0;
+		for (uint64_t k = 0; k < n; k++) {
 			const struct module *m = &__wasm_env_modules[k];
 			uint64_t lo = __atomic_load_n(&m->lo, __ATOMIC_ACQUIRE);
 			if (target < lo || target >= __atomic_load_n(&m->hi, __ATOMIC_ACQUIRE))
 				continue;
-			f = lookup(m->addrs, m->fns, m->count, start);
+			block_fn g = lookup(m->addrs, m->fns, m->count, start);
+			if (g && (!f || m->generation > newest)) {
+				f = g;
+				newest = m->generation;
+			}
 		}
 	}
 	if (!f) {
