@@ -357,7 +357,7 @@ Either way the runtime would expose the GPU to the process through host function
 - Exact host list — is Windows on ARM in scope?
 - Ubuntu version and architecture: assumed 24.04 LTS, arm64 first. Is x86-64 Ubuntu needed early (for x86-only wheels)?
 - Performance bar for translated numerical code: assumed "works, possibly 2–5× slower" at first, with recompiled wheels as the later speed-up.
-- Code generated at run time: translated in-process in about a millisecond, chained rather than retranslated, now within about 30% of qemu for Node with V8's JIT; code rewritten in pages that stay writable and executable is noticed through the cache maintenance the architecture requires (`ic ivau`, then `isb`). And LuaJIT's interpreter, which dispatches each bytecode with a computed branch, runs no faster translated than under qemu: dispatch through the region functions costs more than qemu's chained blocks there.
+- Code generated at run time: translated in-process in about a millisecond, chained rather than retranslated, faster than qemu for Node with V8's JIT (4.4 s against 6 s, with lane-level vectors in the direct compiler); code rewritten in pages that stay writable and executable is noticed through the cache maintenance the architecture requires (`ic ivau`, then `isb`). And LuaJIT's interpreter, which dispatches each bytecode with a computed branch, runs no faster translated than under qemu: dispatch through the region functions costs more than qemu's chained blocks there.
 - Docker interop depth, for example running converted images via runwasi/containerd.
 
 ## Prior art to study

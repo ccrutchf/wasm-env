@@ -64,6 +64,33 @@ enum Ty {
     F64,
     /// A SIMD/FP register (the lifter's i128), as a v128.
     I128,
+    /// A vector (the lifter's view of a SIMD register's lanes), as a v128.
+    Vector(Lanes),
+}
+
+/// A vector type's lanes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lanes {
+    I8x16,
+    I16x8,
+    I32x4,
+    I64x2,
+    F32x4,
+    F64x2,
+}
+
+impl Lanes {
+    /// The element type.
+    fn elem(self) -> Ty {
+        match self {
+            Lanes::I8x16 => Ty::I8,
+            Lanes::I16x8 => Ty::I16,
+            Lanes::I32x4 => Ty::I32,
+            Lanes::I64x2 => Ty::I64,
+            Lanes::F32x4 => Ty::F32,
+            Lanes::F64x2 => Ty::F64,
+        }
+    }
 }
 
 impl Ty {
@@ -78,6 +105,12 @@ impl Ty {
             "float" => Ty::F32,
             "double" => Ty::F64,
             "i128" => Ty::I128,
+            "<16 x i8>" => Ty::Vector(Lanes::I8x16),
+            "<8 x i16>" => Ty::Vector(Lanes::I16x8),
+            "<4 x i32>" => Ty::Vector(Lanes::I32x4),
+            "<2 x i64>" => Ty::Vector(Lanes::I64x2),
+            "<4 x float>" => Ty::Vector(Lanes::F32x4),
+            "<2 x double>" => Ty::Vector(Lanes::F64x2),
             _ => return None,
         })
     }
@@ -88,6 +121,7 @@ impl Ty {
             Ty::F32 => ValType::F32,
             Ty::F64 => ValType::F64,
             Ty::I128 => ValType::V128,
+            Ty::Vector(_) => ValType::V128,
         }
     }
     fn bits(self) -> u32 {
@@ -98,6 +132,7 @@ impl Ty {
             Ty::I32 | Ty::F32 => 32,
             Ty::I64 | Ty::Ptr | Ty::F64 => 64,
             Ty::I128 => 128,
+            Ty::Vector(_) => 128,
         }
     }
     /// Narrower than its WebAssembly type (kept zero-extended).
@@ -539,7 +574,7 @@ impl<'a> FuncGen<'a> {
         for b in &g.blocks {
             for l in &b.lines {
                 if let Some((dest, rest)) = l.split_once(" = phi ") {
-                    let (ty, incoming) = rest.split_once(' ').ok_or("phi")?;
+                    let (ty, incoming) = split_type(rest).ok_or("phi")?;
                     let ty = Ty::parse(ty).ok_or_else(|| format!("phi {ty}"))?;
                     let mut list = Vec::new();
                     for part in split_top(incoming) {
@@ -931,7 +966,7 @@ impl<'a> FuncGen<'a> {
 
     /// A typed operand, "T v".
     fn typed(&mut self, s: &str) -> Res<Ty> {
-        let (t, v) = s.trim().split_once(' ').ok_or_else(|| format!("operand {s}"))?;
+        let (t, v) = split_type(s).ok_or_else(|| format!("operand {s}"))?;
         let ty = Ty::parse(t).ok_or_else(|| format!("type {t}"))?;
         self.value(v, ty)?;
         Ok(ty)
@@ -1016,7 +1051,7 @@ impl<'a> FuncGen<'a> {
                 let ty = self.typed(a)?;
                 self.typed(b)?;
                 self.typed(c)?;
-                self.emit(if ty == Ty::I128 { I::TypedSelect(ValType::V128) } else { I::Select });
+                self.emit(if ty.val() == ValType::V128 { I::TypedSelect(ValType::V128) } else { I::Select });
                 self.define(dest, ty)
             }
             "freeze" => {
@@ -1031,6 +1066,7 @@ impl<'a> FuncGen<'a> {
                 self.emit(I::LocalGet(l));
                 self.define(dest, ty)
             }
+            "extractelement" | "insertelement" => self.lane(dest, word, args),
             "cmpxchg" => self.cmpxchg(dest, args),
             "atomicrmw" => self.atomicrmw(dest, args),
             "fence" => {
@@ -1062,11 +1098,14 @@ impl<'a> FuncGen<'a> {
         let args = skip_flags(args);
         let parts = split_top(args);
         let [a, b] = parts.as_slice() else { return Ok(None) };
-        let (t, a) = a.trim().split_once(' ').ok_or("binop")?;
+        let (t, a) = split_type(a).ok_or("binop")?;
         let Some(ty) = Ty::parse(t) else { unsupported!("{op} on {t}") };
         if ty == Ty::I128 {
             self.binop128(op, a, b)?;
             return Ok(Some(ty));
+        }
+        if let Ty::Vector(_) = ty {
+            unsupported!("{op} on vectors");
         }
         let signed = matches!(op, "ashr" | "sdiv" | "srem");
         self.value(a, ty)?;
@@ -1114,10 +1153,10 @@ impl<'a> FuncGen<'a> {
         let (pred, rest) = args.split_once(' ').ok_or("icmp")?;
         let parts = split_top(rest);
         let [a, b] = parts.as_slice() else { unsupported!("icmp") };
-        let (t, a) = a.trim().split_once(' ').ok_or("icmp")?;
+        let (t, a) = split_type(a).ok_or("icmp")?;
         let Some(ty) = Ty::parse(t) else { unsupported!("icmp on {t}") };
-        if ty == Ty::I128 {
-            unsupported!("icmp on i128");
+        if ty.val() == ValType::V128 {
+            unsupported!("icmp on {t}");
         }
         let signed = pred.starts_with('s');
         self.value(a, ty)?;
@@ -1150,7 +1189,7 @@ impl<'a> FuncGen<'a> {
         let (pred, rest) = args.split_once(' ').ok_or("fcmp")?;
         let parts = split_top(rest);
         let [a, b] = parts.as_slice() else { unsupported!("fcmp") };
-        let (t, a) = a.trim().split_once(' ').ok_or("fcmp")?;
+        let (t, a) = split_type(a).ok_or("fcmp")?;
         let Some(ty) = Ty::parse(t).filter(|t| t.float()) else { unsupported!("fcmp on {t}") };
         let f = ty == Ty::F32;
         let (la, lb) = (self.new_local(ty.val()), self.new_local(ty.val()));
@@ -1225,6 +1264,13 @@ impl<'a> FuncGen<'a> {
         let (from, to) = args.rsplit_once(" to ").ok_or("cast")?;
         let to = Ty::parse(to).ok_or_else(|| format!("{op} to {to}"))?;
         let ft = self.typed(from)?;
+        // Between i128 and vectors (a register's lanes): the same v128.
+        if op == "bitcast" && ft.val() == ValType::V128 && to.val() == ValType::V128 {
+            return self.define(dest, to);
+        }
+        if matches!(ft, Ty::Vector(_)) || matches!(to, Ty::Vector(_)) {
+            unsupported!("{op} {ft:?} to {to:?}");
+        }
         if to == Ty::I128 || ft == Ty::I128 {
             self.cast128(op, ft, to)?;
             return self.define(dest, to);
@@ -1325,6 +1371,7 @@ impl<'a> FuncGen<'a> {
             (Ty::F32, false) => I::F32Load(m),
             (Ty::F64, false) => I::F64Load(m),
             (Ty::I128, false) => I::V128Load(m),
+            (Ty::Vector(_), false) => I::V128Load(m),
             (Ty::I1 | Ty::I8, true) => I::I32AtomicLoad8U(m),
             (Ty::I16, true) => I::I32AtomicLoad16U(m),
             (Ty::I32, true) => I::I32AtomicLoad(m),
@@ -1355,6 +1402,7 @@ impl<'a> FuncGen<'a> {
             (Ty::F32, false) => I::F32Store(m),
             (Ty::F64, false) => I::F64Store(m),
             (Ty::I128, false) => I::V128Store(m),
+            (Ty::Vector(_), false) => I::V128Store(m),
             (Ty::I1 | Ty::I8, true) => I::I32AtomicStore8(m),
             (Ty::I16, true) => I::I32AtomicStore16(m),
             (Ty::I32, true) => I::I32AtomicStore(m),
@@ -1548,8 +1596,8 @@ impl<'a> FuncGen<'a> {
     fn intrinsic(&mut self, name: &str, params: &[&str], ret: Option<Ty>) -> Res<Option<Ty>> {
         let base = name.split('.').next().unwrap_or("");
         let ty = ret.ok_or("intrinsic without a result")?;
-        if ty == Ty::I128 {
-            unsupported!("llvm.{name} on i128");
+        if ty.val() == ValType::V128 {
+            unsupported!("llvm.{name} on a v128");
         }
         let w = ty.wide();
         let f32 = ty == Ty::F32;
@@ -1780,6 +1828,40 @@ impl<'a> FuncGen<'a> {
         }
         self.normalize(ty);
         Ok(())
+    }
+
+    /// extractelement and insertelement at a constant lane:
+    /// `extractelement <N x T> %v, i64 k`, `insertelement <N x T> %v, T %x, i64 k`.
+    fn lane(&mut self, dest: Option<&str>, op: &str, args: &str) -> Res<()> {
+        let parts = split_top(args);
+        let (vector, rest) = parts.split_first().ok_or(op.to_string())?;
+        let ty = self.typed(vector)?;
+        let Ty::Vector(lanes) = ty else { unsupported!("{op} on {ty:?}") };
+        let index = rest.last().ok_or(op.to_string())?;
+        let (_, k) = split_type(index).ok_or(op.to_string())?;
+        let Ok(k) = k.parse::<u8>() else { unsupported!("{op} at a variable lane") };
+        if op == "extractelement" {
+            self.emit(match lanes {
+                Lanes::I8x16 => I::I8x16ExtractLaneU(k),
+                Lanes::I16x8 => I::I16x8ExtractLaneU(k),
+                Lanes::I32x4 => I::I32x4ExtractLane(k),
+                Lanes::I64x2 => I::I64x2ExtractLane(k),
+                Lanes::F32x4 => I::F32x4ExtractLane(k),
+                Lanes::F64x2 => I::F64x2ExtractLane(k),
+            });
+            return self.define(dest, lanes.elem());
+        }
+        let [value, _] = rest else { unsupported!("insertelement") };
+        self.typed(value)?;
+        self.emit(match lanes {
+            Lanes::I8x16 => I::I8x16ReplaceLane(k),
+            Lanes::I16x8 => I::I16x8ReplaceLane(k),
+            Lanes::I32x4 => I::I32x4ReplaceLane(k),
+            Lanes::I64x2 => I::I64x2ReplaceLane(k),
+            Lanes::F32x4 => I::F32x4ReplaceLane(k),
+            Lanes::F64x2 => I::F64x2ReplaceLane(k),
+        });
+        self.define(dest, ty)
     }
 
     /// A cast to or from i128 (a v128), its operand on the stack: zext and
@@ -2043,6 +2125,16 @@ fn gep_constant(args: &str) -> Option<(String, i64)> {
     Some((base.to_string(), offset))
 }
 
+/// Splits "T v" into its type and the rest (a vector type has spaces).
+fn split_type(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim();
+    if s.starts_with('<') {
+        let end = s.find('>')?;
+        return Some((&s[..=end], s[end + 1..].trim()));
+    }
+    s.split_once(' ').map(|(t, v)| (t, v.trim()))
+}
+
 /// Splits on commas outside brackets, braces, parentheses and angles.
 fn split_top(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -2194,8 +2286,23 @@ bad:
 
     #[test]
     fn declines_what_it_does_not_compile() {
-        let vector = CHUNK.replace("%t5 = zext i8 %t4 to i128", "%t5 = bitcast <2 x i64> zeroinitializer to i128");
-        assert!(compile(&[vector], false).is_err());
+        let arithmetic = CHUNK.replace(
+            "%t5 = zext i8 %t4 to i128",
+            "%v = bitcast i128 0 to <4 x i32>\n  %w = add <4 x i32> %v, %v\n  %t5 = bitcast <4 x i32> %w to i128",
+        );
+        assert!(compile(&[arithmetic], false).is_err());
+    }
+
+    #[test]
+    fn compiles_lane_access() {
+        let lanes = CHUNK.replace(
+            "%t5 = zext i8 %t4 to i128",
+            "%v = bitcast i128 0 to <16 x i8>\n  %w = insertelement <16 x i8> %v, i8 %t4, i64 3\n  %e = extractelement <16 x i8> %w, i64 3\n  %t5 = bitcast <16 x i8> %w to i128",
+        );
+        let wasm = compile(&[lanes], false).expect("supported");
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true).wasm_memory64(true).wasm_tail_call(true).shared_memory(true);
+        wasmtime::Module::new(&wasmtime::Engine::new(&config).unwrap(), &wasm).expect("valid");
     }
 
     #[test]
