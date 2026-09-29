@@ -320,6 +320,136 @@ struct Context<'a> {
     state: u32,
 }
 
+/// What encloses the code being emitted, for branch depths: a `block` whose
+/// end leads to a block's code, a `loop` at a block, or anything else.
+#[derive(Clone, Copy, PartialEq)]
+enum Ctx {
+    Other,
+    Block(usize),
+    Loop(usize),
+}
+
+/// A function's control flow, for structured code (Ramsey, "Beyond
+/// Relooper", ICFP 2022): blocks in reverse postorder, their immediate
+/// dominators, the loop headers (targets of back edges), and the merge
+/// nodes (reached by two or more forward branches), which get a `block` in
+/// their dominator; any other block is emitted where it's branched to.
+/// Only for reducible control flow, where every back edge goes to a block
+/// dominating its source (a region entry inside a loop makes a second way
+/// into it, and such a function keeps the `br_table` loop).
+struct Shape {
+    rpo: Vec<usize>,
+    loop_header: Vec<bool>,
+    merge: Vec<bool>,
+    /// Each block's children in the dominator tree that are merge nodes,
+    /// latest first.
+    merge_children: Vec<Vec<usize>>,
+}
+
+const UNREACHED: usize = usize::MAX;
+
+impl Shape {
+    /// The shape of control flow with successors `succs` (by block, each
+    /// branch once, from the entry, block 0), if it's reducible.
+    fn of(succs: &[Vec<usize>]) -> Option<Shape> {
+        let n = succs.len();
+        // Reverse postorder, by an iterative depth-first search.
+        let mut order = Vec::with_capacity(n);
+        let mut seen = vec![false; n];
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some((b, next)) = stack.pop() {
+            if let Some(&s) = succs[b].get(next) {
+                stack.push((b, next + 1));
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                order.push(b);
+            }
+        }
+        order.reverse();
+        let mut rpo = vec![UNREACHED; n];
+        for (k, &b) in order.iter().enumerate() {
+            rpo[b] = k;
+        }
+        let mut preds = vec![Vec::new(); n];
+        for (b, ss) in succs.iter().enumerate() {
+            if rpo[b] != UNREACHED {
+                for &s in ss {
+                    preds[s].push(b);
+                }
+            }
+        }
+        // Immediate dominators (Cooper, Harvey and Kennedy).
+        let mut idom = vec![UNREACHED; n];
+        idom[0] = 0;
+        let intersect = |idom: &[usize], mut a: usize, mut b: usize| {
+            while a != b {
+                while rpo[a] > rpo[b] {
+                    a = idom[a];
+                }
+                while rpo[b] > rpo[a] {
+                    b = idom[b];
+                }
+            }
+            a
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in order.iter().skip(1) {
+                let mut new = UNREACHED;
+                for &p in &preds[b] {
+                    if idom[p] == UNREACHED {
+                        continue;
+                    }
+                    new = if new == UNREACHED { p } else { intersect(&idom, p, new) };
+                }
+                if new != idom[b] {
+                    idom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        let dominates = |a: usize, mut b: usize| loop {
+            if a == b {
+                return true;
+            }
+            if b == 0 {
+                return false;
+            }
+            b = idom[b];
+        };
+        let mut loop_header = vec![false; n];
+        let mut forward = vec![0usize; n];
+        for &b in &order {
+            for &s in &succs[b] {
+                if rpo[s] <= rpo[b] {
+                    if !dominates(s, b) {
+                        return None; // irreducible
+                    }
+                    loop_header[s] = true;
+                } else {
+                    forward[s] += 1;
+                }
+            }
+        }
+        let merge: Vec<bool> = forward.iter().map(|&f| f >= 2).collect();
+        let mut merge_children = vec![Vec::new(); n];
+        for &b in order.iter().skip(1) {
+            if merge[b] {
+                merge_children[idom[b]].push(b);
+            }
+        }
+        for c in &mut merge_children {
+            c.sort_by_key(|&b| std::cmp::Reverse(rpo[b]));
+        }
+        Some(Shape { rpo, loop_header, merge, merge_children })
+    }
+}
+
 /// One basic block: its label and lines.
 struct Block {
     label: String,
@@ -347,6 +477,10 @@ struct FuncGen<'a> {
     label: u32,
     /// Constructs opened in the current block's code (if, block).
     extra: u32,
+    /// Structured control flow (see `Shape`), when the function has it:
+    /// its shape, and the constructs enclosing the code being emitted.
+    shape: Option<Shape>,
+    enclosing: Vec<Ctx>,
     current: usize,
 }
 
@@ -377,6 +511,8 @@ impl<'a> FuncGen<'a> {
             code: Vec::new(),
             label: 0,
             extra: 0,
+            shape: None,
+            enclosing: Vec::new(),
             current: 0,
         };
         g.locals.insert("pc".into(), (0, Ty::I64));
@@ -431,6 +567,16 @@ impl<'a> FuncGen<'a> {
         if n == 0 {
             unsupported!("no blocks");
         }
+        self.shape = Shape::of(&self.successors());
+        if std::env::var_os("WASM_ENV_DEBUG_WASMGEN").is_some() {
+            eprintln!("wasmgen: {} blocks, {}", n, if self.shape.is_some() { "structured" } else { "irreducible: a br_table loop" });
+        }
+        if self.shape.is_some() {
+            self.do_tree(0)?;
+            self.emit(I::Unreachable);
+            self.emit(I::End);
+            return self.finish();
+        }
         // loop { block_{n-1} { ... block_0 { br_table } code_0 } ... code_{n-1} }
         self.emit(I::I32Const(0));
         self.emit(I::LocalSet(self.label));
@@ -457,6 +603,11 @@ impl<'a> FuncGen<'a> {
         self.emit(I::End); // loop
         self.emit(I::Unreachable);
         self.emit(I::End);
+        self.finish()
+    }
+
+    /// The function: its code, tidied (below), and its locals.
+    fn finish(mut self) -> Res<Function> {
         // A value used once, right where it's made, stays on the stack: a
         // `local.set x` and the following `local.get x`, x's only uses, go.
         let (mut sets, mut gets) = (HashMap::<u32, u32>::new(), HashMap::<u32, u32>::new());
@@ -495,6 +646,101 @@ impl<'a> FuncGen<'a> {
         Ok(f)
     }
 
+    /// Each block's successors: a target once per branch to it (a switch's
+    /// cases and default, both arms of a conditional branch).
+    fn successors(&self) -> Vec<Vec<usize>> {
+        self.blocks
+            .iter()
+            .map(|b| {
+                let mut s = Vec::new();
+                for l in &b.lines {
+                    let mut rest = l.as_str();
+                    while let Some(at) = rest.find("label %") {
+                        rest = &rest[at + 7..];
+                        let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.').collect();
+                        if let Some(&t) = self.index.get(&name) {
+                            s.push(t);
+                        }
+                    }
+                }
+                s
+            })
+            .collect()
+    }
+
+    /// Opens constructs (if, block) in a block's code: `n` more levels
+    /// between it and the dispatch loop, or the enclosing constructs.
+    fn open(&mut self, n: u32) {
+        self.extra += n;
+        for _ in 0..n {
+            self.enclosing.push(Ctx::Other);
+        }
+    }
+
+    fn close(&mut self, n: u32) {
+        self.extra -= n;
+        for _ in 0..n {
+            self.enclosing.pop();
+        }
+    }
+
+    /// Structured code for block `x` and the blocks it dominates (see
+    /// Shape): a loop if branches come back to it, then its code inside a
+    /// `block` per merge node it dominates, each merge node's code after the
+    /// end of its block.
+    fn do_tree(&mut self, x: usize) -> Res<()> {
+        let (saved, header, ys) = {
+            let shape = self.shape.as_ref().unwrap();
+            (self.current, shape.loop_header[x], shape.merge_children[x].clone())
+        };
+        if header {
+            self.emit(I::Loop(BlockType::Empty));
+            self.enclosing.push(Ctx::Loop(x));
+        }
+        self.node_within(x, &ys)?;
+        if header {
+            self.emit(I::End);
+            self.enclosing.pop();
+        }
+        self.current = saved;
+        Ok(())
+    }
+
+    fn node_within(&mut self, x: usize, ys: &[usize]) -> Res<()> {
+        let Some((&y, rest)) = ys.split_first() else {
+            self.current = x;
+            let lines = std::mem::take(&mut self.blocks[x].lines);
+            let mut it = lines.iter().peekable();
+            while let Some(line) = it.next() {
+                self.line(line, &mut it)?;
+            }
+            return Ok(());
+        };
+        self.emit(I::Block(BlockType::Empty));
+        self.enclosing.push(Ctx::Block(y));
+        self.node_within(x, rest)?;
+        self.emit(I::End);
+        self.enclosing.pop();
+        self.do_tree(y)
+    }
+
+    /// A branch from the current block to `t`: back to a loop, forward out
+    /// of the block that ends where a merge node's code starts, or else
+    /// into `t`'s code, emitted right here.
+    fn do_branch(&mut self, t: usize) -> Res<()> {
+        let shape = self.shape.as_ref().unwrap();
+        let want = if shape.rpo[t] <= shape.rpo[self.current] {
+            Ctx::Loop(t)
+        } else if shape.merge[t] {
+            Ctx::Block(t)
+        } else {
+            return self.do_tree(t);
+        };
+        let Some(depth) = self.enclosing.iter().rev().position(|&c| c == want) else { unsupported!("branch to a block not enclosing it") };
+        self.emit(I::Br(depth as u32));
+        Ok(())
+    }
+
     /// Depth of the loop from the current point.
     fn loop_depth(&self) -> u32 {
         self.blocks.len() as u32 - 1 - self.current as u32 + self.extra
@@ -516,6 +762,9 @@ impl<'a> FuncGen<'a> {
             for d in dests.into_iter().rev() {
                 self.emit(I::LocalSet(d));
             }
+        }
+        if self.shape.is_some() {
+            return self.do_branch(t);
         }
         if fallthrough && self.extra == 0 && t == self.current + 1 {
             return Ok(());
@@ -704,12 +953,12 @@ impl<'a> FuncGen<'a> {
                 let [c, a, b] = parts.as_slice() else { unsupported!("br {args}") };
                 self.typed(c)?;
                 self.emit(I::If(BlockType::Empty));
-                self.extra += 1;
+                self.open(1);
                 self.goto(a.trim().trim_start_matches("label %"), false)?;
                 self.emit(I::Else);
                 self.goto(b.trim().trim_start_matches("label %"), false)?;
                 self.emit(I::End);
-                self.extra -= 1;
+                self.close(1);
                 self.emit(I::Unreachable);
                 Ok(())
             }
@@ -1188,7 +1437,7 @@ impl<'a> FuncGen<'a> {
             for _ in 0..m {
                 self.emit(I::Block(BlockType::Empty));
             }
-            self.extra += m as u32;
+            self.open(m as u32);
             // Out of range or misaligned: the default.
             self.emit(I::LocalGet(key));
             self.emit(I::I64Const(min));
@@ -1199,7 +1448,7 @@ impl<'a> FuncGen<'a> {
             self.emit(I::I64And);
             self.emit(I::I64Eqz);
             self.emit(I::If(BlockType::Empty));
-            self.extra += 1;
+            self.open(1);
             self.emit(I::LocalGet(idx));
             self.emit(I::I64Const(2));
             self.emit(I::I64ShrU);
@@ -1208,7 +1457,7 @@ impl<'a> FuncGen<'a> {
             self.emit(I::I64Const(slots as i64));
             self.emit(I::I64LtU);
             self.emit(I::If(BlockType::Empty));
-            self.extra += 1;
+            self.open(1);
             self.emit(I::LocalGet(idx));
             self.emit(I::I32WrapI64);
             // (Two ifs deep: the blocks' depths are two more.)
@@ -1216,11 +1465,11 @@ impl<'a> FuncGen<'a> {
             self.emit(I::BrTable(labels.into(), m as u32 - 1 + 2));
             self.emit(I::End);
             self.emit(I::End);
-            self.extra -= 2;
+            self.close(2);
             self.emit(I::Br(m as u32 - 1));
             for t in &targets {
                 self.emit(I::End);
-                self.extra -= 1;
+                self.close(1);
                 self.goto(t, false)?;
             }
             return Ok(());
@@ -1230,10 +1479,10 @@ impl<'a> FuncGen<'a> {
             self.emit(if ty.wide() { I::I64Const(*k) } else { I::I32Const(*k as i32) });
             self.emit(if ty.wide() { I::I64Eq } else { I::I32Eq });
             self.emit(I::If(BlockType::Empty));
-            self.extra += 1;
+            self.open(1);
             self.goto(target, false)?;
             self.emit(I::End);
-            self.extra -= 1;
+            self.close(1);
         }
         self.goto(&default, false)
     }

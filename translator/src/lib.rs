@@ -39,12 +39,25 @@ pub fn code_extent(prog: &discover::Program) -> (u64, u64) {
 /// translates the other way (the translator's process, with clang).
 #[cfg(feature = "lift")]
 pub fn translate_generated(bytes: &[u8], base: u64, roots: &[u64]) -> Result<Vec<u8>, String> {
+    let timings = std::env::var_os("WASM_ENV_TIMINGS").is_some();
+    let t = std::time::Instant::now();
     let mut image = elf::Image::raw(bytes, "generated", base);
     image.roots.extend(roots);
     let prog = discover::discover(&image);
+    let discovered = t.elapsed();
     let mut chunks = Vec::new();
     lift::lift(&image, &prog, true, None, &mut |c| chunks.push(c));
+    let lifted = t.elapsed();
     let wasm = wasmgen::compile(&chunks)?;
+    if timings {
+        eprintln!(
+            "[timing] generated code: {} blocks; discover {:.4} s, lift {:.4} s, compile {:.4} s",
+            prog.leaders.len(),
+            discovered.as_secs_f64(),
+            (lifted - discovered).as_secs_f64(),
+            (t.elapsed() - lifted).as_secs_f64()
+        );
+    }
     let (lo, hi) = code_extent(&prog);
     link::add_library_info(&wasm, lo, hi).map_err(|e| e.to_string())
 }

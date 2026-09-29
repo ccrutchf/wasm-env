@@ -334,6 +334,13 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64, obj
     let bytes = crate::memory::slice(crate::syscall::shared_bytes(&threading.memory), lo, hi - lo)?.to_vec();
     let mut roots = std::collections::BTreeSet::from([pc]);
     let mut replaced: Vec<Arc<Library>> = Vec::new();
+    // The modules on pc's page join from the start (the translation
+    // covers at least that page), so it's rarely made twice.
+    let page = pc & !(crate::abi::PAGE_SIZE - 1);
+    for l in code_in(libraries, page, page + crate::abi::PAGE_SIZE) {
+        roots.extend(&l.code.as_ref().unwrap().roots);
+        replaced.push(l);
+    }
     let (wasm, start, end) = loop {
         let list: Vec<u64> = roots.iter().copied().filter(|r| (lo..hi).contains(r)).collect();
         let wasm = crate::translate::ensure_code(&bytes, lo, &list, &kernel.root, trace)?;
