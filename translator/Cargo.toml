@@ -10,6 +10,7 @@ publish = false
 anyhow = "1"
 bad64 = "0.12"
 object = { version = "0.37", default-features = false, features = ["read", "elf", "std"] }
+wasm-encoder = { version = "0.259", optional = true }
 
 [dev-dependencies]
 wasmtime = "49"
@@ -17,4 +18,4 @@ wasmtime = "49"
 [features]
 # The arm64 → LLVM IR lifter. Off until its instruction semantics
 # (src/lift/insn.rs) are complete, so the rest of the crate builds and tests.
-lift = []
+lift = ["dep:wasm-encoder"]

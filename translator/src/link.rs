@@ -73,7 +73,7 @@ fn ld_args(image_end: u64) -> Vec<String> {
 
 /// How much memory a translated program may use: all of its masked address
 /// space (the runtime's MASK_BITS), in 64 KB pages.
-const MAX_PAGES: u64 = 1 << (38 - 16);
+pub const MAX_PAGES: u64 = 1 << (38 - 16);
 
 /// Post-processes a linked module: its memory may use the whole masked
 /// address space, not just the 16 GB wasm-ld allows.

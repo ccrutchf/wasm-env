@@ -1773,6 +1773,7 @@ dependencies = [
  "anyhow",
  "bad64",
  "object 0.37.3",
+ "wasm-encoder 0.259.0",
  "wasmtime",
 ]
 

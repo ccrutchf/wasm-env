@@ -18,6 +18,8 @@ mod ehframe;
 mod elf;
 #[cfg(feature = "lift")]
 mod lift;
+#[cfg(feature = "lift")]
+mod wasmgen;
 #[cfg_attr(not(feature = "lift"), allow(dead_code))]
 mod link;
 #[cfg(test)]
@@ -198,19 +200,36 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
         let bytes: Vec<u8> = prog.leaders.iter().flat_map(|a| a.to_le_bytes()).collect();
         std::fs::write(path, bytes).with_context(|| format!("writing {path}"))?;
     }
-    let tc = link::Toolchain::from_env()
-        .context("no toolchain found: install wasm-env with its toolchain (nix profile install), set $WASM_ENV_TOOLCHAIN, or run inside `nix develop`")?;
     let image_end = image.segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(0);
     let work = std::env::temp_dir().join(format!("wasm-env-translate-{}", std::process::id()));
-    // Each code module goes to disk as soon as it's lifted (see lift::lift).
-    let mut build = link::Build::new(&tc, &work, library)?;
-    if inputs.raw {
-        build.quick();
-    }
+    // Code the program waits for (generated code, a page translated again)
+    // is compiled straight to WebAssembly if it can be (wasmgen), which
+    // takes milliseconds; otherwise, and for everything else, with clang
+    // and wasm-ld. Each code module goes to disk as soon as it's lifted (see
+    // lift::lift), or for the direct compiler stays in memory (it's small).
+    let direct = (inputs.raw || inputs.page.is_some()) && std::env::var_os("WASM_ENV_NO_WASMGEN").is_none();
+    let mut chunks = Vec::new();
+    let mut build = None;
     let mut failed = None;
+    let make_build = || -> Result<link::Build> {
+        let tc = link::Toolchain::from_env()
+            .context("no toolchain found: install wasm-env with its toolchain (nix profile install), set $WASM_ENV_TOOLCHAIN, or run inside `nix develop`")?;
+        let tc: &'static link::Toolchain = Box::leak(Box::new(tc));
+        let mut b = link::Build::new(tc, &work, library)?;
+        if inputs.raw {
+            b.quick();
+        }
+        Ok(b)
+    };
+    if !direct {
+        build = Some(make_build()?);
+    }
     let lifted = lift::lift(&image, &prog, library, inputs.page, &mut |chunk| {
-        if failed.is_none()
-            && let Err(e) = build.chunk(&chunk)
+        if direct {
+            chunks.push(chunk);
+        } else if failed.is_none()
+            && let Some(b) = build.as_mut()
+            && let Err(e) = b.chunk(&chunk)
         {
             failed = Some(e);
         }
@@ -222,7 +241,24 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     for (op, (n, example)) in &lifted.unsupported {
         eprintln!("warning: {n} × `{op}` not supported yet (traps if executed): {example}");
     }
-    let wasm = build.finish(&lifted.data, image_end).and_then(|wasm| {
+    let compiled = match direct {
+        true => match wasmgen::compile(&chunks) {
+            Ok(wasm) => Ok(wasm),
+            Err(why) => {
+                // WASM_ENV_DEBUG_WASMGEN=1 says why clang compiles it.
+                if std::env::var_os("WASM_ENV_DEBUG_WASMGEN").is_some() {
+                    eprintln!("wasmgen: {why}");
+                }
+                let mut b = make_build()?;
+                for c in &chunks {
+                    b.chunk(c)?;
+                }
+                b.finish(&lifted.data, image_end)
+            }
+        },
+        false => build.take().unwrap().finish(&lifted.data, image_end),
+    };
+    let wasm = compiled.and_then(|wasm| {
         if let Some(page) = inputs.page {
             let start = lift::region_of(page);
             return link::add_library_info(&wasm, start, start + lift::REGION_SPAN);
