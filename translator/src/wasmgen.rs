@@ -243,11 +243,12 @@ impl Parsed {
         }
         store64(&mut relocs, count, &[I::I64Const(n as i64)]);
         for (name, bytes) in &self.strings {
+            // Eight bytes at a time (the string's space is padded to eight).
             let at = string_at[name];
-            for (k, b) in bytes.iter().enumerate() {
-                relocs.instruction(&I::GlobalGet(MEMORY_BASE));
-                relocs.instruction(&I::I32Const(*b as i32));
-                relocs.instruction(&I::I32Store8(MemArg { offset: at + k as u64, align: 0, memory_index: 0 }));
+            for (k, chunk) in bytes.chunks(8).enumerate() {
+                let mut word = [0u8; 8];
+                word[..chunk.len()].copy_from_slice(chunk);
+                store64(&mut relocs, at + 8 * k as u64, &[I::I64Const(i64::from_le_bytes(word))]);
             }
         }
         relocs.instruction(&I::End);
@@ -336,6 +337,11 @@ struct FuncGen<'a> {
     local_types: Vec<ValType>,
     /// cmpxchg results: name → (old value's local, success's local).
     pairs: HashMap<String, (u32, u32)>,
+    /// Addresses left as expressions (a value plus a constant: a constant
+    /// getelementptr, `add nuw` of a constant, inttoptr), computed where
+    /// they're used, and folded into a load's or store's offset there, as
+    /// LLVM would: name → (base value, offset).
+    addr: HashMap<String, (String, i64)>,
     code: Vec<I<'static>>,
     /// The block-number local.
     label: u32,
@@ -367,6 +373,7 @@ impl<'a> FuncGen<'a> {
             locals: HashMap::new(),
             local_types: Vec::new(),
             pairs: HashMap::new(),
+            addr: HashMap::new(),
             code: Vec::new(),
             label: 0,
             extra: 0,
@@ -450,9 +457,39 @@ impl<'a> FuncGen<'a> {
         self.emit(I::End); // loop
         self.emit(I::Unreachable);
         self.emit(I::End);
-        let locals: Vec<(u32, ValType)> = self.local_types.iter().map(|&t| (1, t)).collect();
-        let mut f = Function::new(locals);
+        // A value used once, right where it's made, stays on the stack: a
+        // `local.set x` and the following `local.get x`, x's only uses, go.
+        let (mut sets, mut gets) = (HashMap::<u32, u32>::new(), HashMap::<u32, u32>::new());
         for i in &self.code {
+            match i {
+                I::LocalSet(l) | I::LocalTee(l) => *sets.entry(*l).or_default() += 1,
+                I::LocalGet(l) => *gets.entry(*l).or_default() += 1,
+                _ => {}
+            }
+        }
+        let mut code = Vec::with_capacity(self.code.len());
+        let mut it = std::mem::take(&mut self.code).into_iter().peekable();
+        while let Some(i) = it.next() {
+            if let I::LocalSet(l) = i
+                && sets.get(&l) == Some(&1)
+                && gets.get(&l) == Some(&1)
+                && matches!(it.peek(), Some(I::LocalGet(g)) if *g == l)
+            {
+                it.next();
+                continue;
+            }
+            code.push(i);
+        }
+        // Locals declared in runs of one type.
+        let mut locals: Vec<(u32, ValType)> = Vec::new();
+        for &t in &self.local_types {
+            match locals.last_mut() {
+                Some((n, last)) if *last == t => *n += 1,
+                _ => locals.push((1, t)),
+            }
+        }
+        let mut f = Function::new(locals);
+        for i in &code {
             f.instruction(i);
         }
         Ok(f)
@@ -492,6 +529,14 @@ impl<'a> FuncGen<'a> {
     /// Pushes a value of type `ty`: a local, a constant or a global's address.
     fn value(&mut self, v: &str, ty: Ty) -> Res<()> {
         let v = v.trim();
+        if let Some((base, off)) = v.strip_prefix('%').and_then(|n| self.resolve(n)) {
+            self.value(&base, Ty::I64)?;
+            if off != 0 {
+                self.emit(I::I64Const(off));
+                self.emit(I::I64Add);
+            }
+            return Ok(());
+        }
         if let Some(name) = v.strip_prefix('%') {
             let l = self.local(name, ty);
             self.emit(I::LocalGet(l));
@@ -537,6 +582,56 @@ impl<'a> FuncGen<'a> {
             }
         }
         Ok(())
+    }
+
+    /// A deferred address (see `addr`) as the value it's based on and a
+    /// constant offset, following chains of them.
+    fn resolve(&self, name: &str) -> Option<(String, i64)> {
+        let (base, off) = self.addr.get(name)?;
+        match base.strip_prefix('%').and_then(|b| self.resolve(b)) {
+            Some((root, more)) => Some((root, off + more)),
+            None => Some((base.clone(), *off)),
+        }
+    }
+
+    /// Pushes a load's or store's address operand (`ptr %x`), and returns
+    /// the constant offset for the access itself.
+    fn address(&mut self, p: &str) -> Res<u64> {
+        let v = p.trim().strip_prefix("ptr ").ok_or_else(|| format!("address {p}"))?.trim();
+        if let Some((base, off)) = v.strip_prefix('%').and_then(|n| self.resolve(n))
+            && off >= 0
+        {
+            self.value(&base, Ty::I64)?;
+            return Ok(off as u64);
+        }
+        self.value(v, Ty::Ptr)?;
+        Ok(0)
+    }
+
+    /// Leaves `dest = op` as an address expression if it is one (see
+    /// `addr`): inttoptr and ptrtoint, `add nuw` of a non-negative constant
+    /// (guest addresses, which the lifter marks so), and a getelementptr
+    /// with constant indices (guest registers).
+    fn defer(&mut self, dest: &str, op: &str) -> bool {
+        let found = if let Some(rest) = op.strip_prefix("inttoptr i64 ").or_else(|| op.strip_prefix("ptrtoint ptr ")) {
+            rest.split_once(" to ").filter(|(v, _)| v.starts_with('%')).map(|(v, _)| (v.to_string(), 0))
+        } else if let Some(rest) = op.strip_prefix("add nuw i64 ").or_else(|| op.strip_prefix("add nuw nsw i64 ")) {
+            rest.split_once(", ").and_then(|(v, k)| {
+                let k: i64 = k.trim().parse().ok()?;
+                (v.starts_with('%') && k >= 0).then(|| (v.to_string(), k))
+            })
+        } else if let Some(rest) = op.strip_prefix("getelementptr ") {
+            gep_constant(rest)
+        } else {
+            None
+        };
+        match found {
+            Some(e) => {
+                self.addr.insert(dest.to_string(), e);
+                true
+            }
+            None => false,
+        }
     }
 
     fn zero(&mut self, ty: Ty) {
@@ -593,6 +688,11 @@ impl<'a> FuncGen<'a> {
             Some((d, o)) if d.starts_with('%') => (Some(&d[1..]), o),
             _ => (None, line.as_str()),
         };
+        if let Some(d) = dest
+            && self.defer(d, op)
+        {
+            return Ok(());
+        }
         let (word, args) = op.split_once(' ').unwrap_or((op, ""));
         match word {
             "phi" => Ok(()),
@@ -948,9 +1048,9 @@ impl<'a> FuncGen<'a> {
             return self.define(dest, ty);
         }
         let p = p.split(" seq_cst").next().unwrap().trim();
-        self.typed(p)?;
+        let offset = self.address(p)?;
         let a = if atomic { ty.bits().max(8).trailing_zeros() - 3 } else { 0 };
-        let m = Self::memarg(a);
+        let m = MemArg { offset, align: a, memory_index: 0 };
         self.emit(match (ty, atomic) {
             (Ty::I1 | Ty::I8, false) => I::I32Load8U(m),
             (Ty::I16, false) => I::I32Load16U(m),
@@ -977,10 +1077,10 @@ impl<'a> FuncGen<'a> {
         if p.contains("addrspace") {
             unsupported!("store to {p}");
         }
-        self.typed(p)?;
+        let offset = self.address(p)?;
         let ty = self.typed(v)?;
         let a = if atomic { ty.bits().max(8).trailing_zeros() - 3 } else { 0 };
-        let m = Self::memarg(a);
+        let m = MemArg { offset, align: a, memory_index: 0 };
         self.emit(match (ty, atomic) {
             (Ty::I1 | Ty::I8, false) => I::I32Store8(m),
             (Ty::I16, false) => I::I32Store16(m),
@@ -1630,6 +1730,39 @@ impl Agg {
         }
         at
     }
+}
+
+/// A getelementptr (its operands) whose indices are all constants: its base
+/// value and byte offset.
+fn gep_constant(args: &str) -> Option<(String, i64)> {
+    let args = args.trim_start_matches("inbounds ").trim_start_matches("nuw ").trim_start_matches("nusw ");
+    let parts = split_top(args);
+    let mut ty = Agg::parse(parts.first()?).ok()?;
+    let base = parts.get(1)?.trim().strip_prefix("ptr ")?.trim();
+    if !base.starts_with('%') {
+        return None;
+    }
+    let mut offset = 0i64;
+    for (k, idx) in parts[2..].iter().enumerate() {
+        let (_, v) = idx.trim().split_once(' ')?;
+        let c: i64 = v.parse().ok()?;
+        if k == 0 {
+            offset += c * ty.size() as i64;
+            continue;
+        }
+        match ty.clone() {
+            Agg::Array(_, e) => {
+                offset += c * e.size() as i64;
+                ty = *e;
+            }
+            Agg::Struct(fields) => {
+                offset += ty.field_offset(c as usize) as i64;
+                ty = fields.get(c as usize)?.clone();
+            }
+            Agg::Scalar(_) => return None,
+        }
+    }
+    Some((base.to_string(), offset))
 }
 
 /// Splits on commas outside brackets, braces, parentheses and angles.

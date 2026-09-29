@@ -360,6 +360,15 @@ fn main() -> Result<()> {
             }
             translate(input, output, &inputs)
         }
+        // wasmgen OUT CHUNK.ll...: the direct compiler on kept IR (see
+        // WASM_ENV_KEEP_WORK), for comparing it with clang's module.
+        #[cfg(feature = "lift")]
+        ["wasmgen", output, chunks @ ..] => {
+            let chunks: Vec<String> = chunks.iter().map(std::fs::read_to_string).collect::<std::io::Result<_>>()?;
+            let wasm = wasmgen::compile(&chunks).map_err(|e| anyhow::anyhow!("{e}"))?;
+            std::fs::write(output, wasm)?;
+            Ok(())
+        }
         #[cfg(feature = "lift")]
         ["emit", input] => {
             let bytes = std::fs::read(input)?;
