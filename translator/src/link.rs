@@ -56,6 +56,8 @@ fn ld_args(image_end: u64) -> Vec<String> {
         "__wasm_env_bad_target",
         "__wasm_env_crc32",
         "__wasm_env_counter",
+        "__wasm_env_ic_ivau",
+        "__wasm_env_isb",
         "__wasm_env_modules",
         "__wasm_env_module_count",
         "__wasm_env_modules_added",

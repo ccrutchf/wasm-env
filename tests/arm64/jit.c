@@ -2,7 +2,8 @@
 // anonymous mapping, made executable, and called. Two kernels in one
 // buffer entered separately, and one entered in its middle; a kernel that
 // calls back into compiled code (and is returned to); code rewritten in
-// place after making it writable again; and new code in a fresh mapping
+// place after making it writable again, and in a writable and executable
+// mapping with only cache maintenance; and new code in a fresh mapping
 // after the old one is unmapped.
 #include <stdint.h>
 #include <stdio.h>
@@ -89,6 +90,20 @@ int main(void)
 	emit(buf, 0, times5, 2);
 	make_executable(buf);
 	printf("rewritten: %ld\n", f(9));
+
+	// Writable and executable throughout: rewritten in place, with only the
+	// cache maintenance the architecture requires (no mprotect).
+	uint32_t *rwx = mmap(0, LEN, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (rwx == MAP_FAILED)
+		return 1;
+	long (*h)(long) = (long (*)(long))rwx;
+	emit(rwx, 0, times3_plus7, 3);
+	__builtin___clear_cache((char *)rwx, (char *)rwx + 12);
+	printf("rwx: %ld", h(10));
+	emit(rwx, 0, times5, 2);
+	__builtin___clear_cache((char *)rwx, (char *)rwx + 8);
+	printf(" then %ld\n", h(10));
+	munmap(rwx, LEN);
 
 	// Unmapped; new code in a new mapping (often at the same address).
 	munmap(buf, LEN);

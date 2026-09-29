@@ -315,6 +315,40 @@ static int translate_code(uint64_t pc)
 	return 1;
 }
 
+// Instruction cache maintenance: code a program writes as data runs only
+// after `ic ivau` over its cache lines and an `isb` (the architecture
+// requires it, and JITs do it), so that's when translations of code that
+// changed are retired: the lifted `ic ivau` notes its line here, and at the
+// next `isb` the runtime (the wasm-env call code_changed) compares the
+// translations of those lines with the bytes now, retiring those that
+// differ (and bumping the code epoch, which the `isb` then sees, as it
+// sees other threads' changes). 64-byte lines, as CTR_EL0 says.
+#define WASM_ENV_CODE_CHANGED ((1L << 32) + 5)
+static _Thread_local uint64_t ic_lo, ic_hi;
+
+void __wasm_env_ic_ivau(uint64_t addr)
+{
+	uint64_t line = addr & ~(uint64_t)63;
+	if (!ic_hi) {
+		ic_lo = line;
+		ic_hi = line + 64;
+		return;
+	}
+	if (line < ic_lo)
+		ic_lo = line;
+	if (line + 64 > ic_hi)
+		ic_hi = line + 64;
+}
+
+void __wasm_env_isb(void)
+{
+	if (ic_hi) {
+		__wasm_env_host_syscall(WASM_ENV_CODE_CHANGED, (long)ic_lo, (long)(ic_hi - ic_lo), 0, 0, 0, 0);
+		ic_lo = ic_hi = 0;
+	}
+	check_code_epoch();
+}
+
 // The function of the region starting at `start` in a region table, or 0.
 static block_fn lookup(const uint64_t *addrs, void *const *fns, uint64_t count, uint64_t start)
 {

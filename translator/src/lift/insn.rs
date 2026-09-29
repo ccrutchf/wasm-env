@@ -75,7 +75,22 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         // hints keep the compiler from caching guest memory across them, so
         // a loop polling a word another thread writes sees the write.
         "dmb" | "dsb" => b.line("fence seq_cst"),
-        "yield" | "wfe" | "isb" => b.line("fence syncscope(\"singlethread\") seq_cst"),
+        "yield" | "wfe" => b.line("fence syncscope(\"singlethread\") seq_cst"),
+        // Code written as data runs only after `ic ivau` over its cache lines
+        // and an `isb` (as the architecture requires, and JITs do): the
+        // support code notes the lines, and at the `isb` has the runtime
+        // retire translations of code that changed (docs/abi.md, "Code
+        // generated at run time"). Neither touches guest registers.
+        "isb" => b.line("call void @__wasm_env_isb()"),
+        "ic" if ops.iter().any(|o| matches!(o, Operand::Reg { .. })) => {
+            let r = ops.iter().find_map(|o| match o {
+                Operand::Reg { reg, .. } => super::reg(*reg).ok(),
+                _ => None,
+            });
+            let (r, _) = r.ok_or_else(|| anyhow::anyhow!("ic operand"))?;
+            let addr = b.read(r, 64)?;
+            b.line(format!("call void @__wasm_env_ic_ivau(i64 {addr})"));
+        }
         "nop" | "hint" | "wfi" | "sev" | "sevl" | "csdb" | "clrex"
         | "bti" | "prfm" | "prfum" | "paciasp" | "autiasp" | "pacibsp" | "autibsp" | "xpaclri" | "pacia"
         | "autia1716" | "autib1716" | "pacia1716" | "pacib1716" | "autia" | "pacib" | "autib" | "dc" | "ic" | "dvp"

@@ -649,6 +649,12 @@ impl Process {
                 Ok(0)
             }
             nr::EXIT | nr::EXIT_GROUP => Ok(self.exit(a as i32 & 0xff)),
+            // Code there may have changed (the support code saw `ic ivau` and
+            // an `isb`): translations whose bytes differ are retired.
+            nr::WASM_ENV_CODE_CHANGED => {
+                crate::modules::check_code(&self.group, ua, ua.saturating_add(ub));
+                Ok(0)
+            }
             nr::WASM_ENV_MISSED_TARGET if ub == 0 => {
                 // In a library loaded as its own module: record it there.
                 if let Some(lib) = self.group.libraries.library_at(ua) {
