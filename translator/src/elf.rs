@@ -50,6 +50,9 @@ pub struct Image {
     /// `--roots`): roots too, and marks of code discovery reads poorly (see
     /// discover).
     pub missed: Vec<u64>,
+    /// Code generated at run time (`raw`): discovery follows it from its
+    /// roots only, within their pages (see discover).
+    pub generated: bool,
     /// Libraries the dynamic linker will map at run time: (the path it will
     /// open, prelinked base, end). The support code places them here.
     pub libs: Vec<(String, u64, u64)>,
@@ -418,7 +421,7 @@ fn link(objects: Vec<Parsed>, interp: bool, libs: Vec<(String, u64, u64)>, names
     code.sort_by_key(|r| r.start);
     functions.sort();
     functions.dedup_by_key(|f| f.0);
-    Ok(Image { entry, segments, phdr, phnum, functions, code, app_entry, interp_base, roots, missed: Vec::new(), libs, objects: placed })
+    Ok(Image { entry, segments, phdr, phnum, functions, code, app_entry, interp_base, roots, missed: Vec::new(), generated: false, libs, objects: placed })
 }
 
 /// Writes an 8-byte little-endian value at a guest address, growing the
@@ -477,6 +480,7 @@ impl Image {
             interp_base: 0,
             roots: Vec::new(),
             missed: Vec::new(),
+            generated: true,
             libs: Vec::new(),
             objects: vec![(name.to_string(), base, end)],
         }

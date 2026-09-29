@@ -116,7 +116,11 @@ pub fn discover(image: &Image) -> Program<'_> {
     let in_code = |a: u64| insns.contains_key(&a);
 
     let mut roots = BTreeSet::new();
-    roots.insert(image.entry);
+    // (Generated code has no entry of its own: its base is just where the
+    // mapping starts.)
+    if !image.generated {
+        roots.insert(image.entry);
+    }
     roots.extend(image.functions.iter().map(|f| f.0));
     roots.extend(&image.roots);
     // Where a run jumped to code the translation missed, the code around it
@@ -143,8 +147,11 @@ pub fn discover(image: &Image) -> Program<'_> {
     // - code addresses built in registers: ADR, or ADRP followed by ADD;
     // - every direct branch, indexed by its target (see Code).
     let mut prev_adrp: BTreeMap<u32, u64> = BTreeMap::new();
+    // (Not over generated code: a JIT's buffer is entered where the program
+    // says, and scanning all of it for each new piece would cost more than
+    // translating the piece.)
     let mut incoming: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
-    for (a, i) in insns.iter() {
+    for (a, i) in insns.iter().take(if image.generated { 0 } else { usize::MAX }) {
         if let Some(t) = direct_target(&i) {
             incoming.entry(t).or_default().push(a);
         }
@@ -168,7 +175,7 @@ pub fn discover(image: &Image) -> Program<'_> {
     }
 
     // Code pointers stored in data (function pointer tables, init arrays).
-    for seg in &image.segments {
+    for seg in image.segments.iter().filter(|_| !image.generated) {
         for (k, w) in seg.data.as_chunks::<8>().0.iter().enumerate() {
             if (seg.vaddr + k as u64 * 8).is_multiple_of(8) {
                 roots.insert(u64::from_le_bytes(*w));
@@ -177,6 +184,13 @@ pub fn discover(image: &Image) -> Program<'_> {
     }
     roots.retain(|&a| in_code(a));
 
+    // Generated code is followed only within the pages its roots are on: a
+    // JIT packs code objects densely, and following branches into their
+    // neighbours would translate them all again with each new one (and
+    // grow each module over more pages, see the runtime's translate_code).
+    // Branches out go through dispatch, translated when first taken.
+    let root_pages: BTreeSet<u64> = roots.iter().map(|&a| a / SWEEP).collect();
+    let followed = |a: u64| !image.generated || root_pages.contains(&(a / SWEEP));
     let code = Code { insns, incoming };
     // Follow control flow from the roots.
     let mut leaders = roots.clone();
@@ -192,7 +206,7 @@ pub fn discover(image: &Image) -> Program<'_> {
             let i = &i;
             if is_control(i) {
                 let mut add = |a: u64| {
-                    if in_code(a) && leaders.insert(a) {
+                    if in_code(a) && followed(a) && leaders.insert(a) {
                         work.push(a);
                     }
                 };
