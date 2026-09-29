@@ -64,31 +64,83 @@ enum Ty {
     F64,
     /// A SIMD/FP register (the lifter's i128), as a v128.
     I128,
-    /// A vector (the lifter's view of a SIMD register's lanes), as a v128.
-    Vector(Lanes),
+    /// A vector (the lifter's view of SIMD registers' lanes): up to 16
+    /// bytes a v128 (a narrower one in its low bytes); a wider one, several
+    /// registers' elements together (a structure load's or store's), is
+    /// "wide", kept in consecutive v128 locals (see FuncGen::wide).
+    Vector(VecTy),
 }
 
-/// A vector type's lanes.
+/// A vector type, `<lanes x elem>`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Lanes {
-    I8x16,
-    I16x8,
-    I32x4,
-    I64x2,
-    F32x4,
-    F64x2,
+struct VecTy {
+    lanes: u16,
+    bits: u8,
+    float: bool,
 }
 
-impl Lanes {
-    /// The element type.
+impl VecTy {
+    fn parse(s: &str) -> Option<VecTy> {
+        let inner = s.trim().strip_prefix('<')?.strip_suffix('>')?;
+        let (n, t) = inner.split_once(" x ")?;
+        let (bits, float) = match t.trim() {
+            "i8" => (8, false),
+            "i16" => (16, false),
+            "i32" => (32, false),
+            "i64" => (64, false),
+            "float" => (32, true),
+            "double" => (64, true),
+            _ => return None,
+        };
+        let lanes: u16 = n.trim().parse().ok()?;
+        let bytes = lanes as u32 * bits as u32 / 8;
+        // Whole v128s, or 4 or 8 bytes of one.
+        (bytes == 4 || bytes == 8 || bytes.is_multiple_of(16) || (bytes > 16 && bytes.is_multiple_of(8))).then_some(VecTy { lanes, bits, float })
+    }
     fn elem(self) -> Ty {
-        match self {
-            Lanes::I8x16 => Ty::I8,
-            Lanes::I16x8 => Ty::I16,
-            Lanes::I32x4 => Ty::I32,
-            Lanes::I64x2 => Ty::I64,
-            Lanes::F32x4 => Ty::F32,
-            Lanes::F64x2 => Ty::F64,
+        match (self.bits, self.float) {
+            (8, _) => Ty::I8,
+            (16, _) => Ty::I16,
+            (32, false) => Ty::I32,
+            (32, true) => Ty::F32,
+            (64, false) => Ty::I64,
+            _ => Ty::F64,
+        }
+    }
+    fn bytes(self) -> u64 {
+        self.lanes as u64 * self.bits as u64 / 8
+    }
+    fn wide(self) -> bool {
+        self.bytes() > 16
+    }
+    /// Its v128s.
+    fn pieces(self) -> u64 {
+        self.bytes().div_ceil(16)
+    }
+    /// Lanes per v128.
+    fn per_piece(self) -> u16 {
+        128 / self.bits as u16
+    }
+    /// Takes lane `k` of a v128.
+    fn extract(self, k: u8) -> I<'static> {
+        match (self.bits, self.float) {
+            (8, _) => I::I8x16ExtractLaneU(k),
+            (16, _) => I::I16x8ExtractLaneU(k),
+            (32, false) => I::I32x4ExtractLane(k),
+            (32, true) => I::F32x4ExtractLane(k),
+            (64, false) => I::I64x2ExtractLane(k),
+            _ => I::F64x2ExtractLane(k),
+        }
+    }
+    /// Sets lane `k` of a v128.
+    fn replace(self, k: u8) -> I<'static> {
+        match (self.bits, self.float) {
+            (8, _) => I::I8x16ReplaceLane(k),
+            (16, _) => I::I16x8ReplaceLane(k),
+            (32, false) => I::I32x4ReplaceLane(k),
+            (32, true) => I::F32x4ReplaceLane(k),
+            (64, false) => I::I64x2ReplaceLane(k),
+            _ => I::F64x2ReplaceLane(k),
         }
     }
 }
@@ -105,13 +157,7 @@ impl Ty {
             "float" => Ty::F32,
             "double" => Ty::F64,
             "i128" => Ty::I128,
-            "<16 x i8>" => Ty::Vector(Lanes::I8x16),
-            "<8 x i16>" => Ty::Vector(Lanes::I16x8),
-            "<4 x i32>" => Ty::Vector(Lanes::I32x4),
-            "<2 x i64>" => Ty::Vector(Lanes::I64x2),
-            "<4 x float>" => Ty::Vector(Lanes::F32x4),
-            "<2 x double>" => Ty::Vector(Lanes::F64x2),
-            _ => return None,
+            v => return VecTy::parse(v).map(Ty::Vector),
         })
     }
     fn val(self) -> ValType {
@@ -532,6 +578,9 @@ struct FuncGen<'a> {
     /// With chaining (see `compile`), the global holding the table slot of
     /// the older function of this region.
     prev: Option<u32>,
+    /// Wide vectors (see Ty::Vector): name → (first of their consecutive v128
+    /// locals, type).
+    wide: HashMap<String, (u32, VecTy)>,
     current: usize,
 }
 
@@ -565,6 +614,7 @@ impl<'a> FuncGen<'a> {
             shape: None,
             enclosing: Vec::new(),
             prev: None,
+            wide: HashMap::new(),
             current: 0,
         };
         g.locals.insert("pc".into(), (0, Ty::I64));
@@ -830,6 +880,9 @@ impl<'a> FuncGen<'a> {
     /// Pushes a value of type `ty`: a local, a constant or a global's address.
     fn value(&mut self, v: &str, ty: Ty) -> Res<()> {
         let v = v.trim();
+        if v.strip_prefix('%').is_some_and(|n| self.wide.contains_key(n)) {
+            unsupported!("a wide vector as a value");
+        }
         if let Some((base, off)) = v.strip_prefix('%').and_then(|n| self.resolve(n)) {
             self.value(&base, Ty::I64)?;
             if off != 0 {
@@ -1067,6 +1120,7 @@ impl<'a> FuncGen<'a> {
                 self.define(dest, ty)
             }
             "extractelement" | "insertelement" => self.lane(dest, word, args),
+            "shufflevector" => self.shuffle(dest, args),
             "cmpxchg" => self.cmpxchg(dest, args),
             "atomicrmw" => self.atomicrmw(dest, args),
             "fence" => {
@@ -1268,6 +1322,29 @@ impl<'a> FuncGen<'a> {
         if op == "bitcast" && ft.val() == ValType::V128 && to.val() == ValType::V128 {
             return self.define(dest, to);
         }
+        // Between an 8- or 4-byte vector and a scalar: lane 0 (a vector
+        // narrower than 16 bytes is in the low bytes, the rest ignored).
+        if op == "bitcast" {
+            let scalar = match (ft, to) {
+                (Ty::Vector(v), s) | (s, Ty::Vector(v)) => Some((v.bytes(), s)),
+                _ => None,
+            };
+            if let Some((bytes, s)) = scalar {
+                let into = matches!(to, Ty::Vector(_));
+                self.emit(match (bytes, s, into) {
+                    (8, Ty::I64, false) => I::I64x2ExtractLane(0),
+                    (8, Ty::F64, false) => I::F64x2ExtractLane(0),
+                    (4, Ty::I32, false) => I::I32x4ExtractLane(0),
+                    (4, Ty::F32, false) => I::F32x4ExtractLane(0),
+                    (8, Ty::I64, true) => I::I64x2Splat,
+                    (8, Ty::F64, true) => I::F64x2Splat,
+                    (4, Ty::I32, true) => I::I32x4Splat,
+                    (4, Ty::F32, true) => I::F32x4Splat,
+                    _ => unsupported!("bitcast {ft:?} to {to:?}"),
+                });
+                return self.define(dest, to);
+            }
+        }
         if matches!(ft, Ty::Vector(_)) || matches!(to, Ty::Vector(_)) {
             unsupported!("{op} {ft:?} to {to:?}");
         }
@@ -1355,6 +1432,12 @@ impl<'a> FuncGen<'a> {
         let (Some(t), Some(p)) = (parts.first(), parts.get(1)) else { unsupported!("load") };
         let ty = Ty::parse(t).ok_or_else(|| format!("load {t}"))?;
         let p = p.trim();
+        if let Ty::Vector(v) = ty {
+            if atomic {
+                unsupported!("atomic load of a vector");
+            }
+            return self.load_vector(dest, v, p);
+        }
         if p.starts_with("ptr addrspace(1) @__wasm_env_state") {
             self.emit(I::GlobalGet(self.ctx.state));
             return self.define(dest, ty);
@@ -1389,6 +1472,14 @@ impl<'a> FuncGen<'a> {
         let p = p.split(" seq_cst").next().unwrap().trim();
         if p.contains("addrspace") {
             unsupported!("store to {p}");
+        }
+        if let Some((t, value)) = split_type(v)
+            && let Some(Ty::Vector(vt)) = Ty::parse(t)
+        {
+            if atomic {
+                unsupported!("atomic store of a vector");
+            }
+            return self.store_vector(vt, value, p);
         }
         let offset = self.address(p)?;
         let ty = self.typed(v)?;
@@ -1830,38 +1921,204 @@ impl<'a> FuncGen<'a> {
         Ok(())
     }
 
+    /// The v128 `bytes` long (16, 8 or 4) at the address on the stack plus
+    /// `offset`, into the low bytes.
+    fn load_piece(&mut self, bytes: u64, offset: u64) -> Res<()> {
+        let m = MemArg { offset, align: 0, memory_index: 0 };
+        self.emit(match bytes {
+            16 => I::V128Load(m),
+            8 => I::V128Load64Zero(m),
+            4 => I::V128Load32Zero(m),
+            _ => unsupported!("a {bytes}-byte vector"),
+        });
+        Ok(())
+    }
+
+    /// Stores the low `bytes` (16, 8 or 4) of the v128 on the stack at the
+    /// address under it plus `offset`.
+    fn store_piece(&mut self, bytes: u64, offset: u64) -> Res<()> {
+        let m = MemArg { offset, align: 0, memory_index: 0 };
+        self.emit(match bytes {
+            16 => I::V128Store(m),
+            8 => I::V128Store64Lane { memarg: m, lane: 0 },
+            4 => I::V128Store32Lane { memarg: m, lane: 0 },
+            _ => unsupported!("a {bytes}-byte vector"),
+        });
+        Ok(())
+    }
+
+    /// Makes `n` consecutive v128 locals for a wide vector.
+    fn wide_locals(&mut self, n: u64) -> u32 {
+        let first = self.new_local(ValType::V128);
+        for _ in 1..n {
+            self.new_local(ValType::V128);
+        }
+        first
+    }
+
+    /// A vector load: one v128 (or its low bytes), or a wide vector's
+    /// pieces.
+    fn load_vector(&mut self, dest: Option<&str>, v: VecTy, p: &str) -> Res<()> {
+        if !v.wide() {
+            let offset = self.address(p)?;
+            self.load_piece(v.bytes(), offset)?;
+            return self.define(dest, Ty::Vector(v));
+        }
+        let Some(dest) = dest else { return Ok(()) };
+        let first = self.wide_locals(v.pieces());
+        for k in 0..v.pieces() {
+            let offset = self.address(p)?;
+            self.load_piece((v.bytes() - 16 * k).min(16), offset + 16 * k)?;
+            self.emit(I::LocalSet(first + k as u32));
+        }
+        self.wide.insert(dest.to_string(), (first, v));
+        Ok(())
+    }
+
+    fn store_vector(&mut self, v: VecTy, value: &str, p: &str) -> Res<()> {
+        if !v.wide() {
+            let offset = self.address(p)?;
+            self.value(value, Ty::Vector(v))?;
+            return self.store_piece(v.bytes(), offset);
+        }
+        let Some(&(first, _)) = value.strip_prefix('%').and_then(|n| self.wide.get(n)) else {
+            unsupported!("storing wide vector {value}");
+        };
+        for k in 0..v.pieces() {
+            let offset = self.address(p)?;
+            self.emit(I::LocalGet(first + k as u32));
+            self.store_piece((v.bytes() - 16 * k).min(16), offset + 16 * k)?;
+        }
+        Ok(())
+    }
+
+    /// Pushes v128 number `piece` of a vector operand: a narrow vector (its
+    /// only one), a wide one's, or zeros (poison, undef, zeroinitializer).
+    fn piece(&mut self, v: &str, ty: VecTy, piece: u64) -> Res<()> {
+        let v = v.trim();
+        if matches!(v, "poison" | "undef" | "zeroinitializer") {
+            self.emit(I::V128Const(0));
+            return Ok(());
+        }
+        if let Some(&(first, _)) = v.strip_prefix('%').and_then(|n| self.wide.get(n)) {
+            self.emit(I::LocalGet(first + piece as u32));
+            return Ok(());
+        }
+        if piece != 0 {
+            unsupported!("piece {piece} of a narrow vector");
+        }
+        self.value(v, Ty::Vector(ty))
+    }
+
     /// extractelement and insertelement at a constant lane:
     /// `extractelement <N x T> %v, i64 k`, `insertelement <N x T> %v, T %x, i64 k`.
+    /// A wide vector's lane is in its piece k / (lanes per v128).
     fn lane(&mut self, dest: Option<&str>, op: &str, args: &str) -> Res<()> {
         let parts = split_top(args);
         let (vector, rest) = parts.split_first().ok_or(op.to_string())?;
-        let ty = self.typed(vector)?;
-        let Ty::Vector(lanes) = ty else { unsupported!("{op} on {ty:?}") };
+        let (t, v) = split_type(vector).ok_or(op.to_string())?;
+        let Some(Ty::Vector(vt)) = Ty::parse(t) else { unsupported!("{op} on {t}") };
         let index = rest.last().ok_or(op.to_string())?;
         let (_, k) = split_type(index).ok_or(op.to_string())?;
-        let Ok(k) = k.parse::<u8>() else { unsupported!("{op} at a variable lane") };
+        let Ok(k) = k.parse::<u16>() else { unsupported!("{op} at a variable lane") };
+        let (piece, lane) = ((k / vt.per_piece()) as u64, (k % vt.per_piece()) as u8);
         if op == "extractelement" {
-            self.emit(match lanes {
-                Lanes::I8x16 => I::I8x16ExtractLaneU(k),
-                Lanes::I16x8 => I::I16x8ExtractLaneU(k),
-                Lanes::I32x4 => I::I32x4ExtractLane(k),
-                Lanes::I64x2 => I::I64x2ExtractLane(k),
-                Lanes::F32x4 => I::F32x4ExtractLane(k),
-                Lanes::F64x2 => I::F64x2ExtractLane(k),
-            });
-            return self.define(dest, lanes.elem());
+            self.piece(v, vt, piece)?;
+            self.emit(vt.extract(lane));
+            return self.define(dest, vt.elem());
         }
         let [value, _] = rest else { unsupported!("insertelement") };
-        self.typed(value)?;
-        self.emit(match lanes {
-            Lanes::I8x16 => I::I8x16ReplaceLane(k),
-            Lanes::I16x8 => I::I16x8ReplaceLane(k),
-            Lanes::I32x4 => I::I32x4ReplaceLane(k),
-            Lanes::I64x2 => I::I64x2ReplaceLane(k),
-            Lanes::F32x4 => I::F32x4ReplaceLane(k),
-            Lanes::F64x2 => I::F64x2ReplaceLane(k),
-        });
-        self.define(dest, ty)
+        if !vt.wide() {
+            self.piece(v, vt, 0)?;
+            self.typed(value)?;
+            self.emit(vt.replace(lane));
+            return self.define(dest, Ty::Vector(vt));
+        }
+        // A wide vector: a copy of its pieces, one lane changed.
+        let Some(dest) = dest else { return Ok(()) };
+        let first = self.wide_locals(vt.pieces());
+        for p in 0..vt.pieces() {
+            self.piece(v, vt, p)?;
+            if p == piece {
+                self.typed(value)?;
+                self.emit(vt.replace(lane));
+            }
+            self.emit(I::LocalSet(first + p as u32));
+        }
+        self.wide.insert(dest.to_string(), (first, vt));
+        Ok(())
+    }
+
+    /// shufflevector T %a, T %b, <M x i32> <mask>: one i8x16.shuffle when
+    /// the lanes chosen come from at most two v128s (a structure load's
+    /// registers, of 8 bytes from 24, or 16 from 32), else lane by lane.
+    fn shuffle(&mut self, dest: Option<&str>, args: &str) -> Res<()> {
+        let parts = split_top(args);
+        let [a, b, mask] = parts.as_slice() else { unsupported!("shufflevector") };
+        let (t, a) = split_type(a).ok_or("shufflevector")?;
+        let Some(Ty::Vector(src)) = Ty::parse(t) else { unsupported!("shufflevector of {t}") };
+        let (_, b) = split_type(b).ok_or("shufflevector")?;
+        let (mt, mask) = split_type(mask).ok_or("shufflevector mask")?;
+        let m: u16 = mt.trim_start_matches('<').split(" x ").next().and_then(|n| n.trim().parse().ok()).ok_or("shufflevector mask")?;
+        let result = VecTy { lanes: m, ..src };
+        if result.wide() {
+            unsupported!("a wide shuffle result");
+        }
+        // Each result lane: Some((operand, piece, byte offset in it)), None if
+        // poison.
+        let picks: Vec<Option<(usize, u64, u64)>> = if mask.trim() == "zeroinitializer" {
+            vec![Some((0, 0, 0)); m as usize]
+        } else {
+            let inner = mask.trim().trim_start_matches('<').trim_end_matches('>');
+            split_top(inner)
+                .into_iter()
+                .map(|e| {
+                    let e = e.trim().trim_start_matches("i32").trim();
+                    e.parse::<u64>().ok().map(|i| {
+                        let (operand, lane) = if i < src.lanes as u64 { (0, i) } else { (1, i - src.lanes as u64) };
+                        let byte = lane * src.bits as u64 / 8;
+                        (operand, byte / 16, byte % 16)
+                    })
+                })
+                .collect()
+        };
+        let operands = [a, b];
+        let mut sources: Vec<(usize, u64)> = picks.iter().flatten().map(|&(o, p, _)| (o, p)).collect();
+        sources.sort();
+        sources.dedup();
+        let size = src.bits as u64 / 8;
+        if sources.len() <= 2 {
+            // Each result byte, from the first (0-15) or second (16-31) source.
+            let first = sources.first().copied().unwrap_or((0, 0));
+            let mut lanes = [0u8; 16];
+            for (j, pick) in picks.iter().enumerate() {
+                let Some((o, p, byte)) = *pick else { continue };
+                let base = if (o, p) == first { 0 } else { 16 };
+                for t in 0..size {
+                    lanes[j * size as usize + t as usize] = (base + byte + t) as u8;
+                }
+            }
+            let second = sources.get(1).copied().unwrap_or(first);
+            for (o, p) in [first, second] {
+                self.piece(operands[o], src, p)?;
+            }
+            self.emit(I::I8x16Shuffle(lanes));
+            return self.define(dest, Ty::Vector(result));
+        }
+        // More: lane by lane.
+        let r = self.new_local(ValType::V128);
+        self.emit(I::V128Const(0));
+        self.emit(I::LocalSet(r));
+        for (j, pick) in picks.iter().enumerate() {
+            let Some((o, p, byte)) = *pick else { continue };
+            self.emit(I::LocalGet(r));
+            self.piece(operands[o], src, p)?;
+            self.emit(src.extract((byte / size) as u8));
+            self.emit(src.replace(j as u8));
+            self.emit(I::LocalSet(r));
+        }
+        self.emit(I::LocalGet(r));
+        self.define(dest, Ty::Vector(result))
     }
 
     /// A cast to or from i128 (a v128), its operand on the stack: zext and
@@ -2300,6 +2557,31 @@ bad:
             "%v = bitcast i128 0 to <16 x i8>\n  %w = insertelement <16 x i8> %v, i8 %t4, i64 3\n  %e = extractelement <16 x i8> %w, i64 3\n  %t5 = bitcast <16 x i8> %w to i128",
         );
         let wasm = compile(&[lanes], false).expect("supported");
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true).wasm_memory64(true).wasm_tail_call(true).shared_memory(true);
+        wasmtime::Module::new(&wasmtime::Engine::new(&config).unwrap(), &wasm).expect("valid");
+    }
+
+    #[test]
+    fn compiles_structure_loads_and_stores() {
+        // ld3 {v0.8b-v2.8b} and ld3 {v0.16b-v2.16b}, then st3 of the first,
+        // as the lifter writes them.
+        let structures = CHUNK.replace(
+            "%t5 = zext i8 %t4 to i128",
+            "%p = inttoptr i64 4096 to ptr
+  %a = load <24 x i8>, ptr %p, align 1
+  %r = shufflevector <24 x i8> %a, <24 x i8> poison, <8 x i32> <i32 2, i32 5, i32 8, i32 11, i32 14, i32 17, i32 20, i32 23>
+  %b = bitcast <8 x i8> %r to i64
+  %c = zext i64 %b to i128
+  %d = load <48 x i8>, ptr %p, align 1
+  %s = shufflevector <48 x i8> %d, <48 x i8> poison, <16 x i32> <i32 0, i32 3, i32 6, i32 9, i32 12, i32 15, i32 18, i32 21, i32 24, i32 27, i32 30, i32 33, i32 36, i32 39, i32 42, i32 45>
+  %e = extractelement <8 x i8> %r, i64 7
+  %f = insertelement <24 x i8> poison, i8 %e, i32 0
+  %g = insertelement <24 x i8> %f, i8 %t4, i32 23
+  store <24 x i8> %g, ptr %p, align 1
+  %t5 = bitcast <16 x i8> %s to i128",
+        );
+        let wasm = compile(&[structures], false).expect("supported");
         let mut config = wasmtime::Config::new();
         config.wasm_threads(true).wasm_memory64(true).wasm_tail_call(true).shared_memory(true);
         wasmtime::Module::new(&wasmtime::Engine::new(&config).unwrap(), &wasm).expect("valid");
