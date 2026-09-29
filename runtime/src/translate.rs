@@ -398,13 +398,24 @@ pub fn ensure_code(bytes: &[u8], base: u64, roots: &[u64], root: &Path, trace: b
     if out.exists() {
         return Ok(out);
     }
-    // The translator names the object by the path it's given.
-    let text: String = roots.iter().map(|r| format!("{}\t{:#x}\n", code.display(), r - base)).collect();
     let write = |path: &Path, data: &[u8]| -> SysResult<()> {
         let tmp = path.with_extension(format!("{}.tmp", unique()));
         std::fs::write(&tmp, data).map_err(|e| crate::fs::errno(&e))?;
         std::fs::rename(&tmp, path).map_err(|e| crate::fs::errno(&e))
     };
+    // In this process, compiled straight to WebAssembly (milliseconds); what
+    // the direct compiler doesn't handle goes to the translator's process,
+    // which compiles it with clang.
+    match wasm_env_translate::translate_generated(bytes, base, roots) {
+        Ok(wasm) => {
+            write(&out, &wasm)?;
+            return Ok(out);
+        }
+        Err(why) if trace => eprintln!("[wasm-env] generated code at {base:#x} goes to clang: {why}"),
+        Err(_) => {}
+    }
+    // The translator names the object by the path it's given.
+    let text: String = roots.iter().map(|r| format!("{}\t{:#x}\n", code.display(), r - base)).collect();
     write(&roots_file, text.as_bytes())?;
     write(&code, bytes)?;
     run_translator(&code, &out, &["--raw".into(), "--base".into(), format!("{base:x}")], trace)?;

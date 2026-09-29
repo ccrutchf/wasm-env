@@ -1763,6 +1763,7 @@ dependencies = [
  "socket2",
  "tar",
  "ureq",
+ "wasm-env-translate",
  "wasmtime",
 ]
 

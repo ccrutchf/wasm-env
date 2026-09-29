@@ -12,18 +12,8 @@
 //! program loads later. `--lib`/`--interp` name host files directly.
 
 #[cfg(feature = "lift")]
-mod deps;
-mod discover;
-mod ehframe;
-mod elf;
-#[cfg(feature = "lift")]
-mod lift;
-#[cfg(feature = "lift")]
-mod wasmgen;
-#[cfg_attr(not(feature = "lift"), allow(dead_code))]
-mod link;
-#[cfg(test)]
-mod testutil;
+use wasm_env_translate::{code_extent, deps, lift, link, wasmgen};
+use wasm_env_translate::{discover, elf};
 
 use std::collections::BTreeMap;
 
@@ -289,22 +279,6 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     std::fs::write(output, wasm?).with_context(|| format!("writing {output}"))?;
     eprintln!("{input}: {} blocks in {} module(s) → {output}", lifted.blocks, lifted.chunks);
     Ok(())
-}
-
-/// The pages holding a program's blocks: from the first block's page to
-/// the end of the page where the last block ends.
-#[cfg(feature = "lift")]
-fn code_extent(prog: &discover::Program) -> (u64, u64) {
-    const PAGE: u64 = 0x1000;
-    let (Some(&first), Some(&last)) = (prog.leaders.first(), prog.leaders.last()) else { return (0, 0) };
-    let mut end = last;
-    while let Some(i) = prog.insns.get(&end) {
-        end += 4;
-        if discover::is_control(&i) || prog.leaders.contains(&end) {
-            break;
-        }
-    }
-    (first / PAGE * PAGE, end.max(last + 4).next_multiple_of(PAGE))
 }
 
 /// Reports the blocks discovery found.

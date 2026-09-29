@@ -301,11 +301,13 @@ struct Table {
 /// Recognizes the GCC/LLVM arm64 switch idiom ending in `br` and returns
 /// the case target addresses by reading the offset table:
 ///
-///     adrp xT, PAGE ; add xT, xT, #OFF     ; table base
-///     ldr{b,h,sw} wI, [xT, wIdx, ext #s]   ; entry = table[index]
-///     adr  xB, LABEL                        ; base label
-///     add  xD, xB, wI, ext #2               ; target = LABEL + entry*4
-///     br   xD
+/// ```text
+/// adrp xT, PAGE ; add xT, xT, #OFF     ; table base
+/// ldr{b,h,sw} wI, [xT, wIdx, ext #s]   ; entry = table[index]
+/// adr  xB, LABEL                        ; base label
+/// add  xD, xB, wI, ext #2               ; target = LABEL + entry*4
+/// br   xD
+/// ```
 ///
 /// Register absolute values (from adr/adrp/add-imm/mov) are tracked across
 /// the block. Table entries are read until one points outside the code.

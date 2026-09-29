@@ -18,3 +18,6 @@ flate2 = "1"
 tar = "0.4"
 sha2 = "0.10"
 wasmtime = "49"
+# Code a program generates at run time is translated in-process (see
+# translate::ensure_code).
+wasm-env-translate = { path = "../translator", features = ["lift"] }
