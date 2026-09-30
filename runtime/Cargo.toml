@@ -23,6 +23,8 @@ wasmtime = "49"
 quick-xml = "0.38"
 winit = "0.30"
 softbuffer = "0.4"
+# inotify on every host (inotify.rs): inotify, FSEvents, ReadDirectoryChangesW.
+notify = "8.2"
 # Code a program generates at run time is translated in-process (see
 # translate::ensure_code).
 wasm-env-translate = { path = "../translator", features = ["lift"] }

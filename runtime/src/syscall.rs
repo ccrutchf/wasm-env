@@ -829,36 +829,20 @@ impl Process {
                 mem::write(data, ua, &pair).map(|_| 0)
             }
             // eventfd and epoll (events.rs): libuv's event loop, Node.js's.
-            // inotify: the host's, on the host files under the root. Its
-            // events name files relative to the watched directory, so they
-            // need no translating; the descriptor is an `Open::Host`.
-            #[cfg(target_os = "linux")]
+            // inotify (inotify.rs): a runtime object watching host files
+            // under the root, on every host.
             nr::INOTIFY_INIT1 => {
-                // SAFETY: a new descriptor or -1.
-                let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | if a & o::NONBLOCK != 0 { libc::IN_NONBLOCK } else { 0 }) };
-                if fd < 0 {
-                    return Err(fs::errno(&std::io::Error::last_os_error()));
-                }
-                // SAFETY: owned from here on.
-                let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-                let open = Open::Host(Arc::new(fs::HostFd::new(fd)));
+                let open = Open::Inotify(crate::inotify::Inotify::new()?);
                 let flags = if a & o::NONBLOCK != 0 { o::NONBLOCK } else { 0 };
                 self.fds.insert(fs::Fd { open: Arc::new(Mutex::new(open)), cloexec: a & o::CLOEXEC != 0, flags }, 0)
             }
-            #[cfg(target_os = "linux")]
             nr::INOTIFY_ADD_WATCH => {
-                let (Some((h, _)), path) = (self.host_of(a)?, self.at_path(data, -100, ub, c & 0x0100_0000 == 0)?) else { return Err(EINVAL) };
-                let path = std::ffi::CString::new(path.into_os_string().into_encoded_bytes()).map_err(|_| EINVAL)?;
-                // SAFETY: a C path; the host descriptor is an inotify instance or the call fails.
-                let wd = unsafe { libc::inotify_add_watch(std::os::fd::AsRawFd::as_raw_fd(&h.fd), path.as_ptr(), c as u32) };
-                if wd < 0 { Err(fs::errno(&std::io::Error::last_os_error())) } else { Ok(wd as i64) }
+                let (Some((i, _)), path) = (self.inotify_of(a)?, self.at_path(data, -100, ub, c & 0x0100_0000 == 0)?) else { return Err(EINVAL) };
+                i.add_watch(&path, c as u32).map(|wd| wd as i64)
             }
-            #[cfg(target_os = "linux")]
             nr::INOTIFY_RM_WATCH => {
-                let Some((h, _)) = self.host_of(a)? else { return Err(EINVAL) };
-                // SAFETY: as above.
-                let r = unsafe { libc::inotify_rm_watch(std::os::fd::AsRawFd::as_raw_fd(&h.fd), b as i32) };
-                if r < 0 { Err(fs::errno(&std::io::Error::last_os_error())) } else { Ok(0) }
+                let Some((i, _)) = self.inotify_of(a)? else { return Err(EINVAL) };
+                i.rm_watch(b as i32).map(|_| 0)
             }
             // Advice about access patterns: taken.
             nr::FADVISE64 => Ok(0),
@@ -1376,6 +1360,15 @@ impl Process {
         }
     }
 
+    fn inotify_of(&self, fd: i64) -> SysResult<Option<(Arc<crate::inotify::Inotify>, bool)>> {
+        let fd = self.fds.get(fd)?;
+        let nonblock = fd.flags & o::NONBLOCK != 0;
+        match &*fd.open.lock().unwrap() {
+            Open::Inotify(i) => Ok(Some((i.clone(), nonblock))),
+            _ => Ok(None),
+        }
+    }
+
     /// The signals that interrupt a blocking call (with EINTR): those this
     /// thread doesn't block and that do something (end the process, or run a
     /// handler), not ignored ones.
@@ -1409,6 +1402,9 @@ impl Process {
         if let Some((e, nonblock)) = self.eventfd_of(fd)? {
             return e.read(buf, nonblock, &self.interrupted());
         }
+        if let Some((i, nonblock)) = self.inotify_of(fd)? {
+            return i.read(buf, nonblock, &self.interrupted());
+        }
         if let Some((h, nonblock)) = self.host_of(fd)? {
             return h.read(buf, nonblock);
         }
@@ -1427,7 +1423,7 @@ impl Process {
                 Ok(buf.len())
             }
             Open::Stdout | Open::Stderr | Open::Pipe(_) | Open::Socket(_) | Open::Host(_) | Open::Unix(_) => return Err(EBADF),
-            Open::EventFd(_) | Open::Epoll(_) => return Err(EINVAL),
+            Open::EventFd(_) | Open::Epoll(_) | Open::Inotify(_) => return Err(EINVAL),
         };
         r.map(|n| n as i64).map_err(|e| fs::errno(&e))
     }
@@ -1469,7 +1465,7 @@ impl Process {
             Open::Dir { .. } => return Err(EISDIR),
             Open::Device(_) => Ok(()), // writes to /dev devices are discarded
             Open::Stdin | Open::Pipe(_) | Open::Socket(_) | Open::Host(_) | Open::Unix(_) => return Err(EBADF),
-            Open::EventFd(_) | Open::Epoll(_) => return Err(EINVAL),
+            Open::EventFd(_) | Open::Epoll(_) | Open::Inotify(_) => return Err(EINVAL),
         };
         r.map(|_| buf.len() as i64).map_err(|e| fs::errno(&e))
     }
@@ -1852,6 +1848,11 @@ impl Process {
             && let Some((u, _)) = self.unix_of(fd)?
         {
             return mem::write(data, arg, &(u.available() as i32).to_le_bytes()).map(|_| 0);
+        }
+        if req == FIONREAD
+            && let Some((i, _)) = self.inotify_of(fd)?
+        {
+            return mem::write(data, arg, &(i.available() as i32).to_le_bytes()).map(|_| 0);
         }
         if req == FIONREAD
             && let Some((pipe, _)) = self.pipe_of(fd, false)? {

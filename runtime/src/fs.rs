@@ -413,6 +413,8 @@ pub enum Open {
     Device(Device),
     EventFd(Arc<crate::events::EventFd>),
     Epoll(Arc<crate::events::Epoll>),
+    /// An inotify instance (inotify.rs).
+    Inotify(Arc<crate::inotify::Inotify>),
     /// A Unix socket, the runtime's own (unix.rs).
     Unix(Arc<crate::unix::UnixSocket>),
     /// A host descriptor of a kind the runtime doesn't model itself (a pipe,

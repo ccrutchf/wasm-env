@@ -236,12 +236,17 @@ static void watching(void) {
     snprintf(path, sizeof path, "%s/new-file", dir);
     close(open(path, O_CREAT | O_WRONLY, 0644));
     unlink(path);
+    // (Events may come in more than one read: hosts report them as they
+    // notice them.)
     char buf[4096] __attribute__((aligned(8)));
-    ssize_t n = read(in, buf, sizeof buf);
-    for (char *p = buf; n > 0 && p < buf + n;) {
-        struct inotify_event *e = (struct inotify_event *)p;
-        printf("inotify: %s %s (same watch: %s)\n", e->mask & IN_CREATE ? "created" : e->mask & IN_DELETE ? "deleted" : "?", e->name, e->wd == wd ? "yes" : "no");
-        p += sizeof *e + e->len;
+    for (int seen = 0; seen < 2;) {
+        ssize_t n = read(in, buf, sizeof buf);
+        check(n > 0, "read(inotify)");
+        for (char *p = buf; p < buf + n; seen++) {
+            struct inotify_event *e = (struct inotify_event *)p;
+            printf("inotify: %s %s (same watch: %s)\n", e->mask & IN_CREATE ? "created" : e->mask & IN_DELETE ? "deleted" : "?", e->name, e->wd == wd ? "yes" : "no");
+            p += sizeof *e + e->len;
+        }
     }
     check(inotify_rm_watch(in, wd) == 0, "inotify_rm_watch");
     close(in);

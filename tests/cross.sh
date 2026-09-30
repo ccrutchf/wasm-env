@@ -3,7 +3,8 @@
 # Apple silicon (aarch64-apple-darwin) and Windows (x86_64-pc-windows-gnu).
 # With --build, also builds Windows executables (MinGW's gcc links them),
 # which tests can run under Wine: WASM_ENV_RUNTIME=build/wine-wasm-env
-# tests/m1.sh (docs/hosts.md).
+# tests/m1.sh (docs/hosts.md). With --unit [filter], runs the runtime's unit
+# tests under Wine.
 #
 # Needs network the first time: a Rust toolchain with those targets (in
 # build/rustup), zig (C headers for both targets), MinGW's gcc, and Wine.
@@ -69,5 +70,14 @@ EOF
 	# A Wine prefix, made without Mono or Gecko (their installers would ask).
 	[ -d "$root/build/wineprefix" ] || WINEPREFIX=$root/build/wineprefix WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" "$wine/bin/wineboot" --init >/dev/null 2>&1
 	echo "built: build/wine-wasm-env runs the Windows build under Wine"
+fi
+if [ "${1:-}" = --unit ]; then
+	# The runtime's unit tests, built for Windows and run under Wine.
+	wine=$(store wineWow64Packages.stable)
+	exe=$("$cargo" test -q --release --target x86_64-pc-windows-gnu -p wasm-env --no-run --message-format=json 2>/dev/null |
+		grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | head -1)
+	export WINEPREFIX=$root/build/wineprefix WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
+	[ -d "$WINEPREFIX" ] || "$wine/bin/wineboot" --init >/dev/null 2>&1
+	"$wine/bin/wine" "$exe" ${2:+"$2"} || status=1
 fi
 exit $status

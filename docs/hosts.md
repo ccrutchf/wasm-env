@@ -25,7 +25,8 @@ place to look (runtime/src/memory.rs, `host_page`).
 2. **Build and unit tests.**
    `cargo build --release` then
    `cargo test --release --manifest-path runtime/Cargo.toml`
-   (the runtime's unit tests, including Unix sockets, shared mappings and
+   (the runtime's unit tests, including Unix sockets, shared mappings,
+   inotify, which is FSEvents on a Mac and untried there, and
    the Wayland compositor, headless) and
    `cargo test --release -p wasm-env-translate --all-features`.
 3. **Programs built for wasm-env:** `tests/m0.sh` (the wasm64 toolchain,
@@ -60,7 +61,7 @@ translated program, `--trace`'s last lines) is what's needed to fix it.
 
 Status: the runtime and translator build for `x86_64-pc-windows-gnu`
 (cross-compiled on Linux with MinGW's gcc), and the runtime runs under Wine:
-its unit tests (68; the few that need a Unix host are left out), M1's 34
+its unit tests (70; the few that need a Unix host are left out), M1's 34
 checks (processes, a shell, pipes, sockets, networking) and M0's 20;
 and it translates arm64 programs itself, with LLVM's Windows build as the
 toolchain (M2's `hello`, translated and run on first use).
@@ -96,6 +97,7 @@ executables and makes `build/wine-wasm-env`, which runs them under Wine:
 
 ```
 tests/cross.sh --build
+tests/cross.sh --unit        # the runtime's unit tests, under Wine
 WASM_ENV_RUNTIME=$PWD/build/wine-wasm-env SKIP_BUILD=1 tests/m1.sh
 build/wine-wasm-env run --root build/m2 build/m2/hello.wasm a b
 WASM_ENV_TOOLCHAIN='Z:\path\to\win-toolchain' build/wine-wasm-env run --root 'Z:\path\to\root' /hello

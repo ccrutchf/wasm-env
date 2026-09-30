@@ -25,6 +25,7 @@ mod events;
 mod fork;
 mod fs;
 mod image;
+mod inotify;
 mod kernel;
 mod memory;
 mod modules;

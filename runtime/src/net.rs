@@ -698,6 +698,7 @@ impl Process {
                         let (r, w) = e.readiness();
                         revents[k] = events & ((if r { POLLIN } else { 0 }) | (if w { POLLOUT } else { 0 }));
                     }
+                    Open::Inotify(i) => revents[k] = if i.readable() { events & POLLIN } else { 0 },
                     // (An epoll instance inside another isn't modelled: never ready.)
                     Open::Epoll(_) => {}
                     Open::Pipe(end) => {
