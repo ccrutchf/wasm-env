@@ -2855,6 +2855,7 @@ dependencies = [
  "ureq",
  "wasm-env-translate",
  "wasmtime",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

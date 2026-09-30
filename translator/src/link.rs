@@ -183,12 +183,14 @@ impl Toolchain {
     ///   the builtins toolchain/build.sh builds in the source tree.
     pub fn from_env() -> Option<Toolchain> {
         let installed = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("../lib/wasm-env/toolchain")));
-        let dir = std::env::var_os("WASM_ENV_TOOLCHAIN").map(PathBuf::from).or(installed).filter(|d| d.join("bin/clang").exists());
+        // (clang.exe and wasm-ld.exe on Windows.)
+        let exe = |name: &str| format!("bin/{name}{}", std::env::consts::EXE_SUFFIX);
+        let dir = std::env::var_os("WASM_ENV_TOOLCHAIN").map(PathBuf::from).or(installed).filter(|d| d.join(exe("clang")).exists());
         if let Some(dir) = dir {
             let builtins = dir.join("lib/libclang_rt.builtins.a");
             return Some(Toolchain {
-                cc: dir.join("bin/clang"),
-                wasm_ld: dir.join("bin/wasm-ld"),
+                cc: dir.join(exe("clang")),
+                wasm_ld: dir.join(exe("wasm-ld")),
                 builtins: builtins.exists().then_some(builtins),
             });
         }

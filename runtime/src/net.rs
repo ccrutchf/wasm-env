@@ -45,7 +45,10 @@ impl GuestSocket {
     /// A guest socket for a host socket, blocking or not as the host
     /// socket is now (one passed in may be either).
     pub fn new(sock: Socket, kind: i64) -> Self {
+        #[cfg(unix)]
         let nonblocking = host_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&sock));
+        #[cfg(not(unix))]
+        let nonblocking = false; // (Windows can't ask; new sockets block)
         GuestSocket { sock, kind, nonblocking: Mutex::new(nonblocking), name: Mutex::new(None) }
     }
 
@@ -60,6 +63,7 @@ impl GuestSocket {
 }
 
 /// Whether a host descriptor is non-blocking.
+#[cfg(unix)]
 pub fn host_nonblocking(fd: std::os::fd::RawFd) -> bool {
     // SAFETY: F_GETFL reads the descriptor's flags.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -128,7 +132,7 @@ fn unix_sockaddr(path: &[u8]) -> SysResult<SockAddr> {
             let p = storage.cast::<u8>();
             std::ptr::copy_nonoverlapping((AF_UNIX as u16).to_ne_bytes().as_ptr(), p, 2);
             std::ptr::copy_nonoverlapping(path.as_ptr(), p.add(2), path.len());
-            *len = (2 + path.len()) as libc::socklen_t;
+            *len = (2 + path.len()) as _;
             Ok(())
         })
     }
@@ -146,7 +150,7 @@ fn unix_path(a: &SockAddr) -> &[u8] {
 /// Encodes a socket address as the guest's `struct sockaddr_*`. A Unix
 /// socket's pathname under the root is the guest's path.
 fn sockaddr_bytes(a: &SockAddr, fs: &crate::fs::Fs) -> Vec<u8> {
-    if a.family() == libc::AF_UNIX as libc::sa_family_t {
+    if a.domain() == Domain::UNIX {
         let path = unix_path(a);
         let mut b = (AF_UNIX as u16).to_le_bytes().to_vec();
         if path.first().is_some_and(|&c| c != 0) {
@@ -213,7 +217,7 @@ impl Process {
     /// symlink in its last component). A host path too long for sun_path is
     /// named through a descriptor of its directory, returned too: keep it
     /// until the address is used.
-    fn sockaddr(&self, data: &[u8], addr: u64, len: u64, creating: bool) -> SysResult<(SockAddr, Option<std::os::fd::OwnedFd>)> {
+    fn sockaddr(&self, data: &[u8], addr: u64, len: u64, creating: bool) -> SysResult<(SockAddr, Option<std::fs::File>)> {
         let b = mem::slice(data, addr, len)?;
         let family = u16::from_le_bytes(b.get(..2).ok_or(EINVAL)?.try_into().unwrap()) as i64;
         if family != AF_UNIX {
@@ -236,12 +240,18 @@ impl Process {
         if bytes.len() < 108 {
             return Ok((unix_sockaddr(bytes)?, None));
         }
-        let (Some(dir), Some(name)) = (host.parent(), host.file_name().and_then(|n| n.to_str())) else {
-            return Err(ENAMETOOLONG);
-        };
-        let dir = std::fs::File::open(dir).map_err(|e| crate::fs::errno(&e))?;
-        let short = format!("/proc/self/fd/{}/{name}", std::os::fd::AsRawFd::as_raw_fd(&dir));
-        Ok((unix_sockaddr(short.as_bytes())?, Some(dir.into())))
+        #[cfg(not(target_os = "linux"))]
+        return Err(ENAMETOOLONG);
+        // (Linux: through /proc/self/fd.)
+        #[cfg(target_os = "linux")]
+        {
+            let (Some(dir), Some(name)) = (host.parent(), host.file_name().and_then(|n| n.to_str())) else {
+                return Err(ENAMETOOLONG);
+            };
+            let dir = std::fs::File::open(dir).map_err(|e| crate::fs::errno(&e))?;
+            let short = format!("/proc/self/fd/{}/{name}", std::os::fd::AsRawFd::as_raw_fd(&dir));
+            Ok((unix_sockaddr(short.as_bytes())?, Some(dir)))
+        }
     }
 
     /// The socket behind `fd` and whether the descriptor is non-blocking.
@@ -350,7 +360,7 @@ impl Process {
         let (a, _dir) = self.sockaddr(data, addr, len, true)?;
         s.sock.bind(&a).map_err(|e| errno(&e))?;
         // A Unix socket reports the name the guest gave it (up to its NUL).
-        if a.family() == libc::AF_UNIX as libc::sa_family_t {
+        if a.domain() == Domain::UNIX {
             let b = mem::slice(data, addr, len)?;
             let path = &b[2..];
             let named = match path.first() {
@@ -455,6 +465,8 @@ impl Process {
         let s = self.ready_socket(fd)?;
         let flags = flags as i32 & !MSG_NOSIGNAL;
         let (to, _dir) = if name != 0 { self.sockaddr(data, name, namelen, false).map(|(a, d)| (Some(a), d))? } else { (None, None) };
+        // (Descriptors pass over host sockets only between Unix processes.)
+        #[cfg(unix)]
         if control != 0 && controllen != 0 {
             let fds = self.passed_fds(data, control, controllen)?;
             if !fds.is_empty() {
@@ -519,11 +531,17 @@ impl Process {
         }
         let mut buf = vec![0u8; total as usize];
         let s = self.ready_socket(fd)?;
+        #[cfg(unix)]
         let (n, from, cmsgs, msg_flags) = if control != 0 && controllen != 0 {
             recv_with_control(&s.sock, &mut buf, controllen.min(1 << 16) as usize, flags as i32).map_err(|e| errno(&e))?
         } else {
             let (n, from) = recv_into(&s.sock, &mut buf, flags as i32).map_err(|e| errno(&e))?;
             (n, from, Vec::new(), 0)
+        };
+        #[cfg(not(unix))]
+        let (n, from, msg_flags) = {
+            let (n, from) = recv_into(&s.sock, &mut buf, flags as i32).map_err(|e| errno(&e))?;
+            (n, from, 0i32)
         };
         let mut done = 0;
         for (base, len) in parts {
@@ -535,27 +553,10 @@ impl Process {
             Some(from) => write_sockaddr(data, name, msg + 8, &sockaddr_bytes(&from, &self.fs))?,
             None => mem::write(data, msg + 8, &0u32.to_le_bytes())?,
         }
-        // The control messages, in the guest's layout (the host's, on 64-bit
-        // Linux), with passed descriptors installed as the guest's.
-        let cloexec = flags as i32 & MSG_CMSG_CLOEXEC != 0;
-        let mut out = Vec::new();
-        for (level, ty, body) in cmsgs {
-            let body = match body {
-                Cmsg::Fds(fds) => {
-                    let mut guest = Vec::new();
-                    for host in fds {
-                        guest.extend_from_slice(&(self.adopt(host, cloexec)? as i32).to_le_bytes());
-                    }
-                    guest
-                }
-                Cmsg::Raw(bytes) => bytes,
-            };
-            out.extend_from_slice(&(16 + body.len() as u64).to_le_bytes());
-            out.extend_from_slice(&level.to_le_bytes());
-            out.extend_from_slice(&ty.to_le_bytes());
-            out.extend_from_slice(&body);
-            out.resize(out.len().next_multiple_of(8), 0);
-        }
+        #[cfg(unix)]
+        let out = self.guest_control(cmsgs, flags as i32 & MSG_CMSG_CLOEXEC != 0)?;
+        #[cfg(not(unix))]
+        let out: Vec<u8> = Vec::new();
         let written = out.len().min(controllen as usize);
         if written > 0 {
             mem::write(data, control, &out[..written])?;
@@ -661,7 +662,7 @@ impl Process {
             let mut revents = vec![0i16; fds.len()];
             // Host descriptors (sockets, others passed in), polled on the host:
             // (index, descriptor), and what keeps each open meanwhile.
-            let mut host: Vec<(usize, std::os::fd::RawFd)> = Vec::new();
+            let mut host: Vec<(usize, Pollable)> = Vec::new();
             let mut keep: Vec<Arc<dyn std::any::Any + Send + Sync>> = Vec::new();
             for (k, &(fd, events)) in fds.iter().enumerate() {
                 if fd < 0 {
@@ -673,13 +674,15 @@ impl Process {
                 };
                 match &*d.open.lock().unwrap() {
                     Open::Socket(s) => {
-                        host.push((k, std::os::fd::AsRawFd::as_raw_fd(&s.sock)));
+                        host.push((k, pollable(&s.sock)));
                         keep.push(s.clone());
                     }
+                    #[cfg(unix)]
                     Open::Host(h) => {
                         host.push((k, std::os::fd::AsRawFd::as_raw_fd(&h.fd)));
                         keep.push(h.clone());
                     }
+                    // (Other host handles on Windows: always ready.)
                     Open::Unix(u) => {
                         let (r, w, hup) = u.readiness();
                         let mut ev = 0;
@@ -727,21 +730,9 @@ impl Process {
                 left.min(Duration::from_millis(50))
             };
             if !host.is_empty() {
-                let mut pfds: Vec<libc::pollfd> = host
-                    .iter()
-                    .map(|&(k, fd)| libc::pollfd {
-                        fd,
-                        events: fds[k].1 & (POLLIN | POLLOUT),
-                        revents: 0,
-                    })
-                    .collect();
-                // SAFETY: pfds is a valid array of pollfd for its length.
-                let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, wait.as_millis() as i32) };
-                if n < 0 {
-                    return Err(errno(&std::io::Error::last_os_error()));
-                }
-                for ((k, _), p) in host.iter().zip(&pfds) {
-                    revents[*k] = p.revents;
+                let wanted: Vec<(Pollable, i16)> = host.iter().map(|&(k, fd)| (fd, fds[k].1 & (POLLIN | POLLOUT))).collect();
+                for ((k, _), r) in host.iter().zip(host_poll(&wanted, wait)?) {
+                    revents[*k] = r;
                 }
                 drop(keep);
             } else if !others_ready && !wait.is_zero() {
@@ -1062,6 +1053,7 @@ const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 
 /// A control message received: descriptors passed (SCM_RIGHTS), or another
 /// kind's bytes.
+#[cfg(unix)]
 enum Cmsg {
     Fds(Vec<std::os::fd::OwnedFd>),
     Raw(Vec<u8>),
@@ -1069,9 +1061,11 @@ enum Cmsg {
 
 /// Received: bytes, the sender's address, control messages (level, type,
 /// body) and the message flags.
+#[cfg(unix)]
 type Received = (usize, Option<SockAddr>, Vec<(i32, i32, Cmsg)>, i32);
 
 /// sendmsg on the host with `fds` passed in one SCM_RIGHTS message.
+#[cfg(unix)]
 fn send_with_fds(s: &Socket, bytes: &[u8], to: Option<&SockAddr>, fds: &[std::os::fd::OwnedFd], flags: i32) -> SysResult<i64> {
     use std::os::fd::AsRawFd;
     let data_len = (fds.len() * 4) as u32;
@@ -1112,6 +1106,7 @@ fn send_with_fds(s: &Socket, bytes: &[u8], to: Option<&SockAddr>, fds: &[std::os
 /// recvmsg on the host with room for `control_len` bytes of control
 /// messages. Descriptors received are close-on-exec on the host (the
 /// guest's own flag is separate).
+#[cfg(unix)]
 fn recv_with_control(s: &Socket, buf: &mut [u8], control_len: usize, flags: i32) -> std::io::Result<Received> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let mut control = vec![0u64; control_len.div_ceil(8)];
@@ -1167,6 +1162,7 @@ fn recv_with_control(s: &Socket, buf: &mut [u8], control_len: usize, flags: i32)
 }
 
 /// A host file's identity (device, inode).
+#[cfg(unix)]
 fn file_key(fd: &std::os::fd::OwnedFd) -> SysResult<(u64, u64)> {
     // SAFETY: fstat fills `st`.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1181,6 +1177,7 @@ fn file_key(fd: &std::os::fd::OwnedFd) -> SysResult<(u64, u64)> {
 /// guest process: a token file's identity → the open file description.
 /// The receiver trades the token for the object (`adopt`), so both share
 /// it, as descriptors passed between processes do.
+#[cfg(unix)]
 static TOKENS: std::sync::LazyLock<Mutex<std::collections::HashMap<(u64, u64), Arc<Mutex<Open>>>>> =
     std::sync::LazyLock::new(Default::default);
 
@@ -1191,12 +1188,33 @@ fn token(open: Arc<Mutex<Open>>) -> SysResult<std::os::fd::OwnedFd> {
     Ok(fd)
 }
 
-#[cfg(not(unix))]
-fn token(_open: Arc<Mutex<Open>>) -> SysResult<std::os::fd::OwnedFd> {
-    Err(95) // EOPNOTSUPP
-}
-
+#[cfg(unix)]
 impl Process {
+    /// Control messages received on a host socket, in the guest's layout (the
+    /// host's, on 64-bit Linux), with passed descriptors installed as the
+    /// guest's.
+    fn guest_control(&self, cmsgs: Vec<(i32, i32, Cmsg)>, cloexec: bool) -> SysResult<Vec<u8>> {
+        let mut out = Vec::new();
+        for (level, ty, body) in cmsgs {
+            let body = match body {
+                Cmsg::Fds(fds) => {
+                    let mut guest = Vec::new();
+                    for host in fds {
+                        guest.extend_from_slice(&(self.adopt(host, cloexec)? as i32).to_le_bytes());
+                    }
+                    guest
+                }
+                Cmsg::Raw(bytes) => bytes,
+            };
+            out.extend_from_slice(&(16 + body.len() as u64).to_le_bytes());
+            out.extend_from_slice(&level.to_le_bytes());
+            out.extend_from_slice(&ty.to_le_bytes());
+            out.extend_from_slice(&body);
+            out.resize(out.len().next_multiple_of(8), 0);
+        }
+        Ok(out)
+    }
+
     /// The descriptors of the SCM_RIGHTS messages in a guest control buffer,
     /// as host descriptors to pass.
     fn passed_fds(&self, data: &[u8], control: u64, len: u64) -> SysResult<Vec<std::os::fd::OwnedFd>> {
@@ -1334,11 +1352,84 @@ pub fn send(s: &GuestSocket, buf: &[u8]) -> SysResult<i64> {
 
 /// Bytes waiting to be read (FIONREAD).
 pub fn pending(s: &GuestSocket) -> SysResult<usize> {
-    let mut n: libc::c_int = 0;
-    // SAFETY: FIONREAD writes one int.
-    let r = unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&s.sock), libc::FIONREAD, &mut n) };
-    if r < 0 {
-        return Err(errno(&std::io::Error::last_os_error()));
+    #[cfg(unix)]
+    {
+        let mut n: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int.
+        let r = unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&s.sock), libc::FIONREAD, &mut n) };
+        if r < 0 {
+            return Err(errno(&std::io::Error::last_os_error()));
+        }
+        Ok(n.max(0) as usize)
     }
-    Ok(n.max(0) as usize)
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Networking::WinSock::{FIONREAD, ioctlsocket};
+        let mut n: u32 = 0;
+        // SAFETY: FIONREAD writes one u_long.
+        let r = unsafe { ioctlsocket(std::os::windows::io::AsRawSocket::as_raw_socket(&s.sock) as usize, FIONREAD, &mut n) };
+        if r != 0 {
+            return Err(errno(&std::io::Error::last_os_error()));
+        }
+        Ok(n as usize)
+    }
+}
+
+/// A host descriptor to poll: a file descriptor on Unix hosts, a socket on
+/// Windows.
+#[cfg(unix)]
+type Pollable = std::os::fd::RawFd;
+#[cfg(windows)]
+type Pollable = std::os::windows::io::RawSocket;
+
+fn pollable(s: &Socket) -> Pollable {
+    #[cfg(unix)]
+    return std::os::fd::AsRawFd::as_raw_fd(s);
+    #[cfg(windows)]
+    return std::os::windows::io::AsRawSocket::as_raw_socket(s);
+}
+
+/// Polls host descriptors for (Linux's) POLLIN and POLLOUT, waiting up to
+/// `wait`: their revents, in Linux's bits.
+fn host_poll(fds: &[(Pollable, i16)], wait: Duration) -> SysResult<Vec<i16>> {
+    #[cfg(unix)]
+    {
+        let mut pfds: Vec<libc::pollfd> = fds.iter().map(|&(fd, events)| libc::pollfd { fd, events, revents: 0 }).collect();
+        // SAFETY: pfds is a valid array of pollfd for its length.
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, wait.as_millis() as i32) };
+        if n < 0 {
+            return Err(errno(&std::io::Error::last_os_error()));
+        }
+        Ok(pfds.iter().map(|p| p.revents).collect())
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Networking::WinSock::{POLLERR, POLLHUP, POLLNVAL, POLLRDNORM, POLLWRNORM, WSAPOLLFD, WSAPoll};
+        // Winsock's bits are its own.
+        let (linux_in, linux_out, linux_err, linux_hup, linux_nval) = (1i16, 4i16, 8i16, 16i16, 32i16);
+        let mut pfds: Vec<WSAPOLLFD> = fds
+            .iter()
+            .map(|&(fd, events)| WSAPOLLFD {
+                fd: fd as usize,
+                events: (if events & linux_in != 0 { POLLRDNORM } else { 0 }) | (if events & linux_out != 0 { POLLWRNORM } else { 0 }),
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: pfds is a valid array of WSAPOLLFD for its length.
+        let n = unsafe { WSAPoll(pfds.as_mut_ptr(), pfds.len() as u32, wait.as_millis() as i32) };
+        if n < 0 {
+            return Err(errno(&std::io::Error::last_os_error()));
+        }
+        Ok(pfds
+            .iter()
+            .map(|p| {
+                let r = p.revents;
+                (if r & POLLRDNORM != 0 { linux_in } else { 0 })
+                    | (if r & POLLWRNORM != 0 { linux_out } else { 0 })
+                    | (if r & POLLERR != 0 { linux_err } else { 0 })
+                    | (if r & POLLHUP != 0 { linux_hup } else { 0 })
+                    | (if r & POLLNVAL != 0 { linux_nval } else { 0 })
+            })
+            .collect())
+    }
 }

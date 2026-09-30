@@ -10,6 +10,7 @@
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
@@ -20,9 +21,10 @@ use crate::memory::SysResult;
 
 /// A shared mapping of [start, end): `file` from `offset`.
 #[derive(Clone)]
+#[cfg_attr(not(unix), allow(dead_code))] // (Windows: no shared mappings yet.)
 pub struct SharedMap {
     pub end: u64,
-    pub file: Arc<OwnedFd>,
+    pub file: Arc<crate::fs::HostDescriptor>,
     pub offset: u64,
     pub writable: bool,
 }
@@ -69,6 +71,7 @@ pub fn unmap(base: *mut u8, addr: u64, len: u64) -> SysResult<()> {
 
 /// Removes [start, end) from `maps`, keeping the parts of mappings outside
 /// it. Returns whether any overlapped (the caller then unmaps the range).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn remove(maps: &mut SharedMaps, start: u64, end: u64) -> bool {
     let overlapping: Vec<u64> = maps.range(..end).filter(|(_, m)| m.end > start).map(|(&s, _)| s).collect();
     for s in &overlapping {

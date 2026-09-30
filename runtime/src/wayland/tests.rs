@@ -2,11 +2,10 @@
 //! sockets: no host display, no host Wayland.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use super::protocol::{Value, encode};
 use super::*;
-use crate::unix::{Name, Names, Passed, UnixSocket};
+use crate::unix::{Name, Names, UnixSocket};
 
 fn never() -> bool {
     false
@@ -70,8 +69,11 @@ fn a_client_sees_the_globals() {
     assert_eq!(globals, 9);
 }
 
+#[cfg(unix)] // (a pool in a temporary file: shared::anonymous_file)
 #[test]
 fn a_toplevel_shows_its_buffer() {
+    use crate::unix::Passed;
+    use std::sync::atomic::Ordering;
     let (headless, _comp, mut c) = connect();
     c.send(1, 1, vec![Value::NewId(2)]);
     // Bind wl_compositor (1), wl_shm (3), xdg_wm_base (6).

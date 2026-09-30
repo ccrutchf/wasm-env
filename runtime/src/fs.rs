@@ -418,34 +418,48 @@ pub enum Open {
     /// A host descriptor of a kind the runtime doesn't model itself (a pipe,
     /// a device), passed to the guest by another process: read, write and
     /// poll go to the host.
+    #[cfg_attr(not(unix), allow(dead_code))] // (Only Unix hosts pass descriptors.)
     Host(Arc<HostFd>),
 }
 
+/// A host descriptor: a file descriptor on Unix hosts, a handle on Windows.
+#[cfg(unix)]
+pub type HostDescriptor = std::os::fd::OwnedFd;
+#[cfg(windows)]
+pub type HostDescriptor = std::os::windows::io::OwnedHandle;
+
 /// A host descriptor behind `Open::Host`. Like a socket, it blocks or not as
-/// the guest descriptor's O_NONBLOCK says at each call.
+/// the guest descriptor's O_NONBLOCK says at each call (on Unix hosts).
 pub struct HostFd {
-    pub fd: std::os::fd::OwnedFd,
+    pub fd: HostDescriptor,
     nonblocking: Mutex<bool>,
 }
 
 impl HostFd {
     /// Blocking or not as the host descriptor is now.
-    pub fn new(fd: std::os::fd::OwnedFd) -> Self {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn new(fd: HostDescriptor) -> Self {
+        #[cfg(unix)]
         let nonblocking = crate::net::host_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&fd));
+        #[cfg(not(unix))]
+        let nonblocking = false;
         HostFd { fd, nonblocking: Mutex::new(nonblocking) }
     }
 
     fn blocking(&self, nonblock: bool) -> SysResult<()> {
-        use std::os::fd::AsRawFd;
         let mut current = self.nonblocking.lock().unwrap();
         if *current != nonblock {
-            let fd = self.fd.as_raw_fd();
-            // SAFETY: fcntl on a descriptor this owns.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            let flags = if nonblock { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
-            // SAFETY: as above.
-            if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
-                return Err(errno(&std::io::Error::last_os_error()));
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                let fd = self.fd.as_raw_fd();
+                // SAFETY: fcntl on a descriptor this owns.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                let flags = if nonblock { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
+                // SAFETY: as above.
+                if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+                    return Err(errno(&std::io::Error::last_os_error()));
+                }
             }
             *current = nonblock;
         }
@@ -454,16 +468,34 @@ impl HostFd {
 
     pub fn read(&self, buf: &mut [u8], nonblock: bool) -> SysResult<i64> {
         self.blocking(nonblock)?;
-        // SAFETY: reads into `buf`, which has room for its length.
-        let n = unsafe { libc::read(std::os::fd::AsRawFd::as_raw_fd(&self.fd), buf.as_mut_ptr().cast(), buf.len()) };
-        if n < 0 { Err(errno(&std::io::Error::last_os_error())) } else { Ok(n as i64) }
+        #[cfg(unix)]
+        {
+            // SAFETY: reads into `buf`, which has room for its length.
+            let n = unsafe { libc::read(std::os::fd::AsRawFd::as_raw_fd(&self.fd), buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 { Err(errno(&std::io::Error::last_os_error())) } else { Ok(n as i64) }
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Read;
+            let mut file = std::fs::File::from(self.fd.try_clone().map_err(|e| errno(&e))?);
+            file.read(buf).map(|n| n as i64).map_err(|e| errno(&e))
+        }
     }
 
     pub fn write(&self, buf: &[u8], nonblock: bool) -> SysResult<i64> {
         self.blocking(nonblock)?;
-        // SAFETY: writes from `buf`.
-        let n = unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&self.fd), buf.as_ptr().cast(), buf.len()) };
-        if n < 0 { Err(errno(&std::io::Error::last_os_error())) } else { Ok(n as i64) }
+        #[cfg(unix)]
+        {
+            // SAFETY: writes from `buf`.
+            let n = unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&self.fd), buf.as_ptr().cast(), buf.len()) };
+            if n < 0 { Err(errno(&std::io::Error::last_os_error())) } else { Ok(n as i64) }
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::from(self.fd.try_clone().map_err(|e| errno(&e))?);
+            file.write(buf).map(|n| n as i64).map_err(|e| errno(&e))
+        }
     }
 
     pub fn metadata(&self) -> std::io::Result<std::fs::Metadata> {

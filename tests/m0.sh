@@ -19,7 +19,8 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
 	packages/busybox/build.sh >/dev/null 2>&1
 fi
 
-wasm_env=$root/target/release/wasm-env
+# (WASM_ENV_RUNTIME: another build of the runtime, e.g. Windows' under Wine.)
+wasm_env=${WASM_ENV_RUNTIME:-$root/target/release/wasm-env}
 rootfs=$root/build/test-rootfs
 rm -rf "$rootfs"
 mkdir -p "$rootfs"/{etc,root,tmp,usr/share}

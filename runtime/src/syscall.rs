@@ -371,6 +371,7 @@ fn mremap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
     let (old, old_len, new_len) = (old as u64, page_align(old_len as u64), page_align(new_len as u64));
     // A whole shared mapping (in host pages: see mmap) moves to host pages.
     let page = mem::host_page();
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let (new, new_len, top, whole) = {
         let mut mm = caller.data().group.mm.lock().unwrap();
         if !mm.space.contains(old, old_len) {
@@ -1644,6 +1645,7 @@ impl Process {
     /// for the root directory, reported as ext4.
     fn statfs(&self) -> [u8; 120] {
         let mut b = [0u8; 120];
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut words = [0xef53u64, 4096, 0, 0, 0, 0, 0]; // type, bsize, blocks, bfree, bavail, files, ffree
         #[cfg(unix)]
         {
@@ -1757,6 +1759,7 @@ impl Process {
     /// A host descriptor for what the guest's `fd` refers to (a duplicate),
     /// if it is a host object: to map it shared, or pass it to another
     /// process. EACCES for the runtime's own objects (pipes, eventfds...).
+    #[cfg(unix)]
     pub fn host_file(&self, fd: i64) -> SysResult<std::os::fd::OwnedFd> {
         let open = self.fds.get(fd)?.open.clone();
         let open = open.lock().unwrap();

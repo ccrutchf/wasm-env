@@ -4,11 +4,13 @@
 //! foreground process group (see Kernel::foreground), not to wasm-env.
 
 use std::sync::Arc;
+#[cfg_attr(not(unix), allow(unused_imports))]
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::kernel::Kernel;
 
 /// The last terminal signal the host received (0: none).
+#[cfg_attr(not(unix), allow(dead_code))]
 static RECEIVED: AtomicI32 = AtomicI32::new(0);
 
 pub struct Terminal {

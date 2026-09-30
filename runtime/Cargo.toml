@@ -26,3 +26,7 @@ softbuffer = "0.4"
 # Code a program generates at run time is translated in-process (see
 # translate::ensure_code).
 wasm-env-translate = { path = "../translator", features = ["lift"] }
+
+# Windows hosts: polling sockets (WSAPoll), bytes pending (ioctlsocket).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_Memory"] }

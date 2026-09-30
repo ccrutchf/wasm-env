@@ -58,19 +58,39 @@ translated program, `--trace`'s last lines) is what's needed to fix it.
 
 ## Windows (x86-64)
 
-Status: the translator compiles for `x86_64-pc-windows-gnu`; the runtime
-doesn't yet (it uses Unix descriptors and system calls throughout: the
-Windows port is still to do, see PLAN.md, M8's portability debt). The
-cross-check, on Linux, is how to see what's left:
+Status: the runtime and translator build for `x86_64-pc-windows-gnu`
+(cross-compiled on Linux with MinGW's gcc), and the runtime runs under Wine:
+its unit tests (67; the few that need a Unix host are left out), M1's 34
+checks (processes, a shell, pipes, sockets, networking) and 18 of M0's 20;
+and it translates arm64 programs itself, with LLVM's Windows build as the
+toolchain (M2's `hello`, translated and run on first use). Not yet:
+
+- **Symlinks** in an environment: the runtime follows them itself, reading
+  them as the host stores them; under Wine a Linux symlink can't be read,
+  so an absolute one reaches the host's file (M0's two failures). How an
+  environment's symlinks should be stored on Windows is still open.
+- **Shared mappings** (`MAP_SHARED` is a copy on Windows), and with them
+  graphical programs' buffers: the compositor reads the files clients draw
+  into, which their writes don't reach. Windows' placeholder mappings
+  (`MapViewOfFile3`) could place a file view inside the memory reservation.
+- A native Windows build (MSVC) hasn't been tried.
+
+**The toolchain on Windows.** Translation runs `clang.exe` and
+`wasm-ld.exe` from the directory `WASM_ENV_TOOLCHAIN` names (else
+`..\lib\wasm-env\toolchain` beside `wasm-env.exe`), laid out as
+`bin\clang.exe`, `bin\wasm-ld.exe`, `lib\clang\21\include\` (clang's own
+headers) and `lib\libclang_rt.builtins.a` (compiler-rt's builtins for
+wasm64: WebAssembly, so the flake's `builtins` package, built anywhere,
+serves). The first three come from LLVM's release for Windows
+(`clang+llvm-21.1.8-x86_64-pc-windows-msvc.tar.xz`).
+
+On Linux, `tests/cross.sh` checks that everything compiles for macOS and
+Windows, with no warnings; `tests/cross.sh --build` also builds the Windows
+executables and makes `build/wine-wasm-env`, which runs them under Wine:
 
 ```
-export RUSTUP_HOME=$PWD/build/rustup CARGO_HOME=$PWD/build/cargo-home CARGO_TARGET_DIR=$PWD/build/target-cross
-rustup toolchain install 1.98.1 --target x86_64-pc-windows-gnu --target aarch64-apple-darwin
-cargo +1.98.1 check --release --target x86_64-pc-windows-gnu --workspace
+tests/cross.sh --build
+WASM_ENV_RUNTIME=$PWD/build/wine-wasm-env SKIP_BUILD=1 tests/m1.sh
+build/wine-wasm-env run --root build/m2 build/m2/hello.wasm a b
+WASM_ENV_TOOLCHAIN='Z:\path\to\win-toolchain' build/wine-wasm-env run --root 'Z:\path\to\root' /hello
 ```
-
-(crates with C code need a C compiler for the target: zig works, as
-`CC_x86_64_pc_windows_gnu="zig cc -target x86_64-windows-gnu"`, and for
-bad64's bindings `BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu` pointing
-at zig's `libc/include/any-windows-any`; the same for
-`aarch64-apple-darwin` with zig's `any-darwin-any`.)

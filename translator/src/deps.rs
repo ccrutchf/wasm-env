@@ -256,6 +256,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // (makes symlinks)
     #[test]
     fn realpath_follows_symlinks_inside_the_root() {
         let root = std::env::temp_dir().join(format!("wasm-env-deps-test-{}", std::process::id()));

@@ -53,7 +53,7 @@ fn translator() -> PathBuf {
         return PathBuf::from(p);
     }
     if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.with_file_name("wasm-env-translate");
+        let sibling = exe.with_file_name(format!("wasm-env-translate{}", std::env::consts::EXE_SUFFIX));
         if sibling.exists() {
             return sibling;
         }
@@ -440,9 +440,13 @@ pub fn ensure_code(bytes: &[u8], base: u64, roots: &[u64], direct: bool, root: &
 /// noticeable part of starting up, so the result is remembered in `dir`
 /// against the file's size, mtime and inode, and recomputed when they change.
 fn library_identity(path: &Path, dir: &Path) -> SysResult<(u64, u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).map_err(|e| crate::fs::errno(&e))?;
-    let stamp = format!("{} {} {} {}", meta.size(), meta.mtime(), meta.mtime_nsec(), meta.ino());
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).unwrap_or_default();
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let ino = 0; // (the path and the rest identify it)
+    let stamp = format!("{} {} {} {}", meta.len(), mtime.as_secs(), mtime.subsec_nanos(), ino);
     let memo = dir.join(format!("{:016x}.identity", hash(path.as_os_str().as_encoded_bytes())));
     if let Ok(text) = std::fs::read_to_string(&memo)
         && let Some((recorded, rest)) = text.trim_end().rsplit_once(' ').and_then(|(a, extent)| {
@@ -451,7 +455,7 @@ fn library_identity(path: &Path, dir: &Path) -> SysResult<(u64, u64, u64)> {
         })
         && recorded == stamp
     {
-        return Ok((rest.0, meta.size(), rest.1));
+        return Ok((rest.0, meta.len(), rest.1));
     }
     let bytes = std::fs::read(path).map_err(|e| crate::fs::errno(&e))?;
     let extent = library_extent(&bytes).ok_or(ENOEXEC)?;

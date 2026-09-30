@@ -182,9 +182,12 @@ fn main() -> Result<()> {
     let env: Vec<Vec<u8>> = env.into_iter().map(String::into_bytes).collect();
     let root = root.canonicalize().with_context(|| format!("root directory {}", root.display()))?;
     if graphical {
-        use std::os::unix::fs::DirBuilderExt;
         let dir = root.join(GUEST_RUNTIME_DIR.trim_start_matches('/'));
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let rest: Vec<String> = args.collect();
 
