@@ -833,7 +833,10 @@ fn read_buffer(b: &Buffer) -> (u32, u32, Vec<u32>) {
     let (w, h) = (b.width.max(0) as usize, b.height.max(0) as usize);
     let stride = (b.stride.max(0) as usize).max(w * 4);
     let mut bytes = vec![0u8; stride * h];
-    if let Open::File { file, .. } = &*b.pool.open.lock().unwrap() {
+    // Where shared mappings are copies (shared::host_mappings), the client
+    // drew into its copy: read from there.
+    if crate::shared::read_copy(&b.pool.open, b.offset as u64, &mut bytes) {
+    } else if let Open::File { file, .. } = &*b.pool.open.lock().unwrap() {
         let mut done = 0;
         while done < bytes.len() {
             #[cfg(unix)]

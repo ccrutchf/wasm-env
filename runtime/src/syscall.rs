@@ -208,11 +208,8 @@ fn load_library(caller: &mut Caller<'_, Process>, fd: i64, range: u64) -> SysRes
 
 const MAP_FIXED: i64 = 0x10;
 const MAP_ANONYMOUS: i64 = 0x20;
-#[cfg(unix)]
 const MAP_TYPE: i64 = 0xf;
-#[cfg(unix)]
 const MAP_SHARED: i64 = 0x01;
-#[cfg(unix)]
 const MAP_SHARED_VALIDATE: i64 = 0x03;
 #[cfg(unix)]
 const PROT_WRITE: i64 = 0x2;
@@ -267,10 +264,9 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
     // A shared mapping is the host's, made of its pages (larger than the
     // guest's on Apple silicon): it starts at a host page boundary, and is
     // as long.
-    #[cfg(unix)]
-    let shared = flags & MAP_TYPE == MAP_SHARED || flags & MAP_TYPE == MAP_SHARED_VALIDATE;
-    #[cfg(not(unix))]
-    let shared = false;
+    // (Where the host can't, a copy: see shared::host_mappings.)
+    let shared_asked = flags & MAP_TYPE == MAP_SHARED || flags & MAP_TYPE == MAP_SHARED_VALIDATE;
+    let shared = shared_asked && crate::shared::host_mappings();
     let align = if shared { mem::host_page() } else { abi::PAGE_SIZE };
     let len = len.next_multiple_of(align);
     let (addr, top) = {
@@ -304,7 +300,7 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
         if crate::shared::remove(&mut process.group.mm.lock().unwrap().shared, addr, addr + len) {
             crate::shared::unmap(base, addr, len)?;
         }
-        if flags & MAP_TYPE == MAP_SHARED || flags & MAP_TYPE == MAP_SHARED_VALIDATE {
+        if shared {
             let (file, offset) = if flags & MAP_ANONYMOUS != 0 {
                 (crate::shared::anonymous(len)?, 0)
             } else {
@@ -320,12 +316,13 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
             return Ok(addr as i64);
         }
     }
+    crate::shared::uncopied(&process.group, addr, addr + len);
     mem::zero(data, addr, len)?;
     let range = mem::slice_mut(data, addr, len)?;
     if flags & MAP_ANONYMOUS == 0 {
-        // File mapping: copy the contents in (docs/abi.md; read-only for now).
-        let open = process.fds.get(fd)?.open.clone();
-        let mut open = open.lock().unwrap();
+        // File mapping: copy the contents in (docs/abi.md).
+        let description = process.fds.get(fd)?.open.clone();
+        let mut open = description.lock().unwrap();
         let Open::File { file, .. } = &mut *open else { return Err(EACCES) };
         let pos = file.stream_position().map_err(|e| fs::errno(&e))?;
         file.seek(SeekFrom::Start(off as u64)).map_err(|e| fs::errno(&e))?;
@@ -338,6 +335,11 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
             }
         }
         file.seek(SeekFrom::Start(pos)).map_err(|e| fs::errno(&e))?;
+        drop(open);
+        // A shared mapping the host couldn't make: the copy is recorded.
+        if shared_asked {
+            crate::shared::copied(&description, off as u64, addr, len, &process.group);
+        }
     }
     Ok(addr as i64)
 }
@@ -409,6 +411,7 @@ fn mremap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
             return Err(EINVAL);
         }
     }
+    crate::shared::uncopied(&process.group, old, old + old_len);
     let keep = old_len.min(new_len) as usize;
     data.copy_within(old as usize..old as usize + keep, new as usize);
     mem::zero(data, new + keep as u64, new_len - keep as u64)?;
@@ -494,7 +497,7 @@ impl Process {
                 let path = mem::cstr(data, ub)?;
                 let dir = self.dir_of(a)?;
                 let guest = self.fs.resolve(&dir, &path, false)?;
-                let target = std::fs::read_link(self.fs.host(&guest)).map_err(|e| match fs::errno(&e) {
+                let target = fs::links::read(&self.fs.host(&guest)).map_err(|e| match fs::errno(&e) {
                     ENOENT => ENOENT,
                     _ => EINVAL,
                 })?;
@@ -685,7 +688,7 @@ impl Process {
                 let dir = self.dir_of(a)?;
                 let guest = self.fs.resolve(&dir, &path, d & AT_SYMLINK_NOFOLLOW == 0)?;
                 let host = self.fs.host(&guest);
-                if d & AT_SYMLINK_NOFOLLOW != 0 && host.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+                if d & AT_SYMLINK_NOFOLLOW != 0 && host.symlink_metadata().is_ok_and(|m| fs::links::is_link(&host, &m)) {
                     // A symlink's own times (dpkg sets them on links it unpacks,
                     // whose targets may not exist yet): not kept.
                     return Ok(0);
@@ -1101,6 +1104,7 @@ impl Process {
             }
             nr::MUNMAP => {
                 let len = page_align(ub);
+                crate::shared::uncopied(&self.group, ua, ua + len);
                 let mut mm = self.group.mm.lock().unwrap();
                 #[cfg(unix)]
                 if crate::shared::remove(&mut mm.shared, ua, ua + len) {
@@ -1527,7 +1531,7 @@ impl Process {
         let host = self.fs.host(&guest);
         let access = flags & o::ACCMODE;
         let meta = std::fs::symlink_metadata(&host).ok();
-        if meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+        if meta.as_ref().is_some_and(|m| fs::links::is_link(&host, m)) {
             return Err(ELOOP); // O_NOFOLLOW on a symlink
         }
         let open = if meta.as_ref().is_some_and(|m| m.is_dir()) {
@@ -1685,8 +1689,16 @@ impl Process {
             None => {}
         }
         let guest = self.fs.resolve(&dir, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-        let meta = std::fs::symlink_metadata(self.fs.host(&guest)).map_err(|e| fs::errno(&e))?;
+        let host = self.fs.host(&guest);
+        let meta = std::fs::symlink_metadata(&host).map_err(|e| fs::errno(&e))?;
         let mut st = fs::stat_bytes(&meta);
+        // A link file (Windows hosts: fs::links): a symlink, as long as its target.
+        if !meta.file_type().is_symlink() && fs::links::is_link(&host, &meta) {
+            const S_IFLNK: u32 = 0o120000;
+            let len = fs::links::read(&host).map_or(0, |t| t.as_os_str().len() as u64);
+            st[16..20].copy_from_slice(&(S_IFLNK | 0o777).to_le_bytes());
+            st[48..56].copy_from_slice(&len.to_le_bytes());
+        }
         // A Unix socket's file (unix.rs): a socket, as on Linux.
         if self.kernel.unix.is_socket_path(&guest) {
             const S_IFSOCK: u32 = 0o140000;
@@ -1951,16 +1963,9 @@ fn timespec(t: Duration) -> [u8; 16] {
     ts
 }
 
-#[cfg(unix)]
+/// A symlink in the environment (fs::links: a link file on Windows).
 fn symlink(target: &str, link: &std::path::Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(windows)]
-fn symlink(target: &str, link: &std::path::Path) -> std::io::Result<()> {
-    // Windows needs to know the target's type; guest targets may be
-    // absolute guest paths, so assume a file.
-    std::os::windows::fs::symlink_file(target, link)
+    fs::links::create(target, link)
 }
 
 #[cfg(unix)]

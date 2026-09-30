@@ -202,3 +202,63 @@ mod tests {
         unsafe { libc::munmap(base.cast(), len) };
     }
 }
+
+// --- Shared mappings as copies --------------------------------------------
+
+/// Whether shared mappings are the host's: on Unix hosts, unless
+/// WASM_ENV_NO_SHARED_MAPPINGS is set (to test the other way on Linux).
+/// Elsewhere (Windows, whose file views can't go inside wasmtime's memory
+/// reservation) a shared file mapping is a copy, recorded (see `copied`)
+/// so the compositor reads a client's buffers from it rather than from the
+/// file its writes don't reach.
+pub fn host_mappings() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| cfg!(unix) && std::env::var_os("WASM_ENV_NO_SHARED_MAPPINGS").is_none());
+    *ON
+}
+
+/// A shared file mapping made as a copy: [addr, addr + len) of a process's
+/// memory holds `file` from `offset`.
+struct Copy {
+    file: std::sync::Weak<std::sync::Mutex<crate::fs::Open>>,
+    offset: u64,
+    addr: u64,
+    len: u64,
+    group: std::sync::Weak<crate::thread::Group>,
+}
+
+static COPIES: std::sync::Mutex<Vec<Copy>> = std::sync::Mutex::new(Vec::new());
+
+/// Records a copy made for a shared mapping.
+pub fn copied(file: &Arc<std::sync::Mutex<crate::fs::Open>>, offset: u64, addr: u64, len: u64, group: &Arc<crate::thread::Group>) {
+    let mut copies = COPIES.lock().unwrap();
+    copies.retain(|c| c.file.strong_count() > 0 && c.group.strong_count() > 0);
+    copies.push(Copy { file: Arc::downgrade(file), offset, addr, len, group: Arc::downgrade(group) });
+}
+
+/// [start, end) of a process's memory no longer holds copies (unmapped, or
+/// mapped over).
+pub fn uncopied(group: &Arc<crate::thread::Group>, start: u64, end: u64) {
+    let mut copies = COPIES.lock().unwrap();
+    copies.retain(|c| !(std::ptr::eq(c.group.as_ptr(), Arc::as_ptr(group)) && c.addr < end && start < c.addr + c.len));
+}
+
+/// Reads `buf.len()` bytes of `file` from `offset` out of a process's copy
+/// of it, if a copy holds them all.
+pub fn read_copy(file: &Arc<std::sync::Mutex<crate::fs::Open>>, offset: u64, buf: &mut [u8]) -> bool {
+    let copies = COPIES.lock().unwrap();
+    let end = offset + buf.len() as u64;
+    for c in copies.iter() {
+        if !std::ptr::eq(c.file.as_ptr(), Arc::as_ptr(file)) || offset < c.offset || end > c.offset + c.len {
+            continue;
+        }
+        let Some(group) = c.group.upgrade() else { continue };
+        let Some(threading) = group.threading.get() else { continue };
+        let data = crate::syscall::shared_bytes(&threading.memory);
+        let at = (c.addr + (offset - c.offset)) as usize;
+        let Some(src) = data.get(at..at + buf.len()) else { continue };
+        buf.copy_from_slice(src);
+        return true;
+    }
+    false
+}

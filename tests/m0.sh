@@ -28,10 +28,12 @@ echo wasm-env > "$rootfs/etc/hostname"
 echo 'root:x:0:0:root:/root:/bin/sh' > "$rootfs/etc/passwd"
 echo 'root:x:0:' > "$rootfs/etc/group"
 printf 'hello\nworld\nhello\nwasm\n' > "$rootfs/usr/share/words"
-ln -s /etc/hostname "$rootfs/root/link-to-hostname"
+
 head -c 1000000 /dev/urandom > "$rootfs/tmp/random.bin"
 
 bb() { "$wasm_env" run --root "$rootfs" build/packages/busybox/busybox.wasm "$@"; }
+# A symlink, made by the guest (so as this host keeps them: fs::links).
+bb ln -s /etc/hostname /root/link-to-hostname
 
 passed=0
 failed=0

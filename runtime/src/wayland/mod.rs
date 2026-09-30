@@ -77,8 +77,14 @@ pub struct Headless {
 
 impl Display for Headless {
     fn open(&self, _: u64, _: &str, _: u32, _: u32) {}
-    fn present(&self, _: u64, _: Frame) {
-        self.frames.fetch_add(1, Ordering::Relaxed);
+    fn present(&self, window: u64, frame: Frame) {
+        let n = self.frames.fetch_add(1, Ordering::Relaxed);
+        // WASM_ENV_DEBUG_WAYLAND: what's drawn, now and then (tests check
+        // that frames hold pictures, not only that there are frames).
+        if n % 60 == 0 && std::env::var_os("WASM_ENV_DEBUG_WAYLAND").is_some() {
+            let drawn = frame.pixels.iter().filter(|&&p| p & 0xff_ffff != 0).count();
+            eprintln!("wasm-env: window {window} frame {n}: {}x{}, {drawn} pixels not black", frame.width * frame.scale, frame.height * frame.scale);
+        }
     }
     fn set_title(&self, _: u64, _: &str) {}
     fn close(&self, _: u64) {}

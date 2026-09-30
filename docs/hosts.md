@@ -60,19 +60,25 @@ translated program, `--trace`'s last lines) is what's needed to fix it.
 
 Status: the runtime and translator build for `x86_64-pc-windows-gnu`
 (cross-compiled on Linux with MinGW's gcc), and the runtime runs under Wine:
-its unit tests (67; the few that need a Unix host are left out), M1's 34
-checks (processes, a shell, pipes, sockets, networking) and 18 of M0's 20;
+its unit tests (68; the few that need a Unix host are left out), M1's 34
+checks (processes, a shell, pipes, sockets, networking) and M0's 20;
 and it translates arm64 programs itself, with LLVM's Windows build as the
-toolchain (M2's `hello`, translated and run on first use). Not yet:
+toolchain (M2's `hello`, translated and run on first use).
 
-- **Symlinks** in an environment: the runtime follows them itself, reading
-  them as the host stores them; under Wine a Linux symlink can't be read,
-  so an absolute one reaches the host's file (M0's two failures). How an
-  environment's symlinks should be stored on Windows is still open.
-- **Shared mappings** (`MAP_SHARED` is a copy on Windows), and with them
-  graphical programs' buffers: the compositor reads the files clients draw
-  into, which their writes don't reach. Windows' placeholder mappings
-  (`MapViewOfFile3`) could place a file view inside the memory reservation.
+**Symlinks** in an environment are link files on Windows (making real ones
+needs privileges): a small file with the System attribute holding a marker
+and the target, which the runtime, the converter and `wasm-env export`
+treat as symlinks (runtime/src/fs.rs, `links`). So an environment for
+Windows must be unpacked on Windows (`wasm-env convert`), not copied from a
+Linux host, whose symlinks Windows can't read.
+
+Not yet:
+
+- **Shared mappings** are copies on Windows (a file view can't be placed
+  inside wasmtime's memory reservation): graphical programs' buffers still
+  work, since the compositor reads a client's copy (`WASM_ENV_NO_SHARED_MAPPINGS=1`
+  tests that on Linux), but two processes don't share memory through a file
+  or `MAP_SHARED | MAP_ANONYMOUS` (Python's multiprocessing uses that).
 - A native Windows build (MSVC) hasn't been tried.
 
 **The toolchain on Windows.** Translation runs `clang.exe` and

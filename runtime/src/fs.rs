@@ -113,12 +113,12 @@ impl Fs {
                 }
                 return Err(ENOENT);
             };
-            if meta.file_type().is_symlink() {
+            if self::links::is_link(&host, &meta) {
                 links += 1;
                 if links > 40 {
                     return Err(ELOOP);
                 }
-                let target = std::fs::read_link(&host).map_err(|e| errno(&e))?;
+                let target = self::links::read(&host).map_err(|e| errno(&e))?;
                 let target = target.to_str().ok_or(EINVAL)?.to_string();
                 parts.pop();
                 if target.starts_with('/') {
@@ -619,7 +619,9 @@ pub fn read_dir(fs: &Fs, guest: &str) -> SysResult<Vec<DirEntry>> {
         let e = e.map_err(|e| errno(&e))?;
         let Ok(meta) = e.path().symlink_metadata() else { continue };
         let Some(name) = e.file_name().to_str().map(String::from) else { continue };
-        entries.push(DirEntry { ino: ino(&meta), dtype: dtype(&meta), name });
+        // (A link file, on Windows: a symlink.)
+        let dtype = if links::is_link(&e.path(), &meta) { 10 } else { dtype(&meta) };
+        entries.push(DirEntry { ino: ino(&meta), dtype, name });
     }
     Ok(entries)
 }
@@ -802,4 +804,96 @@ pub fn statx_from_stat(st: &[u8; 128]) -> [u8; 256] {
         put(&mut x, off, &v.to_le_bytes());
     }
     x
+}
+
+/// Symlinks in an environment, on every host. On Unix hosts they are the
+/// host's. On Windows, where making a symlink needs privileges (an
+/// administrator, or developer mode), a link is a small file with the
+/// System attribute holding MAGIC and its target, as Cygwin's links long
+/// were; a host symlink there reads as a link too.
+pub mod links {
+    use std::fs::Metadata;
+    use std::io::{self, Read, Write};
+    use std::path::{Path, PathBuf};
+
+    pub const MAGIC: &[u8] = b"!<wasm-env symlink>\n";
+
+    /// The longest target a link file holds (Linux's PATH_MAX).
+    const MAX: u64 = 4096;
+
+    /// Makes `link` a symlink to `target` (a guest path, as given).
+    pub fn create(target: &str, link: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        return std::os::unix::fs::symlink(target, link);
+        #[cfg(not(unix))]
+        return create_file(target, link);
+    }
+
+    /// A link file: MAGIC and the target.
+    #[cfg_attr(unix, allow(dead_code))]
+    pub fn create_file(target: &str, link: &Path) -> io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::attributes(&mut options, 0x4); // FILE_ATTRIBUTE_SYSTEM
+        let mut f = options.open(link)?;
+        f.write_all(MAGIC)?;
+        f.write_all(target.as_bytes())
+    }
+
+    /// The target in a link file, if `path` is one.
+    #[cfg_attr(unix, allow(dead_code))]
+    pub fn read_file(path: &Path) -> Option<String> {
+        let mut head = Vec::new();
+        std::fs::File::open(path).ok()?.take(MAGIC.len() as u64 + MAX).read_to_end(&mut head).ok()?;
+        let target = head.strip_prefix(MAGIC)?;
+        String::from_utf8(target.to_vec()).ok()
+    }
+
+    /// Whether the host file `path` (whose own, not followed, metadata is
+    /// `meta`) is a link.
+    pub fn is_link(path: &Path, meta: &Metadata) -> bool {
+        meta.file_type().is_symlink() || (may_be_file(meta) && read_file(path).is_some())
+    }
+
+    /// Whether a file could be a link file: on Windows, a small file with
+    /// the System attribute (so ordinary files are never read to find out).
+    #[allow(unused_variables)]
+    fn may_be_file(meta: &Metadata) -> bool {
+        #[cfg(windows)]
+        return meta.is_file()
+            && meta.len() <= MAGIC.len() as u64 + MAX
+            && std::os::windows::fs::MetadataExt::file_attributes(meta) & 0x4 != 0;
+        #[cfg(not(windows))]
+        false
+    }
+
+    /// A link's target: a host symlink's, or a link file's.
+    pub fn read(path: &Path) -> io::Result<PathBuf> {
+        match std::fs::read_link(path) {
+            Ok(t) => Ok(t),
+            Err(e) => std::fs::symlink_metadata(path)
+                .ok()
+                .filter(may_be_file)
+                .and_then(|_| read_file(path))
+                .map(PathBuf::from)
+                .ok_or(e),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn link_files_hold_their_target() {
+            let dir = std::env::temp_dir().join(format!("wasm-env-links-{}", crate::translate::unique()));
+            std::fs::create_dir_all(&dir).unwrap();
+            create_file("/etc/hostname", &dir.join("l")).unwrap();
+            assert_eq!(read_file(&dir.join("l")).as_deref(), Some("/etc/hostname"));
+            std::fs::write(dir.join("plain"), b"not a link").unwrap();
+            assert_eq!(read_file(&dir.join("plain")), None);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
 }

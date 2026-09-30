@@ -59,10 +59,10 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         let entry = entry?;
         let (src, dst) = (entry.path(), to.join(entry.file_name()));
         let kind = entry.file_type()?;
-        if kind.is_symlink() {
+        if kind.is_symlink() || crate::fs::links::is_link(&src, &entry.metadata()?) {
             let _ = std::fs::remove_file(&dst);
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)?;
+            let target = crate::fs::links::read(&src)?;
+            crate::fs::links::create(&target.to_string_lossy(), &dst)?;
         } else if kind.is_dir() {
             std::fs::create_dir_all(&dst)?;
             copy_tree(&src, &dst)?;
@@ -298,6 +298,16 @@ fn unpack_layer(reader: impl Read, out: &Path) -> Result<()> {
         let dest = out.join(&rel);
         if !kind.is_dir() && dest.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
             let _ = std::fs::remove_file(&dest);
+        }
+        // Symlinks as the environment keeps them on this host (fs::links).
+        if kind == tar::EntryType::Symlink {
+            let target = entry.link_name()?.map(|t| t.to_string_lossy().into_owned()).unwrap_or_default();
+            let dest = out.join(&rel);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            crate::fs::links::create(&target, &dest).with_context(|| format!("unpacking {}", rel.display()))?;
+            continue;
         }
         entry.unpack_in(out).with_context(|| format!("unpacking {}", rel.display()))?;
     }

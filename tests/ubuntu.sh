@@ -181,6 +181,17 @@ if tests/ubuntu-fetch.sh wayland-utils weston gtk-3-examples >/dev/null 2>&1; th
 	}
 	compare "weston-simple-shm draws (the runtime's compositor)" yes \
 		"$(frames 20 "$root/build/wl-shm.log" "$wasm_env" run --wayland=headless --root "$R" --env WAYLAND_DEBUG=1 --env HOME=/root /usr/bin/weston-simple-shm)"
+	# Frames hold the picture, with shared mappings the host's and made as
+	# copies (as on Windows hosts, where the compositor reads a client's
+	# copy).
+	for mappings in shared copies; do
+		copies=()
+		[ "$mappings" = copies ] && copies=(WASM_ENV_NO_SHARED_MAPPINGS=1)
+		drawn=$(env "${copies[@]}" WASM_ENV_DEBUG_WAYLAND=1 timeout 20 "$wasm_env" run --wayland=headless --root "$R" --env HOME=/root \
+			/usr/bin/weston-simple-shm 2>&1 | sed -n 's/.*frame 60: .*, \([0-9]*\) pixels not black/\1/p' | head -1)
+		compare "weston-simple-shm's frames hold its picture (shared mappings: $mappings)" yes \
+			"$([ "${drawn:-0}" -gt 10000 ] && echo yes || echo "no (${drawn:-no frame 60})")"
+	done
 	compare "gtk3-widget-factory draws (the runtime's compositor)" yes \
 		"$(frames 20 "$root/build/wl-gtk.log" "$wasm_env" run --wayland=headless --root "$R" --env WAYLAND_DEBUG=1 --env HOME=/root /usr/bin/gtk3-widget-factory)"
 	# Then the optional path, where the host has a compositor: forwarded to

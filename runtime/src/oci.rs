@@ -66,6 +66,14 @@ fn append_tree<W: Write>(tar: &mut tar::Builder<W>, root: &Path, dir: &Path) -> 
         if kind.is_dir() {
             tar.append_dir(rel, &path)?;
             append_tree(tar, root, &path)?;
+        } else if !kind.is_symlink() && crate::fs::links::is_link(&path, &e.metadata()?) {
+            // A link file (Windows hosts: fs::links): archived as the symlink.
+            let target = crate::fs::links::read(&path)?;
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            header.set_size(0);
+            tar.append_link(&mut header, rel, &target).with_context(|| format!("archiving {}", path.display()))?;
         } else if kind.is_file() || kind.is_symlink() {
             tar.append_path_with_name(&path, rel).with_context(|| format!("archiving {}", path.display()))?;
         }
