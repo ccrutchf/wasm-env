@@ -19,7 +19,7 @@ use crate::thread::{Group, GroupEnd};
 const MASK_BITS: u32 = 38;
 /// Our changes to Cranelift's code generation (vendor/cranelift-codegen):
 /// part of a compiled module's cache stamp.
-const CODEGEN: &str = "tail-no-callee-saves";
+const CODEGEN: &str = "tail-no-callee-saves,entry-heap-base";
 
 /// Number of signals, plus one so signal numbers can index directly.
 pub const NSIG: usize = 65;

@@ -71,6 +71,22 @@ impl VmctxLoadChain {
         val
     }
 
+    /// wasm-env: emit the load chain once, in place. Its loads keep their
+    /// flags but aren't `can_move`, so the e-graph doesn't take them as pure
+    /// and recompute them next to each use (in each arm of a switch, where no
+    /// use dominates another): see `masked_heap_base` in func_environ.rs.
+    pub fn emit_pinned(&self, cursor: &mut FuncCursor<'_>, vmctx: ir::Value) -> ir::Value {
+        let mut val = vmctx;
+        for load in &self.0 {
+            let mut flags = ir::MemFlagsData::trusted().with_alias_region(load.flags.alias_region());
+            if load.flags.readonly() {
+                flags = flags.with_readonly();
+            }
+            val = Load { flags, ..*load }.emit(cursor, val);
+        }
+        val
+    }
+
     /// Emit the load chain, starting from `vmctx`, as a sequence of CLIF global
     /// values.
     ///

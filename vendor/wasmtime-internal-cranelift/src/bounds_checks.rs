@@ -351,6 +351,16 @@ fn bounds_check_field_access(
                     .ins()
                     .iconst(env.pointer_type(), ((1u64 << bits) - 1) as i64);
                 let masked = builder.ins().band(index, mask);
+                if let Some((chain, base)) = &env.masked_heap_base
+                    && *chain == heap.base
+                {
+                    let mut addr = builder.ins().iadd(*base, masked);
+                    if offset != 0 {
+                        let offset = builder.ins().iconst(env.pointer_type(), i64::from(offset));
+                        addr = builder.ins().iadd(addr, offset);
+                    }
+                    return Reachable(addr);
+                }
                 return Reachable(compute_addr(
                     &mut builder.cursor(),
                     heap,
@@ -524,7 +534,7 @@ fn bounds_check_field_access(
 
 /// wasm-env experiment: index width for masked 64-bit memories, read from
 /// the `WASM_ENV_MASK_BITS` environment variable at compile time.
-fn mask_bits() -> Option<u32> {
+pub(crate) fn mask_bits() -> Option<u32> {
     std::env::var("WASM_ENV_MASK_BITS").ok()?.parse().ok()
 }
 

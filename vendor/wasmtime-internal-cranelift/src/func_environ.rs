@@ -211,6 +211,13 @@ pub struct FuncEnvironment<'module_environment> {
     /// into the host to trap when signal handlers are disabled.
     pub(crate) stack_limit_at_function_entry: Option<VmctxLoadChain>,
 
+    /// wasm-env: the base of a masked 64-bit memory (see bounds_checks.rs),
+    /// loaded once at function entry, with the load chain it came from.
+    /// Its loads would otherwise be pure to the e-graph and computed again
+    /// next to each access in every arm of a translated region's entry
+    /// switch (three dependent loads, the first from the spilled `vmctx`).
+    pub(crate) masked_heap_base: Option<(VmctxLoadChain, ir::Value)>,
+
     /// Used by the stack switching feature. If set, we have a allocated a
     /// slot on this function's stack to be used for the
     /// current stack's `handler_list` field.
@@ -298,6 +305,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             translation,
 
             stack_limit_at_function_entry: None,
+            masked_heap_base: None,
 
             stack_switching_handler_list_buffer: None,
             stack_switching_values_buffer: None,
@@ -5237,6 +5245,18 @@ impl FuncEnvironment<'_> {
             let sp = builder.ins().get_stack_pointer(self.pointer_type());
             let overflow = builder.ins().icmp(IntCC::UnsignedLessThan, sp, limit);
             self.conditionally_trap(builder, overflow, ir::TrapCode::STACK_OVERFLOW);
+        }
+
+        // wasm-env: a masked memory's base, once (see `masked_heap_base`).
+        if crate::bounds_checks::mask_bits().is_some() && !self.module.memories.is_empty() {
+            let index = MemoryIndex::from_u32(0);
+            if self.module.memories[index].idx_type == wasmtime_environ::IndexType::I64 {
+                let heap = self.get_or_create_heap(builder.func, index);
+                let chain = self.heaps[heap].base.clone();
+                let vmctx = self.vmctx_val(&mut builder.cursor());
+                let base = chain.emit_pinned(&mut builder.cursor(), vmctx);
+                self.masked_heap_base = Some((chain, base));
+            }
         }
 
         self.update_state_slot_vmctx(builder);
