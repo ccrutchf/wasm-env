@@ -45,10 +45,31 @@ pub fn convert(image: &str, out: &Path, opts: &Options) -> Result<()> {
     std::fs::write(out.join(".wasm-env-image"), format!("{image}\n"))?;
     // The image keeps its own translations, made now or on first use.
     std::fs::create_dir_all(out.join("var/cache/wasm-env/translated"))?;
+    install_guest_files(out)?;
     if opts.translate {
         translate_all(out, opts.precompile)?;
     }
     eprintln!("converted {image} into {}; run it with: wasm-env shell {}", out.display(), out.display());
+    Ok(())
+}
+
+/// Files of wasm-env's own that environments get: its OpenCL driver
+/// (packages/opencl, built by flake.nix into `lib/wasm-env/guest` beside
+/// the program; in the source tree, by packages/opencl/build.sh), and its
+/// registration with the Khronos loader.
+pub fn install_guest_files(root: &Path) -> Result<()> {
+    let installed = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("../lib/wasm-env/guest")));
+    let source_tree = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../build/packages/opencl");
+    let Some(dir) = [installed, Some(source_tree)].into_iter().flatten().find(|d| d.join("libwasm-env-opencl.so").exists()) else {
+        eprintln!("note: wasm-env's OpenCL driver isn't built (packages/opencl/build.sh); the environment won't have OpenCL");
+        return Ok(());
+    };
+    let lib = root.join("usr/lib/wasm-env");
+    std::fs::create_dir_all(&lib)?;
+    std::fs::copy(dir.join("libwasm-env-opencl.so"), lib.join("libwasm-env-opencl.so"))?;
+    let vendors = root.join("etc/OpenCL/vendors");
+    std::fs::create_dir_all(&vendors)?;
+    std::fs::write(vendors.join("wasm-env.icd"), "/usr/lib/wasm-env/libwasm-env-opencl.so\n")?;
     Ok(())
 }
 

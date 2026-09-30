@@ -12,3 +12,4 @@ pub mod structure;
 pub mod wgsl;
 pub mod opencl;
 pub mod device;
+pub use wgpu;

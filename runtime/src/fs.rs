@@ -139,6 +139,8 @@ pub enum Device {
     Null,
     Zero,
     Random,
+    /// The GPU service (gpu.rs): opened as an `Open::Gpu` session.
+    Gpu,
 }
 
 #[derive(Debug, PartialEq)]
@@ -148,6 +150,9 @@ pub enum DevPath {
     Fd(i64),
     /// A read-only file the runtime generates (/proc, /sys).
     Synthetic(Synthetic),
+    /// A directory the runtime generates (the CPUs in /sys): its path and
+    /// entries.
+    SyntheticDir(String, Vec<DirEntry>),
 }
 
 /// Files under /proc and /sys that programs read to learn about the machine,
@@ -169,6 +174,53 @@ pub enum Synthetic {
     Mounts,
     /// /proc/self/mountinfo: the same, in its own format.
     MountInfo,
+    /// /proc/meminfo: the host's memory.
+    MemInfo,
+    /// /sys/devices/system/cpu/cpuN/topology/*: each CPU a core of its own,
+    /// all in one package (what hwloc, and so pocl, reads).
+    Topology(u32, Topology),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Topology {
+    /// physical_package_id, die_id, cluster_id: 0.
+    Zero,
+    CoreId,
+    /// The CPU alone (thread_siblings, core_cpus): as a mask or a list.
+    Own(bool),
+    /// Every CPU (core_siblings, package_cpus, die_cpus, cluster_cpus).
+    All(bool),
+}
+
+const TOPOLOGY: &[(&str, Topology)] = &[
+    ("physical_package_id", Topology::Zero),
+    ("die_id", Topology::Zero),
+    ("cluster_id", Topology::Zero),
+    ("core_id", Topology::CoreId),
+    ("thread_siblings", Topology::Own(false)),
+    ("thread_siblings_list", Topology::Own(true)),
+    ("core_cpus", Topology::Own(false)),
+    ("core_cpus_list", Topology::Own(true)),
+    ("core_siblings", Topology::All(false)),
+    ("core_siblings_list", Topology::All(true)),
+    ("package_cpus", Topology::All(false)),
+    ("package_cpus_list", Topology::All(true)),
+    ("die_cpus", Topology::All(false)),
+    ("die_cpus_list", Topology::All(true)),
+    ("cluster_cpus", Topology::All(false)),
+    ("cluster_cpus_list", Topology::All(true)),
+];
+
+/// A CPU mask as sysfs writes it: hex, in comma-separated 32-bit groups.
+fn cpu_mask(cpus: impl Fn(u32) -> bool, n: u32) -> String {
+    let groups: Vec<String> = (0..n.div_ceil(32))
+        .rev()
+        .map(|g| format!("{:08x}", (0..32).filter(|b| g * 32 + b < n && cpus(g * 32 + b)).fold(0u32, |m, b| m | 1 << b)))
+        .collect();
+    let s = groups.join(",");
+    // (The leading group without its leading zeros, as the kernel prints.)
+    let trimmed = s.trim_start_matches('0');
+    if trimmed.is_empty() || trimmed.starts_with(',') { format!("0{trimmed}") } else { trimmed.to_string() }
 }
 
 impl Synthetic {
@@ -193,6 +245,29 @@ impl Synthetic {
                 b"1 0 0:1 / / rw,relatime - ext4 /dev/root rw\n2 1 0:2 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
                     .as_slice()
                     .into()
+            }
+            Synthetic::MemInfo => {
+                let (total, available) = host_memory();
+                format!(
+                    "MemTotal:       {:>8} kB\nMemFree:        {:>8} kB\nMemAvailable:   {:>8} kB\nBuffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n",
+                    total / 1024,
+                    available / 1024,
+                    available / 1024
+                )
+                .into_bytes()
+                .into()
+            }
+            Synthetic::Topology(cpu, t) => {
+                let list = |own: bool| if own { format!("{cpu}") } else if cpus == 1 { "0".into() } else { format!("0-{}", cpus - 1) };
+                let text = match t {
+                    Topology::Zero => "0".into(),
+                    Topology::CoreId => format!("{cpu}"),
+                    Topology::Own(true) => list(true),
+                    Topology::All(true) => list(false),
+                    Topology::Own(false) => cpu_mask(|c| c == cpu, cpus as u32),
+                    Topology::All(false) => cpu_mask(|_| true, cpus as u32),
+                };
+                format!("{text}\n").into_bytes().into()
             }
             Synthetic::ResolvConf => match std::fs::read("/etc/resolv.conf") {
                 Ok(host) if !host.is_empty() => host.into(),
@@ -241,6 +316,8 @@ impl Fs {
             ["sys", "devices", "system", "cpu", "possible" | "online" | "present"] => {
                 return Some(DevPath::Synthetic(Synthetic::CpuList));
             }
+            ["proc", "meminfo"] => return Some(DevPath::Synthetic(Synthetic::MemInfo)),
+            ["sys", "devices", "system", "cpu", ..] | ["sys", "devices", "system"] | ["sys", "devices"] => return cpu_tree(&parts),
             ["etc", "resolv.conf"]
                 if std::fs::metadata(self.host("/etc/resolv.conf")).is_ok_and(|m| m.len() == 0)
                     || std::fs::symlink_metadata(self.host("/etc/resolv.conf")).is_err() =>
@@ -254,6 +331,7 @@ impl Fs {
             ["null"] => Some(DevPath::Device(Device::Null)),
             ["zero"] => Some(DevPath::Device(Device::Zero)),
             ["random"] | ["urandom"] => Some(DevPath::Device(Device::Random)),
+            ["wasm-env-gpu"] => Some(DevPath::Device(Device::Gpu)),
             ["stdin"] => Some(DevPath::Fd(0)),
             ["stdout"] => Some(DevPath::Fd(1)),
             ["stderr"] => Some(DevPath::Fd(2)),
@@ -272,6 +350,7 @@ pub fn device_stat_bytes(d: Device) -> [u8; 128] {
         Device::Null => 3,
         Device::Zero => 5,
         Device::Random => 9,
+        Device::Gpu => 64,
     };
     let mut b = [0u8; 128];
     b[16..20].copy_from_slice(&(S_IFCHR | 0o666).to_le_bytes());
@@ -396,6 +475,7 @@ pub fn fifo_stat_bytes() -> [u8; 128] {
     b
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct DirEntry {
     pub ino: u64,
     pub dtype: u8,
@@ -415,6 +495,8 @@ pub enum Open {
     Epoll(Arc<crate::events::Epoll>),
     /// An inotify instance (inotify.rs).
     Inotify(Arc<crate::inotify::Inotify>),
+    /// A session with the GPU service (/dev/wasm-env-gpu).
+    Gpu(Arc<crate::gpu::Session>),
     /// A Unix socket, the runtime's own (unix.rs).
     Unix(Arc<crate::unix::UnixSocket>),
     /// A host descriptor of a kind the runtime doesn't model itself (a pipe,
@@ -598,6 +680,9 @@ impl FdTable {
 
 /// Reads a directory's entries, including "." and "..".
 pub fn read_dir(fs: &Fs, guest: &str) -> SysResult<Vec<DirEntry>> {
+    if let Some(DevPath::SyntheticDir(_, entries)) = fs.device("/", guest) {
+        return Ok(entries);
+    }
     let host = fs.host(guest);
     let ino = |m: &Metadata| {
         #[cfg(unix)]
@@ -766,7 +851,12 @@ mod tests {
         assert_eq!(fs.device("/", "/dev/sda"), None);
         assert_eq!(fs.device("/", "/proc/cpuinfo"), Some(DevPath::Synthetic(Synthetic::CpuInfo)));
         assert_eq!(fs.device("/sys", "devices/system/cpu/online"), Some(DevPath::Synthetic(Synthetic::CpuList)));
-        assert_eq!(fs.device("/", "/proc/meminfo"), None);
+        assert_eq!(fs.device("/", "/proc/meminfo"), Some(DevPath::Synthetic(Synthetic::MemInfo)));
+        assert!(matches!(fs.device("/", "/sys/devices/system/cpu/cpu0/topology"), Some(DevPath::SyntheticDir(..))));
+        assert_eq!(fs.device("/", "/sys/devices/system/cpu/cpu0/topology/core_id"), Some(DevPath::Synthetic(Synthetic::Topology(0, Topology::CoreId))));
+        assert_eq!(fs.device("/", "/sys/devices/system/cpu/cpu01"), None);
+        assert_eq!(cpu_mask(|c| c == 33, 40), "2,00000000");
+        assert_eq!(cpu_mask(|_| true, 8), "ff");
         #[cfg(unix)]
         {
             assert_eq!(fs.resolve("/", "/bin/sh", true).unwrap(), "/bin/busybox");
@@ -897,5 +987,101 @@ pub mod links {
             assert_eq!(read_file(&dir.join("plain")), None);
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+}
+
+/// /sys/devices/system/cpu and what's under it, the parts other than the
+/// CPU lists: a directory per CPU, each with its topology.
+fn cpu_tree(parts: &[&str]) -> Option<DevPath> {
+    let cpus = crate::syscall::cpus() as u32;
+    let cpu = |c: &str| c.strip_prefix("cpu").and_then(|n| n.parse::<u32>().ok()).filter(|&n| n < cpus && c == format!("cpu{n}"));
+    let dir = |entries: Vec<(String, u8)>| {
+        const DT_DIR: u8 = 4;
+        let path = format!("/{}", parts.join("/"));
+        let mut all = vec![(".".to_string(), DT_DIR), ("..".to_string(), DT_DIR)];
+        all.extend(entries);
+        let entries = all
+            .into_iter()
+            .map(|(name, dtype)| {
+                let ino = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (&path, &name).hash(&mut h);
+                    h.finish() | 1
+                };
+                DirEntry { ino, dtype, name }
+            })
+            .collect();
+        Some(DevPath::SyntheticDir(path, entries))
+    };
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    match parts {
+        ["sys", "devices"] => dir(vec![("system".into(), DT_DIR)]),
+        ["sys", "devices", "system"] => dir(vec![("cpu".into(), DT_DIR)]),
+        ["sys", "devices", "system", "cpu"] => {
+            let mut e: Vec<(String, u8)> = (0..cpus).map(|n| (format!("cpu{n}"), DT_DIR)).collect();
+            e.extend(["online", "possible", "present"].map(|f| (f.to_string(), DT_REG)));
+            dir(e)
+        }
+        ["sys", "devices", "system", "cpu", c] if cpu(c).is_some() => dir(vec![("topology".into(), DT_DIR)]),
+        ["sys", "devices", "system", "cpu", c, "topology"] if cpu(c).is_some() => dir(TOPOLOGY.iter().map(|(n, _)| (n.to_string(), DT_REG)).collect()),
+        ["sys", "devices", "system", "cpu", c, "topology", f] => {
+            let n = cpu(c)?;
+            TOPOLOGY.iter().find(|(name, _)| name == f).map(|(_, t)| DevPath::Synthetic(Synthetic::Topology(n, *t)))
+        }
+        _ => None,
+    }
+}
+
+/// `struct stat` for a directory the runtime generates.
+pub fn synthetic_dir_stat_bytes(path: &str) -> [u8; 128] {
+    const S_IFDIR: u32 = 0o040000;
+    let mut b = [0u8; 128];
+    let ino = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut h);
+        h.finish() | 1
+    };
+    b[0..8].copy_from_slice(&SYNTHETIC_DEV.to_le_bytes());
+    b[8..16].copy_from_slice(&ino.to_le_bytes());
+    b[16..20].copy_from_slice(&(S_IFDIR | 0o555).to_le_bytes());
+    b[20..24].copy_from_slice(&2u32.to_le_bytes());
+    b[56..60].copy_from_slice(&4096u32.to_le_bytes());
+    b
+}
+
+/// The host's memory: (total, available) bytes.
+pub fn host_memory() -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let field = |name: &str| {
+            text.lines().find_map(|l| l.strip_prefix(name)?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()).map(|k| k * 1024)
+        };
+        let total = field("MemTotal:").unwrap_or(4 << 30);
+        (total, field("MemAvailable:").unwrap_or(total / 2))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut total: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: a u64 out-parameter of the size given.
+        let ok = unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut total).cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
+        let total = if ok { total } else { 4 << 30 };
+        (total, total / 2)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: a struct with its length set, to fill.
+        let mut s: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        s.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut s) } != 0 { (s.ullTotalPhys, s.ullAvailPhys) } else { (4 << 30, 2 << 30) }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        (4 << 30, 2 << 30)
     }
 }

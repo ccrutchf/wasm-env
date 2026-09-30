@@ -44,7 +44,7 @@
           windowLibs = with pkgs; [ wayland libxkbcommon libx11 libxcursor libxrandr libxi vulkan-loader ];
           src = lib.fileset.toSource {
             root = ./.;
-            fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./gpu ./runtime ./translator ./vendor ./bench/harness ];
+            fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./gpu ./packages/opencl ./runtime ./translator ./vendor ./bench/harness ];
           };
         in
         rec {
@@ -67,6 +67,12 @@
               ln -s ${llvm.clang-unwrapped}/bin/clang $tc/bin/clang
               ln -s ${llvm.lld}/bin/wasm-ld $tc/bin/wasm-ld
               ln -s ${builtins}/lib/libclang_rt.builtins.a $tc/lib/libclang_rt.builtins.a
+              # The guest's OpenCL driver (packages/opencl), for environments.
+              mkdir -p $out/lib/wasm-env/guest
+              ${llvm.clang-unwrapped}/bin/clang --target=aarch64-linux-gnu -ffreestanding -nostdlib -shared -fPIC \
+                -fuse-ld=${llvm.lld}/bin/ld.lld -O2 -fvisibility=hidden -fno-stack-protector -mno-outline-atomics \
+                -Wno-incompatible-function-pointer-types -I${pkgs.opencl-headers}/include \
+                -Wl,-soname,libwasm-env-opencl.so -o $out/lib/wasm-env/guest/libwasm-env-opencl.so packages/opencl/icd.c
             '';
           };
           default = wasm-env;
@@ -92,6 +98,7 @@
               pkgs.zstd # Ubuntu .deb packages (tests/ubuntu-fetch.sh)
               pkgs.jq # PyPI metadata (tests/wheel-fetch.sh)
               pkgs.unzip # wheels
+              pkgs.opencl-headers # packages/opencl (the guest's OpenCL driver)
             ]
             # Test references that exist only on Linux hosts; elsewhere the
             # tests that need them skip.
@@ -115,6 +122,7 @@
             COMPILER_RT_SRC = "${llvm.compiler-rt.src}";
             # Packages built with the toolchain (packages/*/build.sh).
             BUSYBOX_SRC = "${pkgs.busybox.src}";
+            OPENCL_HEADERS = "${pkgs.opencl-headers}";
             # bindgen (used by the bad64 arm64 decoder crate) needs libclang.
             LIBCLANG_PATH = "${llvm.libclang.lib}/lib";
           } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

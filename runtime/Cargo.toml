@@ -28,8 +28,10 @@ notify = "8.2"
 # Code a program generates at run time is translated in-process (see
 # translate::ensure_code).
 wasm-env-translate = { path = "../translator", features = ["lift"] }
+# The GPU service (gpu.rs, /dev/wasm-env-gpu).
+wasm-env-gpu = { path = "../gpu" }
 
 # Windows hosts: polling sockets (WSAPoll), bytes pending (ioctlsocket), file
-# identities (locks.rs).
+# identities (locks.rs), memory (/proc/meminfo).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_SystemInformation"] }

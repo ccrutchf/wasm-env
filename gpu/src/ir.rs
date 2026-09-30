@@ -685,6 +685,27 @@ impl<'a> Parser<'a> {
 
     /// A value of type `ty`: a local, an argument, or a constant.
     fn value(&mut self, ty: &Type, f: &mut FnState) -> Res<Value> {
+        if *ty == Type::Metadata {
+            // A metadata operand (!9, !{...}, !"..."): nothing kernels use.
+            if self.eat('!') && self.punct('{') {
+                let mut depth = 0;
+                while let Ok(t) = self.next() {
+                    match t {
+                        Tok::Punct('{') => depth += 1,
+                        Tok::Punct('}') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                self.next()?;
+            }
+            return Ok(Value::Const(Const::Undef));
+        }
         if let Some(Tok::Local(n)) = self.peek() {
             self.i += 1;
             return Ok(f.named(n, ty));

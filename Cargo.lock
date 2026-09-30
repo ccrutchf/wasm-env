@@ -3271,6 +3271,7 @@ dependencies = [
  "softbuffer",
  "tar",
  "ureq",
+ "wasm-env-gpu",
  "wasm-env-translate",
  "wasmtime",
  "windows-sys 0.61.2",

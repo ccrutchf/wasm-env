@@ -500,7 +500,7 @@ impl Process {
             }
             nr::READLINKAT => {
                 let path = mem::cstr(data, ub)?;
-                let dir = self.dir_of(a)?;
+                let dir = self.dir_of(a, &path)?;
                 let guest = self.fs.resolve(&dir, &path, false)?;
                 let target = fs::links::read(&self.fs.host(&guest)).map_err(|e| match fs::errno(&e) {
                     ENOENT => ENOENT,
@@ -510,9 +510,10 @@ impl Process {
                 let n = target.len().min(d as usize);
                 mem::write(data, uc, &target[..n]).map(|_| n as i64)
             }
-            nr::FACCESSAT => {
+            // (faccessat2: the same, with flags that don't matter here.)
+            nr::FACCESSAT | nr::FACCESSAT2 => {
                 let path = mem::cstr(data, ub)?;
-                let dir = self.dir_of(a)?;
+                let dir = self.dir_of(a, &path)?;
                 if self.fs.device(&dir, &path).is_some() {
                     return Ok(0);
                 }
@@ -583,13 +584,13 @@ impl Process {
             }
             nr::MKDIRAT => {
                 let path = mem::cstr(data, ub)?;
-                let dir = self.dir_of(a)?;
+                let dir = self.dir_of(a, &path)?;
                 let guest = self.fs.resolve(&dir, &path, false)?;
                 std::fs::create_dir(self.fs.host(&guest)).map(|_| 0).map_err(|e| fs::errno(&e))
             }
             nr::UNLINKAT => {
                 let path = mem::cstr(data, ub)?;
-                let dir = self.dir_of(a)?;
+                let dir = self.dir_of(a, &path)?;
                 let guest = self.fs.resolve(&dir, &path, false)?;
                 let host = self.fs.host(&guest);
                 let r = if c & AT_REMOVEDIR != 0 { std::fs::remove_dir(host) } else { std::fs::remove_file(host) };
@@ -692,7 +693,7 @@ impl Process {
                     return self.with_file(a, |f| Ok(apply(f))).and_then(|r| r);
                 }
                 let path = mem::cstr(data, ub)?;
-                let dir = self.dir_of(a)?;
+                let dir = self.dir_of(a, &path)?;
                 let guest = self.fs.resolve(&dir, &path, d & AT_SYMLINK_NOFOLLOW == 0)?;
                 let host = self.fs.host(&guest);
                 if d & AT_SYMLINK_NOFOLLOW != 0 && host.symlink_metadata().is_ok_and(|m| fs::links::is_link(&host, &m)) {
@@ -1137,12 +1138,16 @@ impl Process {
     /// The host path for an *at() call's (dirfd, path) pair.
     fn at_path(&self, data: &[u8], dirfd: i64, path: u64, follow: bool) -> SysResult<std::path::PathBuf> {
         let path = mem::cstr(data, path)?;
-        let dir = self.dir_of(dirfd)?;
+        let dir = self.dir_of(dirfd, &path)?;
         Ok(self.fs.host(&self.fs.resolve(&dir, &path, follow)?))
     }
 
-    /// The guest directory an *at() call is relative to.
-    fn dir_of(&self, dirfd: i64) -> SysResult<String> {
+    /// The guest directory an *at() call is relative to: none for an
+    /// absolute path, whose descriptor Linux ignores (hwloc passes -1).
+    fn dir_of(&self, dirfd: i64, path: &str) -> SysResult<String> {
+        if path.starts_with('/') {
+            return Ok("/".into());
+        }
         // A descriptor is an int: AT_FDCWD may arrive without sign extension.
         let dirfd = dirfd as i32 as i64;
         if dirfd == AT_FDCWD {
@@ -1430,7 +1435,7 @@ impl Process {
                 Ok(buf.len())
             }
             Open::Stdout | Open::Stderr | Open::Pipe(_) | Open::Socket(_) | Open::Host(_) | Open::Unix(_) => return Err(EBADF),
-            Open::EventFd(_) | Open::Epoll(_) | Open::Inotify(_) => return Err(EINVAL),
+            Open::EventFd(_) | Open::Epoll(_) | Open::Inotify(_) | Open::Gpu(_) | Open::Device(Device::Gpu) => return Err(EINVAL),
         };
         r.map(|n| n as i64).map_err(|e| fs::errno(&e))
     }
@@ -1472,7 +1477,7 @@ impl Process {
             Open::Dir { .. } => return Err(EISDIR),
             Open::Device(_) => Ok(()), // writes to /dev devices are discarded
             Open::Stdin | Open::Pipe(_) | Open::Socket(_) | Open::Host(_) | Open::Unix(_) => return Err(EBADF),
-            Open::EventFd(_) | Open::Epoll(_) | Open::Inotify(_) => return Err(EINVAL),
+            Open::EventFd(_) | Open::Epoll(_) | Open::Inotify(_) | Open::Gpu(_) => return Err(EINVAL),
         };
         r.map(|_| buf.len() as i64).map_err(|e| fs::errno(&e))
     }
@@ -1510,8 +1515,12 @@ impl Process {
     }
 
     fn openat(&mut self, dirfd: i64, path: &str, flags: i64) -> SysResult<i64> {
-        let dir = self.dir_of(dirfd)?;
+        let dir = self.dir_of(dirfd, &path)?;
         match self.fs.device(&dir, path) {
+            Some(DevPath::Device(Device::Gpu)) => {
+                let open = Arc::new(Mutex::new(Open::Gpu(Arc::new(crate::gpu::Session::open()?))));
+                return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
+            }
             Some(DevPath::Device(d)) => {
                 let open = Arc::new(Mutex::new(Open::Device(d)));
                 return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
@@ -1526,6 +1535,13 @@ impl Process {
                 }
                 let file = s.open().map_err(|e| fs::errno(&e))?;
                 let open = Arc::new(Mutex::new(Open::File { file, path: path.to_string(), append: false }));
+                return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
+            }
+            Some(DevPath::SyntheticDir(guest, _)) => {
+                if flags & o::ACCMODE != 0 {
+                    return Err(EISDIR);
+                }
+                let open = Arc::new(Mutex::new(Open::Dir { path: guest, entries: None, pos: 0 }));
                 return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
             }
             None => {}
@@ -1638,10 +1654,14 @@ impl Process {
         match &*open {
             Open::File { file, .. } => file.metadata().map(|m| fs::stat_bytes(&m)).map_err(|e| fs::errno(&e)),
             Open::Dir { path, .. } => {
+                if let Some(DevPath::SyntheticDir(p, _)) = self.fs.device("/", path) {
+                    return Ok(fs::synthetic_dir_stat_bytes(&p));
+                }
                 std::fs::metadata(self.fs.host(path)).map(|m| fs::stat_bytes(&m)).map_err(|e| fs::errno(&e))
             }
             Open::Pipe(_) => Ok(fs::fifo_stat_bytes()),
             Open::Device(d) => Ok(fs::device_stat_bytes(*d)),
+            Open::Gpu(_) => Ok(fs::device_stat_bytes(Device::Gpu)),
             Open::Host(h) => h.metadata().map(|m| fs::stat_bytes(&m)).map_err(|e| fs::errno(&e)),
             Open::Unix(_) | Open::Socket(_) => Ok(fs::socket_stat_bytes()),
             _ => Ok(fs::stdio_stat_bytes()),
@@ -1681,7 +1701,7 @@ impl Process {
         if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
             return self.fstat(dirfd);
         }
-        let dir = self.dir_of(dirfd)?;
+        let dir = self.dir_of(dirfd, &path)?;
         match self.fs.device(&dir, path) {
             Some(DevPath::Device(d)) => return Ok(fs::device_stat_bytes(d)),
             Some(DevPath::Fd(n)) => return self.fstat(n),
@@ -1689,6 +1709,7 @@ impl Process {
                 let meta = s.open().and_then(|f| f.metadata()).map_err(|e| fs::errno(&e))?;
                 return Ok(fs::stat_bytes(&meta));
             }
+            Some(DevPath::SyntheticDir(p, _)) => return Ok(fs::synthetic_dir_stat_bytes(&p)),
             None => {}
         }
         let guest = self.fs.resolve(&dir, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
@@ -1879,6 +1900,13 @@ impl Process {
     fn ioctl(&mut self, data: &mut [u8], fd: i64, req: i64, arg: u64) -> SysResult<i64> {
         // The request is an unsigned int (see fcntl).
         let req = req as u32 as i64;
+        if req == crate::gpu::GPU_CALL {
+            let session = match &*self.fds.get(fd)?.open.lock().unwrap() {
+                Open::Gpu(s) => s.clone(),
+                _ => return Err(ENOTTY),
+            };
+            return session.call(data, arg);
+        }
         const TIOCGWINSZ: i64 = 0x5413;
         const FIONREAD: i64 = 0x541b;
         const FIONBIO: i64 = 0x5421;

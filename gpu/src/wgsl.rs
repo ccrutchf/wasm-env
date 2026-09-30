@@ -1055,7 +1055,8 @@ impl Gen<'_> {
     // ---- Calls: OpenCL's builtins and LLVM's intrinsics ----
 
     fn call(&mut self, i: &Inst, name: &str, args: &[Operand]) -> Res<()> {
-        let vals: Vec<String> = args.iter().map(|a| self.val(a)).collect::<Res<_>>()?;
+        // (Metadata arguments, to intrinsics that don't matter here, have no value.)
+        let vals: Vec<String> = args.iter().map(|a| if a.ty == Type::Metadata { Ok(String::new()) } else { self.val(a) }).collect::<Res<_>>()?;
         if let Some(intr) = name.strip_prefix("llvm.") {
             return self.intrinsic(i, intr, args, &vals);
         }
@@ -1603,6 +1604,8 @@ __kernel void bytes(__global uchar *p, float4 v, __global float4 *q) {
     p[i] = p[i] * 2 + 1;
     q[i] = q[i] * v + (float4)(sqrt(v.x), native_sin(v.y), fma(v.z, v.w, 1.0f), 0);
 }
+static void helper(__global float * restrict a, __global const float * restrict b, int i) { a[i] += b[i]; }
+__kernel void restricted(__global float * restrict a, __global const float * restrict b) { helper(a, b, get_global_id(0)); }
 __constant int table[4] = {3, 1, 4, 1};
 typedef struct { int a; float b; char c; } params;
 __kernel void misc(__global int *out, params p, __global short *s) {
@@ -1627,7 +1630,7 @@ __kernel void misc(__global int *out, params p, __global short *s) {
     #[test]
     fn kernels_become_valid_wgsl() {
         let launch = Launch { local: [64, 1, 1], local_bytes: vec![(2, 256)] };
-        for k in ["add", "reduce", "bytes", "misc"] {
+        for k in ["add", "reduce", "bytes", "misc", "restricted"] {
             wgsl(KERNELS, k, &launch);
         }
     }

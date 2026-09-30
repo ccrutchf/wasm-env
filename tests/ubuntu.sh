@@ -216,6 +216,39 @@ else
 	echo "skipped Wayland: can't fetch the packages (offline?)"
 fi
 
+# OpenCL (M9): Ubuntu's loader (ocl-icd) with wasm-env's driver
+# (packages/opencl) on the runtime's GPU service, on the host's GPU and on
+# software Vulkan (lavapipe), where there is one. Against answers computed
+# on the CPU: qemu has no GPU.
+if tests/ubuntu-fetch.sh ocl-icd-opencl-dev clinfo >/dev/null 2>&1 && packages/opencl/build.sh >/dev/null; then
+	mkdir -p "$R/usr/lib/wasm-env" "$R/etc/OpenCL/vendors"
+	cp build/packages/opencl/libwasm-env-opencl.so "$R/usr/lib/wasm-env/"
+	echo /usr/lib/wasm-env/libwasm-env-opencl.so > "$R/etc/OpenCL/vendors/wasm-env.icd"
+	if "${cc[@]}" -O2 -o "$R/opt/tests/opencl" tests/arm64/opencl.c -lOpenCL; then
+		for gpu in host software; do
+			# (Only wasm-env's driver: other drivers the environment has, like
+			# pocl, aren't what this checks.)
+			only=(--env OCL_ICD_VENDORS=/etc/OpenCL/vendors/wasm-env.icd)
+			platforms=$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" /usr/bin/clinfo -l 2>&1)
+			if grep -q "^Platform #.: wasm-env$" <<<"$platforms"; then
+				compare "OpenCL ($gpu)" "platform: wasm-env
+kernels: 3
+add: 0 of 100000 wrong
+reduce: right
+bytes: 0 of 3200 wrong
+bad program: fails, log mentions it: yes
+done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" /opt/tests/opencl 2>&1)"
+			else
+				echo "skipped OpenCL ($gpu): no such GPU adapter"
+			fi
+		done
+	else
+		compare "opencl: build" ok failed
+	fi
+else
+	echo "skipped OpenCL: can't fetch the packages (offline?)"
+fi
+
 # Networking, if PyPI is reachable: DNS (glibc's resolver, over the host's
 # resolv.conf), HTTPS (Ubuntu's OpenSSL with its CA certificates), and pip
 # installing a package from PyPI. Ubuntu's ca-certificates package builds

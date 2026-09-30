@@ -19,11 +19,16 @@
 //!          windows (tests); =host: the host's own compositor instead
 //!          (Linux hosts running Wayland)
 
+// (wgpu's types nest deeply enough for the Send and Sync checks of the
+// threads that hold them.)
+#![recursion_limit = "256"]
+
 mod abi;
 mod convert;
 mod events;
 mod fork;
 mod fs;
+mod gpu;
 mod image;
 mod inotify;
 mod kernel;

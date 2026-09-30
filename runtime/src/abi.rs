@@ -20,6 +20,7 @@ pub mod nr {
     pub const FCHOWNAT: i64 = 54;
     pub const FCHOWN: i64 = 55;
     pub const FACCESSAT: i64 = 48;
+    pub const FACCESSAT2: i64 = 439;
     pub const CHDIR: i64 = 49;
     pub const FCHDIR: i64 = 50;
     pub const OPENAT: i64 = 56;
@@ -171,7 +172,7 @@ pub fn name(n: i64) -> &'static str {
         MKDIRAT => "mkdirat", UNLINKAT => "unlinkat", SYMLINKAT => "symlinkat", LINKAT => "linkat",
         RENAMEAT => "renameat", RENAMEAT2 => "renameat2", FTRUNCATE => "ftruncate", FCHMOD => "fchmod",
         FCHMODAT => "fchmodat", FCHOWNAT => "fchownat", FCHOWN => "fchown", FSYNC => "fsync",
-        FDATASYNC => "fdatasync", FACCESSAT => "faccessat",
+        FDATASYNC => "fdatasync", FACCESSAT => "faccessat", FACCESSAT2 => "faccessat2",
         CHDIR => "chdir", FCHDIR => "fchdir", OPENAT => "openat", CLOSE => "close",
         GETDENTS64 => "getdents64", LSEEK => "lseek", READ => "read", WRITE => "write",
         READV => "readv", WRITEV => "writev", PREAD64 => "pread64", PWRITE64 => "pwrite64",
@@ -218,6 +219,7 @@ pub mod errno {
     pub const EFAULT: i64 = 14;
     pub const EEXIST: i64 = 17;
     pub const EXDEV: i64 = 18;
+    pub const ENODEV: i64 = 19;
     pub const ENOTDIR: i64 = 20;
     pub const EISDIR: i64 = 21;
     pub const EINVAL: i64 = 22;
