@@ -452,7 +452,12 @@ impl Process {
                 let path = mem::cstr(data, ub)?;
                 self.openat(a, &path, c)
             }
-            nr::CLOSE => self.fds.close(a).map(|_| 0),
+            nr::CLOSE => {
+                let file = self.file_id_of(a);
+                self.fds.close(a)?;
+                self.unlocked(file);
+                Ok(0)
+            }
             nr::LSEEK => self.lseek(a, b, c),
             nr::GETDENTS64 => self.getdents64(a, mem::slice_mut(data, ub, uc)?),
             nr::NEWFSTATAT => {
@@ -571,7 +576,9 @@ impl Process {
                     return Err(EINVAL);
                 }
                 let fd = Fd { cloexec: c & o::CLOEXEC != 0, ..self.fds.get(a)?.clone() };
+                let file = self.file_id_of(b);
                 self.fds.set(usize::try_from(b).map_err(|_| EBADF)?, fd);
+                self.unlocked(file);
                 Ok(b)
             }
             nr::MKDIRAT => {
@@ -1705,63 +1712,106 @@ impl Process {
     }
 
     /// fcntl's record locks (F_GETLK, F_SETLK, F_SETLKW and their F_OFD_
-    /// forms) on the file behind `fd`: the host's open-file-description
-    /// locks, since the environment's processes share one host process (so
-    /// its per-process POSIX locks would never conflict between them). A
-    /// lock on anything but a file succeeds.
+    /// forms) on the file behind `fd`, in the runtime's lock table
+    /// (locks.rs): a process's, or with F_OFD_ the open file description's.
+    /// A lock on anything but a file succeeds.
     fn lock(&mut self, data: &mut [u8], fd: i64, cmd: i64, flock: u64) -> SysResult<i64> {
+        use crate::locks::{F_RDLCK, F_UNLCK, F_WRLCK, Kind, Owner};
         let open = self.fds.get(fd)?.open.clone();
-        let guard = open.lock().unwrap();
-        let Open::File { file, .. } = &*guard else { return Ok(0) };
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            // struct flock: l_type, l_whence (i16), l_start, l_len (i64),
-            // l_pid (i32): the same layout on every 64-bit Linux.
-            let b = mem::slice(data, flock, 32)?;
-            let mut l: libc::flock = unsafe { std::mem::zeroed() };
-            l.l_type = i16::from_le_bytes([b[0], b[1]]);
-            l.l_whence = i16::from_le_bytes([b[2], b[3]]);
-            l.l_start = i64::from_le_bytes(b[8..16].try_into().unwrap());
-            l.l_len = i64::from_le_bytes(b[16..24].try_into().unwrap());
-            let host_cmd = match cmd {
-                5 | 36 => libc::F_OFD_GETLK,
-                6 | 37 => libc::F_OFD_SETLK,
-                _ => libc::F_OFD_SETLKW,
+        // struct flock: l_type, l_whence (i16), l_start, l_len (i64), l_pid
+        // (i32): the same layout on every 64-bit Linux.
+        let b = mem::slice(data, flock, 32)?;
+        let ty = i16::from_le_bytes([b[0], b[1]]);
+        let whence = i16::from_le_bytes([b[2], b[3]]);
+        let (l_start, l_len) = (i64::from_le_bytes(b[8..16].try_into().unwrap()), i64::from_le_bytes(b[16..24].try_into().unwrap()));
+        let (file, base) = {
+            let guard = open.lock().unwrap();
+            let Open::File { file, .. } = &*guard else { return Ok(0) };
+            let base = match whence {
+                0 => 0,
+                1 => (&*file).stream_position().map_err(|e| fs::errno(&e))? as i64,
+                2 => file.metadata().map_err(|e| fs::errno(&e))?.len() as i64,
+                _ => return Err(EINVAL),
             };
-            // SAFETY: a valid descriptor and a flock struct.
-            let r = unsafe { libc::fcntl(file.as_raw_fd(), host_cmd, &mut l) };
-            if r < 0 {
-                return Err(std::io::Error::last_os_error().raw_os_error().map_or(EIO, |e| e as i64));
-            }
-            if host_cmd == libc::F_OFD_GETLK {
-                let b = mem::slice_mut(data, flock, 32)?;
-                b[0..2].copy_from_slice(&l.l_type.to_le_bytes());
-                b[2..4].copy_from_slice(&l.l_whence.to_le_bytes());
-                b[8..16].copy_from_slice(&l.l_start.to_le_bytes());
-                b[16..24].copy_from_slice(&l.l_len.to_le_bytes());
-                b[24..28].copy_from_slice(&(if l.l_type == libc::F_UNLCK as i16 { 0 } else { -1i32 }).to_le_bytes());
-            }
+            (crate::locks::file_id(file)?, base)
+        };
+        let start = base.checked_add(l_start).ok_or(EINVAL)?;
+        let (start, end) = match l_len {
+            0 => (start, u64::MAX as i128),
+            n if n > 0 => (start, start as i128 + n as i128),
+            n => (start + n, start as i128),
+        };
+        if start < 0 {
+            return Err(EINVAL);
         }
-        let _ = (data, cmd, flock, file);
-        Ok(0)
+        let (start, end) = (start as u64, end.min(u64::MAX as i128) as u64);
+        let owner = if cmd >= 36 { Owner::Description(Arc::downgrade(&open)) } else { Owner::Process(self.pid) };
+        if cmd == 5 || cmd == 36 {
+            if !matches!(ty, F_RDLCK | F_WRLCK) {
+                return Err(EINVAL);
+            }
+            let held = self.kernel.locks.test(Kind::Record, file, &owner, start, end, ty == F_WRLCK);
+            let b = mem::slice_mut(data, flock, 32)?;
+            match held {
+                None => b[0..2].copy_from_slice(&F_UNLCK.to_le_bytes()),
+                Some(h) => {
+                    b[0..2].copy_from_slice(&(if h.write { F_WRLCK } else { F_RDLCK }).to_le_bytes());
+                    b[2..4].copy_from_slice(&0i16.to_le_bytes());
+                    b[8..16].copy_from_slice(&h.start.to_le_bytes());
+                    b[16..24].copy_from_slice(&h.len.to_le_bytes());
+                    b[24..28].copy_from_slice(&h.pid.to_le_bytes());
+                }
+            }
+            return Ok(0);
+        }
+        if !matches!(ty, F_RDLCK | F_WRLCK | F_UNLCK) {
+            return Err(EINVAL);
+        }
+        let wait = cmd == 7 || cmd == 38;
+        self.kernel.locks.set(Kind::Record, file, owner, start, end, ty, wait, &self.interrupted()).map(|_| 0)
     }
 
-    /// flock: the host's (a lock per open file description, as on Linux).
+    /// flock: whole-file locks of the open file description, in the
+    /// runtime's lock table (apart from fcntl's, as on Linux).
     fn flock(&mut self, fd: i64, op: i64) -> SysResult<i64> {
+        use crate::locks::{F_RDLCK, F_UNLCK, F_WRLCK, Kind, Owner};
+        const LOCK_SH: i64 = 1;
+        const LOCK_EX: i64 = 2;
+        const LOCK_NB: i64 = 4;
+        const LOCK_UN: i64 = 8;
         let open = self.fds.get(fd)?.open.clone();
-        let guard = open.lock().unwrap();
-        let Open::File { file, .. } = &*guard else { return Ok(0) };
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: a valid descriptor.
-            if unsafe { libc::flock(file.as_raw_fd(), op as i32) } < 0 {
-                return Err(std::io::Error::last_os_error().raw_os_error().map_or(EIO, |e| e as i64));
-            }
+        let file = match &*open.lock().unwrap() {
+            Open::File { file, .. } => crate::locks::file_id(file)?,
+            _ => return Ok(0),
+        };
+        let ty = match op & !LOCK_NB {
+            LOCK_SH => F_RDLCK,
+            LOCK_EX => F_WRLCK,
+            LOCK_UN => F_UNLCK,
+            _ => return Err(EINVAL),
+        };
+        let owner = Owner::Description(Arc::downgrade(&open));
+        self.kernel.locks.set(Kind::Flock, file, owner, 0, u64::MAX, ty, op & LOCK_NB == 0, &self.interrupted()).map(|_| 0)
+    }
+
+    /// The host file behind `fd`, if it is one: to release its locks once
+    /// the descriptor closes.
+    fn file_id_of(&self, fd: i64) -> Option<crate::locks::FileId> {
+        let open = self.fds.get(fd).ok()?.open.clone();
+        match &*open.lock().unwrap() {
+            Open::File { file, .. } => crate::locks::file_id(file).ok(),
+            _ => None,
         }
-        let _ = (file, op);
-        Ok(0)
+    }
+
+    /// A descriptor closed: the process's record locks on its file go, and
+    /// waiters recheck (an open file description's locks go with its last
+    /// descriptor).
+    fn unlocked(&self, file: Option<crate::locks::FileId>) {
+        match file {
+            Some(file) => self.kernel.locks.closed(self.pid, file),
+            None => self.kernel.locks.released(),
+        }
     }
 
     /// A host descriptor for what the guest's `fd` refers to (a duplicate),

@@ -72,6 +72,8 @@ pub struct Kernel {
     forwarded: Mutex<HashMap<String, PathBuf>>,
     /// Unix socket names (unix.rs).
     pub unix: crate::unix::Names,
+    /// File locks (locks.rs).
+    pub locks: crate::locks::Locks,
     /// Signalled whenever a process exits or receives a signal.
     changed: Condvar,
     /// Compiled programs by host path, with the (mtime, size) they were
@@ -106,6 +108,7 @@ impl Kernel {
             foreground: std::sync::atomic::AtomicI32::new(1),
             forwarded: Mutex::new(HashMap::new()),
             unix: Default::default(),
+            locks: Default::default(),
             changed: Condvar::new(),
             modules: Mutex::new(HashMap::new()),
             timers: Mutex::new(HashMap::new()),
@@ -134,6 +137,7 @@ impl Kernel {
     /// Records that `pid` ended, and wakes anyone waiting for it.
     pub fn exit(&self, pid: i32, how: Termination) {
         self.timers.lock().unwrap().remove(&pid);
+        self.locks.exited(pid);
         let mut p = self.procs.lock().unwrap();
         // Orphans: forget exited children, and let running ones clean up
         // after themselves when they exit.

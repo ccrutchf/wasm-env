@@ -27,6 +27,7 @@ mod fs;
 mod image;
 mod inotify;
 mod kernel;
+mod locks;
 mod memory;
 mod modules;
 mod net;

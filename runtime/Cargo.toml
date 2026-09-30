@@ -29,6 +29,7 @@ notify = "8.2"
 # translate::ensure_code).
 wasm-env-translate = { path = "../translator", features = ["lift"] }
 
-# Windows hosts: polling sockets (WSAPoll), bytes pending (ioctlsocket).
+# Windows hosts: polling sockets (WSAPoll), bytes pending (ioctlsocket), file
+# identities (locks.rs).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_Memory"] }

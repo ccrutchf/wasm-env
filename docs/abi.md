@@ -164,7 +164,7 @@ It also generates `/proc/cpuinfo`, `/sys/devices/system/cpu/{online,possible,pre
 
 **Terminals.** When the runtime's stdin, stdout or stderr is a terminal, `TCGETS`, `TCSETS*`, `TIOCGWINSZ`, `TCXONC` and `TCFLSH` on them go to the host terminal (on Linux hosts: the structures have the same layout), and `TIOCGPGRP`/`TIOCSPGRP` read and set the environment's foreground process group. Ctrl-C and Ctrl-\ at the host terminal send SIGINT and SIGQUIT to that group; the terminal's settings are restored when wasm-env exits.
 
-**Locks.** `fcntl`'s record locks (`F_GETLK`, `F_SETLK`, `F_SETLKW` and the `F_OFD_` forms) and `flock` are the host's open-file-description locks: the environment's processes share one host process, whose per-process POSIX locks would never conflict between them.
+**Locks.** `fcntl`'s record locks (`F_GETLK`, `F_SETLK`, `F_SETLKW` and the `F_OFD_` forms) and `flock` are the runtime's, on every host (runtime/src/locks.rs): a table keyed by the host file's identity, as Linux's kernel keeps it, since the environment's processes share one host process and the host's per-process locks would never conflict between them. A process's record locks go when it closes any descriptor for the file, or exits; an open file description's (`F_OFD_`, `flock`) with its last descriptor; record locks and `flock` locks don't see each other. Locks are between the environment's processes: host programs outside it don't see them.
 
 **fork (programs built with the toolchain)**, which keep C state on the host stack, remains open (they have vfork). The options:
 

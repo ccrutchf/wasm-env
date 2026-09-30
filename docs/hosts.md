@@ -61,7 +61,7 @@ translated program, `--trace`'s last lines) is what's needed to fix it.
 
 Status: the runtime and translator build for `x86_64-pc-windows-gnu`
 (cross-compiled on Linux with MinGW's gcc), and the runtime runs under Wine:
-its unit tests (70; the few that need a Unix host are left out), M1's 34
+its unit tests (75; the few that need a Unix host are left out), M1's 34
 checks (processes, a shell, pipes, sockets, networking) and M0's 20;
 and it translates arm64 programs itself, with LLVM's Windows build as the
 toolchain (M2's `hello`, translated and run on first use).

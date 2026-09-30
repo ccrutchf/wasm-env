@@ -1,13 +1,14 @@
 // Unix sockets with paths, descriptor passing (SCM_RIGHTS), memfd and
 // shared mappings (MAP_SHARED): what Wayland clients and GPU drivers need
-// (PLAN.md, M8). Differential against qemu, so it prints no pids, addresses
-// or host paths.
+// (PLAN.md, M8), and file locks between processes. Differential against
+// qemu, so it prints no pids, addresses or host paths.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -255,6 +256,60 @@ static void watching(void) {
     printf("dumpable: %d\n", prctl(PR_GET_DUMPABLE));
 }
 
+// Record locks (a process's and F_OFD_ ones) and flock, between processes.
+static int setlk(int fd, int cmd, short type, off_t start, off_t len) {
+    struct flock l = {.l_type = type, .l_whence = SEEK_SET, .l_start = start, .l_len = len};
+    return fcntl(fd, cmd, &l);
+}
+
+static void locking(void) {
+    const char *path = "unix-test-locks";
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    check(fd >= 0, "open");
+    check(setlk(fd, F_SETLK, F_WRLCK, 0, 10) == 0, "F_SETLK");
+    check(setlk(fd, F_OFD_SETLK, F_WRLCK, 100, 10) == 0, "F_OFD_SETLK");
+    check(setlk(fd, F_SETLK, F_WRLCK, 200, 1) == 0, "F_SETLK 200");
+    int whole = open(path, O_RDWR);
+    check(flock(whole, LOCK_EX) == 0, "flock");
+    pid_t parent = getpid();
+    pid_t child = fork();
+    if (child == 0) {
+        int own = open(path, O_RDWR);
+        errno = 0;
+        printf("lock: child's write lock in the parent's range: %s\n", setlk(own, F_SETLK, F_WRLCK, 5, 1) == 0 ? "taken" : errno == EAGAIN || errno == EACCES ? "refused" : "?");
+        struct flock l = {.l_type = F_RDLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
+        check(fcntl(own, F_GETLK, &l) == 0, "F_GETLK");
+        printf("lock: F_GETLK: %s at %ld+%ld by the parent: %s\n", l.l_type == F_WRLCK ? "write" : "?", (long)l.l_start, (long)l.l_len, l.l_pid == parent ? "yes" : "no");
+        printf("lock: beyond it: %s\n", setlk(own, F_SETLK, F_WRLCK, 20, 10) == 0 ? "taken" : "refused");
+        printf("lock: in the description's range: %s\n", setlk(own, F_OFD_SETLK, F_RDLCK, 105, 1) == 0 ? "taken" : "refused");
+        printf("flock: another description: %s\n", flock(own, LOCK_EX | LOCK_NB) == 0 ? "taken" : errno == EWOULDBLOCK ? "would block" : "?");
+        printf("flock: the same description: %s\n", flock(whole, LOCK_EX | LOCK_NB) == 0 ? "taken" : "refused");
+        check(setlk(own, F_SETLKW, F_WRLCK, 200, 1) == 0, "F_SETLKW");
+        printf("lock: waited for the parent's\n");
+        _exit(0);
+    }
+    usleep(200 * 1000);
+    printf("lock: parent unlocks\n");
+    check(setlk(fd, F_SETLK, F_UNLCK, 200, 1) == 0, "F_UNLCK");
+    int status;
+    waitpid(child, &status, 0);
+    // Closing any descriptor for the file releases the process's locks,
+    // but not the open file description's.
+    int other = open(path, O_RDONLY);
+    close(other);
+    child = fork();
+    if (child == 0) {
+        int own = open(path, O_RDWR);
+        printf("lock: after the parent closed a descriptor: %s\n", setlk(own, F_SETLK, F_WRLCK, 0, 10) == 0 ? "taken" : "refused");
+        printf("lock: the description's still held: %s\n", setlk(own, F_SETLK, F_WRLCK, 100, 1) == 0 ? "no" : "yes");
+        _exit(0);
+    }
+    waitpid(child, &status, 0);
+    close(whole);
+    close(fd);
+    unlink(path);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     watching();
@@ -262,6 +317,7 @@ int main(void) {
     shared_across_fork();
     passing_descriptors();
     path_sockets();
+    locking();
     puts("done");
     return 0;
 }
