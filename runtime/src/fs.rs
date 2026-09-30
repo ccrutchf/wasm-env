@@ -16,6 +16,13 @@ use crate::pipe::PipeEnd;
 
 /// Maps a host I/O error to a Linux errno.
 pub fn errno(e: &io::Error) -> i64 {
+    // A Linux host's numbers are the guest's (EPERM stays EPERM, not the
+    // EACCES its kind would give).
+    if cfg!(target_os = "linux")
+        && let Some(n) = e.raw_os_error()
+    {
+        return n as i64;
+    }
     use io::ErrorKind::*;
     match e.kind() {
         NotFound => ENOENT,
@@ -63,6 +70,12 @@ impl Fs {
     /// The host path for a resolved guest path.
     pub fn host(&self, guest: &str) -> PathBuf {
         self.root.join(guest.trim_start_matches('/'))
+    }
+
+    /// The guest path of a host path under the root (None outside it).
+    pub fn guest(&self, host: &Path) -> Option<String> {
+        let rest = host.strip_prefix(&self.root).ok()?;
+        Some(format!("/{}", rest.to_str()?))
     }
 
     /// Resolves `path` relative to the guest directory `dir` into a
@@ -388,6 +401,61 @@ pub enum Open {
     Device(Device),
     EventFd(Arc<crate::events::EventFd>),
     Epoll(Arc<crate::events::Epoll>),
+    /// A host descriptor of a kind the runtime doesn't model itself (a pipe,
+    /// a device), passed to the guest by another process: read, write and
+    /// poll go to the host.
+    Host(Arc<HostFd>),
+}
+
+/// A host descriptor behind `Open::Host`. Like a socket, it blocks or not as
+/// the guest descriptor's O_NONBLOCK says at each call.
+pub struct HostFd {
+    pub fd: std::os::fd::OwnedFd,
+    nonblocking: Mutex<bool>,
+}
+
+impl HostFd {
+    /// Blocking or not as the host descriptor is now.
+    pub fn new(fd: std::os::fd::OwnedFd) -> Self {
+        let nonblocking = crate::net::host_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&fd));
+        HostFd { fd, nonblocking: Mutex::new(nonblocking) }
+    }
+
+    fn blocking(&self, nonblock: bool) -> SysResult<()> {
+        use std::os::fd::AsRawFd;
+        let mut current = self.nonblocking.lock().unwrap();
+        if *current != nonblock {
+            let fd = self.fd.as_raw_fd();
+            // SAFETY: fcntl on a descriptor this owns.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            let flags = if nonblock { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
+            // SAFETY: as above.
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+                return Err(errno(&std::io::Error::last_os_error()));
+            }
+            *current = nonblock;
+        }
+        Ok(())
+    }
+
+    pub fn read(&self, buf: &mut [u8], nonblock: bool) -> SysResult<i64> {
+        self.blocking(nonblock)?;
+        // SAFETY: reads into `buf`, which has room for its length.
+        let n = unsafe { libc::read(std::os::fd::AsRawFd::as_raw_fd(&self.fd), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 { Err(errno(&std::io::Error::last_os_error())) } else { Ok(n as i64) }
+    }
+
+    pub fn write(&self, buf: &[u8], nonblock: bool) -> SysResult<i64> {
+        self.blocking(nonblock)?;
+        // SAFETY: writes from `buf`.
+        let n = unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&self.fd), buf.as_ptr().cast(), buf.len()) };
+        if n < 0 { Err(errno(&std::io::Error::last_os_error())) } else { Ok(n as i64) }
+    }
+
+    pub fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        let file = std::fs::File::from(self.fd.try_clone()?);
+        file.metadata()
+    }
 }
 
 /// A descriptor: the open file description (shared by dup, vfork and

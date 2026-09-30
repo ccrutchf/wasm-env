@@ -36,6 +36,8 @@ pub struct Mm {
     /// `mprotect` with PROT_EXEC): where a JIT puts the code it generates,
     /// translated when it's first jumped to (see translate::ensure_code).
     pub code: Ranges,
+    /// Shared mappings: host mappings of files (see shared.rs).
+    pub shared: crate::shared::SharedMaps,
 }
 
 /// Disjoint address ranges, start → end.
@@ -156,7 +158,7 @@ pub struct Group {
 impl Group {
     pub fn new() -> Arc<Group> {
         Arc::new(Group {
-            mm: Mutex::new(Mm { space: AddressSpace::new(0), brk: 0, brk_start: 0, low: Default::default(), code: Default::default() }),
+            mm: Mutex::new(Mm { space: AddressSpace::new(0), brk: 0, brk_start: 0, low: Default::default(), code: Default::default(), shared: Default::default() }),
             futex: Futexes::default(),
             threading: OnceLock::new(),
             libraries: Default::default(),
@@ -170,7 +172,7 @@ impl Group {
     pub fn fork(&self, memory: SharedMemory) -> Arc<Group> {
         let mm = self.mm.lock().unwrap();
         let child = Arc::new(Group {
-            mm: Mutex::new(Mm { space: mm.space.clone(), brk: mm.brk, brk_start: mm.brk_start, low: mm.low.clone(), code: mm.code.clone() }),
+            mm: Mutex::new(Mm { space: mm.space.clone(), brk: mm.brk, brk_start: mm.brk_start, low: mm.low.clone(), code: mm.code.clone(), shared: mm.shared.clone() }),
             futex: Futexes::default(),
             threading: OnceLock::new(),
             libraries: self.libraries.fork(),

@@ -93,6 +93,7 @@ int main(void)
 	r = connect(r2, (struct sockaddr *)&a, sizeof a);
 	printf("refused: %s\n", r < 0 && errno == ECONNREFUSED ? "ECONNREFUSED" : "unexpected");
 
-	printf("unix socket: %s\n", socket(AF_UNIX, SOCK_STREAM, 0) < 0 && errno == EAFNOSUPPORT ? "EAFNOSUPPORT" : "?");
+	printf("unix socket: %s\n", socket(AF_UNIX, SOCK_STREAM, 0) >= 0 ? "ok" : "?");
+	printf("netlink socket: %s\n", socket(AF_NETLINK, SOCK_RAW, 0) < 0 && errno == EAFNOSUPPORT ? "EAFNOSUPPORT" : "?");
 	return 0;
 }

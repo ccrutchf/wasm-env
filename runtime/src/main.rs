@@ -27,6 +27,7 @@ mod net;
 mod oci;
 mod pipe;
 mod process;
+mod shared;
 mod syscall;
 mod terminal;
 mod thread;

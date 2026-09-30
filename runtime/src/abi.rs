@@ -94,10 +94,12 @@ pub mod nr {
     pub const EXECVE: i64 = 221;
     pub const MMAP: i64 = 222;
     pub const MPROTECT: i64 = 226;
+    pub const MSYNC: i64 = 227;
     pub const MADVISE: i64 = 233;
     pub const WAIT4: i64 = 260;
     pub const PRLIMIT64: i64 = 261;
     pub const RENAMEAT2: i64 = 276;
+    pub const MEMFD_CREATE: i64 = 279;
     pub const GETRANDOM: i64 = 278;
     pub const PSELECT6: i64 = 72;
     pub const PPOLL: i64 = 73;
@@ -176,7 +178,7 @@ pub fn name(n: i64) -> &'static str {
         UMASK => "umask", GETTIMEOFDAY => "gettimeofday", GETPID => "getpid",
         GETPPID => "getppid", GETUID => "getuid", GETEUID => "geteuid", GETGID => "getgid",
         GETEGID => "getegid", GETTID => "gettid", BRK => "brk", MUNMAP => "munmap",
-        MREMAP => "mremap", MMAP => "mmap", MPROTECT => "mprotect", MADVISE => "madvise",
+        MREMAP => "mremap", MMAP => "mmap", MPROTECT => "mprotect", MSYNC => "msync", MEMFD_CREATE => "memfd_create", MADVISE => "madvise",
         PRLIMIT64 => "prlimit64", GETRANDOM => "getrandom", PIPE2 => "pipe2", CLONE => "clone",
         EXECVE => "execve", WAIT4 => "wait4", SETPGID => "setpgid", GETPGID => "getpgid",
         GETSID => "getsid", SETSID => "setsid", PSELECT6 => "pselect6", PPOLL => "ppoll",

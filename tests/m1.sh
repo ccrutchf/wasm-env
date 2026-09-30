@@ -112,7 +112,8 @@ idle poll: 0
 udp sent 8
 udp received 8: datagram from 127.0.0.1
 refused: ECONNREFUSED
-unix socket: EAFNOSUPPORT" "$(timeout 30 "$wasm_env" run --root "$rootfs" /bin/net-test 2>&1)"
+unix socket: ok
+netlink socket: EAFNOSUPPORT" "$(timeout 30 "$wasm_env" run --root "$rootfs" /bin/net-test 2>&1)"
 
 # futex, single-threaded (glibc relies on it).
 check "futex" "wait on a changed word: EAGAIN

@@ -71,6 +71,12 @@ pub fn fork(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64>
     for lib in p.group.libraries.list.lock().unwrap().iter() {
         copy_pages(from, to, lib.base, lib.end);
     }
+    // Shared mappings stay shared: the child maps the same files (over the
+    // copies just made).
+    #[cfg(target_os = "linux")]
+    for (&start, m) in &p.group.mm.lock().unwrap().shared {
+        crate::shared::map(to.as_mut_ptr(), start, m.end - start, &m.file, m.offset, m.writable)?;
+    }
 
     let pid = kernel.create(p.pid);
     if flags & CLONE_PARENT_SETTID != 0 {
