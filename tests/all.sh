@@ -20,6 +20,10 @@ step() {
 
 step "unit tests (runtime, bench harness)" cargo test -q --release -p wasm-env -p bench-harness
 step "unit tests (translator)" cargo test -q -p wasm-env-translate --features lift
+# The GPU service: on the host's GPU, then on software Vulkan (lavapipe),
+# where there is one; its kernels compile with $WASM_CC.
+step "unit tests (GPU service)" cargo test -q --release -p wasm-env-gpu
+step "unit tests (GPU service, software)" env WASM_ENV_GPU=software cargo test -q --release -p wasm-env-gpu device
 step "M0: toolchain, runtime, BusyBox" tests/m0.sh
 step "M1: processes and a shell" env SKIP_BUILD=1 tests/m1.sh
 step "M2: arm64 translation (differential vs qemu)" tests/m2.sh

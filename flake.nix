@@ -39,11 +39,12 @@
             llvm-ar rcs $out/lib/libclang_rt.builtins.a $TMPDIR/obj/*.o
           '';
           # Libraries the compositor's host windows (winit) load at run time
-          # on Linux: the host's window system, Wayland or X11.
-          windowLibs = with pkgs; [ wayland libxkbcommon libx11 libxcursor libxrandr libxi ];
+          # on Linux: the host's window system, Wayland or X11, and the Vulkan
+          # loader the GPU service (wgpu) opens.
+          windowLibs = with pkgs; [ wayland libxkbcommon libx11 libxcursor libxrandr libxi vulkan-loader ];
           src = lib.fileset.toSource {
             root = ./.;
-            fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./runtime ./translator ./vendor ./bench/harness ];
+            fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./gpu ./runtime ./translator ./vendor ./bench/harness ];
           };
         in
         rec {
@@ -117,8 +118,9 @@
             # bindgen (used by the bad64 arm64 decoder crate) needs libclang.
             LIBCLANG_PATH = "${llvm.libclang.lib}/lib";
           } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-            # The compositor's host windows (winit) load these at run time.
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [ wayland libxkbcommon libx11 libxcursor libxrandr libxi ]);
+            # The compositor's host windows (winit) and the GPU service (wgpu)
+            # load these at run time.
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [ wayland libxkbcommon libx11 libxcursor libxrandr libxi vulkan-loader ]);
             # arm64 musl runtime (libc.so, ld-musl) for dynamic-linking tests.
             AARCH64_MUSL = "${pkgs.pkgsCross.aarch64-multiplatform-musl.musl}";
           });

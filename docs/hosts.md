@@ -53,6 +53,11 @@ place to look (runtime/src/memory.rs, `host_page`).
    `target/release/wasm-env run --wayland --root build/ubuntu --env HOME=/root /usr/bin/gtk3-widget-factory`
    (GTK 3; its libraries take several minutes to translate the first
    time). `--wayland=headless` runs the same without windows.
+6. **The GPU service (M9, begun: not yet reachable from the environment).**
+   `cargo test --release -p wasm-env-gpu -- --nocapture` compiles OpenCL
+   kernels to WGSL and runs them on the Mac's GPU through Metal, checking
+   the results against the CPU; it prints the adapter it used. Nothing
+   has run on Metal yet.
 
 Where something fails, the command's output (and, for a crash inside a
 translated program, `--trace`'s last lines) is what's needed to fix it.
@@ -81,6 +86,10 @@ Not yet:
   tests that on Linux), but two processes don't share memory through a file
   or `MAP_SHARED | MAP_ANONYMOUS` (Python's multiprocessing uses that).
 - A native Windows build (MSVC) hasn't been tried.
+- **The GPU service** runs on DirectX 12 there, which hasn't been tried
+  on Windows itself: under Wine, whose HLSL compiler can't compile the
+  shaders wgpu makes for DirectX 12, it's tested through Vulkan instead
+  (`WGPU_BACKEND=vulkan tests/cross.sh --unit`).
 
 **The toolchain on Windows.** Translation runs `clang.exe` and
 `wasm-ld.exe` from the directory `WASM_ENV_TOOLCHAIN` names (else

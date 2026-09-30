@@ -3,8 +3,8 @@
 # Apple silicon (aarch64-apple-darwin) and Windows (x86_64-pc-windows-gnu).
 # With --build, also builds Windows executables (MinGW's gcc links them),
 # which tests can run under Wine: WASM_ENV_RUNTIME=build/wine-wasm-env
-# tests/m1.sh (docs/hosts.md). With --unit [filter], runs the runtime's unit
-# tests under Wine.
+# tests/m1.sh (docs/hosts.md). With --unit [filter], runs the runtime's and
+# the GPU service's unit tests under Wine.
 #
 # Needs network the first time: a Rust toolchain with those targets (in
 # build/rustup), zig (C headers for both targets), MinGW's gcc, and Wine.
@@ -72,12 +72,19 @@ EOF
 	echo "built: build/wine-wasm-env runs the Windows build under Wine"
 fi
 if [ "${1:-}" = --unit ]; then
-	# The runtime's unit tests, built for Windows and run under Wine.
+	# The runtime's and the GPU service's unit tests, built for Windows and
+	# run under Wine (OpenCL kernels compiled by the Windows toolchain's
+	# clang, in build/win-toolchain, if it's there).
 	wine=$(store wineWow64Packages.stable)
-	exe=$("$cargo" test -q --release --target x86_64-pc-windows-gnu -p wasm-env --no-run --message-format=json 2>/dev/null |
-		grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | head -1)
 	export WINEPREFIX=$root/build/wineprefix WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
 	[ -d "$WINEPREFIX" ] || "$wine/bin/wineboot" --init >/dev/null 2>&1
-	"$wine/bin/wine" "$exe" ${2:+"$2"} || status=1
+	if [ -e build/win-toolchain/bin/clang.exe ]; then
+		export WASM_CC="Z:$(pwd | tr / '\\')\\build\\win-toolchain\\bin\\clang.exe"
+	fi
+	for package in wasm-env wasm-env-gpu; do
+		exe=$("$cargo" test -q --release --target x86_64-pc-windows-gnu -p $package --no-run --message-format=json 2>/dev/null |
+			grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | head -1)
+		"$wine/bin/wine" "$exe" ${2:+"$2"} || status=1
+	done
 fi
 exit $status

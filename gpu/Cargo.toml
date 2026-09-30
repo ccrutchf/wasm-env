@@ -1,0 +1,14 @@
+[package]
+name = "wasm-env-gpu"
+version = "0.1.0"
+description = "wasm-env's GPU service: OpenCL kernels compiled to WGSL and run on wgpu"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+wgpu = "30"
+pollster = "0.4"
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }

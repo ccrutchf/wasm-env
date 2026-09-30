@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["bench/harness", "runtime", "translator"]
+members = ["bench/harness", "gpu", "runtime", "translator"]
 
 [workspace.package]
 edition = "2024"
