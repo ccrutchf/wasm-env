@@ -17,6 +17,9 @@ use crate::thread::{Group, GroupEnd};
 
 /// Width of masked addresses: 2^38 bytes (256 GB) per process.
 const MASK_BITS: u32 = 38;
+/// Our changes to Cranelift's code generation (vendor/cranelift-codegen):
+/// part of a compiled module's cache stamp.
+const CODEGEN: &str = "tail-no-callee-saves";
 
 /// Number of signals, plus one so signal numbers can index directly.
 pub const NSIG: usize = 65;
@@ -281,7 +284,10 @@ pub fn load_module(engine: &Engine, host: &std::path::Path) -> Result<Module> {
     let mtime = meta.modified()?.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut h);
-    let stamp = format!("{} {} {} {:016x}\n", meta.len(), mtime.as_nanos(), MASK_BITS, h.finish());
+    // CODEGEN names our own changes to Cranelift's code generation, which
+    // its compatibility hash doesn't see: code compiled before a change
+    // mustn't be mixed with code compiled after it.
+    let stamp = format!("{} {} {} {CODEGEN} {:016x}\n", meta.len(), mtime.as_nanos(), MASK_BITS, h.finish());
     let key = crate::translate::hash(host.as_os_str().as_encoded_bytes());
     let (entry, stamp_file) = (dir.join(format!("{key:016x}.cwasm")), dir.join(format!("{key:016x}.stamp")));
     if std::fs::read_to_string(&stamp_file).is_ok_and(|s| s == stamp) {

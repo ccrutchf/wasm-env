@@ -1011,10 +1011,15 @@ fn lift_region(prog: &Program, region: u64, leaders: &[u64], alone: bool, unsupp
         out.loop_edges.extend(b.succs.iter().filter(|&&s| region_of(s) == region && s <= start).map(|&s| (s, start, pc)));
         // Calls and returns don't carry flags (the arm64 procedure call
         // standard leaves NZCV undefined across them, and compiled code
-        // never reads them on entry), so they don't propagate liveness;
-        // other indirect jumps (jump tables) might, so they're assumed to.
+        // never reads them on entry), so they don't propagate liveness.
+        // Nor does an indirect jump's unknown target: compilers set flags
+        // again after a computed jump (an interpreter's dispatch, a
+        // computed goto), and a jump table's targets, when discovery found
+        // them, are successors like any other. Treating `br` as reading them
+        // kept every flag computation ahead of CPython's opcode dispatch.
         let (succs, unknown) = match last {
             "bl" | "blr" | "blraa" | "blrab" | "ret" | "retaa" | "retab" => (Vec::new(), false),
+            "br" | "braa" | "brab" | "braaz" | "brabz" => (std::mem::take(&mut b.succs), false),
             _ => (std::mem::take(&mut b.succs), b.indirect),
         };
         let body = std::mem::take(&mut b.body);

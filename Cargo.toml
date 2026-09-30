@@ -13,3 +13,6 @@ debug = "line-tables-only"
 # See vendor/wasmtime-internal-cranelift/src/bounds_checks.rs (search "wasm-env").
 [patch.crates-io]
 wasmtime-internal-cranelift = { path = "vendor/wasmtime-internal-cranelift" }
+# No callee-saved registers in the tail calling convention: see
+# vendor/cranelift-codegen/src/isa/x64/abi.rs (search "wasm-env").
+cranelift-codegen = { path = "vendor/cranelift-codegen" }
