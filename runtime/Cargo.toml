@@ -18,6 +18,11 @@ flate2 = "1"
 tar = "0.4"
 sha2 = "0.10"
 wasmtime = "49"
+# The runtime's Wayland compositor (wayland/): the protocol descriptions, and
+# host windows (winit) drawn in software (softbuffer), on every host.
+quick-xml = "0.38"
+winit = "0.30"
+softbuffer = "0.4"
 # Code a program generates at run time is translated in-process (see
 # translate::ensure_code).
 wasm-env-translate = { path = "../translator", features = ["lift"] }

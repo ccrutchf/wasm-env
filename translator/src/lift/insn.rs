@@ -763,6 +763,72 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let r = vbuild(b, e, &parts);
             b.write_v(d, r, 128);
         }
+        "uabdl" | "sabdl" | "uabdl2" | "sabdl2" | "uabal" | "sabal" | "uabal2" | "sabal2" => {
+            // Absolute difference long (and accumulate): |x - y| of the
+            // narrow operands' low (or high, "2") halves, widened.
+            let (d, e, _) = vec_dst(&ops[0])?;
+            let x = read_v128(b, &ops[1])?;
+            let y = read_v128(b, &ops[2])?;
+            let old = b.read_v(d, 128);
+            let lanes = 128 / e;
+            let first = if m.ends_with('2') { lanes } else { 0 };
+            let (ext, gt) = if m.starts_with('s') { ("sext", "sgt") } else { ("zext", "ugt") };
+            let mut parts = Vec::new();
+            for k in 0..lanes {
+                let xn = vlane(b, &x, e / 2, first + k);
+                let yn = vlane(b, &y, e / 2, first + k);
+                let xw = b.val(format!("{ext} i{} {xn} to i{e}", e / 2));
+                let yw = b.val(format!("{ext} i{} {yn} to i{e}", e / 2));
+                let up = b.val(format!("sub i{e} {xw}, {yw}"));
+                let down = b.val(format!("sub i{e} {yw}, {xw}"));
+                let bigger = b.val(format!("icmp {gt} i{e} {xw}, {yw}"));
+                let mut r = b.val(format!("select i1 {bigger}, i{e} {up}, i{e} {down}"));
+                if m.contains("aba") {
+                    let acc = vlane(b, &old, e, k);
+                    r = b.val(format!("add i{e} {acc}, {r}"));
+                }
+                parts.push(r);
+            }
+            let r = vbuild(b, e, &parts);
+            b.write_v(d, r, 128);
+        }
+        "addhn" | "addhn2" | "raddhn" | "raddhn2" | "subhn" | "subhn2" | "rsubhn" | "rsubhn2" => narrow_high(b, i, m)?,
+        "sqdmulh" | "sqrdmulh" if is_v(ops.first()) => {
+            // Saturating (rounding) doubling multiply, high half: the high
+            // half of 2xy (+ 2^(e-1) to round), in double width; only
+            // min * min overflows, to max. The second operand may be an
+            // element. (FPSR.QC isn't modelled.)
+            let (d, e, total) = vec_dst(&ops[0])?;
+            let x = read_v128(b, &ops[1])?;
+            let element = elem_of(&ops[2]);
+            let y = match element {
+                Some((sn, _, _)) => b.read_v(sn, 128),
+                None => read_v128(b, &ops[2])?,
+            };
+            let w = 2 * e;
+            let max = (1i64 << (e - 1)) - 1;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, e) {
+                let xk = vlane(b, &x, e, k);
+                let yk = match element {
+                    Some((_, ee, lane)) => vlane(b, &y, ee, lane),
+                    None => vlane(b, &y, e, k),
+                };
+                let xw = b.val(format!("sext i{e} {xk} to i{w}"));
+                let yw = b.val(format!("sext i{e} {yk} to i{w}"));
+                // 2xy >> e, as xy >> (e - 1): doubling min * min would overflow.
+                let mut p = b.val(format!("mul i{w} {xw}, {yw}"));
+                if m == "sqrdmulh" {
+                    p = b.val(format!("add i{w} {p}, {}", 1i64 << (e - 2)));
+                }
+                let s = b.val(format!("ashr i{w} {p}, {}", e - 1));
+                let over = b.val(format!("icmp sgt i{w} {s}, {max}"));
+                let s = b.val(format!("select i1 {over}, i{w} {max}, i{w} {s}"));
+                parts.push(b.val(format!("trunc i{w} {s} to i{e}")));
+            }
+            let r = vbuild(b, e, &parts);
+            b.write_v(d, r, 128);
+        }
         "uaddlp" | "saddlp" | "uadalp" | "sadalp" => {
             // Pairwise add long, optionally accumulating into the destination.
             let (d, e, total) = vec_dst(&ops[0])?;
@@ -791,7 +857,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         {
             vector_binary(b, i, m)?
         }
-        "not" | "abs" | "cnt" | "neg" | "rbit" if is_v(ops.first()) => vector_unary(b, i, m)?,
+        "not" | "abs" | "cnt" | "neg" | "rbit" | "clz" | "cls" if is_v(ops.first()) => vector_unary(b, i, m)?,
         "addp" | "umaxp" | "uminp" | "smaxp" | "sminp" if is_v(ops.first()) => {
             let (d, elem, total) = vec_dst(&ops[0])?;
             if ops.len() == 3 {
@@ -842,7 +908,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             }
             b.write_v(d, r, 128);
         }
-        "shrn" | "shrn2" | "xtn" | "xtn2" => vector_narrow(b, i, m)?,
+        "shrn" | "shrn2" | "rshrn" | "rshrn2" | "xtn" | "xtn2" => vector_narrow(b, i, m)?,
 
         // --- Scalar floating point ---------------------------------------------------------
         "fadd" | "fsub" | "fmul" | "fdiv" | "fnmul" | "fmin" | "fmax" | "fminnm" | "fmaxnm" if is_scalar_fp(ops) => {
@@ -1125,6 +1191,126 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             }
             let r = vbuild(b, elem, &parts);
             b.write_v(d, r, 128);
+        }
+        "uhadd" | "urhadd" | "uhsub" | "shadd" | "srhadd" | "shsub" if is_v(ops.first()) => {
+            // Halving add or subtract (rhadd rounding), in double width.
+            let (d, e, total) = vec_dst(&ops[0])?;
+            let x = read_v128(b, &ops[1])?;
+            let y = read_v128(b, &ops[2])?;
+            let ext = if m.starts_with('s') { "sext" } else { "zext" };
+            let w = 2 * e;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, e) {
+                let xk = vlane(b, &x, e, k);
+                let yk = vlane(b, &y, e, k);
+                let xw = b.val(format!("{ext} i{e} {xk} to i{w}"));
+                let yw = b.val(format!("{ext} i{e} {yk} to i{w}"));
+                let op = if m.ends_with("sub") { "sub" } else { "add" };
+                let mut s = b.val(format!("{op} i{w} {xw}, {yw}"));
+                if m[1..].starts_with("rh") {
+                    s = b.val(format!("add i{w} {s}, 1"));
+                }
+                let h = b.val(format!("ashr i{w} {s}, 1"));
+                parts.push(b.val(format!("trunc i{w} {h} to i{e}")));
+            }
+            let r = vbuild(b, e, &parts);
+            b.write_v(d, r, 128);
+        }
+        "urshr" | "srshr" | "ursra" | "srsra" if is_v(ops.first()) => {
+            // Rounding shift right (and accumulate): (x + 2^(s-1)) >> s, in
+            // double width.
+            let (d, e, total) = vec_dst(&ops[0])?;
+            let s = b.imm_op(i, 2)?;
+            let x = read_v128(b, &ops[1])?;
+            let acc = b.read_v(d, 128);
+            let (ext, shr) = if m.starts_with('s') { ("sext", "ashr") } else { ("zext", "lshr") };
+            let w = 2 * e;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, e) {
+                let xk = vlane(b, &x, e, k);
+                let xw = b.val(format!("{ext} i{e} {xk} to i{w}"));
+                let rounded = b.val(format!("add i{w} {xw}, {}", konst(1 << (s - 1), w)));
+                let sh = b.val(format!("{shr} i{w} {rounded}, {s}"));
+                let mut r = b.val(format!("trunc i{w} {sh} to i{e}"));
+                if m.ends_with("sra") {
+                    let a = vlane(b, &acc, e, k);
+                    r = b.val(format!("add i{e} {a}, {r}"));
+                }
+                parts.push(r);
+            }
+            let r = vbuild(b, e, &parts);
+            b.write_v(d, r, 128);
+        }
+        "sqshrn" | "sqrshrn" | "sqshrun" | "sqrshrun" | "uqshrn" | "uqrshrn" | "sqshrn2" | "sqrshrn2" | "sqshrun2"
+        | "sqrshrun2" | "uqshrn2" | "uqrshrn2" => {
+            // Saturating (rounding) shift right narrow: shifted in double the
+            // source width (so rounding can't overflow), clamped to the
+            // narrow type (signed, or unsigned for …un and uq…), narrowed
+            // into the low half, or the high half for the "2" forms.
+            let base = m.trim_end_matches('2');
+            let (d, e, _) = vec_dst(&ops[0])?;
+            let (_, wide, src_total) = vec_dst(&ops[1])?;
+            let s = b.imm_op(i, 2)?;
+            let x = read_v128(b, &ops[1])?;
+            let (ext, shr) = if base.starts_with("sq") { ("sext", "ashr") } else { ("zext", "lshr") };
+            let (lo, hi): (i128, i128) = if base.starts_with("sq") && !base.ends_with("un") {
+                (-(1i128 << (e - 1)), (1i128 << (e - 1)) - 1)
+            } else {
+                (0, (1i128 << e) - 1)
+            };
+            let w = 2 * wide;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(src_total, wide) {
+                let xk = vlane(b, &x, wide, k);
+                let mut v = b.val(format!("{ext} i{wide} {xk} to i{w}"));
+                if base.contains("rshr") {
+                    v = b.val(format!("add i{w} {v}, {}", 1i128 << (s - 1)));
+                }
+                let v = b.val(format!("{shr} i{w} {v}, {s}"));
+                let big = b.val(format!("icmp sgt i{w} {v}, {hi}"));
+                let v = b.val(format!("select i1 {big}, i{w} {hi}, i{w} {v}"));
+                let small = b.val(format!("icmp slt i{w} {v}, {lo}"));
+                let v = b.val(format!("select i1 {small}, i{w} {lo}, i{w} {v}"));
+                parts.push(b.val(format!("trunc i{w} {v} to i{e}")));
+            }
+            let narrowed = vbuild(b, e, &parts);
+            write_narrowed(b, d, narrowed, m.ends_with('2'));
+        }
+        "uqshl" | "sqshlu" if is_v(ops.first()) && matches!(ops.get(2), Some(Operand::Imm64 { .. } | Operand::Imm32 { .. })) => {
+            // Saturating shift left by an immediate, to an unsigned result
+            // (sqshlu: a negative lane gives 0), in double width.
+            let (d, e, total) = vec_dst(&ops[0])?;
+            let s = b.imm_op(i, 2)?;
+            let x = read_v128(b, &ops[1])?;
+            let ext = if m == "sqshlu" { "sext" } else { "zext" };
+            let w = 2 * e;
+            let max = (1i128 << e) - 1;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, e) {
+                let xk = vlane(b, &x, e, k);
+                let xw = b.val(format!("{ext} i{e} {xk} to i{w}"));
+                let v = b.val(format!("shl i{w} {xw}, {s}"));
+                let big = b.val(format!("icmp sgt i{w} {v}, {max}"));
+                let v = b.val(format!("select i1 {big}, i{w} {max}, i{w} {v}"));
+                let neg = b.val(format!("icmp slt i{w} {v}, 0"));
+                let v = b.val(format!("select i1 {neg}, i{w} 0, i{w} {v}"));
+                parts.push(b.val(format!("trunc i{w} {v} to i{e}")));
+            }
+            let r = vbuild(b, e, &parts);
+            b.write_v(d, r, 128);
+        }
+        "ld2r" | "ld3r" | "ld4r" => {
+            // Load N consecutive elements, each replicated across its
+            // register.
+            let (regs, elem, total) = reg_list(&ops[0])?;
+            let addr = structure_address(b, i)?;
+            for (r, &n) in regs.iter().enumerate() {
+                let a = b.val(format!("add nuw i64 {addr}, {}", r as u32 * elem / 8));
+                let v = b.load(&a, elem);
+                let wide = b.val(format!("zext i{elem} {v} to i128"));
+                let v = b.val(format!("mul i128 {wide}, {}", konst128(broadcast(elem, total))));
+                b.write_v(n, v, 128);
+            }
         }
         "sqxtn" | "uqxtn" | "sqxtun" | "sqxtn2" | "uqxtn2" | "sqxtun2" => {
             // Narrow each lane with saturation; the "2" forms fill the upper
@@ -2162,6 +2348,14 @@ fn vector_unary(b: &mut Block, i: &Instruction, m: &str) -> Result<()> {
             }
             "cnt" => b.val(format!("call i{elem} @llvm.ctpop.i{elem}(i{elem} {xk})")),
             "rbit" => b.val(format!("call i{elem} @llvm.bitreverse.i{elem}(i{elem} {xk})")),
+            "clz" => b.val(format!("call i{elem} @llvm.ctlz.i{elem}(i{elem} {xk}, i1 false)")),
+            // Leading sign bits after the first: clz of x xor its sign, less one.
+            "cls" => {
+                let sign = b.val(format!("ashr i{elem} {xk}, {}", elem - 1));
+                let diff = b.val(format!("xor i{elem} {xk}, {sign}"));
+                let n = b.val(format!("call i{elem} @llvm.ctlz.i{elem}(i{elem} {diff}, i1 false)"));
+                b.val(format!("sub i{elem} {n}, 1"))
+            }
             _ => bail!("vector unary {m}"),
         };
         parts.push(r);
@@ -2304,24 +2498,62 @@ fn vector_permute(b: &mut Block, i: &Instruction, m: &str) -> Result<()> {
     Ok(())
 }
 
-/// Narrowing: shrn (shift right and narrow) and xtn (extract narrow). The
-/// `2` variants write the high 64 bits; the base forms write the low half.
+/// Narrowing: shrn (shift right and narrow, rshrn rounding) and xtn
+/// (extract narrow). The `2` variants write the high 64 bits; the base
+/// forms write the low half.
 fn vector_narrow(b: &mut Block, i: &Instruction, m: &str) -> Result<()> {
     let high = m.ends_with('2');
     let (d, out_elem, _) = vec_dst(&i.operands()[0])?;
     let (_, in_elem, in_total) = vec_dst(&i.operands()[1])?;
     let x = read_v128(b, &i.operands()[1])?;
-    let amt = if m.starts_with("shrn") { b.imm_op(i, 2)? } else { 0 };
+    let amt = if m.contains("shrn") { b.imm_op(i, 2)? } else { 0 };
+    let round = m.starts_with('r') && amt > 0;
     let lanes = nlanes(in_total, in_elem);
     let mut parts = Vec::new();
     for k in 0..lanes {
-        let lane = vlane(b, &x, in_elem, k);
+        let mut lane = vlane(b, &x, in_elem, k);
+        // (A carry out of the lane would be shifted into bits the narrowing
+        // drops, so the lane's width is enough.)
+        if round {
+            lane = b.val(format!("add i{in_elem} {lane}, {}", konst(1 << (amt - 1), in_elem)));
+        }
         let shifted = if amt == 0 { lane } else { b.val(format!("lshr i{in_elem} {lane}, {amt}")) };
         parts.push(b.val(format!("trunc i{in_elem} {shifted} to i{out_elem}")));
     }
     let narrowed = vbuild(b, out_elem, &parts);
+    write_narrowed(b, d, narrowed, high);
+    Ok(())
+}
+
+/// Add or subtract, then narrow to each lane's high half: addhn, subhn
+/// (raddhn, rsubhn rounding). The `2` variants write the high 64 bits.
+fn narrow_high(b: &mut Block, i: &Instruction, m: &str) -> Result<()> {
+    let high = m.ends_with('2');
+    let (d, out_elem, _) = vec_dst(&i.operands()[0])?;
+    let (_, in_elem, in_total) = vec_dst(&i.operands()[1])?;
+    let x = read_v128(b, &i.operands()[1])?;
+    let y = read_v128(b, &i.operands()[2])?;
+    let op = if m.contains("add") { "add" } else { "sub" };
+    let mut parts = Vec::new();
+    for k in 0..nlanes(in_total, in_elem) {
+        let xk = vlane(b, &x, in_elem, k);
+        let yk = vlane(b, &y, in_elem, k);
+        let mut s = b.val(format!("{op} i{in_elem} {xk}, {yk}"));
+        if m.starts_with('r') {
+            s = b.val(format!("add i{in_elem} {s}, {}", konst(1 << (out_elem - 1), in_elem)));
+        }
+        let hi = b.val(format!("lshr i{in_elem} {s}, {out_elem}"));
+        parts.push(b.val(format!("trunc i{in_elem} {hi} to i{out_elem}")));
+    }
+    let narrowed = vbuild(b, out_elem, &parts);
+    write_narrowed(b, d, narrowed, high);
+    Ok(())
+}
+
+/// Writes a narrowed 64-bit result: to the low half (clearing the high
+/// one), or with `high` to the high half, keeping the low one.
+fn write_narrowed(b: &mut Block, d: u8, narrowed: String, high: bool) {
     if high {
-        // Keep the existing low 64 bits, place the result in the high half.
         let old = b.read_v(d, 128);
         let low = b.val(format!("and i128 {old}, 18446744073709551615"));
         let hi = b.val(format!("shl i128 {narrowed}, 64"));
@@ -2330,7 +2562,6 @@ fn vector_narrow(b: &mut Block, i: &Instruction, m: &str) -> Result<()> {
     } else {
         b.write_v(d, narrowed, 128);
     }
-    Ok(())
 }
 
 /// fmov in its several forms: gpr<->fp bit moves, reg-reg copy, and moving

@@ -103,33 +103,49 @@ pub fn map(memory: &SharedMemory, wasm: &Path) -> Result<()> {
 #[cfg(unix)]
 fn map_run(file: &File, base: *mut u8, r: &Run) -> Result<()> {
     use std::os::fd::AsRawFd;
-    // SAFETY: [addr, addr + len) lies inside the memory (grown to cover it
+    // The file's pages can be mapped where the run is whole host pages at
+    // the same offset within a host page as in the file (with 4 KiB host
+    // pages, every run); the rest is copied.
+    let page = crate::memory::host_page();
+    let (first, last) = (r.addr.next_multiple_of(page), (r.addr + r.len) / page * page);
+    if r.addr % page != r.offset % page || last <= first {
+        return copy_run(file, base, r.addr, r.offset, r.len);
+    }
+    copy_run(file, base, r.addr, r.offset, first - r.addr)?;
+    // SAFETY: [first, last) lies inside the memory (grown to cover it
     // above), which nothing else is using yet; the mapping replaces those
     // pages with a private copy-on-write view of the file.
     let p = unsafe {
         libc::mmap(
-            base.add(r.addr as usize).cast(),
-            r.len as usize,
+            base.add(first as usize).cast(),
+            (last - first) as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_FIXED,
             file.as_raw_fd(),
-            r.offset as libc::off_t,
+            (r.offset + (first - r.addr)) as libc::off_t,
         )
     };
     if p == libc::MAP_FAILED {
         bail!("mapping the guest image: {}", std::io::Error::last_os_error());
     }
-    Ok(())
+    copy_run(file, base, last, r.offset + (last - r.addr), r.addr + r.len - last)
 }
 
 #[cfg(not(unix))]
 fn map_run(file: &File, base: *mut u8, r: &Run) -> Result<()> {
-    use std::os::windows::fs::FileExt;
-    // SAFETY: as for the Unix version; the pages are copied instead.
-    let dst = unsafe { std::slice::from_raw_parts_mut(base.add(r.addr as usize), r.len as usize) };
+    copy_run(file, base, r.addr, r.offset, r.len)
+}
+
+/// Copies [offset, offset + len) of the file to guest address `addr`.
+fn copy_run(file: &File, base: *mut u8, addr: u64, offset: u64, len: u64) -> Result<()> {
+    // SAFETY: as for map_run: the range is inside the memory, unused yet.
+    let dst = unsafe { std::slice::from_raw_parts_mut(base.add(addr as usize), len as usize) };
     let mut done = 0;
     while done < dst.len() {
-        let n = file.seek_read(&mut dst[done..], r.offset + done as u64)?;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(file, &mut dst[done..], offset + done as u64)?;
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(file, &mut dst[done..], offset + done as u64)?;
         if n == 0 {
             break;
         }

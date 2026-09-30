@@ -14,6 +14,7 @@ pub mod nr {
     pub const LINKAT: i64 = 37;
     pub const RENAMEAT: i64 = 38;
     pub const FTRUNCATE: i64 = 46;
+    pub const FALLOCATE: i64 = 47;
     pub const FCHMOD: i64 = 52;
     pub const FCHMODAT: i64 = 53;
     pub const FCHOWNAT: i64 = 54;
@@ -104,6 +105,11 @@ pub mod nr {
     pub const PSELECT6: i64 = 72;
     pub const PPOLL: i64 = 73;
     pub const EVENTFD2: i64 = 19;
+    pub const INOTIFY_INIT1: i64 = 26;
+    pub const INOTIFY_ADD_WATCH: i64 = 27;
+    pub const INOTIFY_RM_WATCH: i64 = 28;
+    pub const PRCTL: i64 = 167;
+    pub const FADVISE64: i64 = 223;
     pub const EPOLL_CREATE1: i64 = 20;
     pub const EPOLL_CTL: i64 = 21;
     pub const EPOLL_PWAIT: i64 = 22;
@@ -178,7 +184,7 @@ pub fn name(n: i64) -> &'static str {
         UMASK => "umask", GETTIMEOFDAY => "gettimeofday", GETPID => "getpid",
         GETPPID => "getppid", GETUID => "getuid", GETEUID => "geteuid", GETGID => "getgid",
         GETEGID => "getegid", GETTID => "gettid", BRK => "brk", MUNMAP => "munmap",
-        MREMAP => "mremap", MMAP => "mmap", MPROTECT => "mprotect", MSYNC => "msync", MEMFD_CREATE => "memfd_create", MADVISE => "madvise",
+        MREMAP => "mremap", MMAP => "mmap", MPROTECT => "mprotect", FALLOCATE => "fallocate", MSYNC => "msync", INOTIFY_INIT1 => "inotify_init1", INOTIFY_ADD_WATCH => "inotify_add_watch", INOTIFY_RM_WATCH => "inotify_rm_watch", PRCTL => "prctl", FADVISE64 => "fadvise64", MEMFD_CREATE => "memfd_create", MADVISE => "madvise",
         PRLIMIT64 => "prlimit64", GETRANDOM => "getrandom", PIPE2 => "pipe2", CLONE => "clone",
         EXECVE => "execve", WAIT4 => "wait4", SETPGID => "setpgid", GETPGID => "getpgid",
         GETSID => "getsid", SETSID => "setsid", PSELECT6 => "pselect6", PPOLL => "ppoll",

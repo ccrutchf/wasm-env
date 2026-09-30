@@ -372,6 +372,18 @@ pub fn stdio_stat_bytes() -> [u8; 128] {
     b
 }
 
+/// `struct stat` for a socket (or a socket's file, with its path's own).
+pub fn socket_stat_bytes() -> [u8; 128] {
+    const S_IFSOCK: u32 = 0o140000;
+    let mut b = [0u8; 128];
+    b[16..20].copy_from_slice(&(S_IFSOCK | 0o777).to_le_bytes());
+    b[20..24].copy_from_slice(&1u32.to_le_bytes());
+    b[56..60].copy_from_slice(&4096u32.to_le_bytes());
+    b[0..8].copy_from_slice(&8u64.to_le_bytes()); // sockfs
+    b[8..16].copy_from_slice(&0x400u64.to_le_bytes());
+    b
+}
+
 /// `struct stat` for a pipe.
 pub fn fifo_stat_bytes() -> [u8; 128] {
     const S_IFIFO: u32 = 0o010000;
@@ -401,6 +413,8 @@ pub enum Open {
     Device(Device),
     EventFd(Arc<crate::events::EventFd>),
     Epoll(Arc<crate::events::Epoll>),
+    /// A Unix socket, the runtime's own (unix.rs).
+    Unix(Arc<crate::unix::UnixSocket>),
     /// A host descriptor of a kind the runtime doesn't model itself (a pipe,
     /// a device), passed to the guest by another process: read, write and
     /// poll go to the host.

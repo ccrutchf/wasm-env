@@ -1,0 +1,25 @@
+[package]
+name = "bad64"
+version = "0.12.0"
+authors = ["yrp <yrp604@protonmail.com>"]
+edition = "2024"
+description = "Rust bindings for Binja's arm64 disassembler"
+license = "Apache-2.0"
+repository = "https://github.com/yrp604/bad64"
+categories = ["api-bindings", "encoding", "no-std"]
+keywords = ["disassembler", "armv8", "arm64", "aarch64", "binja"]
+
+
+[dependencies]
+bad64-sys = "0.10"
+cstr_core = "0.2"
+num-traits = "0.2"
+num-derive = "0.4"
+static_assertions = "1"
+
+[dev-dependencies]
+rand = "0.9"
+xmas-elf = "0.10"
+
+[features]
+std = []

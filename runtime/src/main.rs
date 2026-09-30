@@ -1,9 +1,9 @@
 //! wasm-env: runs WebAssembly programs built for the wasm-env Linux ABI
 //! (docs/abi.md) on any host.
 //!
-//!   wasm-env run [--root DIR] [--env KEY=VALUE]... [--trace] PROGRAM [ARGS]...
+//!   wasm-env run [--root DIR] [--env KEY=VALUE]... [--wayland[=headless|=host]] [--trace] PROGRAM [ARGS]...
 //!   wasm-env convert [--lazy] [--no-precompile] IMAGE DIR   (see convert.rs)
-//!   wasm-env shell DIR [SHELL-ARGS]...   a login shell in an environment
+//!   wasm-env shell [--wayland] DIR [SHELL-ARGS]...   a login shell in an environment
 //!   wasm-env export DIR OUT[.tar]   an environment as an OCI image (see oci.rs)
 //!
 //! PROGRAM is a path inside the environment (e.g. /bin/sh), or else a
@@ -13,6 +13,11 @@
 //! --env    environment variable for the program (repeatable; default: a
 //!          minimal PATH/HOME/TERM, not the host environment)
 //! --trace  log every syscall to stderr (also WASM_ENV_TRACE=1)
+//! --wayland  a Wayland compositor for the environment, the runtime's own:
+//!          graphical programs' windows are windows of the host's, on any
+//!          host (headless if it has no window system). =headless: no
+//!          windows (tests); =host: the host's own compositor instead
+//!          (Linux hosts running Wayland)
 
 mod abi;
 mod convert;
@@ -32,6 +37,8 @@ mod syscall;
 mod terminal;
 mod thread;
 mod translate;
+mod unix;
+mod wayland;
 
 use std::path::PathBuf;
 
@@ -42,9 +49,9 @@ use crate::process::{ExecImage, Inherit};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: wasm-env run [--root DIR] [--env KEY=VALUE]... [--argv0 NAME] [--trace] PROGRAM [ARGS]...\n\
+        "usage: wasm-env run [--root DIR] [--env KEY=VALUE]... [--argv0 NAME] [--wayland[=headless|=host]] [--trace] PROGRAM [ARGS]...\n\
          \x20      wasm-env convert [--lazy] [--no-precompile] IMAGE DIR\n\
-         \x20      wasm-env shell DIR [SHELL-ARGS]...\n\
+         \x20      wasm-env shell [--wayland] DIR [SHELL-ARGS]...\n\
          \x20      wasm-env export DIR OUT[.tar]"
     );
     std::process::exit(2);
@@ -69,10 +76,17 @@ fn convert(args: impl Iterator<Item = String>) -> Result<()> {
 /// `wasm-env shell DIR [ARGS]...`: a login shell in an environment (bash if
 /// it has one), with the variables a terminal session has, as `run` args.
 fn shell_args(mut args: impl Iterator<Item = String>) -> Vec<String> {
-    let dir = args.next().unwrap_or_else(|| usage());
+    let mut dir = args.next().unwrap_or_else(|| usage());
+    let wayland = dir.starts_with("--wayland").then(|| dir.clone());
+    if wayland.is_some() {
+        dir = args.next().unwrap_or_else(|| usage());
+    }
     let shell = if PathBuf::from(&dir).join("bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".into());
     let mut out: Vec<String> = vec!["--root".into(), dir];
+    if let Some(w) = wayland {
+        out.push(w);
+    }
     for var in [
         format!("TERM={term}"),
         "HOME=/root".into(),
@@ -90,6 +104,35 @@ fn shell_args(mut args: impl Iterator<Item = String>) -> Vec<String> {
     out
 }
 
+/// How graphical programs are served (`--wayland`).
+enum Wayland {
+    Off,
+    /// The runtime's compositor, with host windows (if the host has a
+    /// window system) or none.
+    Builtin { windows: bool },
+    /// The host's own compositor, at this socket.
+    Host(PathBuf),
+}
+
+/// The environment's XDG_RUNTIME_DIR with `--wayland` (programs run as root).
+const GUEST_RUNTIME_DIR: &str = "/run/user/0";
+
+/// The host's Wayland compositor socket: $WAYLAND_DISPLAY, a path or a name
+/// in $XDG_RUNTIME_DIR.
+fn host_wayland() -> Result<PathBuf> {
+    let display = std::env::var_os("WAYLAND_DISPLAY").context("--wayland: WAYLAND_DISPLAY isn't set (no Wayland session)")?;
+    let path = PathBuf::from(&display);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("--wayland: XDG_RUNTIME_DIR isn't set")?).join(path)
+    };
+    if !path.exists() {
+        bail!("--wayland: no compositor socket at {}", path.display());
+    }
+    Ok(path)
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut args: Box<dyn Iterator<Item = String>> = match args.next().as_deref() {
@@ -105,6 +148,7 @@ fn main() -> Result<()> {
     let mut root = std::env::current_dir()?;
     let mut env = vec![];
     let mut trace = std::env::var_os("WASM_ENV_TRACE").is_some_and(|v| v != "0");
+    let mut wayland = Wayland::Off;
     // The program's argv[0] (default: its path, or a host file's name).
     let mut argv0: Option<String> = None;
     let program = loop {
@@ -112,6 +156,9 @@ fn main() -> Result<()> {
             Some(a) if a == "--root" => root = PathBuf::from(args.next().unwrap_or_else(|| usage())),
             Some(a) if a == "--env" => env.push(args.next().unwrap_or_else(|| usage())),
             Some(a) if a == "--trace" => trace = true,
+            Some(a) if a == "--wayland" => wayland = Wayland::Builtin { windows: true },
+            Some(a) if a == "--wayland=headless" => wayland = Wayland::Builtin { windows: false },
+            Some(a) if a == "--wayland=host" => wayland = Wayland::Host(host_wayland()?),
             Some(a) if a == "--argv0" => argv0 = Some(args.next().unwrap_or_else(|| usage())),
             Some(a) if a.starts_with("--") => bail!("unknown option {a}"),
             Some(a) => break a,
@@ -121,8 +168,24 @@ fn main() -> Result<()> {
     if env.is_empty() {
         env = ["PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/root", "TERM=xterm"].map(String::from).to_vec();
     }
+    // The compositor, reached from the environment as
+    // $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY.
+    let graphical = !matches!(wayland, Wayland::Off);
+    if graphical {
+        for var in [format!("XDG_RUNTIME_DIR={GUEST_RUNTIME_DIR}"), "WAYLAND_DISPLAY=wayland-0".into()] {
+            let name = var.split('=').next().unwrap().to_string() + "=";
+            if !env.iter().any(|e| e.starts_with(&name)) {
+                env.push(var);
+            }
+        }
+    }
     let env: Vec<Vec<u8>> = env.into_iter().map(String::into_bytes).collect();
     let root = root.canonicalize().with_context(|| format!("root directory {}", root.display()))?;
+    if graphical {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = root.join(GUEST_RUNTIME_DIR.trim_start_matches('/'));
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     let rest: Vec<String> = args.collect();
 
     // A path inside the environment, or a .wasm file on the host.
@@ -153,6 +216,31 @@ fn main() -> Result<()> {
     };
 
     let kernel = Kernel::new(process::engine()?, root, trace);
+    // The compositor. With host windows, the host's event loop needs this
+    // (the main) thread; the program runs on another, as always.
+    let mut windows = None;
+    let mut compositor = None;
+    match wayland {
+        Wayland::Off => {}
+        Wayland::Host(socket) => kernel.forward(&format!("{GUEST_RUNTIME_DIR}/wayland-0"), socket),
+        Wayland::Builtin { windows: want } => {
+            let display: std::sync::Arc<dyn wayland::Display> = match want.then(wayland::window::event_loop).flatten() {
+                Some((windowed, run)) => {
+                    windows = Some((windowed.clone(), run));
+                    windowed
+                }
+                None => {
+                    if want {
+                        eprintln!("wasm-env: no window system on this host: the compositor is headless");
+                    }
+                    std::sync::Arc::new(wayland::Headless::default())
+                }
+            };
+            compositor = Some(wayland::Compositor::start(&kernel.unix, display));
+            // Its socket's file, as a compositor's would be.
+            let _ = std::fs::File::create(kernel.root.join(wayland::SOCKET.trim_start_matches('/')));
+        }
+    }
     let pid = kernel.create(0);
     let terminal = terminal::Terminal::take(kernel.clone());
     // wasmtime runs guest code on the host stack, so give it room.
@@ -163,7 +251,21 @@ fn main() -> Result<()> {
             let kernel = kernel.clone();
             move || kernel.run(pid, image, Inherit::initial())
         })?;
-    let how = first.join().map_err(|_| anyhow::anyhow!("process thread panicked"))?;
+    let status = match (windows, compositor) {
+        (Some((windowed, run)), Some(comp)) => {
+            // The event loop until the program ends.
+            std::thread::spawn(move || {
+                let status = first.join().map_or(134, |how| how.shell_status());
+                windowed.exit(status);
+            });
+            run(comp)
+        }
+        (_, comp) => {
+            let status = first.join().map_err(|_| anyhow::anyhow!("process thread panicked"))?.shell_status();
+            drop(comp);
+            status
+        }
+    };
     drop(terminal);
-    std::process::exit(how.shell_status());
+    std::process::exit(status);
 }

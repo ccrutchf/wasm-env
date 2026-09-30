@@ -153,6 +153,58 @@ else
 	echo "skipped Node.js: can't fetch the package (offline?)"
 fi
 
+# Wayland (M8). First the runtime's own compositor (--wayland=headless: no
+# windows, so it runs on any host): Ubuntu's own clients over the runtime's
+# Unix sockets, their buffers read from the memfds they pass, a keymap
+# passed to them. The fetch script only unpacks packages, so the triggers
+# GTK needs run here, in the environment (pixbuf loaders, MIME database,
+# GSettings schemas).
+if tests/ubuntu-fetch.sh wayland-utils weston gtk-3-examples >/dev/null 2>&1; then
+	timeout 3600 "$wasm_env" run --root "$R" /bin/sh -c '
+		/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache
+		update-mime-database /usr/share/mime
+		/usr/lib/aarch64-linux-gnu/glib-2.0/glib-compile-schemas /usr/share/glib-2.0/schemas' >/dev/null 2>&1
+	compare "wayland-info (the runtime's compositor)" "wl_compositor wl_subcompositor wl_shm wl_seat wl_output xdg_wm_base wl_data_device_manager wp_viewporter zxdg_output_manager_v1" \
+		"$(timeout 900 "$wasm_env" run --wayland=headless --root "$R" /usr/bin/wayland-info 2>&1 | sed -n "s/^interface: '\([a-z0-9_]*\)'.*/\1/p" | tr '\n' ' ' | sed 's/ $//')"
+	# A client that draws until stopped: frames committed, shown and their
+	# buffers released. (Stopped once it has drawn N frames, or at the end.)
+	frames() { # N, log, command...
+		local want=$1 log=$2; shift 2
+		timeout 1800 "$@" >"$log" 2>&1 &
+		local pid=$! n=0
+		while kill -0 "$pid" 2>/dev/null && [ "$n" -lt "$want" ]; do
+			sleep 2
+			n=$(grep -ac 'wl_buffer@[0-9]*\.release' "$log")
+		done
+		pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+		[ "$n" -ge "$want" ] && echo yes || echo "no ($n frames)"
+	}
+	compare "weston-simple-shm draws (the runtime's compositor)" yes \
+		"$(frames 20 "$root/build/wl-shm.log" "$wasm_env" run --wayland=headless --root "$R" --env WAYLAND_DEBUG=1 --env HOME=/root /usr/bin/weston-simple-shm)"
+	compare "gtk3-widget-factory draws (the runtime's compositor)" yes \
+		"$(frames 20 "$root/build/wl-gtk.log" "$wasm_env" run --wayland=headless --root "$R" --env WAYLAND_DEBUG=1 --env HOME=/root /usr/bin/gtk3-widget-factory)"
+	# Then the optional path, where the host has a compositor: forwarded to
+	# it (--wayland=host), here a headless weston on a Linux host.
+	if command -v weston >/dev/null; then
+		xdg=$root/build/wl # short: a socket path fits in 108 bytes
+		rm -rf "$xdg"
+		mkdir -p -m 700 "$xdg"
+		XDG_RUNTIME_DIR=$xdg weston --backend=headless --socket=wl-test --idle-time=0 >"$xdg.log" 2>&1 &
+		weston_pid=$!
+		for _ in $(seq 100); do [ -S "$xdg/wl-test" ] && break; sleep 0.1; done
+		wl() { XDG_RUNTIME_DIR=$xdg WAYLAND_DISPLAY=wl-test "$@"; }
+		# The compositor's globals, as the host's own wayland-info lists them.
+		expected=$(wl wayland-info 2>&1 | grep '^interface')
+		actual=$(wl timeout 900 "$wasm_env" run --wayland=host --root "$R" /usr/bin/wayland-info 2>&1 | grep '^interface')
+		compare "wayland-info (forwarded to the host's)" "$expected" "$actual"
+		compare "weston-simple-shm draws (forwarded to the host's)" yes \
+			"$(wl frames 10 "$root/build/wl-host-shm.log" "$wasm_env" run --wayland=host --root "$R" --env WAYLAND_DEBUG=1 --env HOME=/root /usr/bin/weston-simple-shm)"
+		kill "$weston_pid"
+	fi
+else
+	echo "skipped Wayland: can't fetch the packages (offline?)"
+fi
+
 # Networking, if PyPI is reachable: DNS (glibc's resolver, over the host's
 # resolv.conf), HTTPS (Ubuntu's OpenSSL with its CA certificates), and pip
 # installing a package from PyPI. Ubuntu's ca-certificates package builds

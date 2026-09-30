@@ -5,7 +5,8 @@
 
   outputs = { self, nixpkgs }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      # (nixpkgs no longer supports x86_64-darwin; macOS means arm64.)
+      systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
@@ -37,6 +38,9 @@
             done
             llvm-ar rcs $out/lib/libclang_rt.builtins.a $TMPDIR/obj/*.o
           '';
+          # Libraries the compositor's host windows (winit) load at run time
+          # on Linux: the host's window system, Wayland or X11.
+          windowLibs = with pkgs; [ wayland libxkbcommon libx11 libxcursor libxrandr libxi ];
           src = lib.fileset.toSource {
             root = ./.;
             fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./runtime ./translator ./vendor ./bench/harness ];
@@ -53,6 +57,9 @@
             doCheck = false;
             nativeBuildInputs = [ llvm.clang ];
             LIBCLANG_PATH = "${llvm.libclang.lib}/lib";
+            postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              patchelf --add-rpath ${lib.makeLibraryPath windowLibs} $out/bin/wasm-env
+            '';
             postInstall = ''
               tc=$out/lib/wasm-env/toolchain
               mkdir -p $tc/bin $tc/lib
@@ -67,7 +74,7 @@
       devShells = forAll (pkgs:
         let llvm = pkgs.llvmPackages_21;
         in {
-          default = pkgs.mkShell {
+          default = pkgs.mkShell ({
             packages = [
               pkgs.rustc
               pkgs.cargo
@@ -80,13 +87,21 @@
               pkgs.wabt # wasm2c, wasm-objdump, wasm2wat
               pkgs.simde # SIMD headers used by wasm2c output
               pkgs.wasmtime
-              # M2: arm64 reference toolchain and emulator for translator tests.
-              pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
-              pkgs.qemu-user
               pkgs.gnumake
               pkgs.zstd # Ubuntu .deb packages (tests/ubuntu-fetch.sh)
               pkgs.jq # PyPI metadata (tests/wheel-fetch.sh)
               pkgs.unzip # wheels
+            ]
+            # Test references that exist only on Linux hosts; elsewhere the
+            # tests that need them skip.
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              # M2: arm64 reference toolchain and emulator for translator tests.
+              pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
+              pkgs.qemu-user
+              # M8: a headless compositor for Wayland clients, and the host's own
+              # wayland-info to compare against (tests/ubuntu.sh).
+              pkgs.weston
+              pkgs.wayland-utils
             ];
             # The wrapped clang injects host flags that break wasm targets,
             # so wasm builds use the unwrapped compiler.
@@ -99,11 +114,14 @@
             COMPILER_RT_SRC = "${llvm.compiler-rt.src}";
             # Packages built with the toolchain (packages/*/build.sh).
             BUSYBOX_SRC = "${pkgs.busybox.src}";
-            # arm64 musl runtime (libc.so, ld-musl) for dynamic-linking tests.
-            AARCH64_MUSL = "${pkgs.pkgsCross.aarch64-multiplatform-musl.musl}";
             # bindgen (used by the bad64 arm64 decoder crate) needs libclang.
             LIBCLANG_PATH = "${llvm.libclang.lib}/lib";
-          };
+          } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            # The compositor's host windows (winit) load these at run time.
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [ wayland libxkbcommon libx11 libxcursor libxrandr libxi ]);
+            # arm64 musl runtime (libc.so, ld-musl) for dynamic-linking tests.
+            AARCH64_MUSL = "${pkgs.pkgsCross.aarch64-multiplatform-musl.musl}";
+          });
         });
     };
 }

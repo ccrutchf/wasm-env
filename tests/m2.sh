@@ -35,6 +35,7 @@ fixtures=(
 	"atomics:tests/arm64/atomics.c:-static -march=armv8.1-a"
 	"simd3:tests/arm64/simd3.c:-static -march=armv8.2-a+crc+sha3"
 	"simd4:tests/arm64/simd4.c:-static"
+	"simd5:tests/arm64/simd5.c:-static"
 	"fpexc:tests/arm64/fpexc.c:-static -lm"
 	"flags:tests/arm64/flags.c:-static"
 	"calls:tests/arm64/calls.c:-static"

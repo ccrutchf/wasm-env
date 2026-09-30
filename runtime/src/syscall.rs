@@ -208,13 +208,13 @@ fn load_library(caller: &mut Caller<'_, Process>, fd: i64, range: u64) -> SysRes
 
 const MAP_FIXED: i64 = 0x10;
 const MAP_ANONYMOUS: i64 = 0x20;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const MAP_TYPE: i64 = 0xf;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const MAP_SHARED: i64 = 0x01;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const MAP_SHARED_VALIDATE: i64 = 0x03;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const PROT_WRITE: i64 = 0x2;
 const PROT_EXEC: i64 = 0x4;
 const MREMAP_MAYMOVE: i64 = 1;
@@ -264,20 +264,29 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
         return Err(EINVAL);
     }
     let len = page_align(len as u64);
+    // A shared mapping is the host's, made of its pages (larger than the
+    // guest's on Apple silicon): it starts at a host page boundary, and is
+    // as long.
+    #[cfg(unix)]
+    let shared = flags & MAP_TYPE == MAP_SHARED || flags & MAP_TYPE == MAP_SHARED_VALIDATE;
+    #[cfg(not(unix))]
+    let shared = false;
+    let align = if shared { mem::host_page() } else { abi::PAGE_SIZE };
+    let len = len.next_multiple_of(align);
     let (addr, top) = {
         let mut mm = caller.data().group.mm.lock().unwrap();
         let addr = if flags & MAP_FIXED != 0 {
             let addr = addr as u64;
-            if addr < mm.space.start || !addr.is_multiple_of(abi::PAGE_SIZE) {
+            if addr < mm.space.start || !addr.is_multiple_of(align) {
                 return Err(EINVAL);
             }
             mm.space.alloc_at(addr, len);
             addr
-        } else if mm.map_at_hint(addr as u64, len) {
+        } else if (addr as u64).is_multiple_of(align) && mm.map_at_hint(addr as u64, len) {
             // Where the program asked, that being free (as Linux does).
             addr as u64
         } else {
-            mm.space.alloc(len)
+            mm.space.alloc_aligned(len, align)
         };
         (addr, mm.space.top.max(addr + len))
     };
@@ -289,7 +298,7 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
     grow_to(caller, top)?;
     let (data, process) = data_and_process(caller);
     // A mapping over a shared one replaces it (shared.rs).
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let base = data.as_mut_ptr();
         if crate::shared::remove(&mut process.group.mm.lock().unwrap().shared, addr, addr + len) {
@@ -299,7 +308,7 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
             let (file, offset) = if flags & MAP_ANONYMOUS != 0 {
                 (crate::shared::anonymous(len)?, 0)
             } else {
-                if !(off as u64).is_multiple_of(abi::PAGE_SIZE) {
+                if !(off as u64).is_multiple_of(align) {
                     return Err(EINVAL);
                 }
                 (process.host_file(fd)?, off as u64)
@@ -360,23 +369,33 @@ fn mremap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
         return Err(ENOMEM);
     }
     let (old, old_len, new_len) = (old as u64, page_align(old_len as u64), page_align(new_len as u64));
-    let (new, top) = {
+    // A whole shared mapping (in host pages: see mmap) moves to host pages.
+    let page = mem::host_page();
+    let (new, new_len, top, whole) = {
         let mut mm = caller.data().group.mm.lock().unwrap();
         if !mm.space.contains(old, old_len) {
             return Err(EFAULT);
         }
-        (mm.space.alloc(new_len), mm.space.top)
+        let whole = mm.shared.get(&old).filter(|m| m.end == old + old_len.next_multiple_of(page)).cloned();
+        let (new, new_len) = match whole {
+            Some(_) => {
+                let new_len = new_len.next_multiple_of(page);
+                (mm.space.alloc_aligned(new_len, page), new_len)
+            }
+            None => (mm.space.alloc(new_len), new_len),
+        };
+        (new, new_len, mm.space.top, whole)
     };
     grow_to(caller, top)?;
     let (data, process) = data_and_process(caller);
     // A shared mapping moves as a mapping of the same file (shared.rs):
     // only one whole mapping, from its start.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let mut mm = process.group.mm.lock().unwrap();
-        let whole = mm.shared.get(&old).filter(|m| m.end == old + old_len).cloned();
         let base = data.as_mut_ptr();
         if let Some(m) = whole {
+            let old_len = m.end - old;
             crate::shared::map(base, new, new_len, &m.file, m.offset, m.writable)?;
             crate::shared::remove(&mut mm.shared, old, old + old_len);
             crate::shared::unmap(base, old, old_len)?;
@@ -560,9 +579,13 @@ impl Process {
             nr::UNLINKAT => {
                 let path = mem::cstr(data, ub)?;
                 let dir = self.dir_of(a)?;
-                let host = self.fs.host(&self.fs.resolve(&dir, &path, false)?);
+                let guest = self.fs.resolve(&dir, &path, false)?;
+                let host = self.fs.host(&guest);
                 let r = if c & AT_REMOVEDIR != 0 { std::fs::remove_dir(host) } else { std::fs::remove_file(host) };
-                r.map(|_| 0).map_err(|e| fs::errno(&e))
+                r.map_err(|e| fs::errno(&e))?;
+                // A Unix socket's name goes with its file.
+                self.kernel.unix.forget(&guest);
+                Ok(0)
             }
             nr::RENAMEAT | nr::RENAMEAT2 => {
                 // renameat2 flags (RENAME_NOREPLACE etc.) aren't supported yet.
@@ -601,6 +624,26 @@ impl Process {
             // changes are accepted and ignored.
             nr::FCHOWNAT | nr::FCHOWN => Ok(0),
             nr::FTRUNCATE => self.with_file(a, |f| f.set_len(ub)).map(|_| 0),
+            // fallocate(fd, mode, offset, len): the host file's (a memfd's size
+            // for a Wayland buffer, through posix_fallocate).
+            #[cfg(target_os = "linux")]
+            nr::FALLOCATE => self
+                .with_file(a, |f| {
+                    // SAFETY: fallocate on a descriptor the file owns.
+                    let r = unsafe { libc::fallocate(std::os::fd::AsRawFd::as_raw_fd(f), b as i32, c, d) };
+                    if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+                })
+                .map(|_| 0),
+            // Elsewhere, the plain form (mode 0: make the file at least that
+            // long) by growing it; the others (punching holes...) aren't there.
+            #[cfg(not(target_os = "linux"))]
+            nr::FALLOCATE => {
+                if b != 0 {
+                    return Err(ENOTSUP);
+                }
+                let end = (c as u64).checked_add(d as u64).ok_or(27)?; // EFBIG
+                self.with_file(a, |f| if f.metadata()?.len() < end { f.set_len(end) } else { Ok(()) }).map(|_| 0)
+            }
             nr::FSYNC | nr::FDATASYNC => {
                 // Syncing a directory (dpkg does, after renaming into it): its
                 // entries are the host's, already written through.
@@ -782,6 +825,59 @@ impl Process {
                 mem::write(data, ua, &pair).map(|_| 0)
             }
             // eventfd and epoll (events.rs): libuv's event loop, Node.js's.
+            // inotify: the host's, on the host files under the root. Its
+            // events name files relative to the watched directory, so they
+            // need no translating; the descriptor is an `Open::Host`.
+            #[cfg(target_os = "linux")]
+            nr::INOTIFY_INIT1 => {
+                // SAFETY: a new descriptor or -1.
+                let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | if a & o::NONBLOCK != 0 { libc::IN_NONBLOCK } else { 0 }) };
+                if fd < 0 {
+                    return Err(fs::errno(&std::io::Error::last_os_error()));
+                }
+                // SAFETY: owned from here on.
+                let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+                let open = Open::Host(Arc::new(fs::HostFd::new(fd)));
+                let flags = if a & o::NONBLOCK != 0 { o::NONBLOCK } else { 0 };
+                self.fds.insert(fs::Fd { open: Arc::new(Mutex::new(open)), cloexec: a & o::CLOEXEC != 0, flags }, 0)
+            }
+            #[cfg(target_os = "linux")]
+            nr::INOTIFY_ADD_WATCH => {
+                let (Some((h, _)), path) = (self.host_of(a)?, self.at_path(data, -100, ub, c & 0x0100_0000 == 0)?) else { return Err(EINVAL) };
+                let path = std::ffi::CString::new(path.into_os_string().into_encoded_bytes()).map_err(|_| EINVAL)?;
+                // SAFETY: a C path; the host descriptor is an inotify instance or the call fails.
+                let wd = unsafe { libc::inotify_add_watch(std::os::fd::AsRawFd::as_raw_fd(&h.fd), path.as_ptr(), c as u32) };
+                if wd < 0 { Err(fs::errno(&std::io::Error::last_os_error())) } else { Ok(wd as i64) }
+            }
+            #[cfg(target_os = "linux")]
+            nr::INOTIFY_RM_WATCH => {
+                let Some((h, _)) = self.host_of(a)? else { return Err(EINVAL) };
+                // SAFETY: as above.
+                let r = unsafe { libc::inotify_rm_watch(std::os::fd::AsRawFd::as_raw_fd(&h.fd), b as i32) };
+                if r < 0 { Err(fs::errno(&std::io::Error::last_os_error())) } else { Ok(0) }
+            }
+            // Advice about access patterns: taken.
+            nr::FADVISE64 => Ok(0),
+            // prctl: a thread's name and dumpability, and settings a process
+            // here can accept without effect.
+            nr::PRCTL => {
+                const PR_SET_PDEATHSIG: i64 = 1;
+                const PR_GET_DUMPABLE: i64 = 3;
+                const PR_SET_DUMPABLE: i64 = 4;
+                const PR_SET_NAME: i64 = 15;
+                const PR_GET_NAME: i64 = 16;
+                const PR_SET_NO_NEW_PRIVS: i64 = 38;
+                match a {
+                    PR_GET_DUMPABLE => Ok(1),
+                    PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_NAME | PR_SET_NO_NEW_PRIVS => Ok(0),
+                    PR_GET_NAME => {
+                        let mut name = [0u8; 16];
+                        name[..8].copy_from_slice(b"wasm-env");
+                        mem::write(data, ub, &name).map(|_| 0)
+                    }
+                    _ => Err(EINVAL),
+                }
+            }
             nr::EVENTFD2 => {
                 const EFD_SEMAPHORE: i64 = 1;
                 let open = Open::EventFd(Arc::new(crate::events::EventFd::new(ua & 0xffff_ffff, b & EFD_SEMAPHORE != 0)));
@@ -992,7 +1088,7 @@ impl Process {
             nr::UMASK => Ok(std::mem::replace(&mut self.umask, (a & 0o777) as u32) as i64),
             // Shared mappings are the files' own pages: nothing to write back.
             nr::MSYNC => Ok(0),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             nr::MEMFD_CREATE => {
                 const MFD_CLOEXEC: i64 = 1;
                 let name = mem::cstr(data, ua)?;
@@ -1005,7 +1101,7 @@ impl Process {
             nr::MUNMAP => {
                 let len = page_align(ub);
                 let mut mm = self.group.mm.lock().unwrap();
-                #[cfg(target_os = "linux")]
+                #[cfg(unix)]
                 if crate::shared::remove(&mut mm.shared, ua, ua + len) {
                     crate::shared::unmap(data.as_mut_ptr(), ua, len)?;
                 }
@@ -1247,6 +1343,14 @@ impl Process {
     }
 
     /// The eventfd behind `fd`, if it is one, and whether it's non-blocking.
+    /// Raises SIGPIPE (a write nobody will read), if it does something.
+    pub(crate) fn raise_sigpipe(&mut self) {
+        const SIGPIPE: i32 = 13;
+        if let Some(how) = self.signal_effect(SIGPIPE) {
+            self.pending = Some(Pending::Terminate(how));
+        }
+    }
+
     /// The host descriptor behind `fd`, if it is an `Open::Host`, and whether
     /// the guest descriptor is non-blocking.
     fn host_of(&self, fd: i64) -> SysResult<Option<(Arc<fs::HostFd>, bool)>> {
@@ -1288,6 +1392,9 @@ impl Process {
     }
 
     fn read(&mut self, fd: i64, buf: &mut [u8]) -> SysResult<i64> {
+        if let Some((u, nonblock)) = self.unix_of(fd)? {
+            return self.unix_read(&u, nonblock, buf);
+        }
         if let Some(s) = self.maybe_socket(fd)? {
             return crate::net::recv(&s, buf);
         }
@@ -1314,13 +1421,16 @@ impl Process {
                 getrandom::fill(buf).map_err(|_| EIO)?;
                 Ok(buf.len())
             }
-            Open::Stdout | Open::Stderr | Open::Pipe(_) | Open::Socket(_) | Open::Host(_) => return Err(EBADF),
+            Open::Stdout | Open::Stderr | Open::Pipe(_) | Open::Socket(_) | Open::Host(_) | Open::Unix(_) => return Err(EBADF),
             Open::EventFd(_) | Open::Epoll(_) => return Err(EINVAL),
         };
         r.map(|n| n as i64).map_err(|e| fs::errno(&e))
     }
 
     fn write(&mut self, fd: i64, buf: &[u8]) -> SysResult<i64> {
+        if let Some((u, nonblock)) = self.unix_of(fd)? {
+            return self.unix_write(&u, nonblock, buf);
+        }
         if let Some(s) = self.maybe_socket(fd)? {
             return crate::net::send(&s, buf);
         }
@@ -1334,10 +1444,7 @@ impl Process {
             let r = pipe.write(buf, nonblock, &self.interrupted());
             if r == Err(EPIPE) {
                 // Writing to a pipe nobody reads raises SIGPIPE.
-                const SIGPIPE: i32 = 13;
-                if let Some(how) = self.signal_effect(SIGPIPE) {
-                    self.pending = Some(Pending::Terminate(how));
-                }
+                self.raise_sigpipe();
             }
             return r.map(|n| n as i64);
         }
@@ -1356,7 +1463,7 @@ impl Process {
             }
             Open::Dir { .. } => return Err(EISDIR),
             Open::Device(_) => Ok(()), // writes to /dev devices are discarded
-            Open::Stdin | Open::Pipe(_) | Open::Socket(_) | Open::Host(_) => return Err(EBADF),
+            Open::Stdin | Open::Pipe(_) | Open::Socket(_) | Open::Host(_) | Open::Unix(_) => return Err(EBADF),
             Open::EventFd(_) | Open::Epoll(_) => return Err(EINVAL),
         };
         r.map(|_| buf.len() as i64).map_err(|e| fs::errno(&e))
@@ -1528,6 +1635,7 @@ impl Process {
             Open::Pipe(_) => Ok(fs::fifo_stat_bytes()),
             Open::Device(d) => Ok(fs::device_stat_bytes(*d)),
             Open::Host(h) => h.metadata().map(|m| fs::stat_bytes(&m)).map_err(|e| fs::errno(&e)),
+            Open::Unix(_) | Open::Socket(_) => Ok(fs::socket_stat_bytes()),
             _ => Ok(fs::stdio_stat_bytes()),
         }
     }
@@ -1544,7 +1652,11 @@ impl Process {
                 // SAFETY: statvfs fills the struct it's given.
                 let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
                 if unsafe { libc::statvfs(path.as_ptr(), &mut s) } == 0 {
-                    words = [0xef53, s.f_bsize, s.f_blocks, s.f_bfree, s.f_bavail, s.f_files, s.f_ffree];
+                    // (The fields' types differ between hosts.)
+                    #[allow(clippy::unnecessary_cast)]
+                    {
+                        words = [0xef53, s.f_bsize as u64, s.f_blocks as u64, s.f_bfree as u64, s.f_bavail as u64, s.f_files as u64, s.f_ffree as u64];
+                    }
                 }
             }
         }
@@ -1572,7 +1684,14 @@ impl Process {
         }
         let guest = self.fs.resolve(&dir, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
         let meta = std::fs::symlink_metadata(self.fs.host(&guest)).map_err(|e| fs::errno(&e))?;
-        Ok(fs::stat_bytes(&meta))
+        let mut st = fs::stat_bytes(&meta);
+        // A Unix socket's file (unix.rs): a socket, as on Linux.
+        if self.kernel.unix.is_socket_path(&guest) {
+            const S_IFSOCK: u32 = 0o140000;
+            let mode = u32::from_le_bytes(st[16..20].try_into().unwrap()) & 0o7777;
+            st[16..20].copy_from_slice(&(S_IFSOCK | mode).to_le_bytes());
+        }
+        Ok(st)
     }
 
     /// fcntl's record locks (F_GETLK, F_SETLK, F_SETLKW and their F_OFD_
@@ -1667,6 +1786,10 @@ impl Process {
                 let fd = Fd { cloexec: cmd == F_DUPFD_CLOEXEC, ..self.fds.get(fd)?.clone() };
                 self.fds.insert(fd, usize::try_from(arg).map_err(|_| EINVAL)?)
             }
+            // No seals where memfds are temporary files (as for a file that
+            // doesn't support them).
+            #[cfg(not(target_os = "linux"))]
+            F_ADD_SEALS | F_GET_SEALS => Err(EINVAL),
             // A memfd's seals are the host memfd's.
             #[cfg(target_os = "linux")]
             F_ADD_SEALS | F_GET_SEALS => {
@@ -1709,6 +1832,11 @@ impl Process {
         {
             let n = crate::net::pending(&s)?;
             return mem::write(data, arg, &(n as i32).to_le_bytes()).map(|_| 0);
+        }
+        if req == FIONREAD
+            && let Some((u, _)) = self.unix_of(fd)?
+        {
+            return mem::write(data, arg, &(u.available() as i32).to_le_bytes()).map(|_| 0);
         }
         if req == FIONREAD
             && let Some((pipe, _)) = self.pipe_of(fd, false)? {

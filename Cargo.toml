@@ -16,3 +16,6 @@ wasmtime-internal-cranelift = { path = "vendor/wasmtime-internal-cranelift" }
 # No callee-saved registers in the tail calling convention: see
 # vendor/cranelift-codegen/src/isa/x64/abi.rs (search "wasm-env").
 cranelift-codegen = { path = "vendor/cranelift-codegen" }
+# bad64 (the arm64 decoder) passes its C enums as i32, which Windows
+# targets' bindings make u32: `as _` at the four calls (vendor/bad64).
+bad64 = { path = "vendor/bad64" }

@@ -89,10 +89,10 @@ END {
 	echo "$sum  $deb" | sha256sum -c --quiet
 	member=$(ar t "$deb" | grep '^data\.tar')
 	case $member in
-	*.zst) ar p "$deb" "$member" | zstd -dq | tar -x -C "$dest" ;;
-	*.xz) ar p "$deb" "$member" | xz -d | tar -x -C "$dest" ;;
-	*.gz) ar p "$deb" "$member" | tar -xz -C "$dest" ;;
-	*) ar p "$deb" "$member" | tar -x -C "$dest" ;;
+	*.zst) ar p "$deb" "$member" | zstd -dq | tar -x --keep-directory-symlink -C "$dest" ;;
+	*.xz) ar p "$deb" "$member" | xz -d | tar -x --keep-directory-symlink -C "$dest" ;;
+	*.gz) ar p "$deb" "$member" | tar -xz --keep-directory-symlink -C "$dest" ;;
+	*) ar p "$deb" "$member" | tar -x --keep-directory-symlink -C "$dest" ;;
 	esac
 	touch "$dest/.pkg-$pkg"
 	echo "installed $pkg"

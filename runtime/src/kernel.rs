@@ -66,6 +66,12 @@ pub struct Kernel {
     /// The terminal's foreground process group (TIOCGPGRP, TIOCSPGRP): the
     /// first process's at first. Ctrl-C at the host terminal goes to it.
     pub foreground: std::sync::atomic::AtomicI32,
+    /// Unix socket paths inside the environment that lead to host sockets
+    /// (guest path → host path): the host's Wayland compositor, with
+    /// `--wayland`. A connect to one reaches the host socket.
+    forwarded: Mutex<HashMap<String, PathBuf>>,
+    /// Unix socket names (unix.rs).
+    pub unix: crate::unix::Names,
     /// Signalled whenever a process exits or receives a signal.
     changed: Condvar,
     /// Compiled programs by host path, with the (mtime, size) they were
@@ -81,6 +87,16 @@ pub struct Kernel {
 const SIGNAL_POLL: Duration = Duration::from_millis(50);
 
 impl Kernel {
+    /// Makes the guest socket path `guest` lead to the host socket `host`.
+    pub fn forward(&self, guest: &str, host: PathBuf) {
+        self.forwarded.lock().unwrap().insert(guest.to_string(), host);
+    }
+
+    /// The host socket a guest socket path leads to, if it is forwarded.
+    pub fn forwarded(&self, guest: &str) -> Option<PathBuf> {
+        self.forwarded.lock().unwrap().get(guest).cloned()
+    }
+
     pub fn new(engine: Engine, root: PathBuf, trace: bool) -> Arc<Kernel> {
         Arc::new(Kernel {
             engine,
@@ -88,6 +104,8 @@ impl Kernel {
             trace,
             procs: Mutex::new(Procs { next_pid: 1, table: HashMap::new() }),
             foreground: std::sync::atomic::AtomicI32::new(1),
+            forwarded: Mutex::new(HashMap::new()),
+            unix: Default::default(),
             changed: Condvar::new(),
             modules: Mutex::new(HashMap::new()),
             timers: Mutex::new(HashMap::new()),

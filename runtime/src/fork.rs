@@ -73,7 +73,7 @@ pub fn fork(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64>
     }
     // Shared mappings stay shared: the child maps the same files (over the
     // copies just made).
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     for (&start, m) in &p.group.mm.lock().unwrap().shared {
         crate::shared::map(to.as_mut_ptr(), start, m.end - start, &m.file, m.offset, m.writable)?;
     }

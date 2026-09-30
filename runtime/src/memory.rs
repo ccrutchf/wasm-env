@@ -66,16 +66,20 @@ pub fn iovecs(data: &[u8], addr: u64, count: u64) -> SysResult<Vec<(u64, u64)>> 
 /// the guest image, whose pages would read back as the file's.
 pub fn zero(data: &mut [u8], addr: u64, len: u64) -> SysResult<()> {
     let range = slice_mut(data, addr, len)?;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        let page = PAGE_SIZE as usize;
+        let page = host_page() as usize;
         let start = range.as_ptr() as usize;
         let (first, last) = (start.next_multiple_of(page), (start + range.len()) / page * page);
         if last > first {
             // SAFETY: [first, last) lies within `range`, memory this process
             // owns; MADV_DONTNEED on private anonymous memory makes it read
-            // as zero.
+            // as zero on Linux. Elsewhere (macOS's MADV_DONTNEED is only
+            // advice) new anonymous pages replace them.
+            #[cfg(target_os = "linux")]
             let r = unsafe { libc::madvise(first as *mut libc::c_void, last - first, libc::MADV_DONTNEED) };
+            #[cfg(not(target_os = "linux"))]
+            let r = unsafe { fresh_pages(first, last - first) };
             if r == 0 {
                 range[..first - start].fill(0);
                 range[last - start..].fill(0);
@@ -85,6 +89,36 @@ pub fn zero(data: &mut [u8], addr: u64, len: u64) -> SysResult<()> {
     }
     range.fill(0);
     Ok(())
+}
+
+/// Replaces [addr, addr + len) (page-aligned, the process's own private
+/// anonymous memory) with new zero pages that take no memory until used.
+/// 0 on success, as madvise.
+///
+/// # Safety
+/// The range must be such memory, and nothing may rely on its contents.
+#[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))] // (Linux uses MADV_DONTNEED.)
+pub unsafe fn fresh_pages(addr: usize, len: usize) -> i32 {
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED;
+    // SAFETY: as the caller promises; MAP_FIXED replaces exactly the range.
+    let p = unsafe { libc::mmap(addr as *mut libc::c_void, len, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
+    if p == libc::MAP_FAILED { -1 } else { 0 }
+}
+
+/// The host's page size: 4 KiB on x86-64, 16 KiB on Apple silicon. Host
+/// mappings inside the guest's memory (the guest image, shared mappings)
+/// are made of these; the guest's own page size stays PAGE_SIZE.
+pub fn host_page() -> u64 {
+    static PAGE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        #[cfg(unix)]
+        // SAFETY: sysconf only reads a value.
+        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        #[cfg(not(unix))]
+        let p = 4096;
+        (p as u64).max(PAGE_SIZE)
+    });
+    *PAGE
 }
 
 /// How far the program break may grow (the region between the heap base and
@@ -125,6 +159,25 @@ impl AddressSpace {
         let addr = self.top;
         self.top += len;
         addr
+    }
+
+    /// Like `alloc`, at a multiple of `align` (a power of two, a multiple
+    /// of the page size): for mappings made of the host's pages, which may
+    /// be larger than the guest's (16 KiB on Apple silicon).
+    pub fn alloc_aligned(&mut self, len: u64, align: u64) -> u64 {
+        if align <= PAGE_SIZE {
+            return self.alloc(len);
+        }
+        let span = len + align - PAGE_SIZE;
+        let addr = self.alloc(span);
+        let aligned = addr.next_multiple_of(align);
+        if aligned > addr {
+            self.release(addr, aligned - addr);
+        }
+        if addr + span > aligned + len {
+            self.release(aligned + len, addr + span - aligned - len);
+        }
+        aligned
     }
 
     /// Returns [addr, addr+len) to the free list, merging neighbours.
@@ -193,6 +246,24 @@ impl AddressSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_pages_read_as_zero() {
+        let page = PAGE_SIZE as usize;
+        // SAFETY: a fresh anonymous region, unmapped below.
+        let base = unsafe { libc::mmap(std::ptr::null_mut(), 3 * page, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        assert_ne!(base, libc::MAP_FAILED);
+        // SAFETY: the region just mapped.
+        let data = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), 3 * page) };
+        data.fill(7);
+        // SAFETY: its middle page, whose contents nothing needs.
+        assert_eq!(unsafe { fresh_pages(base as usize + page, page) }, 0);
+        assert!(data[page..2 * page].iter().all(|&b| b == 0));
+        assert!(data[..page].iter().chain(&data[2 * page..]).all(|&b| b == 7));
+        // SAFETY: the region mapped above.
+        unsafe { libc::munmap(base, 3 * page) };
+    }
 
     #[test]
     fn zero_clears_whole_and_partial_pages() {

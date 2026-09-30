@@ -226,7 +226,12 @@ impl Process {
         }
         let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
         let guest = std::str::from_utf8(&path[..end]).map_err(|_| EINVAL)?;
-        let host = self.fs.host(&self.fs.resolve(&self.fs.cwd(), guest, !creating)?);
+        let resolved = self.fs.resolve(&self.fs.cwd(), guest, !creating)?;
+        // A path forwarded to a host socket (the compositor's) leads there.
+        let host = match self.kernel.forwarded(&resolved) {
+            Some(host) if !creating => host,
+            _ => self.fs.host(&resolved),
+        };
         let bytes = host.as_os_str().as_encoded_bytes();
         if bytes.len() < 108 {
             return Ok((unix_sockaddr(bytes)?, None));
@@ -270,11 +275,19 @@ impl Process {
     }
 
     pub fn socket(&mut self, domain: i64, ty: i64, protocol: i64) -> SysResult<i64> {
+        // Unix sockets are the runtime's own (unix.rs).
+        if domain == AF_UNIX {
+            let kind = ty & 0xf;
+            if !matches!(kind, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) {
+                return Err(EINVAL);
+            }
+            let open = Open::Unix(crate::unix::UnixSocket::new(kind));
+            let flags = 2 /* O_RDWR */ | if ty & SOCK_NONBLOCK != 0 { o::NONBLOCK } else { 0 };
+            return self.fds.insert(Fd { open: Arc::new(Mutex::new(open)), cloexec: ty & SOCK_CLOEXEC != 0, flags }, 0);
+        }
         let domain = match domain {
             AF_INET => Domain::IPV4,
             AF_INET6 => Domain::IPV6,
-            // Host Unix sockets, their paths under the root (see `sockaddr`).
-            AF_UNIX => Domain::UNIX,
             // AF_NETLINK...: not yet. glibc copes (no nscd, and getaddrinfo
             // assumes both address families are configured).
             _ => return Err(EAFNOSUPPORT),
@@ -283,7 +296,6 @@ impl Process {
         let t = match kind {
             SOCK_STREAM => Type::STREAM,
             SOCK_DGRAM => Type::DGRAM,
-            SOCK_SEQPACKET if domain == Domain::UNIX => Type::SEQPACKET,
             _ => return Err(EINVAL),
         };
         let protocol = (protocol != 0).then(|| Protocol::from(protocol as i32));
@@ -301,24 +313,15 @@ impl Process {
             return Err(EAFNOSUPPORT);
         }
         let kind = ty & 0xf;
-        let host = match kind {
-            SOCK_STREAM => libc::SOCK_STREAM,
-            SOCK_DGRAM => libc::SOCK_DGRAM,
-            SOCK_SEQPACKET => libc::SOCK_SEQPACKET,
-            _ => return Err(EINVAL),
-        };
-        let mut raw = [0i32; 2];
-        // SAFETY: `raw` has room for the two descriptors.
-        if unsafe { libc::socketpair(libc::AF_UNIX, host | libc::SOCK_CLOEXEC, 0, raw.as_mut_ptr()) } < 0 {
-            return Err(errno(&std::io::Error::last_os_error()));
+        if !matches!(kind, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) {
+            return Err(EINVAL);
         }
+        // A pair of the runtime's own Unix sockets (unix.rs).
+        let (a, b) = crate::unix::UnixSocket::pair(kind, self.pid);
         let mut pair = [0u8; 8];
-        for (k, raw) in raw.into_iter().enumerate() {
-            // SAFETY: a descriptor socketpair just made, owned from here on.
-            let sock = unsafe { <Socket as std::os::fd::FromRawFd>::from_raw_fd(raw) };
-            let s = GuestSocket::new(sock, kind);
+        for (k, s) in [a, b].into_iter().enumerate() {
             let flags = 2 /* O_RDWR */ | if ty & SOCK_NONBLOCK != 0 { o::NONBLOCK } else { 0 };
-            let fd = Fd { open: Arc::new(Mutex::new(Open::Socket(Arc::new(s)))), cloexec: ty & SOCK_CLOEXEC != 0, flags };
+            let fd = Fd { open: Arc::new(Mutex::new(Open::Unix(s))), cloexec: ty & SOCK_CLOEXEC != 0, flags };
             let fd = self.fds.insert(fd, 0)?;
             pair[4 * k..4 * k + 4].copy_from_slice(&(fd as i32).to_le_bytes());
         }
@@ -326,6 +329,9 @@ impl Process {
     }
 
     pub fn connect(&mut self, data: &[u8], fd: i64, addr: u64, len: u64) -> SysResult<i64> {
+        if let Some((u, nonblock)) = self.unix_of(fd)? {
+            return self.unix_connect(data, fd, &u, nonblock, addr, len);
+        }
         let s = self.ready_socket(fd)?;
         let (a, _dir) = self.sockaddr(data, addr, len, false)?;
         match s.sock.connect(&a) {
@@ -337,6 +343,9 @@ impl Process {
     }
 
     pub fn bind(&mut self, data: &[u8], fd: i64, addr: u64, len: u64) -> SysResult<i64> {
+        if let Some((u, _)) = self.unix_of(fd)? {
+            return self.unix_bind(data, &u, addr, len);
+        }
         let s = self.ready_socket(fd)?;
         let (a, _dir) = self.sockaddr(data, addr, len, true)?;
         s.sock.bind(&a).map_err(|e| errno(&e))?;
@@ -357,11 +366,17 @@ impl Process {
     }
 
     pub fn listen(&mut self, fd: i64, backlog: i64) -> SysResult<i64> {
+        if let Some((u, _)) = self.unix_of(fd)? {
+            return u.listen(backlog).map(|_| 0);
+        }
         let s = self.ready_socket(fd)?;
         s.sock.listen(backlog as i32).map(|_| 0).map_err(|e| errno(&e))
     }
 
     pub fn accept(&mut self, data: &mut [u8], fd: i64, addr: u64, len_at: u64, flags: i64) -> SysResult<i64> {
+        if let Some((u, nonblock)) = self.unix_of(fd)? {
+            return self.unix_accept(data, &u, nonblock, addr, len_at, flags);
+        }
         let s = self.ready_socket(fd)?;
         let (sock, from) = s.sock.accept().map_err(|e| errno(&e))?;
         write_sockaddr(data, addr, len_at, &sockaddr_bytes(&from, &self.fs))?;
@@ -372,6 +387,10 @@ impl Process {
     }
 
     pub fn sock_name(&mut self, data: &mut [u8], fd: i64, addr: u64, len_at: u64, peer: bool) -> SysResult<i64> {
+        if let Some((u, _)) = self.unix_of(fd)? {
+            let a = if peer { u.peer()?.0 } else { u.address() };
+            return write_sockaddr(data, addr, len_at, &a.unwrap_or(UNNAMED.to_vec())).map(|_| 0);
+        }
         let s = self.ready_socket(fd)?;
         if !peer && let Some(name) = &*s.name.lock().unwrap() {
             return write_sockaddr(data, addr, len_at, name).map(|_| 0);
@@ -381,6 +400,11 @@ impl Process {
     }
 
     pub fn sendto(&mut self, data: &[u8], fd: i64, buf: u64, len: u64, flags: i64, addr: u64, alen: u64) -> SysResult<i64> {
+        if let Some((u, nonblock)) = self.unix_of(fd)? {
+            let to = if addr != 0 { self.unix_name(data, addr, alen, false)?.map(|(n, _)| n) } else { None };
+            let bytes = mem::slice(data, buf, len)?;
+            return self.unix_send(&u, nonblock, bytes, Vec::new(), to, flags as i32);
+        }
         let s = self.ready_socket(fd)?;
         let bytes = mem::slice(data, buf, len)?;
         // SIGPIPE isn't raised for sockets yet; a broken connection is EPIPE.
@@ -395,6 +419,15 @@ impl Process {
     }
 
     pub fn recvfrom(&mut self, data: &mut [u8], fd: i64, buf: u64, len: u64, flags: i64, addr: u64, len_at: u64) -> SysResult<i64> {
+        if let Some((u, nonblock)) = self.unix_of(fd)? {
+            let got = self.unix_recv(&u, nonblock, len as usize, flags as i32)?;
+            mem::write(data, buf, &got.data)?;
+            if let Some(from) = &got.from {
+                write_sockaddr(data, addr, len_at, from)?;
+            }
+            // (MSG_TRUNC: a datagram's whole length.)
+            return Ok(if got.truncated && flags as i32 & MSG_TRUNC != 0 { got.full as i64 } else { got.data.len() as i64 });
+        }
         let s = self.ready_socket(fd)?;
         let (n, from) = recv_into(&s.sock, mem::slice_mut(data, buf, len)?, flags as i32).map_err(|e| errno(&e))?;
         if let Some(from) = from {
@@ -413,6 +446,11 @@ impl Process {
         let mut bytes = Vec::new();
         for (base, len) in mem::iovecs(data, iov, iovlen)? {
             bytes.extend_from_slice(mem::slice(data, base, len)?);
+        }
+        if let Some((u, nonblock)) = self.unix_of(fd)? {
+            let to = if name != 0 { self.unix_name(data, name, namelen, false)?.map(|(n, _)| n) } else { None };
+            let fds = if control != 0 && controllen != 0 { self.unix_passed(data, control, controllen)? } else { Vec::new() };
+            return self.unix_send(&u, nonblock, &bytes, fds, to, flags as i32);
         }
         let s = self.ready_socket(fd)?;
         let flags = flags as i32 & !MSG_NOSIGNAL;
@@ -438,6 +476,47 @@ impl Process {
         let (control, controllen) = (mem::read_u64(data, msg + 32)?, mem::read_u64(data, msg + 40)?);
         let parts = mem::iovecs(data, iov, iovlen)?;
         let total: u64 = parts.iter().map(|p| p.1).sum();
+        if let Some((u, nonblock)) = self.unix_of(fd)? {
+            let got = self.unix_recv(&u, nonblock, total as usize, flags as i32)?;
+            let mut done = 0;
+            for &(base, len) in &parts {
+                let k = (len as usize).min(got.data.len() - done);
+                mem::write(data, base, &got.data[done..done + k])?;
+                done += k;
+            }
+            match &got.from {
+                Some(from) => write_sockaddr(data, name, msg + 8, from)?,
+                None => mem::write(data, msg + 8, &0u32.to_le_bytes())?,
+            }
+            // Descriptors passed: installed as the guest's, as many as the
+            // control buffer holds (the rest are closed: MSG_CTRUNC).
+            let mut msg_flags = if got.truncated { MSG_TRUNC } else { 0 };
+            let room = if control != 0 { (controllen as usize).saturating_sub(16) / 4 } else { 0 };
+            let mut written = 0;
+            if !got.fds.is_empty() {
+                let n = got.fds.len().min(room);
+                if n < got.fds.len() {
+                    msg_flags |= MSG_CTRUNC;
+                }
+                if n > 0 {
+                    let cloexec = flags as i32 & MSG_CMSG_CLOEXEC != 0;
+                    let mut out = Vec::new();
+                    out.extend_from_slice(&(16 + 4 * n as u64).to_le_bytes());
+                    out.extend_from_slice(&SOL_SOCKET.to_le_bytes());
+                    out.extend_from_slice(&SCM_RIGHTS.to_le_bytes());
+                    for p in got.fds.into_iter().take(n) {
+                        let guest = self.fds.insert(Fd { open: p.open, cloexec, flags: p.flags }, 0)?;
+                        out.extend_from_slice(&(guest as i32).to_le_bytes());
+                    }
+                    out.resize(out.len().next_multiple_of(8).min(controllen as usize), 0);
+                    mem::write(data, control, &out)?;
+                    written = out.len() as u64;
+                }
+            }
+            mem::write(data, msg + 40, &written.to_le_bytes())?; // msg_controllen
+            mem::write(data, msg + 48, &msg_flags.to_le_bytes())?; // msg_flags
+            return Ok(if got.truncated && flags as i32 & MSG_TRUNC != 0 { got.full as i64 } else { got.data.len() as i64 });
+        }
         let mut buf = vec![0u8; total as usize];
         let s = self.ready_socket(fd)?;
         let (n, from, cmsgs, msg_flags) = if control != 0 && controllen != 0 {
@@ -503,6 +582,9 @@ impl Process {
     }
 
     pub fn shutdown(&mut self, fd: i64, how: i64) -> SysResult<i64> {
+        if let Some((u, _)) = self.unix_of(fd)? {
+            return u.shutdown(how).map(|_| 0);
+        }
         let s = self.ready_socket(fd)?;
         let how = match how {
             0 => std::net::Shutdown::Read,
@@ -514,6 +596,9 @@ impl Process {
     }
 
     pub fn setsockopt(&mut self, data: &[u8], fd: i64, level: i64, name: i64, val: u64, len: u64) -> SysResult<i64> {
+        if self.unix_of(fd)?.is_some() {
+            return Ok(0); // (SO_PASSCRED and the like: accepted)
+        }
         let s = self.ready_socket(fd)?;
         let int = mem::slice(data, val, len.min(4))?;
         let on = int.len() == 4 && u32::from_le_bytes(int.try_into().unwrap()) != 0;
@@ -537,6 +622,9 @@ impl Process {
     }
 
     pub fn getsockopt(&mut self, data: &mut [u8], fd: i64, level: i64, name: i64, val: u64, len_at: u64) -> SysResult<i64> {
+        if let Some((u, _)) = self.unix_of(fd)? {
+            return self.unix_sockopt(data, &u, level, name, val, len_at);
+        }
         let s = self.ready_socket(fd)?;
         const SOL_SOCKET: i64 = 1;
         let v: i64 = match (level, name) {
@@ -591,6 +679,17 @@ impl Process {
                     Open::Host(h) => {
                         host.push((k, std::os::fd::AsRawFd::as_raw_fd(&h.fd)));
                         keep.push(h.clone());
+                    }
+                    Open::Unix(u) => {
+                        let (r, w, hup) = u.readiness();
+                        let mut ev = 0;
+                        if r {
+                            ev |= POLLIN;
+                        }
+                        if w {
+                            ev |= POLLOUT;
+                        }
+                        revents[k] = (ev & events) | if hup { POLLHUP } else { 0 };
                     }
                     Open::EventFd(e) => {
                         let (r, w) = e.readiness();
@@ -704,6 +803,17 @@ impl Process {
             {
                 entry.0 = EPOLLONESHOT;
             }
+            // Edge-triggered on something whose readiness never changes (a
+            // file, /proc/self/mountinfo, a device): one report, as on Linux,
+            // until EPOLL_CTL_MOD. (Pipes, sockets and eventfds stay
+            // level-triggered, which suits edge-triggered readers too: they
+            // read until EAGAIN.) GLib's mount monitor spun on mountinfo.
+            if ev & EPOLLET != 0
+                && self.fds.get(fd).is_ok_and(|d| matches!(&*d.open.lock().unwrap(), Open::File { .. } | Open::Dir { .. } | Open::Device(_)))
+                && let Some(entry) = interest.get_mut(&fd)
+            {
+                entry.0 &= !(EPOLLIN | EPOLLOUT | EPOLLPRI | EPOLLRDHUP);
+            }
         }
         Ok(count)
     }
@@ -765,6 +875,184 @@ impl Process {
     }
 }
 
+
+
+// --- Unix sockets: the runtime's own (unix.rs) ------------------------------
+
+const MSG_PEEK: i32 = 2;
+const MSG_CTRUNC: i32 = 8;
+const MSG_TRUNC: i32 = 0x20;
+const MSG_DONTWAIT: i32 = 0x40;
+const MSG_WAITALL: i32 = 0x100;
+
+/// An unnamed Unix socket's address: the family alone.
+const UNNAMED: [u8; 2] = [AF_UNIX as u8, 0];
+
+impl Process {
+    /// The runtime Unix socket behind `fd`, if it is one, and whether the
+    /// descriptor is non-blocking.
+    pub fn unix_of(&self, fd: i64) -> SysResult<Option<(Arc<crate::unix::UnixSocket>, bool)>> {
+        let fd = self.fds.get(fd)?;
+        let nonblock = fd.flags & o::NONBLOCK != 0;
+        match &*fd.open.lock().unwrap() {
+            Open::Unix(u) => Ok(Some((u.clone(), nonblock))),
+            _ => Ok(None),
+        }
+    }
+
+    /// A guest `struct sockaddr_un`: its name (a path resolved under the
+    /// root, or an abstract name) and its bytes as given (up to a path's
+    /// NUL); None for an unnamed address. `creating` (bind) doesn't follow
+    /// a symlink in the last component.
+    fn unix_name(&self, data: &[u8], addr: u64, len: u64, creating: bool) -> SysResult<Option<(crate::unix::Name, Vec<u8>)>> {
+        use crate::unix::Name;
+        let b = mem::slice(data, addr, len)?;
+        if b.len() < 2 || u16::from_le_bytes([b[0], b[1]]) as i64 != AF_UNIX {
+            return Err(EINVAL);
+        }
+        let path = &b[2..];
+        match path.first() {
+            None => Ok(None),
+            Some(0) => Ok(Some((Name::Abstract(path[1..].to_vec()), b.to_vec()))),
+            Some(_) => {
+                let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+                let guest = std::str::from_utf8(&path[..end]).map_err(|_| EINVAL)?;
+                let resolved = self.fs.resolve(&self.fs.cwd(), guest, !creating)?;
+                Ok(Some((Name::Path(resolved), [&b[..2 + end], &[0]].concat())))
+            }
+        }
+    }
+
+    fn unix_bind(&mut self, data: &[u8], u: &Arc<crate::unix::UnixSocket>, addr: u64, len: u64) -> SysResult<i64> {
+        use crate::unix::Name;
+        // (An unnamed address: no name. Linux would pick an abstract one.)
+        let Some((name, shown)) = self.unix_name(data, addr, len, true)? else { return Ok(0) };
+        if let Name::Path(p) = &name {
+            // The socket's file, as Linux makes one: taken if it exists.
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(self.fs.host(p)) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(98), // EADDRINUSE
+                Err(e) => return Err(crate::fs::errno(&e)),
+            }
+        }
+        u.bind(&self.kernel.unix, name, shown).map(|_| 0)
+    }
+
+    fn unix_connect(&mut self, data: &[u8], fd: i64, u: &Arc<crate::unix::UnixSocket>, nonblock: bool, addr: u64, len: u64) -> SysResult<i64> {
+        use crate::unix::Name;
+        let Some((name, _)) = self.unix_name(data, addr, len, false)? else { return Err(EINVAL) };
+        if let Name::Path(p) = &name {
+            // A path leading to a host socket (the host's compositor, with
+            // --wayland=host): the description becomes a host socket.
+            if let Some(host) = self.kernel.forwarded(p) {
+                let t = match u.kind {
+                    SOCK_DGRAM => Type::DGRAM,
+                    SOCK_SEQPACKET => Type::SEQPACKET,
+                    _ => Type::STREAM,
+                };
+                let sock = Socket::new(Domain::UNIX, t, None).map_err(|e| errno(&e))?;
+                sock.connect(&SockAddr::unix(&host).map_err(|e| errno(&e))?).map_err(|e| errno(&e))?;
+                *self.fds.get(fd)?.open.lock().unwrap() = Open::Socket(Arc::new(GuestSocket::new(sock, u.kind)));
+                return Ok(0);
+            }
+            // Its file was removed: nothing listens there any more.
+            if !self.fs.host(p).exists() {
+                return Err(ENOENT);
+            }
+        }
+        u.connect(&self.kernel.unix, &name, self.pid, nonblock, &self.interrupted()).map(|_| 0)
+    }
+
+    fn unix_accept(&mut self, data: &mut [u8], u: &crate::unix::UnixSocket, nonblock: bool, addr: u64, len_at: u64, flags: i64) -> SysResult<i64> {
+        let s = u.accept(nonblock, &self.interrupted())?;
+        let peer = s.peer().ok().and_then(|(a, _)| a).unwrap_or(UNNAMED.to_vec());
+        write_sockaddr(data, addr, len_at, &peer)?;
+        let fl = 2 | if flags & SOCK_NONBLOCK != 0 { o::NONBLOCK } else { 0 };
+        let fd = Fd { open: Arc::new(Mutex::new(Open::Unix(s))), cloexec: flags & SOCK_CLOEXEC != 0, flags: fl };
+        self.fds.insert(fd, 0)
+    }
+
+    /// The descriptors of the SCM_RIGHTS messages in a guest control
+    /// buffer, as open file descriptions to pass.
+    fn unix_passed(&self, data: &[u8], control: u64, len: u64) -> SysResult<Vec<crate::unix::Passed>> {
+        let (mut at, end) = (control, control + len);
+        let mut fds = Vec::new();
+        while at + 16 <= end {
+            let len = mem::read_u64(data, at)?;
+            let head = mem::slice(data, at + 8, 8)?;
+            let (level, ty) = (i32::from_le_bytes(head[..4].try_into().unwrap()), i32::from_le_bytes(head[4..].try_into().unwrap()));
+            if len < 16 || at + len > end {
+                return Err(EINVAL);
+            }
+            if level == SOL_SOCKET && ty == SCM_RIGHTS {
+                for k in 0..(len - 16) / 4 {
+                    let n = i32::from_le_bytes(mem::slice(data, at + 16 + 4 * k, 4)?.try_into().unwrap());
+                    let fd = self.fds.get(n as i64)?;
+                    fds.push(crate::unix::Passed { open: fd.open.clone(), flags: fd.flags });
+                }
+            }
+            at += len.next_multiple_of(8);
+        }
+        Ok(fds)
+    }
+
+    /// A send on a runtime Unix socket: EPIPE raises SIGPIPE unless
+    /// MSG_NOSIGNAL.
+    fn unix_send(&mut self, u: &crate::unix::UnixSocket, nonblock: bool, bytes: &[u8], fds: Vec<crate::unix::Passed>, to: Option<crate::unix::Name>, flags: i32) -> SysResult<i64> {
+        let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+        let r = u.send(&self.kernel.unix, bytes, fds, to.as_ref(), nonblock, &self.interrupted());
+        if r == Err(EPIPE) && flags & MSG_NOSIGNAL == 0 {
+            self.raise_sigpipe();
+        }
+        r.map(|n| n as i64)
+    }
+
+    fn unix_recv(&self, u: &crate::unix::UnixSocket, nonblock: bool, len: usize, flags: i32) -> SysResult<crate::unix::Received> {
+        let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+        u.recv(len, flags & MSG_PEEK != 0, flags & MSG_WAITALL != 0, nonblock, &self.interrupted())
+    }
+
+    /// read() on a runtime Unix socket (descriptors sent with the bytes are
+    /// closed, as Linux does).
+    pub fn unix_read(&self, u: &crate::unix::UnixSocket, nonblock: bool, buf: &mut [u8]) -> SysResult<i64> {
+        let got = self.unix_recv(u, nonblock, buf.len(), 0)?;
+        buf[..got.data.len()].copy_from_slice(&got.data);
+        Ok(got.data.len() as i64)
+    }
+
+    /// write() on a runtime Unix socket.
+    pub fn unix_write(&mut self, u: &crate::unix::UnixSocket, nonblock: bool, buf: &[u8]) -> SysResult<i64> {
+        self.unix_send(u, nonblock, buf, Vec::new(), None, 0)
+    }
+
+    fn unix_sockopt(&self, data: &mut [u8], u: &crate::unix::UnixSocket, level: i64, name: i64, val: u64, len_at: u64) -> SysResult<i64> {
+        const SO_PEERCRED: i64 = 17;
+        let v: i64 = match (level, name) {
+            // struct ucred: the connecting process, and root (as the
+            // environment's programs run).
+            (1, SO_PEERCRED) => {
+                let (_, pid) = u.peer()?;
+                let mut cred = [0u8; 12];
+                cred[..4].copy_from_slice(&pid.to_le_bytes());
+                if len_at != 0 {
+                    mem::write(data, val, &cred)?;
+                    mem::write(data, len_at, &12u32.to_le_bytes())?;
+                }
+                return Ok(0);
+            }
+            (1, 3) => u.kind,                // SO_TYPE
+            (1, 7) | (1, 8) => 212_992,      // SO_SNDBUF, SO_RCVBUF
+            (1, 39) => AF_UNIX,              // SO_DOMAIN
+            (1, _) => 0,                     // SO_ERROR, SO_PASSCRED...
+            _ => return Err(ENOPROTOOPT),
+        };
+        if len_at != 0 {
+            mem::write(data, val, &(v as i32).to_le_bytes())?;
+            mem::write(data, len_at, &4u32.to_le_bytes())?;
+        }
+        Ok(0)
+    }
+}
 
 // --- Passing descriptors (SCM_RIGHTS) ---------------------------------------
 
@@ -839,7 +1127,9 @@ fn recv_with_control(s: &Socket, buf: &mut [u8], control_len: usize, flags: i32)
             m.msg_iovlen = 1;
             m.msg_control = control.as_mut_ptr().cast();
             m.msg_controllen = control_len as _;
-            let n = libc::recvmsg(s.as_raw_fd(), &mut m, flags | libc::MSG_CMSG_CLOEXEC);
+            #[cfg(target_os = "linux")]
+            let flags = flags | libc::MSG_CMSG_CLOEXEC;
+            let n = libc::recvmsg(s.as_raw_fd(), &mut m, flags);
             if n < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -858,7 +1148,13 @@ fn recv_with_control(s: &Socket, buf: &mut [u8], control_len: usize, flags: i32)
             let body = libc::CMSG_DATA(c);
             let len = (*c).cmsg_len as usize - (body as usize - c as usize);
             let msg = if level == SOL_SOCKET && ty == SCM_RIGHTS {
-                Cmsg::Fds((0..len / 4).map(|k| OwnedFd::from_raw_fd(body.cast::<i32>().add(k).read_unaligned())).collect())
+                let fds: Vec<OwnedFd> = (0..len / 4).map(|k| OwnedFd::from_raw_fd(body.cast::<i32>().add(k).read_unaligned())).collect();
+                // Where recvmsg can't set it (MSG_CMSG_CLOEXEC is Linux's).
+                #[cfg(not(target_os = "linux"))]
+                for fd in &fds {
+                    libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                Cmsg::Fds(fds)
             } else {
                 Cmsg::Raw(std::slice::from_raw_parts(body, len).to_vec())
             };
@@ -877,7 +1173,8 @@ fn file_key(fd: &std::os::fd::OwnedFd) -> SysResult<(u64, u64)> {
     if unsafe { libc::fstat(std::os::fd::AsRawFd::as_raw_fd(fd), &mut st) } < 0 {
         return Err(errno(&std::io::Error::last_os_error()));
     }
-    Ok((st.st_dev, st.st_ino))
+    #[allow(clippy::unnecessary_cast)]
+    Ok((st.st_dev as u64, st.st_ino as u64))
 }
 
 /// The runtime's own objects (pipes, eventfds...) on their way to another
@@ -887,14 +1184,14 @@ fn file_key(fd: &std::os::fd::OwnedFd) -> SysResult<(u64, u64)> {
 static TOKENS: std::sync::LazyLock<Mutex<std::collections::HashMap<(u64, u64), Arc<Mutex<Open>>>>> =
     std::sync::LazyLock::new(Default::default);
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn token(open: Arc<Mutex<Open>>) -> SysResult<std::os::fd::OwnedFd> {
     let fd = crate::shared::memfd(c"wasm-env-token", 0)?;
     TOKENS.lock().unwrap().insert(file_key(&fd)?, open);
     Ok(fd)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn token(_open: Arc<Mutex<Open>>) -> SysResult<std::os::fd::OwnedFd> {
     Err(95) // EOPNOTSUPP
 }

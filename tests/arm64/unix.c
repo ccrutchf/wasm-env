@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -222,8 +224,35 @@ static void path_sockets(void) {
     close(c);
 }
 
+// inotify (the host's, on the files under the root) and prctl's thread name.
+static void watching(void) {
+    const char *dir = "unix-test-watched";
+    mkdir(dir, 0755);
+    int in = inotify_init1(IN_CLOEXEC);
+    check(in >= 0, "inotify_init1");
+    int wd = inotify_add_watch(in, dir, IN_CREATE | IN_DELETE);
+    check(wd >= 0, "inotify_add_watch");
+    char path[64];
+    snprintf(path, sizeof path, "%s/new-file", dir);
+    close(open(path, O_CREAT | O_WRONLY, 0644));
+    unlink(path);
+    char buf[4096] __attribute__((aligned(8)));
+    ssize_t n = read(in, buf, sizeof buf);
+    for (char *p = buf; n > 0 && p < buf + n;) {
+        struct inotify_event *e = (struct inotify_event *)p;
+        printf("inotify: %s %s (same watch: %s)\n", e->mask & IN_CREATE ? "created" : e->mask & IN_DELETE ? "deleted" : "?", e->name, e->wd == wd ? "yes" : "no");
+        p += sizeof *e + e->len;
+    }
+    check(inotify_rm_watch(in, wd) == 0, "inotify_rm_watch");
+    close(in);
+    rmdir(dir);
+    check(prctl(PR_SET_NAME, "worker") == 0, "prctl(PR_SET_NAME)");
+    printf("dumpable: %d\n", prctl(PR_GET_DUMPABLE));
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    watching();
     memfd_and_mapping();
     shared_across_fork();
     passing_descriptors();
