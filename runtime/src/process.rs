@@ -165,6 +165,8 @@ pub struct Process {
     pub pending: Option<Pending>,
     pub trace: bool,
     pub start: Instant,
+    /// The program's path in the environment, absolute (/proc/self/exe).
+    pub exe: String,
     /// The WebAssembly module this process runs (for translation feedback).
     pub module: PathBuf,
     /// Where to clear the thread's id when it exits (CLONE_CHILD_CLEARTID,
@@ -497,6 +499,7 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
     let fs = Fs::new(kernel.root.clone());
     fs.set_cwd(inherit.cwd);
     let group = Group::new();
+    let exe = fs.resolve(&fs.cwd(), &image.path, true).unwrap_or_else(|_| image.path.clone());
     let process = Process {
         kernel: kernel.clone(),
         pid,
@@ -513,6 +516,7 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
         pending: None,
         trace: kernel.trace,
         start: Instant::now(),
+        exe,
         module: image.host.clone(),
         clear_tid: 0,
         started: None,

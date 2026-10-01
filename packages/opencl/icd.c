@@ -27,16 +27,23 @@ void *memset(void *, int, size_t);
 size_t strlen(const char *);
 int strcmp(const char *, const char *);
 char *strchr(const char *, int);
+char *strstr(const char *, const char *);
+int memcmp(const void *, const void *, size_t);
 int open(const char *, int, ...);
 int ioctl(int, unsigned long, ...);
 int close(int);
+struct timespec {
+    long tv_sec, tv_nsec;
+};
+int clock_gettime(int, struct timespec *);
+#define CLOCK_MONOTONIC 1
 #define O_RDWR 02
 #define O_CLOEXEC 02000000
 
 #define API __attribute__((visibility("default")))
 #define GPU_CALL 0xc0805740u
 
-enum { INFO = 1, CREATE, FREE, WRITE, READ, COPY, FILL, BUILD, LOG, KERNELS, ARGS, RUN, FINISH };
+enum { INFO = 1, CREATE, FREE, WRITE, READ, COPY, FILL, BUILD, LOG, KERNELS, ARGS, RUN, FINISH, ATTRIBUTES, COMPILE, LINK, BINARY, LOAD };
 
 struct request {
     uint64_t op, a[9], r[6];
@@ -72,6 +79,12 @@ struct _cl_mem {
     cl_mem parent;
     void *host;
     cl_uint maps;
+    // Destructor callbacks, the latest first (the order they run in).
+    struct callback {
+        void(CL_CALLBACK *f)(cl_mem, void *);
+        void *user;
+        struct callback *next;
+    } *callbacks;
 };
 struct _cl_program {
     struct _cl_icd_dispatch *d;
@@ -82,6 +95,11 @@ struct _cl_program {
     uint64_t handle;
     cl_build_status status;
     cl_uint kernels;
+    // An executable, a compiled object or a library (bitcode in the runtime).
+    cl_program_binary_type binary;
+    // Linked (or loaded from a linked binary): nothing to build, and its
+    // binary is its bitcode.
+    int prebuilt;
 };
 struct arg {
     uint32_t kind, size, offset, zero;
@@ -100,6 +118,7 @@ struct _cl_kernel {
     uint32_t *locals;
     uint8_t *set;
     size_t required[3];
+    char *attributes;
 };
 struct _cl_event {
     struct _cl_icd_dispatch *d;
@@ -108,6 +127,15 @@ struct _cl_event {
     cl_command_queue queue;
     cl_command_type type;
     cl_int status;
+    // When it was enqueued (its work began) and when it finished.
+    cl_ulong began, ended;
+    // Callbacks waiting for a status (user events').
+    struct waiting {
+        void(CL_CALLBACK *f)(cl_event, cl_int, void *);
+        void *user;
+        cl_int type;
+        struct waiting *next;
+    } *waiting;
 };
 
 static struct _cl_platform_id platform = {&dispatch};
@@ -123,7 +151,21 @@ static struct {
     uint8_t pad[8];
 } desc;
 
+static cl_ulong now(void) {
+    struct timespec t = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (cl_ulong)t.tv_sec * 1000000000u + (cl_ulong)t.tv_nsec;
+}
+
+// When the command being enqueued began: its first request to the device.
+static cl_ulong began;
+static int beginning = 1;
+
 static int call(struct request *r) {
+    if (beginning) {
+        began = now();
+        beginning = 0;
+    }
     return ioctl(gpu, GPU_CALL, r) == 0 ? (int)(int64_t)r->r[1] : CL_OUT_OF_RESOURCES;
 }
 
@@ -174,6 +216,8 @@ static cl_event event(cl_command_queue q, cl_command_type type) {
     cl_event e = calloc(1, sizeof *e);
     if (e) {
         *e = (struct _cl_event){&dispatch, 1, q ? q->ctx : NULL, q, type, CL_COMPLETE};
+        e->ended = now();
+        e->began = beginning ? e->ended : began;
         if (q)
             q->refs++;
     }
@@ -181,9 +225,12 @@ static cl_event event(cl_command_queue q, cl_command_type type) {
 }
 
 static cl_int done(cl_command_queue q, cl_command_type type, cl_event *ev) {
+    cl_int e = CL_SUCCESS;
     if (ev && !(*ev = event(q, type)))
-        return CL_OUT_OF_HOST_MEMORY;
-    return CL_SUCCESS;
+        e = CL_OUT_OF_HOST_MEMORY;
+    // (The next request begins another command.)
+    beginning = 1;
+    return e;
 }
 
 // ---- Platform and device ----
@@ -224,6 +271,9 @@ static cl_int GetPlatformInfo(cl_platform_id p, cl_platform_info what, size_t ca
 static cl_int GetDeviceIDs(cl_platform_id p, cl_device_type type, cl_uint n, cl_device_id *devices, cl_uint *count) {
     if (p && p != &platform)
         return CL_INVALID_PLATFORM;
+    const cl_device_type known = CL_DEVICE_TYPE_DEFAULT | CL_DEVICE_TYPE_CPU | CL_DEVICE_TYPE_GPU | CL_DEVICE_TYPE_ACCELERATOR | CL_DEVICE_TYPE_CUSTOM;
+    if (type != CL_DEVICE_TYPE_ALL && (!type || (type & ~known)))
+        return CL_INVALID_DEVICE_TYPE;
     if ((!devices && !count) || (devices && !n))
         return CL_INVALID_VALUE;
     int match = type == CL_DEVICE_TYPE_ALL || type == CL_DEVICE_TYPE_DEFAULT || (type & desc.type);
@@ -336,7 +386,8 @@ static cl_int GetDeviceInfo(cl_device_id dev, cl_device_info what, size_t cap, v
     case CL_DEVICE_EXECUTION_CAPABILITIES:
         INFO_OF(cl_device_exec_capabilities, CL_EXEC_KERNEL);
     case CL_DEVICE_QUEUE_PROPERTIES:
-        INFO_OF(cl_command_queue_properties, CL_QUEUE_PROFILING_ENABLE);
+        // (Out of order allowed: commands running in order is one such order.)
+        INFO_OF(cl_command_queue_properties, CL_QUEUE_PROFILING_ENABLE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE);
     case CL_DEVICE_NAME:
         INFO_STR(desc.name);
     case CL_DEVICE_VENDOR:
@@ -380,6 +431,21 @@ static cl_context CreateContext(const cl_context_properties *props, cl_uint n, c
     for (cl_uint i = 0; e == CL_SUCCESS && i < n; i++)
         if (devices[i] != &device)
             e = CL_INVALID_DEVICE;
+    // Properties: the platform (ours), and interop sync (accepted).
+    for (size_t i = 0; e == CL_SUCCESS && props && props[i]; i += 2) {
+        if (props[i] == CL_CONTEXT_PLATFORM) {
+            if ((cl_platform_id)props[i + 1] != &platform)
+                e = CL_INVALID_PLATFORM;
+        } else if (props[i] == CL_CONTEXT_INTEROP_USER_SYNC) {
+            if (props[i + 1] != CL_TRUE && props[i + 1] != CL_FALSE)
+                e = CL_INVALID_PROPERTY;
+        } else {
+            e = CL_INVALID_PROPERTY;
+        }
+        for (size_t j = 0; e == CL_SUCCESS && j < i; j += 2)
+            if (props[j] == props[i])
+                e = CL_INVALID_PROPERTY;
+    }
     cl_context c = e == CL_SUCCESS ? calloc(1, sizeof *c) : NULL;
     if (e == CL_SUCCESS && !c)
         e = CL_OUT_OF_HOST_MEMORY;
@@ -440,7 +506,7 @@ static cl_int GetContextInfo(cl_context c, cl_context_info what, size_t cap, voi
 }
 
 static cl_command_queue queue(cl_context c, cl_device_id d, cl_command_queue_properties props, cl_int *err) {
-    cl_int e = !c ? CL_INVALID_CONTEXT : d != &device ? CL_INVALID_DEVICE : CL_SUCCESS;
+    cl_int e = !c ? CL_INVALID_CONTEXT : d != &device ? CL_INVALID_DEVICE : props & ~(cl_command_queue_properties)(CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE | CL_QUEUE_PROFILING_ENABLE) ? CL_INVALID_VALUE : CL_SUCCESS;
     cl_command_queue q = e == CL_SUCCESS ? calloc(1, sizeof *q) : NULL;
     if (q) {
         *q = (struct _cl_command_queue){&dispatch, 1, c, props};
@@ -512,6 +578,10 @@ static cl_int Finish(cl_command_queue q) {
 static uint64_t base_handle(cl_mem m) { return m->parent ? m->parent->handle : m->handle; }
 static size_t base_offset(cl_mem m) { return m->offset; }
 
+// Whether the host may read or write a buffer (CL_MEM_HOST_*).
+static int host_reads(cl_mem m) { return !(m->flags & (CL_MEM_HOST_WRITE_ONLY | CL_MEM_HOST_NO_ACCESS)); }
+static int host_writes(cl_mem m) { return !(m->flags & (CL_MEM_HOST_READ_ONLY | CL_MEM_HOST_NO_ACCESS)); }
+
 static cl_int write_mem(cl_mem m, size_t offset, size_t size, const void *p) {
     struct request r = {WRITE, {base_handle(m), base_offset(m) + offset, (uintptr_t)p, size}};
     return call(&r);
@@ -566,7 +636,26 @@ static cl_mem CreateSubBuffer(cl_mem parent, cl_mem_flags flags, cl_buffer_creat
         e = CL_INVALID_VALUE;
     cl_mem m = e == CL_SUCCESS ? calloc(1, sizeof *m) : NULL;
     if (m) {
-        *m = (struct _cl_mem){&dispatch, 1, parent->ctx, flags ? flags : parent->flags, region->size, region->origin, 0, parent};
+        // Unspecified access and host flags are the parent's.
+        const cl_mem_flags access = CL_MEM_READ_WRITE | CL_MEM_WRITE_ONLY | CL_MEM_READ_ONLY;
+        const cl_mem_flags host = CL_MEM_USE_HOST_PTR | CL_MEM_ALLOC_HOST_PTR | CL_MEM_COPY_HOST_PTR;
+        const cl_mem_flags hostaccess = CL_MEM_HOST_WRITE_ONLY | CL_MEM_HOST_READ_ONLY | CL_MEM_HOST_NO_ACCESS;
+        // (A sub-buffer can't give the host access its parent doesn't.)
+        if (((flags & CL_MEM_HOST_WRITE_ONLY) && (parent->flags & CL_MEM_HOST_READ_ONLY)) || ((flags & CL_MEM_HOST_READ_ONLY) && (parent->flags & CL_MEM_HOST_WRITE_ONLY)) ||
+            ((flags & (CL_MEM_HOST_READ_ONLY | CL_MEM_HOST_WRITE_ONLY)) && (parent->flags & CL_MEM_HOST_NO_ACCESS))) {
+            free(m);
+            if (err)
+                *err = CL_INVALID_VALUE;
+            return NULL;
+        }
+        cl_mem_flags f = flags | (parent->flags & host);
+        if (!(flags & access))
+            f |= parent->flags & access;
+        if (!(flags & hostaccess))
+            f |= parent->flags & hostaccess;
+        *m = (struct _cl_mem){&dispatch, 1, parent->ctx, f, region->size, region->origin, 0, parent};
+        if (parent->host)
+            m->host = (char *)parent->host + region->origin;
         parent->refs++;
         parent->ctx->refs++;
     } else if (e == CL_SUCCESS) {
@@ -588,6 +677,11 @@ static cl_int ReleaseMemObject(cl_mem m) {
     if (!m)
         return CL_INVALID_MEM_OBJECT;
     if (--m->refs == 0) {
+        for (struct callback *c = m->callbacks, *next; c; c = next) {
+            next = c->next;
+            c->f(m, c->user);
+            free(c);
+        }
         if (m->parent) {
             ReleaseMemObject(m->parent);
         } else {
@@ -597,6 +691,19 @@ static cl_int ReleaseMemObject(cl_mem m) {
         ReleaseContext(m->ctx);
         free(m);
     }
+    return CL_SUCCESS;
+}
+
+static cl_int SetMemObjectDestructorCallback(cl_mem m, void(CL_CALLBACK *f)(cl_mem, void *), void *user) {
+    if (!m)
+        return CL_INVALID_MEM_OBJECT;
+    if (!f)
+        return CL_INVALID_VALUE;
+    struct callback *c = malloc(sizeof *c);
+    if (!c)
+        return CL_OUT_OF_HOST_MEMORY;
+    *c = (struct callback){f, user, m->callbacks};
+    m->callbacks = c;
     return CL_SUCCESS;
 }
 
@@ -642,6 +749,8 @@ static cl_int EnqueueReadBuffer(cl_command_queue q, cl_mem m, cl_bool blocking, 
         return CL_INVALID_COMMAND_QUEUE;
     if (!m)
         return CL_INVALID_MEM_OBJECT;
+    if (!host_reads(m))
+        return CL_INVALID_OPERATION;
     if (!p || offset + size > m->size)
         return CL_INVALID_VALUE;
     cl_int e = read_mem(m, offset, size, p);
@@ -655,6 +764,8 @@ static cl_int EnqueueWriteBuffer(cl_command_queue q, cl_mem m, cl_bool blocking,
         return CL_INVALID_COMMAND_QUEUE;
     if (!m)
         return CL_INVALID_MEM_OBJECT;
+    if (!host_writes(m))
+        return CL_INVALID_OPERATION;
     if (!p || offset + size > m->size)
         return CL_INVALID_VALUE;
     cl_int e = write_mem(m, offset, size, p);
@@ -720,6 +831,8 @@ static cl_int EnqueueReadBufferRect(cl_command_queue q, cl_mem m, cl_bool blocki
         return CL_INVALID_COMMAND_QUEUE;
     if (!m)
         return CL_INVALID_MEM_OBJECT;
+    if (!host_reads(m))
+        return CL_INVALID_OPERATION;
     cl_int e = rect(m, 0, bo, ho, reg, brp, bsp, hrp, hsp, p);
     return e != CL_SUCCESS ? e : done(q, CL_COMMAND_READ_BUFFER_RECT, ev);
 }
@@ -731,6 +844,8 @@ static cl_int EnqueueWriteBufferRect(cl_command_queue q, cl_mem m, cl_bool block
         return CL_INVALID_COMMAND_QUEUE;
     if (!m)
         return CL_INVALID_MEM_OBJECT;
+    if (!host_writes(m))
+        return CL_INVALID_OPERATION;
     cl_int e = rect(m, 1, bo, ho, reg, brp, bsp, hrp, hsp, (void *)p);
     return e != CL_SUCCESS ? e : done(q, CL_COMMAND_WRITE_BUFFER_RECT, ev);
 }
@@ -747,10 +862,47 @@ struct mapping {
 };
 static struct mapping *mappings;
 
+static cl_int EnqueueCopyBufferRect(cl_command_queue q, cl_mem src, cl_mem dst, const size_t *so, const size_t *dor, const size_t *reg, size_t srp, size_t ssp,
+                                    size_t drp, size_t dsp, cl_uint nw, const cl_event *wait, cl_event *ev) {
+    (void)nw, (void)wait;
+    if (!q)
+        return CL_INVALID_COMMAND_QUEUE;
+    if (!src || !dst)
+        return CL_INVALID_MEM_OBJECT;
+    if (!so || !dor || !reg || !reg[0] || !reg[1] || !reg[2])
+        return CL_INVALID_VALUE;
+    if (!srp)
+        srp = reg[0];
+    if (!ssp)
+        ssp = reg[1] * srp;
+    if (!drp)
+        drp = reg[0];
+    if (!dsp)
+        dsp = reg[1] * drp;
+    // Row by row, through the host.
+    char *row = malloc(reg[0]);
+    if (!row)
+        return CL_OUT_OF_HOST_MEMORY;
+    cl_int e = CL_SUCCESS;
+    for (size_t z = 0; e == CL_SUCCESS && z < reg[2]; z++)
+        for (size_t y = 0; e == CL_SUCCESS && y < reg[1]; y++) {
+            size_t s = (so[2] + z) * ssp + (so[1] + y) * srp + so[0];
+            size_t d = (dor[2] + z) * dsp + (dor[1] + y) * drp + dor[0];
+            if (s + reg[0] > src->size || d + reg[0] > dst->size)
+                e = CL_INVALID_VALUE;
+            else if ((e = read_mem(src, s, reg[0], row)) == CL_SUCCESS)
+                e = write_mem(dst, d, reg[0], row);
+        }
+    free(row);
+    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_COPY_BUFFER_RECT, ev);
+}
+
 static void *EnqueueMapBuffer(cl_command_queue q, cl_mem m, cl_bool blocking, cl_map_flags flags, size_t offset, size_t size, cl_uint nw,
                               const cl_event *wait, cl_event *ev, cl_int *err) {
     (void)blocking, (void)nw, (void)wait;
     cl_int e = !q ? CL_INVALID_COMMAND_QUEUE : !m ? CL_INVALID_MEM_OBJECT : offset + size > m->size ? CL_INVALID_VALUE : CL_SUCCESS;
+    if (e == CL_SUCCESS && (((flags & CL_MAP_READ) && !host_reads(m)) || ((flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION)) && !host_writes(m))))
+        e = CL_INVALID_OPERATION;
     void *p = NULL;
     struct mapping *map = NULL;
     if (e == CL_SUCCESS) {
@@ -847,16 +999,51 @@ static cl_program CreateProgramWithSource(cl_context c, cl_uint n, const char **
 }
 
 // A program's "binary" is its source: built again when loaded.
+// A program's binary: for an executable, its source (built again when
+// loaded); for a compiled object or a library, a tag and its bitcode.
+static const char object_tag[] = "WENVO", library_tag[] = "WENVL", executable_tag[] = "WENVX";
+
 static cl_program CreateProgramWithBinary(cl_context c, cl_uint n, const cl_device_id *devices, const size_t *lengths, const unsigned char **binaries,
                                           cl_int *status, cl_int *err) {
-    if (!c || n != 1 || !devices || devices[0] != &device || !lengths || !binaries || !binaries[0]) {
+    if (!c || n != 1 || !devices || devices[0] != &device || !lengths || !binaries || !binaries[0] || !lengths[0]) {
         if (err)
             *err = !c ? CL_INVALID_CONTEXT : CL_INVALID_VALUE;
         return NULL;
     }
     if (status)
         status[0] = CL_SUCCESS;
-    return program(c, dup_bytes((const char *)binaries[0], lengths[0]), lengths[0], err);
+    const char *b = (const char *)binaries[0];
+    int tagged = lengths[0] > 5;
+    int kind = tagged && !memcmp(b, library_tag, 5) ? 1 : tagged && !memcmp(b, executable_tag, 5) ? 2 : tagged && !memcmp(b, object_tag, 5) ? 0 : -1;
+    if (kind >= 0) {
+        cl_program p = program(c, dup_bytes("", 0), 0, err);
+        if (p) {
+            struct request r = {LOAD, {(uintptr_t)(b + 5), lengths[0] - 5, (uint64_t)kind}};
+            cl_int e = call(&r);
+            p->handle = r.r[0];
+            p->binary = kind == 1 ? CL_PROGRAM_BINARY_TYPE_LIBRARY : kind == 2 ? CL_PROGRAM_BINARY_TYPE_EXECUTABLE : CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT;
+            p->prebuilt = kind == 2;
+            if (e != CL_SUCCESS && err)
+                *err = e;
+        }
+        return p;
+    }
+    return program(c, dup_bytes(b, lengths[0]), lengths[0], err);
+}
+
+// An object's or library's bitcode, tagged (a new buffer; its length).
+static char *object_binary(cl_program p, size_t *len) {
+    struct request r = {BINARY, {p->handle, 0, 0}};
+    if (call(&r) != CL_SUCCESS)
+        return NULL;
+    char *b = malloc(r.r[0] + 5);
+    if (!b)
+        return NULL;
+    memcpy(b, r.r[2] == 1 ? library_tag : r.r[2] == 2 ? executable_tag : object_tag, 5);
+    r = (struct request){BINARY, {p->handle, (uintptr_t)(b + 5), r.r[0]}};
+    call(&r);
+    *len = r.r[0] + 5;
+    return b;
 }
 
 static cl_int RetainProgram(cl_program p) {
@@ -891,6 +1078,12 @@ static cl_int BuildProgram(cl_program p, cl_uint n, const cl_device_id *devices,
     for (cl_uint i = 0; i < n; i++)
         if (devices[i] != &device)
             return CL_INVALID_DEVICE;
+    if (p->prebuilt) {
+        p->status = CL_BUILD_SUCCESS;
+        if (notify)
+            notify(p, user);
+        return CL_SUCCESS;
+    }
     if (p->handle) {
         struct request f = {FREE, {p->handle}};
         call(&f);
@@ -902,6 +1095,7 @@ static cl_int BuildProgram(cl_program p, cl_uint n, const cl_device_id *devices,
     cl_int e = call(&r);
     p->handle = r.r[0];
     p->status = e == CL_SUCCESS ? CL_BUILD_SUCCESS : CL_BUILD_ERROR;
+    p->binary = e == CL_SUCCESS ? CL_PROGRAM_BINARY_TYPE_EXECUTABLE : CL_PROGRAM_BINARY_TYPE_NONE;
     if (notify)
         notify(p, user);
     return e;
@@ -909,27 +1103,72 @@ static cl_int BuildProgram(cl_program p, cl_uint n, const cl_device_id *devices,
 
 static cl_int CompileProgram(cl_program p, cl_uint n, const cl_device_id *devices, const char *options, cl_uint nh, const cl_program *headers,
                              const char **names, void(CL_CALLBACK *notify)(cl_program, void *), void *user) {
-    (void)nh, (void)headers, (void)names;
-    return BuildProgram(p, n, devices, options, notify, user);
+    if (!p)
+        return CL_INVALID_PROGRAM;
+    if ((n && !devices) || (!n && devices) || (nh && (!headers || !names)) || (!nh && (headers || names)))
+        return CL_INVALID_VALUE;
+    for (cl_uint i = 0; i < n; i++)
+        if (devices[i] != &device)
+            return CL_INVALID_DEVICE;
+    // The headers it includes by name: (source, length, name, length) each.
+    uint64_t *records = calloc(nh + 1, 4 * sizeof *records);
+    if (!records)
+        return CL_OUT_OF_HOST_MEMORY;
+    for (cl_uint i = 0; i < nh; i++) {
+        records[i * 4] = (uintptr_t)headers[i]->source;
+        records[i * 4 + 1] = headers[i]->len;
+        records[i * 4 + 2] = (uintptr_t)names[i];
+        records[i * 4 + 3] = strlen(names[i]);
+    }
+    if (p->handle) {
+        struct request f = {FREE, {p->handle}};
+        call(&f);
+        p->handle = 0;
+    }
+    free(p->options);
+    p->options = dup_bytes(options ? options : "", options ? strlen(options) : 0);
+    struct request r = {COMPILE, {(uintptr_t)p->source, p->len, (uintptr_t)p->options, strlen(p->options), (uintptr_t)records, nh}};
+    cl_int e = call(&r);
+    free(records);
+    p->handle = r.r[0];
+    p->status = e == CL_SUCCESS ? CL_BUILD_SUCCESS : CL_BUILD_ERROR;
+    p->binary = e == CL_SUCCESS ? CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT : CL_PROGRAM_BINARY_TYPE_NONE;
+    if (notify)
+        notify(p, user);
+    return e;
 }
 
 static cl_program LinkProgram(cl_context c, cl_uint n, const cl_device_id *devices, const char *options, cl_uint np, const cl_program *programs,
                               void(CL_CALLBACK *notify)(cl_program, void *), void *user, cl_int *err) {
-    const char **sources = malloc(np * sizeof *sources);
-    size_t *lengths = malloc(np * sizeof *lengths);
-    cl_program p = NULL;
-    if (sources && lengths) {
-        for (cl_uint i = 0; i < np; i++)
-            sources[i] = programs[i]->source, lengths[i] = programs[i]->len;
-        p = CreateProgramWithSource(c, np, sources, lengths, err);
-    }
-    free(sources);
-    free(lengths);
+    cl_int e = !c ? CL_INVALID_CONTEXT : (!np || !programs || (n && !devices) || (!n && devices) || (!notify && user)) ? CL_INVALID_VALUE : CL_SUCCESS;
+    for (cl_uint i = 0; e == CL_SUCCESS && i < n; i++)
+        if (devices[i] != &device)
+            e = CL_INVALID_DEVICE;
+    for (cl_uint i = 0; e == CL_SUCCESS && i < np; i++)
+        if (!programs[i] || (programs[i]->binary != CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT && programs[i]->binary != CL_PROGRAM_BINARY_TYPE_LIBRARY))
+            e = CL_INVALID_PROGRAM;
+    uint64_t *handles = e == CL_SUCCESS ? malloc(np * sizeof *handles) : NULL;
+    if (e == CL_SUCCESS && !handles)
+        e = CL_OUT_OF_HOST_MEMORY;
+    cl_program p = e == CL_SUCCESS ? program(c, dup_bytes("", 0), 0, &e) : NULL;
     if (p) {
-        cl_int e = BuildProgram(p, n, devices, options, notify, user);
-        if (err)
-            *err = e == CL_BUILD_PROGRAM_FAILURE ? CL_LINK_PROGRAM_FAILURE : e;
+        for (cl_uint i = 0; i < np; i++)
+            handles[i] = programs[i]->handle;
+        p->options = dup_bytes(options ? options : "", options ? strlen(options) : 0);
+        struct request r = {LINK, {(uintptr_t)handles, np, (uintptr_t)p->options, strlen(p->options)}};
+        e = call(&r);
+        p->handle = r.r[0];
+        p->status = e == CL_SUCCESS ? CL_BUILD_SUCCESS : CL_BUILD_ERROR;
+        int library = strstr(p->options, "-create-library") != NULL;
+        p->binary = e != CL_SUCCESS ? CL_PROGRAM_BINARY_TYPE_NONE : library ? CL_PROGRAM_BINARY_TYPE_LIBRARY : CL_PROGRAM_BINARY_TYPE_EXECUTABLE;
+        p->prebuilt = e == CL_SUCCESS && !library;
+        if (notify)
+            notify(p, user);
     }
+    free(handles);
+    if (err)
+        *err = e;
+    // (A failed link still returns the program, with its log.)
     return p;
 }
 
@@ -965,21 +1204,34 @@ static cl_int GetProgramInfo(cl_program p, cl_program_info what, size_t cap, voi
     case CL_PROGRAM_SOURCE:
         return info(p->source, p->len + 1, cap, out, size_ret);
     case CL_PROGRAM_BINARY_SIZES:
-        INFO_OF(size_t, p->len);
-    case CL_PROGRAM_BINARIES:
+    case CL_PROGRAM_BINARIES: {
+        size_t len = p->len;
+        char *bits = p->source;
+        int object = p->binary == CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT || p->binary == CL_PROGRAM_BINARY_TYPE_LIBRARY || p->prebuilt;
+        if (object && !(bits = object_binary(p, &len)))
+            return CL_OUT_OF_RESOURCES;
+        if (what == CL_PROGRAM_BINARY_SIZES) {
+            cl_int e = info(&len, sizeof len, cap, out, size_ret);
+            if (object)
+                free(bits);
+            return e;
+        }
         if (out) {
             if (cap < sizeof(char *))
                 return CL_INVALID_VALUE;
             unsigned char *b = *(unsigned char **)out;
             if (b)
-                memcpy(b, p->source, p->len);
+                memcpy(b, bits, len);
         }
+        if (object)
+            free(bits);
         if (size_ret)
             *size_ret = sizeof(char *);
         return CL_SUCCESS;
+    }
     case CL_PROGRAM_NUM_KERNELS:
     case CL_PROGRAM_KERNEL_NAMES: {
-        if (p->status != CL_BUILD_SUCCESS)
+        if (p->status != CL_BUILD_SUCCESS || p->binary != CL_PROGRAM_BINARY_TYPE_EXECUTABLE)
             return CL_INVALID_PROGRAM_EXECUTABLE;
         char *names = kernel_names(p);
         if (!names)
@@ -1011,7 +1263,7 @@ static cl_int GetProgramBuildInfo(cl_program p, cl_device_id d, cl_program_build
     case CL_PROGRAM_BUILD_OPTIONS:
         INFO_STR(p->options ? p->options : "");
     case CL_PROGRAM_BINARY_TYPE:
-        INFO_OF(cl_program_binary_type, p->status == CL_BUILD_SUCCESS ? CL_PROGRAM_BINARY_TYPE_EXECUTABLE : CL_PROGRAM_BINARY_TYPE_NONE);
+        INFO_OF(cl_program_binary_type, p->binary);
     case CL_PROGRAM_BUILD_LOG: {
         if (!p->handle)
             INFO_STR("");
@@ -1035,7 +1287,7 @@ static cl_int GetProgramBuildInfo(cl_program p, cl_device_id d, cl_program_build
 // ---- Kernels ----
 
 static cl_kernel CreateKernel(cl_program p, const char *name, cl_int *err) {
-    cl_int e = !p ? CL_INVALID_PROGRAM : p->status != CL_BUILD_SUCCESS ? CL_INVALID_PROGRAM_EXECUTABLE : !name ? CL_INVALID_VALUE : CL_SUCCESS;
+    cl_int e = !p ? CL_INVALID_PROGRAM : p->status != CL_BUILD_SUCCESS || p->binary != CL_PROGRAM_BINARY_TYPE_EXECUTABLE ? CL_INVALID_PROGRAM_EXECUTABLE : !name ? CL_INVALID_VALUE : CL_SUCCESS;
     cl_kernel k = NULL;
     if (e == CL_SUCCESS) {
         struct request r = {ARGS, {p->handle, (uintptr_t)name, strlen(name), 0, 0}};
@@ -1054,11 +1306,16 @@ static cl_kernel CreateKernel(cl_program p, const char *name, cl_int *err) {
             r = (struct request){ARGS, {p->handle, (uintptr_t)name, strlen(name), (uintptr_t)k->args, n * sizeof *k->args}};
             if (!k->name || !k->args || !k->block || !k->handles || !k->locals || !k->set || call(&r) != CL_SUCCESS) {
                 e = CL_OUT_OF_HOST_MEMORY;
-                free(k->name), free(k->args), free(k->block), free(k->handles), free(k->locals), free(k->set), free(k);
+                free(k->name), free(k->args), free(k->block), free(k->handles), free(k->locals), free(k->set), free(k->attributes), free(k);
                 k = NULL;
             } else {
                 p->refs++;
                 p->kernels++;
+                struct request q = {ATTRIBUTES, {p->handle, (uintptr_t)name, strlen(name), 0, 0}};
+                if (call(&q) == CL_SUCCESS && (k->attributes = calloc(1, q.r[0] + 1))) {
+                    q = (struct request){ATTRIBUTES, {p->handle, (uintptr_t)name, strlen(name), (uintptr_t)k->attributes, q.r[0]}};
+                    call(&q);
+                }
             }
         } else if (e == CL_SUCCESS) {
             e = CL_OUT_OF_HOST_MEMORY;
@@ -1116,7 +1373,7 @@ static cl_int ReleaseKernel(cl_kernel k) {
     if (--k->refs == 0) {
         k->program->kernels--;
         ReleaseProgram(k->program);
-        free(k->name), free(k->args), free(k->block), free(k->handles), free(k->locals), free(k->set), free(k);
+        free(k->name), free(k->args), free(k->block), free(k->handles), free(k->locals), free(k->set), free(k->attributes), free(k);
     }
     return CL_SUCCESS;
 }
@@ -1173,7 +1430,7 @@ static cl_int GetKernelInfo(cl_kernel k, cl_kernel_info what, size_t cap, void *
     case CL_KERNEL_PROGRAM:
         INFO_OF(cl_program, k->program);
     case CL_KERNEL_ATTRIBUTES:
-        INFO_STR("");
+        INFO_STR(k->attributes ? k->attributes : "");
     }
     return CL_INVALID_VALUE;
 }
@@ -1188,7 +1445,12 @@ static cl_int GetKernelWorkGroupInfo(cl_kernel k, cl_device_id d, cl_kernel_work
         INFO_OF(size_t, desc.max_group);
     case CL_KERNEL_COMPILE_WORK_GROUP_SIZE:
         return info(k->required, sizeof k->required, cap, out, size_ret);
-    case CL_KERNEL_LOCAL_MEM_SIZE:
+    case CL_KERNEL_LOCAL_MEM_SIZE: {
+        cl_ulong total = 0;
+        for (cl_uint i = 0; i < k->nargs; i++)
+            total += k->locals[i];
+        INFO_OF(cl_ulong, total);
+    }
     case CL_KERNEL_PRIVATE_MEM_SIZE:
         INFO_OF(cl_ulong, 0);
     case CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE:
@@ -1260,16 +1522,49 @@ static cl_int EnqueueTask(cl_command_queue q, cl_kernel k, cl_uint nw, const cl_
     return EnqueueNDRangeKernel(q, k, 1, NULL, &one, &one, nw, wait, ev);
 }
 
+static cl_int EnqueueMigrateMemObjects(cl_command_queue q, cl_uint n, const cl_mem *objects, cl_mem_migration_flags flags, cl_uint nw, const cl_event *wait,
+                                       cl_event *ev) {
+    // One device: nothing to move.
+    if (!q)
+        return CL_INVALID_COMMAND_QUEUE;
+    if (!n || !objects)
+        return CL_INVALID_VALUE;
+    for (cl_uint i = 0; i < n; i++)
+        if (!objects[i])
+            return CL_INVALID_MEM_OBJECT;
+    if (flags & ~(cl_mem_migration_flags)(CL_MIGRATE_MEM_OBJECT_HOST | CL_MIGRATE_MEM_OBJECT_CONTENT_UNDEFINED))
+        return CL_INVALID_VALUE;
+    (void)nw, (void)wait;
+    return done(q, CL_COMMAND_MIGRATE_MEM_OBJECTS, ev);
+}
+
 // ---- Events and synchronization ----
 
+// A wait list: well formed, and events of the queue's context.
+static cl_int waits(cl_command_queue q, cl_uint n, const cl_event *wait) {
+    if ((n && !wait) || (!n && wait))
+        return CL_INVALID_EVENT_WAIT_LIST;
+    for (cl_uint i = 0; i < n; i++) {
+        if (!wait[i])
+            return CL_INVALID_EVENT_WAIT_LIST;
+        if (wait[i]->ctx != q->ctx)
+            return CL_INVALID_CONTEXT;
+    }
+    return CL_SUCCESS;
+}
+
 static cl_int EnqueueMarkerWithWaitList(cl_command_queue q, cl_uint nw, const cl_event *wait, cl_event *ev) {
-    (void)nw, (void)wait;
-    return q ? done(q, CL_COMMAND_MARKER, ev) : CL_INVALID_COMMAND_QUEUE;
+    if (!q)
+        return CL_INVALID_COMMAND_QUEUE;
+    cl_int e = waits(q, nw, wait);
+    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_MARKER, ev);
 }
 
 static cl_int EnqueueBarrierWithWaitList(cl_command_queue q, cl_uint nw, const cl_event *wait, cl_event *ev) {
-    (void)nw, (void)wait;
-    return q ? done(q, CL_COMMAND_BARRIER, ev) : CL_INVALID_COMMAND_QUEUE;
+    if (!q)
+        return CL_INVALID_COMMAND_QUEUE;
+    cl_int e = waits(q, nw, wait);
+    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_BARRIER, ev);
 }
 
 static cl_int EnqueueMarker(cl_command_queue q, cl_event *ev) { return EnqueueMarkerWithWaitList(q, 0, NULL, ev); }
@@ -1312,14 +1607,16 @@ static cl_int GetEventProfilingInfo(cl_event e, cl_profiling_info what, size_t c
         return CL_INVALID_EVENT;
     if (!e->queue || !(e->queue->props & CL_QUEUE_PROFILING_ENABLE))
         return CL_PROFILING_INFO_NOT_AVAILABLE;
-    // Commands run as they're enqueued: no times to tell apart.
+    // Commands run as they're enqueued: queued, submitted and started
+    // together.
     switch (what) {
     case CL_PROFILING_COMMAND_QUEUED:
     case CL_PROFILING_COMMAND_SUBMIT:
     case CL_PROFILING_COMMAND_START:
+        INFO_OF(cl_ulong, e->began);
     case CL_PROFILING_COMMAND_END:
     case CL_PROFILING_COMMAND_COMPLETE:
-        INFO_OF(cl_ulong, 0);
+        INFO_OF(cl_ulong, e->ended);
     }
     return CL_INVALID_VALUE;
 }
@@ -1339,7 +1636,22 @@ static cl_event CreateUserEvent(cl_context c, cl_int *err) {
 static cl_int SetUserEventStatus(cl_event e, cl_int status) {
     if (!e || e->type != CL_COMMAND_USER)
         return CL_INVALID_EVENT;
+    if (status > CL_COMPLETE)
+        return CL_INVALID_VALUE;
+    if (e->status <= CL_COMPLETE)
+        return CL_INVALID_OPERATION;
     e->status = status;
+    // The callbacks for this status (complete, or an error: past running).
+    for (struct waiting **at = &e->waiting; *at;) {
+        struct waiting *w = *at;
+        if (status <= w->type) {
+            *at = w->next;
+            w->f(e, status, w->user);
+            free(w);
+        } else {
+            at = &w->next;
+        }
+    }
     return CL_SUCCESS;
 }
 
@@ -1348,9 +1660,19 @@ static cl_int SetEventCallback(cl_event e, cl_int type, void(CL_CALLBACK *notify
         return CL_INVALID_EVENT;
     if (!notify)
         return CL_INVALID_VALUE;
-    // Events are complete when made (user events aside): the callback runs now.
-    if (e->status <= type)
+    if (type != CL_COMPLETE && type != CL_RUNNING && type != CL_SUBMITTED)
+        return CL_INVALID_VALUE;
+    // Events are complete when made (user events aside): the callback runs
+    // now, or when a user event gets there.
+    if (e->status <= type) {
         notify(e, e->status, user);
+        return CL_SUCCESS;
+    }
+    struct waiting *w = malloc(sizeof *w);
+    if (!w)
+        return CL_OUT_OF_HOST_MEMORY;
+    *w = (struct waiting){notify, user, type, e->waiting};
+    e->waiting = w;
     return CL_SUCCESS;
 }
 
@@ -1448,11 +1770,13 @@ __attribute__((constructor)) static void init(void) {
         .clEnqueueBarrier = EnqueueBarrier,
         .clGetExtensionFunctionAddress = GetExtensionFunctionAddress,
         .clCreateSubBuffer = CreateSubBuffer,
+        .clSetMemObjectDestructorCallback = SetMemObjectDestructorCallback,
         .clSetEventCallback = SetEventCallback,
         .clCreateUserEvent = CreateUserEvent,
         .clSetUserEventStatus = SetUserEventStatus,
         .clEnqueueReadBufferRect = EnqueueReadBufferRect,
         .clEnqueueWriteBufferRect = EnqueueWriteBufferRect,
+        .clEnqueueCopyBufferRect = EnqueueCopyBufferRect,
         .clRetainDevice = RetainDevice,
         .clReleaseDevice = ReleaseDevice,
         .clCompileProgram = CompileProgram,
@@ -1460,6 +1784,7 @@ __attribute__((constructor)) static void init(void) {
         .clUnloadPlatformCompiler = UnloadPlatformCompiler,
         .clGetKernelArgInfo = GetKernelArgInfo,
         .clEnqueueFillBuffer = EnqueueFillBuffer,
+        .clEnqueueMigrateMemObjects = EnqueueMigrateMemObjects,
         .clEnqueueMarkerWithWaitList = EnqueueMarkerWithWaitList,
         .clEnqueueBarrierWithWaitList = EnqueueBarrierWithWaitList,
         .clGetExtensionFunctionAddressForPlatform = GetExtensionFunctionAddressForPlatform,

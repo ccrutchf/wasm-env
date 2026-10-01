@@ -101,6 +101,7 @@ pub fn fork(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64>
         pending: None,
         trace: p.trace,
         start: std::time::Instant::now(),
+        exe: p.exe.clone(),
         module: wasm,
         clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid as u64 } else { 0 },
         started: None,

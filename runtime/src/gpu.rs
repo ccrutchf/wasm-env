@@ -33,6 +33,19 @@
 //!              a7: per argument, a buffer handle (u64; 0 if none),
 //!              a8: per argument, local memory bytes (u32)
 //!  13 FINISH
+//!  14 ATTRIBUTES a0: program, a1: name, a2: length, a3: address, a4: capacity
+//!              r0: the length of the kernel's attributes ("reqd_work_group_size(…)…")
+//!  15 COMPILE  a0: source, a1: length, a2: options, a3: length, a4: headers
+//!              (u64 × 4 each: source, length, name, length), a5: their number
+//!              r0: program handle (an object: clCompileProgram)
+//!  16 LINK     a0: program handles (u64), a1: their number, a2: options,
+//!              a3: length   r0: program handle (executable, or a library
+//!              with -create-library)
+//!  17 BINARY   a0: program, a1: address, a2: capacity   r0: the length of an
+//!              object's, library's or linked executable's bitcode, r2: which
+//!              (0, 1, 2)
+//!  18 LOAD     a0: bitcode, a1: length, a2: its kind (as BINARY's r2)
+//!              r0: program handle
 //!
 //! INFO's description (256 bytes): name, vendor and driver (64 bytes
 //! each), device type (u32: OpenCL's), maximum work-group size, maximum
@@ -58,6 +71,10 @@ const CL_SUCCESS: i64 = 0;
 const CL_MEM_OBJECT_ALLOCATION_FAILURE: i64 = -4;
 const CL_OUT_OF_RESOURCES: i64 = -5;
 const CL_BUILD_PROGRAM_FAILURE: i64 = -11;
+const CL_COMPILE_PROGRAM_FAILURE: i64 = -15;
+const CL_LINK_PROGRAM_FAILURE: i64 = -17;
+const CL_INVALID_PROGRAM: i64 = -44;
+const CL_INVALID_BINARY: i64 = -42;
 const CL_INVALID_VALUE: i64 = -30;
 const CL_INVALID_MEM_OBJECT: i64 = -38;
 const CL_INVALID_PROGRAM_EXECUTABLE: i64 = -45;
@@ -91,6 +108,9 @@ struct Program {
     id: usize,
     module: Option<Arc<Module>>,
     log: String,
+    /// A compiled object or a library (bitcode), not yet linked.
+    object: Option<Vec<u8>>,
+    library: bool,
 }
 
 impl std::fmt::Debug for Session {
@@ -111,13 +131,14 @@ impl Session {
     }
 
     /// One request: the block at `arg` in the caller's memory.
-    pub fn call(&self, data: &mut [u8], arg: u64) -> SysResult<i64> {
+    /// `guest`: where the calling program is (its paths, for clang).
+    pub fn call(&self, data: &mut [u8], arg: u64, guest: &wasm_env_gpu::opencl::Guest) -> SysResult<i64> {
         let block: [u8; 128] = mem::slice(data, arg, 128)?.try_into().unwrap();
         let w = |k: usize| u64::from_le_bytes(block[k * 8..k * 8 + 8].try_into().unwrap());
         let op = w(0);
         let a: [u64; 9] = std::array::from_fn(|k| w(k + 1));
         let mut r = [0u64; 6];
-        let status = match self.op(data, op, &a, &mut r) {
+        let status = match self.op(data, op, &a, &mut r, guest) {
             Ok(()) => CL_SUCCESS,
             Err(Failure::Errno(e)) => return Err(e),
             Err(Failure::Cl(s)) => s,
@@ -130,7 +151,7 @@ impl Session {
         Ok(0)
     }
 
-    fn op(&self, data: &mut [u8], op: u64, a: &[u64; 9], r: &mut [u64; 6]) -> Result<(), Failure> {
+    fn op(&self, data: &mut [u8], op: u64, a: &[u64; 9], r: &mut [u64; 6], guest: &wasm_env_gpu::opencl::Guest) -> Result<(), Failure> {
         let g = &self.gpu;
         match op {
             1 => {
@@ -183,12 +204,12 @@ impl Session {
             8 => {
                 let source = String::from_utf8_lossy(mem::slice(data, a[0], a[1])?).into_owned();
                 let options = String::from_utf8_lossy(mem::slice(data, a[2], a[3])?).into_owned();
-                let (module, log) = build(&source, &options);
+                let (module, log) = build(&source, &options, guest);
                 let failed = module.is_none();
                 let mut st = self.state.lock().unwrap();
                 let h = st.next;
                 st.next += 1;
-                st.programs.insert(h, Program { id: PROGRAMS.fetch_add(1, Ordering::Relaxed), module: module.map(Arc::new), log });
+                st.programs.insert(h, Program { id: PROGRAMS.fetch_add(1, Ordering::Relaxed), module: module.map(Arc::new), log, object: None, library: false });
                 r[0] = h;
                 if failed {
                     return Err(Failure::Cl(CL_BUILD_PROGRAM_FAILURE));
@@ -236,6 +257,86 @@ impl Session {
                     rec[72..72 + nm.len().min(55)].copy_from_slice(&nm[..nm.len().min(55)]);
                 }
             }
+            14 => {
+                let (_, m) = self.program(a[0])?;
+                let name = String::from_utf8_lossy(mem::slice(data, a[1], a[2])?).into_owned();
+                let info = wgsl::kernel_info(&m, &name).map_err(|_| Failure::Cl(CL_INVALID_KERNEL_NAME))?;
+                r[0] = info.attributes.len() as u64;
+                let n = info.attributes.len().min(a[4] as usize);
+                mem::slice_mut(data, a[3], n as u64)?.copy_from_slice(&info.attributes.as_bytes()[..n]);
+            }
+            15 => {
+                let source = String::from_utf8_lossy(mem::slice(data, a[0], a[1])?).into_owned();
+                let options = String::from_utf8_lossy(mem::slice(data, a[2], a[3])?).into_owned();
+                let records = mem::slice(data, a[4], a[5] * 32)?.to_vec();
+                let w = |k: usize| u64::from_le_bytes(records[k * 8..k * 8 + 8].try_into().unwrap());
+                let mut headers = Vec::new();
+                for h in 0..a[5] as usize {
+                    let text = mem::slice(data, w(h * 4), w(h * 4 + 1))?.to_vec();
+                    let name = String::from_utf8_lossy(mem::slice(data, w(h * 4 + 2), w(h * 4 + 3))?).into_owned();
+                    headers.push((name, text));
+                }
+                let (object, log) = match toolchain() {
+                    Ok(cc) => match wasm_env_gpu::opencl::compile(&cc, &source, &options, &headers, Some(guest)) {
+                        Ok(o) => (Some(o), String::new()),
+                        Err(log) => (None, log),
+                    },
+                    Err(log) => (None, log),
+                };
+                let failed = object.is_none();
+                r[0] = self.add_program(Program { id: PROGRAMS.fetch_add(1, Ordering::Relaxed), module: None, log, object, library: false });
+                if failed {
+                    return Err(Failure::Cl(CL_COMPILE_PROGRAM_FAILURE));
+                }
+            }
+            16 => {
+                let handles = mem::slice(data, a[0], a[1] * 8)?.to_vec();
+                let options = String::from_utf8_lossy(mem::slice(data, a[2], a[3])?).into_owned();
+                let library = options.split_whitespace().any(|o| o == "-create-library");
+                let objects: Vec<Vec<u8>> = {
+                    let st = self.state.lock().unwrap();
+                    handles
+                        .chunks(8)
+                        .map(|c| st.programs.get(&u64::from_le_bytes(c.try_into().unwrap())).and_then(|p| p.object.clone()).ok_or(Failure::Cl(CL_INVALID_PROGRAM)))
+                        .collect::<Result<_, _>>()?
+                };
+                let linked = toolchain().and_then(|cc| wasm_env_gpu::opencl::link(&cc, &objects, library));
+                let (program, failed) = match linked {
+                    Ok(wasm_env_gpu::opencl::Linked::Library(o)) => (Program { id: 0, module: None, log: String::new(), object: Some(o), library: true }, false),
+                    Ok(wasm_env_gpu::opencl::Linked::Executable(m, bitcode)) => {
+                        let log = check_kernels(&m);
+                        let ok = log.is_empty();
+                        // (Its bitcode kept: its binary.)
+                        (Program { id: 0, module: ok.then(|| Arc::new(m)), log, object: Some(bitcode), library: false }, !ok)
+                    }
+                    Err(log) => (Program { id: 0, module: None, log, object: None, library: false }, true),
+                };
+                r[0] = self.add_program(Program { id: PROGRAMS.fetch_add(1, Ordering::Relaxed), ..program });
+                if failed {
+                    return Err(Failure::Cl(CL_LINK_PROGRAM_FAILURE));
+                }
+            }
+            17 => {
+                let st = self.state.lock().unwrap();
+                let p = st.programs.get(&a[0]).ok_or(Failure::Cl(CL_INVALID_PROGRAM))?;
+                let o = p.object.as_deref().unwrap_or_default();
+                r[0] = o.len() as u64;
+                // 0: an object, 1: a library, 2: an executable (linked).
+                r[2] = if p.library { 1 } else if p.module.is_some() { 2 } else { 0 };
+                let n = o.len().min(a[2] as usize);
+                mem::slice_mut(data, a[1], n as u64)?.copy_from_slice(&o[..n]);
+            }
+            18 => {
+                let o = mem::slice(data, a[0], a[1])?.to_vec();
+                // An executable's bitcode is built again into its module.
+                let module = if a[2] == 2 {
+                    let m = toolchain().and_then(|cc| wasm_env_gpu::opencl::from_bitcode(&cc, &o)).map_err(|_| Failure::Cl(CL_INVALID_BINARY))?;
+                    Some(Arc::new(m))
+                } else {
+                    None
+                };
+                r[0] = self.add_program(Program { id: PROGRAMS.fetch_add(1, Ordering::Relaxed), module, log: String::new(), object: Some(o), library: a[2] == 1 });
+            }
             12 => self.run(data, a)?,
             13 => g.finish().map_err(|_| Failure::Cl(CL_OUT_OF_RESOURCES))?,
             _ => return Err(Failure::Errno(EINVAL)),
@@ -277,6 +378,8 @@ impl Session {
         let n = info.args.len() as u64;
         let handles = mem::slice(data, a[7], n * 8)?.to_vec();
         let locals = mem::slice(data, a[8], n * 4)?.to_vec();
+        // What a null buffer argument binds (a kernel mustn't use it).
+        let placeholder = self.gpu.buffer(4).map_err(|_| Failure::Cl(CL_OUT_OF_RESOURCES))?;
         let mut local_bytes = Vec::new();
         let st = self.state.lock().unwrap();
         let mut bound = Vec::new();
@@ -285,7 +388,7 @@ impl Session {
             match arg.kind {
                 ArgKind::Buffer { .. } => {
                     let h = u64::from_le_bytes(handles[k * 8..k * 8 + 8].try_into().unwrap());
-                    let b = st.buffers.get(&h).ok_or(Failure::Cl(CL_INVALID_KERNEL_ARGS))?;
+                    let b = if h == 0 { &placeholder } else { st.buffers.get(&h).ok_or(Failure::Cl(CL_INVALID_KERNEL_ARGS))? };
                     bound.push((k, b));
                 }
                 ArgKind::Local => {
@@ -306,6 +409,14 @@ impl Session {
             }
             Failure::Cl(CL_OUT_OF_RESOURCES)
         })
+    }
+
+    fn add_program(&self, p: Program) -> u64 {
+        let mut st = self.state.lock().unwrap();
+        let h = st.next;
+        st.next += 1;
+        st.programs.insert(h, p);
+        h
     }
 
     fn buffer(&self, h: u64) -> Result<wgpu::Buffer, Failure> {
@@ -388,22 +499,40 @@ fn vendor_name(id: u32) -> String {
 
 /// A program's source built: its module (with every kernel checked to
 /// translate), or none; and the build log.
-fn build(source: &str, options: &str) -> (Option<Module>, String) {
-    let Some(tc) = wasm_env_translate::link::Toolchain::from_env() else {
-        return (None, "wasm-env: no toolchain (clang) to compile OpenCL C with".into());
+fn build(source: &str, options: &str, guest: &wasm_env_gpu::opencl::Guest) -> (Option<Module>, String) {
+    let cc = match toolchain() {
+        Ok(cc) => cc,
+        Err(log) => return (None, log),
     };
-    let m = match wasm_env_gpu::opencl::build(&tc.cc, source, options) {
+    let timing = std::env::var_os("WASM_ENV_DEBUG_GPU_TIME").is_some();
+    let start = std::time::Instant::now();
+    let m = match wasm_env_gpu::opencl::build(&cc, source, options, Some(guest)) {
         Ok(m) => m,
         Err(log) => return (None, log),
     };
+    let built = start.elapsed();
+    let log = check_kernels(&m);
+    if timing {
+        eprintln!("wasm-env: GPU: built a program of {} bytes: clang and parsing {built:?}, checking its kernels {:?}", source.len(), start.elapsed() - built);
+    }
+    if log.is_empty() { (Some(m), log) } else { (None, log) }
+}
+
+/// The clang that compiles OpenCL C: the translation toolchain's.
+fn toolchain() -> Result<std::path::PathBuf, String> {
+    wasm_env_translate::link::Toolchain::from_env().map(|t| t.cc).ok_or_else(|| "wasm-env: no toolchain (clang) to compile OpenCL C with".into())
+}
+
+/// What a module's kernels use that the device can't do: the build log.
+fn check_kernels(m: &Module) -> String {
     let mut log = String::new();
     for f in m.functions.iter().filter(|f| f.kernel) {
         // Checked with a trivial launch: what the kernel's code needs is the
         // same for every launch.
         let locals = f.params.iter().enumerate().filter(|(_, t)| **t == wasm_env_gpu::ir::Type::Ptr(3)).map(|(k, _)| (k, 4)).collect();
-        if let Err(e) = wgsl::compile(&m, &f.name, &Launch { local: [1, 1, 1], local_bytes: locals }) {
+        if let Err(e) = wgsl::compile(m, &f.name, &Launch { local: [1, 1, 1], local_bytes: locals }) {
             log.push_str(&format!("kernel {}: not supported here: {e}\n", f.name));
         }
     }
-    if log.is_empty() { (Some(m), log) } else { (None, log) }
+    log
 }

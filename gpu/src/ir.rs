@@ -77,6 +77,9 @@ pub enum Value {
     Local(usize),
     Arg(usize),
     Const(Const),
+    /// A WGSL expression the code generator made (one lane of a wide
+    /// vector): never in parsed IR.
+    Wgsl(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -170,6 +173,8 @@ pub struct Module {
     pub functions: Vec<Function>,
     /// Numbered metadata nodes, as their operands' text.
     pub metadata: HashMap<usize, Vec<MetaItem>>,
+    /// The same nodes as written (for operands `MetaItem` doesn't keep: types).
+    pub metadata_text: HashMap<usize, String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -540,6 +545,11 @@ impl<'a> Parser<'a> {
                 "float" => Type::Float,
                 "double" => Type::Double,
                 "label" => Type::Label,
+                // An opaque target type (OpenCL's events): a 32-bit value here.
+                "target" => {
+                    self.skip_group();
+                    Type::Int(32)
+                }
                 "metadata" => Type::Metadata,
                 "ptr" => {
                     if self.eat_word("addrspace") {
@@ -813,6 +823,7 @@ pub fn parse(text: &str) -> Res<Module> {
             let body = body.trim_start_matches("distinct ");
             let Some(body) = body.strip_prefix("!{").and_then(|b| b.strip_suffix('}')) else { continue };
             m.metadata.insert(num, meta_items(body));
+            m.metadata_text.insert(num, body.to_string());
         }
     }
     Ok(m)

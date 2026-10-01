@@ -111,12 +111,44 @@ pub fn structure(f: &Function) -> Res<Node> {
             }
         }
     }
-    let merge: Vec<bool> = forward_in.iter().map(|&k| k >= 2).collect();
+    // Each loop's blocks: its header and what reaches a back edge to it
+    // without passing the header.
+    let mut in_loop: Vec<Vec<bool>> = vec![Vec::new(); n];
+    for &b in &rpo {
+        for &h in &succs[b] {
+            if order[h] > order[b] {
+                continue;
+            }
+            let body = &mut in_loop[h];
+            if body.is_empty() {
+                *body = vec![false; n];
+                body[h] = true;
+            }
+            let mut todo = vec![b];
+            while let Some(x) = todo.pop() {
+                if !body[x] {
+                    body[x] = true;
+                    todo.extend(preds[x].iter().copied());
+                }
+            }
+        }
+    }
+    // A block a loop's header dominates but that isn't in the loop follows
+    // it: it's placed after the loop (which jumps out to it) rather than
+    // inside, so what comes after a loop, a barrier say, runs once all its
+    // work-items have left it.
+    let mut merge: Vec<bool> = forward_in.iter().map(|&k| k >= 2).collect();
+    for &b in &rpo[1..] {
+        let h = idom[b];
+        if header[h] && !in_loop[h][b] {
+            merge[b] = true;
+        }
+    }
     let mut children = vec![Vec::new(); n];
     for &b in &rpo[1..] {
         children[idom[b]].push(b);
     }
-    let s = Structurer { f, order, header, merge, children };
+    let s = Structurer { f, order, header, merge, children, in_loop };
     let tree = s.tree(0);
     Ok(tidy(tree))
 }
@@ -148,6 +180,7 @@ struct Structurer<'a> {
     header: Vec<bool>,
     merge: Vec<bool>,
     children: Vec<Vec<usize>>,
+    in_loop: Vec<Vec<bool>>,
 }
 
 impl Structurer<'_> {
@@ -156,8 +189,16 @@ impl Structurer<'_> {
         // at the last of them.
         let mut ys: Vec<usize> = self.children[x].iter().copied().filter(|&c| self.merge[c]).collect();
         ys.sort_by_key(|&y| std::cmp::Reverse(self.order[y]));
-        let code = self.within(x, &ys);
-        if self.header[x] { Node::Loop(x, Box::new(code)) } else { code }
+        if !self.header[x] {
+            return self.within(x, &ys);
+        }
+        // A loop: its own merges inside it, the blocks that follow it around it.
+        let (inside, after): (Vec<usize>, Vec<usize>) = ys.into_iter().partition(|&y| self.in_loop[x][y]);
+        let mut node = Node::Loop(x, Box::new(self.within(x, &inside)));
+        for &y in after.iter().rev() {
+            node = Node::Seq(vec![Node::Block(y, Box::new(node)), self.tree(y)]);
+        }
+        node
     }
 
     fn within(&self, x: usize, ys: &[usize]) -> Node {
@@ -283,7 +324,7 @@ mod tests {
     fn a_loop_restarts_and_exits() {
         // 0 -> 1 (header) -> 2 (body) -> 1, 1 -> 3 (exit).
         let s = structured("  br label %3\n3:\n  br i1 %1, label %4, label %5\n4:\n  br label %3\n5:\n  ret void");
-        assert_eq!(s, "0 loop1[1 if(2 | 3 ret)]");
+        assert_eq!(s, "0 block3[loop1[1 if(2 | ->3)]] 3 ret");
     }
 
     #[test]

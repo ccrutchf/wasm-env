@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 
-use crate::ir::{Const, Function, Inst, Module, Op, Operand, Res, Type, Value, bail};
+use crate::ir::{Const, Function, Inst, Module, Op, Operand, Res, Term, Type, Value, bail};
 use crate::structure::{Node, structure};
 
 /// The argument block's header, in words: the global offset (3), the
@@ -67,6 +67,9 @@ pub struct KernelInfo {
     pub block_size: u32,
     /// `reqd_work_group_size`, if the kernel has one.
     pub required_local: Option<[u32; 3]>,
+    /// The kernel's attributes, as clGetKernelInfo gives them:
+    /// "reqd_work_group_size(X,Y,Z) vec_type_hint(T)" and the like.
+    pub attributes: String,
 }
 
 /// A kernel's arguments and their layout.
@@ -103,7 +106,8 @@ pub fn kernel_info(m: &Module, name: &str) -> Res<KernelInfo> {
         offset += size;
     }
     let required_local = f.metadata.get("reqd_work_group_size").map(|&n| m.meta_ints(n)).filter(|v| v.len() == 3).map(|v| [v[0] as u32, v[1] as u32, v[2] as u32]);
-    Ok(KernelInfo { name: name.to_string(), args, block_size: offset.next_multiple_of(4), required_local })
+    let attributes = attributes(m, f, required_local);
+    Ok(KernelInfo { name: name.to_string(), args, block_size: offset.next_multiple_of(4), required_local, attributes })
 }
 
 /// A byval argument's struct type: recorded by the parser from the
@@ -147,8 +151,9 @@ pub fn compile(m: &Module, name: &str, launch: &Launch) -> Res<String> {
         }
     }
     let tree = structure(f)?;
-    let mut g = Gen { m, f, info: &info, launch, out: String::new(), bases: HashMap::new(), atomic: BTreeSet::new(), private: BTreeMap::new(), depth: 1, temp: 0, needs: Default::default() };
+    let mut g = Gen { m, f, info: &info, launch, out: String::new(), bases: HashMap::new(), atomic: BTreeSet::new(), private: BTreeMap::new(), depth: 1, temp: 0, lets: BTreeSet::new(), vector_call: false, loop_exit: None, lane: None, needs: Default::default() };
     g.provenance()?;
+    g.lets = local_values(f);
     g.find_atomic_bases()?;
     // The body first: it finds the bases it uses and the helpers it needs.
     let mut body = String::new();
@@ -171,6 +176,16 @@ struct Gen<'a> {
     private: BTreeMap<usize, u64>,
     depth: usize,
     temp: usize,
+    /// Values used only in the block that defines them: `let`s there
+    /// rather than variables (`local_values`).
+    lets: BTreeSet<usize>,
+    /// Whether the builtin being called is a vector form (OpenCL's select
+    /// differs), when its lanes are done one at a time.
+    vector_call: bool,
+    /// The Block the next Loop is the whole of (see `node`).
+    loop_exit: Option<usize>,
+    /// Where a lane-at-a-time instruction's result goes (`wide`).
+    lane: Option<String>,
     /// Library functions the code calls (`LIBRARY`).
     needs: std::cell::RefCell<BTreeSet<&'static str>>,
 }
@@ -182,6 +197,7 @@ impl std::hash::Hash for Value {
             Value::Local(n) => (0u8, *n).hash(h),
             Value::Arg(n) => (1u8, *n).hash(h),
             Value::Const(c) => (2u8, format!("{c:?}")).hash(h),
+            Value::Wgsl(s) => (3u8, s.clone()).hash(h),
         }
     }
 }
@@ -225,7 +241,9 @@ impl Gen<'_> {
                     let base = match &i.op {
                         Op::Alloca(t, n, _) => {
                             let (s, _) = self.m.layout(t)?;
-                            self.private.insert(r, (s * n).div_ceil(4).max(1));
+                            // (A few words beyond, as drivers have: programs (the CTS
+                            // among them) store a little past a private array.)
+                            self.private.insert(r, (s * n).div_ceil(4) + 4);
                             Some(Base::Private(r))
                         }
                         Op::Gep(_, p, _) | Op::Cast(_, p) | Op::Freeze(p) => self.base_of(&p.v),
@@ -288,6 +306,21 @@ impl Gen<'_> {
                             self.atomic.insert(b);
                         }
                     }
+                    Op::Call(name, args) if demangle(name).is_some_and(|(b, _)| b.starts_with("async_work_group")) => {
+                        let b = self.base(&args[0])?;
+                        if elem_size(name).is_none_or(|s| s % 4 != 0) && matches!(b, Base::Buffer(_) | Base::LocalArg(_) | Base::Global(_)) {
+                            self.atomic.insert(b);
+                        }
+                    }
+                    // vstoreN of elements narrower than a word: bytes
+                    // other work-items write share its words.
+                    Op::Call(name, args) if demangle(name).is_some_and(|(b, _)| b.starts_with("vstore")) && args.len() == 3 => {
+                        let b = self.base(&args[2])?;
+                        let (size, _) = self.m.layout(args[0].ty.scalar())?;
+                        if size % 4 != 0 && matches!(b, Base::Buffer(_) | Base::LocalArg(_) | Base::Global(_)) {
+                            self.atomic.insert(b);
+                        }
+                    }
                     Op::Call(name, args) if atomic_builtin(name) => {
                         let b = self.base(&args[0])?;
                         self.atomic.insert(b);
@@ -344,8 +377,17 @@ impl Gen<'_> {
         for b in &bases {
             self.helpers(*b, &mut o);
         }
-        for (n, code) in LIBRARY {
-            if self.needs.borrow().contains(n) {
+        // (With what they call: WGSL takes functions in any order.)
+        let mut needed = self.needs.borrow().clone();
+        loop {
+            let more: BTreeSet<&str> = LIBRARY.iter().filter(|(n, _, _)| needed.contains(n)).flat_map(|(_, deps, _)| deps.iter().copied()).collect();
+            if more.is_subset(&needed) {
+                break;
+            }
+            needed.extend(more);
+        }
+        for (n, _, code) in LIBRARY {
+            if needed.contains(n) {
                 o.push_str(code);
                 o.push('\n');
             }
@@ -368,6 +410,9 @@ impl Gen<'_> {
             writeln!(o, "    let a{k} = {v};").unwrap();
         }
         for (r, t) in self.f.values.iter().enumerate() {
+            if self.lets.contains(&r) {
+                continue;
+            }
             if let Some(ty) = self.wty_opt(t)? {
                 writeln!(o, "    var v{r}: {ty};").unwrap();
             } else if let Type::Struct(fields, _) = t
@@ -457,8 +502,13 @@ impl Gen<'_> {
             Type::Void | Type::Struct(..) | Type::Array(..) | Type::Label | Type::Metadata => return Ok(None),
             Type::Int(1) => "bool".into(),
             Type::Int(8 | 16 | 32) | Type::Ptr(_) => "u32".into(),
+            // 64-bit integers: (low word, high word); vectors of them, arrays.
+            Type::Int(64) => "vec2<u32>".into(),
+            Type::Vector(n, e) if **e == Type::Int(64) => format!("array<vec2<u32>, {n}>"),
             Type::Float => "f32".into(),
             Type::Vector(n @ 2..=4, e) => format!("vec{n}<{}>", self.wty(e)?),
+            // Wider vectors (8 and 16 lanes): arrays, operated on lane by lane.
+            Type::Vector(n @ (8 | 16), e) => format!("array<{}, {n}>", self.wty(e)?),
             t => bail!("values of type {t:?}"),
         }))
     }
@@ -469,6 +519,7 @@ impl Gen<'_> {
             Value::Local(n) => Ok(format!("v{n}")),
             Value::Arg(n) => Ok(format!("a{n}")),
             Value::Const(c) => self.constant(&o.ty, c),
+            Value::Wgsl(s) => Ok(s.clone()),
         }
     }
 
@@ -476,6 +527,7 @@ impl Gen<'_> {
         let t = self.m.resolve(t)?;
         Ok(match (c, t) {
             (Const::Int(n), Type::Int(1)) => (if n & 1 != 0 { "true" } else { "false" }).into(),
+            (Const::Int(n), Type::Int(64)) => format!("vec2<u32>({}u, {}u)", *n as u32, (*n >> 32) as u32),
             (Const::Int(n), Type::Int(b)) => format!("{}u", n & mask(*b) as u64),
             (Const::Float(x), Type::Float) => float(*x as f32),
             (Const::Undef | Const::Zero | Const::Null, Type::Ptr(_)) => "0u".into(),
@@ -490,6 +542,9 @@ impl Gen<'_> {
                 let off = self.gep_offset(src, &ops[1..])?;
                 format!("({base} + {off})")
             }
+            // (A pointer as a 64-bit integer: its offset, widened.)
+            (Const::Cast(_, o), Type::Int(64)) if bits(&o.ty) != 64 => format!("vec2<u32>({}, 0u)", self.val(o)?),
+            (Const::Cast(_, o), Type::Int(b)) if bits(&o.ty) == 64 && *b < 64 => format!("{}.x", self.val(o)?),
             (Const::Cast(_, o), _) => self.val(o)?,
             (c, t) => bail!("the constant {c:?} of {t:?}"),
         })
@@ -538,14 +593,17 @@ impl Gen<'_> {
         let v = self.val(o)?;
         Ok(match b {
             32 => v,
-            64 => bail!("64-bit integers"),
+            // (Pointers are 32-bit: the low word is the index that matters.)
+            64 => format!("{v}.x"),
             b => sext_expr(&v, b),
         })
     }
 
     // ---- Structured code ----
 
-    fn node(&mut self, n: &Node, stack: &mut Vec<(bool, usize)>) -> Res<()> {
+    /// `stack`: the WGSL loops around, innermost last: (a Loop?, its label,
+    /// the Block a Loop is the whole of, whose end a `break` reaches).
+    fn node(&mut self, n: &Node, stack: &mut Vec<(bool, usize, Option<usize>)>) -> Res<()> {
         match n {
             Node::Code(b) => {
                 for i in &self.f.blocks[*b].insts {
@@ -561,7 +619,12 @@ impl Gen<'_> {
                 let is_loop = matches!(n, Node::Loop(..));
                 self.line("loop {");
                 self.depth += 1;
-                stack.push((is_loop, *label));
+                // A Block that is just a Loop: leaving the loop leaves it.
+                let exit = if is_loop { self.loop_exit.take() } else { None };
+                if !is_loop && matches!(**body, Node::Loop(..)) {
+                    self.loop_exit = Some(*label);
+                }
+                stack.push((is_loop, *label, exit));
                 self.node(body, stack)?;
                 stack.pop();
                 if !is_loop {
@@ -574,7 +637,7 @@ impl Gen<'_> {
                 targets(body, &mut outer);
                 outer.remove(label);
                 if !outer.is_empty() {
-                    let Some(&(parent_loop, parent)) = stack.last() else { bail!("a jump out of the function") };
+                    let Some(&(parent_loop, parent, _)) = stack.last() else { bail!("a jump out of the function") };
                     self.line("if (jump != 0u) {");
                     self.depth += 1;
                     if outer.contains(&parent) {
@@ -602,7 +665,8 @@ impl Gen<'_> {
             Node::Case(v, k, a, b) => {
                 let x = self.val(v)?;
                 let k = self.constant(&v.ty, &Const::Int(*k))?;
-                self.line(&format!("if ({x} == {k}) {{"));
+                let test = if bits(&v.ty) == 64 { format!("all({x} == {k})") } else { format!("{x} == {k}") };
+                self.line(&format!("if ({test}) {{"));
                 self.depth += 1;
                 self.node(a, stack)?;
                 self.depth -= 1;
@@ -615,8 +679,9 @@ impl Gen<'_> {
             Node::Jump { from, to } => {
                 self.phis(*from, *to)?;
                 match stack.last() {
-                    Some(&(true, l)) if l == *to => self.line("continue;"),
-                    Some(&(false, l)) if l == *to => self.line("break;"),
+                    Some(&(true, l, _)) if l == *to => self.line("continue;"),
+                    Some(&(true, _, Some(e))) if e == *to => self.line("break;"),
+                    Some(&(false, l, _)) if l == *to => self.line("break;"),
                     _ => self.line(&format!("jump = {}u; break;", to + 1)),
                 }
             }
@@ -655,13 +720,69 @@ impl Gen<'_> {
 
     // ---- Instructions ----
 
+    fn need(&self, n: &'static str) {
+        self.needs.borrow_mut().insert(n);
+    }
+
     fn set(&mut self, i: &Inst, e: String) {
-        if let Some(r) = i.result {
-            self.line(&format!("v{r} = {e};"));
+        if let Some(t) = self.lane.clone() {
+            self.line(&format!("{t} = {e};"));
+        } else if let Some(r) = i.result {
+            let keyword = if self.lets.contains(&r) { "let " } else { "" };
+            self.line(&format!("{keyword}v{r} = {e};"));
+        }
+    }
+
+    /// Whether an instruction works on vectors wider than WGSL's (as arrays),
+    /// so it's done a lane at a time.
+    fn wide(i: &Inst) -> Option<u32> {
+        // (Vectors of 64-bit integers are arrays of vec2<u32> at any width.)
+        let wide = |t: &Type| matches!(t, Type::Vector(n, e) if *n > 4 || **e == Type::Int(64));
+        let lanes = |t: &Type| t.lanes();
+        match &i.op {
+            Op::Bin(..) | Op::FNeg(_) | Op::Select(..) | Op::Freeze(_) | Op::Cast(..) if wide(&i.ty) => Some(lanes(&i.ty)),
+            Op::Cast(_, a) if wide(&a.ty) && a.ty.lanes() == i.ty.lanes() => Some(lanes(&i.ty)),
+            Op::ICmp(_, a, _) | Op::FCmp(_, a, _) if wide(&a.ty) => Some(lanes(&a.ty)),
+            Op::Call(name, _) if i.ty.lanes() > 1 && demangle(name).is_some_and(|(b, _)| SCALAR_ONLY.contains(&b.as_str())) => Some(lanes(&i.ty)),
+            Op::Call(name, args) if (wide(&i.ty) || (i.ty.lanes() > 1 && args.iter().any(|a| wide(&a.ty) && a.ty.lanes() == i.ty.lanes()))) && !name.starts_with("llvm.mem") && !demangle(name).is_some_and(|(b, _)| b.starts_with("vload") || b.starts_with("shuffle")) => {
+                let _ = args;
+                Some(lanes(&i.ty))
+            }
+            _ => None,
         }
     }
 
     fn inst(&mut self, i: &Inst) -> Res<()> {
+        if let (Some(n), Some(r)) = (Self::wide(i), i.result) {
+            // Lane by lane: the instruction on each lane's scalars.
+            for k in 0..n {
+                let lane = |o: &Operand, g: &Self| -> Res<Operand> {
+                    Ok(if matches!(o.ty, Type::Vector(m, _) if m == n) { Operand { ty: o.ty.scalar().clone(), v: Value::Wgsl(format!("{}[{k}]", g.val(o)?)) } } else { o.clone() })
+                };
+                let op = match &i.op {
+                    Op::Bin(s, a, b) => Op::Bin(s.clone(), lane(a, self)?, lane(b, self)?),
+                    Op::FNeg(a) => Op::FNeg(lane(a, self)?),
+                    Op::Freeze(a) => Op::Freeze(lane(a, self)?),
+                    Op::Select(c, a, b) => Op::Select(lane(c, self)?, lane(a, self)?, lane(b, self)?),
+                    Op::Cast(s, a) => {
+                        if a.ty.lanes() != n {
+                            bail!("a {s} from {:?} to {:?}", a.ty, i.ty);
+                        }
+                        Op::Cast(s.clone(), lane(a, self)?)
+                    }
+                    Op::ICmp(p, a, b) => Op::ICmp(p.clone(), lane(a, self)?, lane(b, self)?),
+                    Op::FCmp(p, a, b) => Op::FCmp(p.clone(), lane(a, self)?, lane(b, self)?),
+                    Op::Call(name, args) => Op::Call(name.clone(), args.iter().map(|a| lane(a, self)).collect::<Res<_>>()?),
+                    _ => unreachable!(),
+                };
+                let scalar = Inst { result: i.result, ty: i.ty.scalar().clone(), op };
+                self.lane = Some(format!("v{r}[{k}]"));
+                let done = self.inst(&scalar);
+                self.lane = None;
+                done?;
+            }
+            return Ok(());
+        }
         match &i.op {
             Op::Phi(_) => {}
             Op::Bin(op, a, b) => {
@@ -719,6 +840,14 @@ impl Gen<'_> {
             }
             Op::InsertElement(v, e, k) => {
                 let Some(r) = i.result else { return Ok(()) };
+                if let Value::Const(Const::Int(k)) = k.v {
+                    // A constant lane: the vector built anew, in one expression.
+                    let (vv, ev) = (self.val(v)?, self.val(e)?);
+                    let lanes: Vec<String> = (0..v.ty.lanes() as u64).map(|j| if j == k { ev.clone() } else { format!("{vv}[{j}]") }).collect();
+                    let ty = self.wty(&i.ty)?;
+                    self.set(i, format!("{ty}({})", lanes.join(", ")));
+                    return Ok(());
+                }
                 let (v, e, k) = (self.val(v)?, self.val(e)?, self.index(k)?);
                 self.line(&format!("v{r} = {v};"));
                 self.line(&format!("v{r}[{k}] = {e};"));
@@ -763,6 +892,7 @@ impl Gen<'_> {
     fn index(&self, k: &Operand) -> Res<String> {
         Ok(match &k.v {
             Value::Const(Const::Int(n)) => format!("{n}"),
+            _ if bits(&k.ty) == 64 => format!("{}.x", self.val(k)?),
             _ => self.val(k)?,
         })
     }
@@ -792,8 +922,30 @@ impl Gen<'_> {
                 o => bail!("{o} on i1"),
             });
         }
+        if w == 64 {
+            let call = |n: &'static str, y: &str| {
+                self.need(n);
+                format!("{n}({x}, {y})")
+            };
+            return Ok(match op {
+                "add" => call("add64", &y),
+                "sub" => call("sub64", &y),
+                "mul" => call("mul64", &y),
+                "udiv" => call("udiv64", &y),
+                "urem" => call("urem64", &y),
+                "sdiv" => call("sdiv64", &y),
+                "srem" => call("srem64", &y),
+                "shl" => call("shl64", &format!("{y}.x")),
+                "lshr" => call("lshr64", &format!("{y}.x")),
+                "ashr" => call("ashr64", &format!("{y}.x")),
+                "and" => format!("{x} & {y}"),
+                "or" => format!("{x} | {y}"),
+                "xor" => format!("{x} ^ {y}"),
+                o => bail!("the operation {o}"),
+            });
+        }
         if w > 32 {
-            bail!("64-bit integers");
+            bail!("integers of {w} bits");
         }
         let wrap = |e: String| if w < 32 { format!("(({e}) & {})", self.splat(t, &format!("{}u", mask(w)))) } else { e };
         let signed = |v: &str| sext_signed(v, w, t.lanes());
@@ -824,8 +976,21 @@ impl Gen<'_> {
     fn icmp(&self, p: &str, a: &Operand, b: &Operand) -> Res<String> {
         let (x, y) = (self.val(a)?, self.val(b)?);
         let w = bits(&a.ty);
+        if w == 64 {
+            let (lt, x, y) = if p.starts_with('s') { ("slt64", x, y) } else { ("ult64", x, y) };
+            self.need(lt);
+            return Ok(match p {
+                "eq" => format!("all({x} == {y})"),
+                "ne" => format!("any({x} != {y})"),
+                "ult" | "slt" => format!("{lt}({x}, {y})"),
+                "ugt" | "sgt" => format!("{lt}({y}, {x})"),
+                "ule" | "sle" => format!("!{lt}({y}, {x})"),
+                "uge" | "sge" => format!("!{lt}({x}, {y})"),
+                p => bail!("icmp {p}"),
+            });
+        }
         if w > 32 && !matches!(a.ty.scalar(), Type::Ptr(_)) {
-            bail!("64-bit integers");
+            bail!("integers of {w} bits");
         }
         let (x, y) = if p.starts_with('s') && w < 32 && w > 1 {
             (sext_signed(&x, w, a.ty.lanes()), sext_signed(&y, w, a.ty.lanes()))
@@ -854,25 +1019,31 @@ impl Gen<'_> {
 
     fn fcmp(&self, p: &str, a: &Operand, b: &Operand) -> Res<String> {
         let (x, y) = (self.val(a)?, self.val(b)?);
-        let ord = format!("(({x} == {x}) && ({y} == {y}))");
+        // NaN by its bits (a driver may take `x == x` to be true), and `&`,
+        // `|` rather than `&&`, `||`, which WGSL's bool vectors don't have.
+        let lanes = a.ty.lanes();
+        let u = if lanes > 1 { format!("vec{lanes}<u32>") } else { "u32".into() };
+        let s = |n: u32| if lanes > 1 { format!("vec{lanes}<u32>({n}u)") } else { format!("{n}u") };
+        let number = |v: &str| format!("((bitcast<{u}>({v}) & {}) <= {})", s(0x7fff_ffff), s(0x7f80_0000));
+        let ord = format!("({} & {})", number(&x), number(&y));
         let c = |o: &str| format!("({x} {o} {y})");
         Ok(match p {
-            "oeq" => c("=="),
-            "one" => format!("({} && {ord})", c("!=")),
-            "olt" => c("<"),
-            "ole" => c("<="),
-            "ogt" => c(">"),
-            "oge" => c(">="),
+            "oeq" => format!("({} & {ord})", c("==")),
+            "one" => format!("({} & {ord})", c("!=")),
+            "olt" => format!("({} & {ord})", c("<")),
+            "ole" => format!("({} & {ord})", c("<=")),
+            "ogt" => format!("({} & {ord})", c(">")),
+            "oge" => format!("({} & {ord})", c(">=")),
             "ord" => ord,
             "uno" => format!("!{ord}"),
-            "ueq" => format!("!({} || {} )", c("<"), c(">")),
-            "une" => c("!="),
-            "ult" => format!("!{}", c(">=")),
-            "ule" => format!("!{}", c(">")),
-            "ugt" => format!("!{}", c("<=")),
-            "uge" => format!("!{}", c("<")),
-            "true" => "true".into(),
-            "false" => "false".into(),
+            "ueq" => format!("({} | !{ord})", c("==")),
+            "une" => format!("({} | !{ord})", c("!=")),
+            "ult" => format!("({} | !{ord})", c("<")),
+            "ule" => format!("({} | !{ord})", c("<=")),
+            "ugt" => format!("({} | !{ord})", c(">")),
+            "uge" => format!("({} | !{ord})", c(">=")),
+            "true" => if lanes > 1 { format!("vec{lanes}<bool>(true)") } else { "true".into() },
+            "false" => if lanes > 1 { format!("vec{lanes}<bool>(false)") } else { "false".into() },
             p => bail!("fcmp {p}"),
         })
     }
@@ -882,8 +1053,40 @@ impl Gen<'_> {
         let (from_w, to_w) = (bits(&a.ty), bits(to));
         let lanes = to.lanes();
         let vt = |s: &str| if lanes > 1 { format!("vec{lanes}<{s}>") } else { s.to_string() };
+        let int64 = |t: &Type| *t == Type::Int(64);
+        if int64(to) || int64(&a.ty) {
+            let call = |n: &'static str| {
+                self.need(n);
+                format!("{n}({x})")
+            };
+            return Ok(match op {
+                "zext" if from_w == 1 => format!("vec2<u32>(select(0u, 1u, {x}), 0u)"),
+                "zext" | "ptrtoint" => format!("vec2<u32>({x}, 0u)"),
+                "sext" if from_w == 1 => format!("select(vec2<u32>(0u, 0u), vec2<u32>(0xffffffffu, 0xffffffffu), {x})"),
+                "sext" => {
+                    let s = sext_signed(&x, from_w, 1);
+                    format!("vec2<u32>(bitcast<u32>({s}), select(0u, 0xffffffffu, {s} < 0i))")
+                }
+                "trunc" if to_w == 1 => format!("(({x}.x & 1u) != 0u)"),
+                "trunc" if to_w < 32 => format!("({x}.x & {}u)", mask(to_w)),
+                "trunc" | "inttoptr" => format!("{x}.x"),
+                "fptoui" => call("f32tou64"),
+                "fptosi" => call("f32tos64"),
+                "uitofp" => call("u64tof32"),
+                "sitofp" => call("s64tof32"),
+                "bitcast" => match (&a.ty, to) {
+                    (Type::Int(64), Type::Int(64)) => x,
+                    // <2 x i32> is a vec2<u32> too.
+                    (Type::Vector(2, e), _) | (_, Type::Vector(2, e)) if **e == Type::Int(32) => x,
+                    (Type::Vector(2, e), _) if **e == Type::Float => format!("bitcast<vec2<u32>>({x})"),
+                    (_, Type::Vector(2, e)) if **e == Type::Float => format!("bitcast<vec2<f32>>({x})"),
+                    (f, t) => bail!("a bitcast from {f:?} to {t:?}"),
+                },
+                op => bail!("{op} from {:?} to {to:?}", a.ty),
+            });
+        }
         if (from_w > 32 && !a.ty.scalar().is_float() && !matches!(a.ty.scalar(), Type::Ptr(_))) || (to_w > 32 && !to.scalar().is_float() && !matches!(to.scalar(), Type::Ptr(_))) {
-            bail!("64-bit integers");
+            bail!("integers of {} bits", from_w.max(to_w));
         }
         if matches!(a.ty.scalar(), Type::Double | Type::Half) || matches!(to.scalar(), Type::Double | Type::Half) {
             bail!("{op} with {:?} or {to:?}", a.ty);
@@ -964,6 +1167,10 @@ impl Gen<'_> {
             }
             _ => {
                 let (s, _) = self.m.layout(t)?;
+                if *t == Type::Int(64) {
+                    let word = |q: String| if align.is_multiple_of(4) { self.word_at(b, &q, 4) } else { format!("ld_{}({q})", name(b)) };
+                    return Ok(format!("vec2<u32>({}, {})", word(p.to_string()), word(format!("({p} + 4u)"))));
+                }
                 let w = if s >= 4 { self.word_at(b, p, align) } else { format!("ld_{}({p})", name(b)) };
                 self.from_word(&w, t)
             }
@@ -975,20 +1182,49 @@ impl Gen<'_> {
         match &t {
             Type::Vector(n, e) => {
                 let (s, _) = self.m.layout(e)?;
+                // Narrow lanes filling whole aligned words: packed into words,
+                // stored a word at a time.
+                if s < 4 && (*n as u64 * s).is_multiple_of(4) && align >= 4 && !e.is_float() {
+                    let per = (4 / s) as u32;
+                    for w in 0..*n / per {
+                        let word: Vec<String> = (0..per).map(|k| format!("({v}[{}] << {}u)", w * per + k, k as u64 * s * 8)).collect();
+                        self.store(b, &format!("({p} + {}u)", w * 4), &Type::Int(32), &format!("({})", word.join(" | ")), 4)?;
+                    }
+                    return Ok(());
+                }
                 for k in 0..*n {
                     self.store(b, &format!("({p} + {}u)", k as u64 * s), e, &format!("{v}[{k}]"), if align as u64 >= s { s as u32 } else { align })?;
                 }
+            }
+            Type::Int(64) => {
+                let a = align.min(4);
+                self.store(b, p, &Type::Int(32), &format!("{v}.x"), a)?;
+                self.store(b, &format!("({p} + 4u)"), &Type::Int(32), &format!("{v}.y"), a)?;
             }
             _ => {
                 let (s, _) = self.m.layout(&t)?;
                 let w = self.to_word(v, &t)?;
                 let n = name(b);
+                let atomic = self.atomic.contains(&b);
                 if s == 4 && align.is_multiple_of(4) {
-                    if self.atomic.contains(&b) {
+                    if atomic {
                         self.line(&format!("atomicStore(&{n}[({p}) >> 2u], {w});"));
                     } else {
                         self.line(&format!("{n}[({p}) >> 2u] = {w};"));
                     }
+                } else if s == 1 || (s == 2 && align >= 2) {
+                    // Within one word: its bits replaced, inline.
+                    let m = if s == 1 { "0xffu" } else { "0xffffu" };
+                    self.line("{");
+                    self.line(&format!("    let q = {p};"));
+                    self.line("    let s = (q & 3u) * 8u;");
+                    if atomic {
+                        self.line(&format!("    atomicAnd(&{n}[q >> 2u], ~({m} << s));"));
+                        self.line(&format!("    atomicOr(&{n}[q >> 2u], (({w}) & {m}) << s);"));
+                    } else {
+                        self.line(&format!("    {n}[q >> 2u] = ({n}[q >> 2u] & ~({m} << s)) | ((({w}) & {m}) << s);"));
+                    }
+                    self.line("}");
                 } else {
                     self.line(&format!("st_{n}({p}, {w}, {s}u);"));
                 }
@@ -1081,6 +1317,34 @@ impl Gen<'_> {
                 dim(self, "1u", &format!("(args[{GLOBAL_SIZE}u + min({v}, 2u)] / vec3<u32>({x}u, {y}u, {z}u)[min({v}, 2u)])", v = vals[0]))
             }
             "get_work_dim" => format!("args[{WORK_DIM}]"),
+            "wait_group_events" => {
+                self.line("workgroupBarrier();");
+                self.line("storageBarrier();");
+                return Ok(());
+            }
+            "async_work_group_copy" | "async_work_group_strided_copy" => {
+                // The work-group's items share the copy, each taking every
+                // (group size)th element; words at a time.
+                let size = elem_size(name).ok_or_else(|| format!("the element type of {name}"))?;
+                let (db, sb) = (self.base(&args[0])?, self.base(&args[1])?);
+                let stride = if base == "async_work_group_strided_copy" { vals[3].clone() } else { "1u".into() };
+                // Strided: the global side.
+                let (ds, ss) = if matches!(args[0].ty, Type::Ptr(3)) { ("1u".to_string(), stride) } else { (stride, "1u".to_string()) };
+                let [x, y, z] = self.launch.local;
+                let (dn, sn) = (name_of(db), name_of(sb));
+                self.line(&format!("for (var e = lid.x + lid.y * {x}u + lid.z * {}u; e < {}; e += {}u) {{", x * y, vals[2], x * y * z));
+                if size % 4 == 0 {
+                    self.line(&format!("    for (var w = 0u; w < {}u; w++) {{", size / 4));
+                    self.line(&format!("        st_{dn}({} + e * {ds} * {size}u + w * 4u, ld_{sn}({} + e * {ss} * {size}u + w * 4u), 4u);", vals[0], vals[1]));
+                    self.line("    }");
+                } else {
+                    self.line(&format!("    for (var w = 0u; w < {size}u; w++) {{"));
+                    self.line(&format!("        st_{dn}({} + e * {ds} * {size}u + w, ld_{sn}({} + e * {ss} * {size}u + w) & 0xffu, 1u);", vals[0], vals[1]));
+                    self.line("    }");
+                }
+                self.line("}");
+                "0u".to_string()
+            }
             "barrier" | "work_group_barrier" => {
                 self.line("workgroupBarrier();");
                 if !matches!(args.first().map(|a| &a.v), Some(Value::Const(Const::Int(1)))) {
@@ -1088,7 +1352,7 @@ impl Gen<'_> {
                 }
                 return Ok(());
             }
-            "mem_fence" | "read_mem_fence" | "write_mem_fence" => return Ok(()),
+            "mem_fence" | "read_mem_fence" | "write_mem_fence" | "prefetch" => return Ok(()),
             b if atomic_builtin(name) => {
                 let op = b.trim_start_matches("atomic_").trim_start_matches("atom_");
                 let bse = self.base(&args[0])?;
@@ -1115,7 +1379,18 @@ impl Gen<'_> {
                 let p = format!("({} + {} * {}u)", vals[2], vals[1], n as u64 * s);
                 return self.store(bse, &p, &args[0].ty, &vals[0], s as u32);
             }
-            b => self.math(b, i, args, &vals, unsigned)?,
+            b => {
+                // Scalar arguments to vector forms (fmax(float4, float), step(float,
+                // float4), clamp(int4, int, int)): splatted, as WGSL wants.
+                let lanes = i.ty.lanes();
+                let vals: Vec<String> = if lanes > 1 && lanes <= 4 && SPLATTED.contains(&b) {
+                    args.iter().zip(&vals).map(|(a, v)| Ok(if a.ty.lanes() == 1 { format!("vec{lanes}<{}>({v})", self.wty(a.ty.scalar())?) } else { v.clone() })).collect::<Res<_>>()?
+                } else {
+                    vals
+                };
+                self.vector_call = name.contains("Dv");
+                self.math(b, i, args, &vals, unsigned)?
+            }
         };
         self.set(i, e);
         Ok(())
@@ -1124,8 +1399,57 @@ impl Gen<'_> {
     fn intrinsic(&mut self, i: &Inst, name: &str, args: &[Operand], v: &[String]) -> Res<()> {
         let base = name.split('.').next().unwrap_or(name);
         let t = &i.ty;
+        if bits(t) == 64 && !t.scalar().is_float() {
+            let lt = |s: bool| {
+                let n = if s { "slt64" } else { "ult64" };
+                self.need(n);
+                n
+            };
+            let call = |n: &'static str| {
+                self.need(n);
+                format!("{n}({})", v[0])
+            };
+            let e = match base {
+                "smin" | "umin" => format!("select({a}, {b}, {}({b}, {a}))", lt(base == "smin"), a = v[0], b = v[1]),
+                "smax" | "umax" => format!("select({a}, {b}, {}({a}, {b}))", lt(base == "smax"), a = v[0], b = v[1]),
+                "abs" => call("abs64"),
+                "ctpop" => call("popcount64"),
+                "ctlz" => call("clz64"),
+                "cttz" => call("ctz64"),
+                n => bail!("the intrinsic llvm.{n} on 64-bit integers"),
+            };
+            self.set(i, e);
+            return Ok(());
+        }
         let e = match base {
             "lifetime" | "assume" | "experimental" | "dbg" | "invariant" => return Ok(()),
+            "vector" if name.starts_with("vector.reduce.") => {
+                // A vector folded to a scalar, lane by lane (the same
+                // operations as on scalars, for the element type).
+                let op = name.split('.').nth(2).unwrap_or("");
+                let a = args.last().ok_or("a reduction without a vector")?;
+                let et = a.ty.scalar().clone();
+                let lane = |k: u32| Operand { ty: et.clone(), v: Value::Wgsl(format!("{}[{k}]", v[args.len() - 1])) };
+                let mut acc = lane(0);
+                for k in 1..a.ty.lanes() {
+                    let e = match op {
+                        "add" | "mul" | "and" | "or" | "xor" => self.binary(op, &acc, &lane(k))?,
+                        "fadd" | "fmul" => self.binary(op, &acc, &lane(k))?,
+                        "smax" | "smin" | "umax" | "umin" => {
+                            let c = self.icmp(&format!("{}{}", &op[..1], if op.ends_with("max") { "gt" } else { "lt" }), &acc, &lane(k))?;
+                            format!("select({}, {}, {c})", self.val(&lane(k))?, self.val(&acc)?)
+                        }
+                        "fmax" | "fmaximum" => format!("max({}, {})", self.val(&acc)?, self.val(&lane(k))?),
+                        "fmin" | "fminimum" => format!("min({}, {})", self.val(&acc)?, self.val(&lane(k))?),
+                        o => bail!("the reduction {o}"),
+                    };
+                    acc = Operand { ty: et.clone(), v: Value::Wgsl(format!("({e})")) };
+                }
+                // (fadd and fmul start from their first operand too.)
+                let e = if (op == "fadd" || op == "fmul") && args.len() == 2 { self.binary(op, &args[0], &acc)? } else { self.val(&acc)? };
+                self.set(i, e);
+                return Ok(());
+            }
             "fmuladd" | "fma" => format!("fma({}, {}, {})", v[0], v[1], v[2]),
             "fabs" => format!("abs({})", v[0]),
             "sqrt" | "floor" | "ceil" | "trunc" | "exp2" | "log2" | "exp" | "log" | "sin" | "cos" | "pow" => format!("{base}({})", v.join(", ")),
@@ -1201,7 +1525,7 @@ impl Gen<'_> {
             }
             "memcpy" | "memmove" | "memset" => {
                 let (db, sb) = (self.base(&args[0])?, if base == "memset" { None } else { Some(self.base(&args[1])?) });
-                let len = self.val(&args[2])?;
+                let len = if bits(&args[2].ty) == 64 { format!("{}.x", self.val(&args[2])?) } else { self.val(&args[2])? };
                 let (dn, d) = (name_of(db), &v[0]);
                 self.line(&format!("for (var k = 0u; k < {len}; k++) {{"));
                 match sb {
@@ -1231,10 +1555,19 @@ impl Gen<'_> {
         let t = &i.ty;
         let float = t.scalar().is_float() || args.first().is_some_and(|a| a.ty.scalar().is_float());
         let b = b.trim_start_matches("native_").trim_start_matches("half_");
+        let b = b.trim_start_matches("fast_");
+        // A vector's length without overflow or underflow: scaled by its
+        // largest component.
+        let biggest = |x: &str, n: u32| (1..n).fold(format!("abs({x})[0]"), |m, k| format!("max({m}, abs({x})[{k}])"));
+        let length = |x: &str, n: u32| {
+            let m = biggest(x, n);
+            // (Zero for zero; infinite if a component is.)
+            format!("select(select(0.0, ({m}) * length({x} / ({m})), ({m}) > 0.0), ({m}), ({m}) > 3.4028235e38)")
+        };
         let f1 = |f: &str| format!("{f}({})", v[0]);
         Ok(match b {
             "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "exp" | "exp2" | "log" | "log2"
-            | "floor" | "ceil" | "trunc" | "sign" | "degrees" | "radians" | "length" | "normalize" | "fract"
+            | "floor" | "ceil" | "trunc" | "sign" | "degrees" | "radians" | "fract"
                 if float =>
             {
                 f1(b)
@@ -1260,13 +1593,48 @@ impl Gen<'_> {
             "fmod" => format!("({} % {})", v[0], v[1]),
             "fdim" => format!("max({} - {}, {}(0.0))", v[0], v[1], self.wty(t)?),
             "fma" | "mad" => format!("fma({}, {}, {})", v[0], v[1], v[2]),
-            "mix" => format!("mix({}, {}, {})", v[0], v[1], v[2]),
+            // (OpenCL's definition, which rounds as the CTS expects.)
+            "mix" => format!("({x} + ({y} - {x}) * {a})", x = v[0], y = v[1], a = v[2]),
             "clamp" if float => format!("clamp({}, {}, {})", v[0], v[1], v[2]),
             "step" => format!("step({}, {})", v[0], v[1]),
             "smoothstep" => format!("smoothstep({}, {}, {})", v[0], v[1], v[2]),
+            "dot" if args[0].ty.lanes() == 1 => format!("({} * {})", v[0], v[1]),
             "dot" => format!("dot({}, {})", v[0], v[1]),
+            // (float4: the cross product of xyz, w 0.)
+            "cross" if args[0].ty.lanes() == 4 => format!("vec4<f32>(cross({}.xyz, {}.xyz), 0.0)", v[0], v[1]),
             "cross" => format!("cross({}, {})", v[0], v[1]),
-            "distance" => format!("distance({}, {})", v[0], v[1]),
+            "length" if args[0].ty.lanes() > 1 => length(&v[0], args[0].ty.lanes()),
+            "length" => format!("abs({})", v[0]),
+            "distance" if args[0].ty.lanes() > 1 => length(&format!("({} - {})", v[0], v[1]), args[0].ty.lanes()),
+            "distance" => format!("abs({} - {})", v[0], v[1]),
+            "normalize" if args[0].ty.lanes() > 1 => {
+                let m = biggest(&v[0], args[0].ty.lanes());
+                format!("select({x}, normalize({x} / ({m})), ({m}) > 0.0)", x = v[0])
+            }
+            "normalize" => format!("sign({})", v[0]),
+            "shuffle" | "shuffle2" => {
+                let (n, m) = (args[0].ty.lanes(), t.lanes());
+                let mask = &args[args.len() - 1];
+                let mv = &v[args.len() - 1];
+                let lanes: Vec<String> = (0..m)
+                    .map(|k| {
+                        let i = if bits(&mask.ty) == 64 { format!("{mv}[{k}].x") } else { format!("{mv}[{k}]") };
+                        if b == "shuffle" {
+                            format!("{}[{i} % {n}u]", v[0])
+                        } else {
+                            let i = format!("({i} % {}u)", 2 * n);
+                            format!("select({x}[min({i}, {}u)], {y}[max({i}, {n}u) - {n}u], {i} >= {n}u)", n - 1, x = v[0], y = v[1])
+                        }
+                    })
+                    .collect();
+                if m == 1 { lanes[0].clone() } else { format!("{}({})", self.wty(t)?, lanes.join(", ")) }
+            }
+            "nextafter" => {
+                let (x, y) = (&v[0], &v[1]);
+                let bx = format!("bitcast<u32>({x})");
+                let step = format!("select({bx} - 1u, {bx} + 1u, ({y} > {x}) == ({x} > 0.0))");
+                format!("select(select(bitcast<f32>({step}), bitcast<f32>(select(1u, 0x80000001u, {y} < 0.0)), {x} == 0.0), {y}, {x} == {y} || {x} != {x} || {y} != {y})")
+            }
             "copysign" => {
                 let lanes = t.lanes();
                 let u = if lanes > 1 { format!("vec{lanes}<u32>") } else { "u32".into() };
@@ -1292,36 +1660,65 @@ impl Gen<'_> {
                     _ => format!("(({bitsx} & {}) < {}) && (({bitsx} & {}) >= {})", s(0x7fffffff), s(0x7f800000), s(0x7fffffff), s(0x00800000)),
                 };
                 // Scalars: 1 or 0; vectors: -1 (all bits) or 0.
-                let yes = if lanes > 1 { self.splat(t, &format!("{}u", mask(bits(t)))) } else { "1u".into() };
+                let yes = if lanes > 1 || self.vector_call { self.splat(t, &format!("{}u", mask(bits(t)))) } else { "1u".into() };
                 format!("select({}, {yes}, {cond})", self.splat(t, "0u"))
             }
-            "isequal" | "isnotequal" | "isgreater" | "isgreaterequal" | "isless" | "islessequal" => {
-                let o = match b {
-                    "isequal" => "==",
-                    "isnotequal" => "!=",
-                    "isgreater" => ">",
-                    "isgreaterequal" => ">=",
-                    "isless" => "<",
-                    _ => "<=",
+            "isequal" | "isnotequal" | "isgreater" | "isgreaterequal" | "isless" | "islessequal" | "islessgreater" | "isordered" | "isunordered" => {
+                // As fcmp's predicates, NaN and all.
+                let p = match b {
+                    "isequal" => "oeq",
+                    "isnotequal" => "une",
+                    "isgreater" => "ogt",
+                    "isgreaterequal" => "oge",
+                    "isless" => "olt",
+                    "islessequal" => "ole",
+                    "islessgreater" => "one",
+                    "isordered" => "ord",
+                    _ => "uno",
                 };
-                let yes = if t.lanes() > 1 { self.splat(t, &format!("{}u", mask(bits(t)))) } else { "1u".into() };
-                format!("select({}, {yes}, {} {o} {})", self.splat(t, "0u"), v[0], v[1])
+                let cond = self.fcmp(p, &args[0], &args[1])?;
+                let yes = if t.lanes() > 1 || self.vector_call { self.splat(t, &format!("{}u", mask(bits(t)))) } else { "1u".into() };
+                format!("select({}, {yes}, {cond})", self.splat(t, "0u"))
             }
             "select" => {
-                // OpenCL's select(a, b, c): b where c (its top bit, for vectors).
+                // OpenCL's select(a, b, c): b where c is nonzero, or for vectors
+                // where its top bit is set (lane by lane too: `vector_call`).
                 let c = &args[2];
-                let cond = if c.ty.lanes() > 1 {
-                    let w = bits(&c.ty);
-                    format!("(({} >> {}) & {}) != {}", v[2], self.splat(&c.ty, &format!("{}u", w - 1)), self.splat(&c.ty, "1u"), self.splat(&c.ty, "0u"))
-                } else {
-                    format!("{} != 0u", v[2])
+                let w = bits(c.ty.scalar());
+                let cond = match (self.vector_call, w) {
+                    (true, 64) => format!("(({}.y >> 31u) != 0u)", v[2]),
+                    (false, 64) => format!("any({} != vec2<u32>(0u, 0u))", v[2]),
+                    (true, w) => format!("(({} >> {}) & {}) != {}", v[2], self.splat(&c.ty, &format!("{}u", w - 1)), self.splat(&c.ty, "1u"), self.splat(&c.ty, "0u")),
+                    (false, _) => format!("{} != 0u", v[2]),
                 };
                 format!("select({}, {}, {cond})", v[0], v[1])
+            }
+            "bitselect" => {
+                // (a & ~c) | (b & c), on the bits.
+                let t0 = &args[0].ty;
+                if t0.scalar().is_float() {
+                    let lanes = t0.lanes();
+                    let u = if lanes > 1 { format!("vec{lanes}<u32>") } else { "u32".into() };
+                    format!("bitcast<{}>((bitcast<{u}>({a}) & ~bitcast<{u}>({c})) | (bitcast<{u}>({b}) & bitcast<{u}>({c})))", self.wty(t0)?, a = v[0], b = v[1], c = v[2])
+                } else {
+                    let e = format!("(({a} & ~{c}) | ({b} & {c}))", a = v[0], b = v[1], c = v[2]);
+                    let w = bits(t0.scalar());
+                    if w < 32 { format!("({e} & {})", self.splat(t0, &format!("{}u", mask(w)))) } else { e }
+                }
+            }
+            "any" | "all" => {
+                // Of the top bits (any(x < 0) for a scalar).
+                let a = &args[0];
+                let w = bits(a.ty.scalar());
+                let top = |x: &str| if w == 64 { format!("(({x}.y >> 31u) != 0u)") } else { format!("((({x} >> {}u) & 1u) != 0u)", w - 1) };
+                let lanes: Vec<String> = if a.ty.lanes() > 1 { (0..a.ty.lanes()).map(|k| top(&format!("{}[{k}]", v[0]))).collect() } else { vec![top(&v[0])] };
+                let joined = lanes.join(if b == "any" { " || " } else { " && " });
+                format!("select(0u, 1u, {joined})")
             }
             // Integers.
             "min" | "max" | "clamp" | "abs" | "abs_diff" | "add_sat" | "sub_sat" | "hadd" | "rhadd" | "mad24" | "mul24" | "mad_hi" | "mul_hi" | "rotate" | "clz" | "ctz"
             | "popcount" | "upsample" | "mad_sat" => self.integer(b, t, args, v, unsigned)?,
-            b if b.starts_with("convert_") => self.convert(b, t, &args[0], &v[0])?,
+            b if b.starts_with("convert_") => self.convert(b, t, &args[0], &v[0], unsigned)?,
             b if b.starts_with("vload") => {
                 // vloadN(offset, p): N elements at p + offset * N.
                 let n: u32 = b[5..].trim_start_matches("_half").parse().map_err(|_| format!("{b}"))?;
@@ -1341,13 +1738,35 @@ impl Gen<'_> {
 
     fn integer(&self, b: &str, t: &Type, args: &[Operand], v: &[String], unsigned: bool) -> Res<String> {
         let w = bits(&args[0].ty);
+        if w == 64 {
+            let lt = if unsigned { "ult64" } else { "slt64" };
+            let call = |n: &'static str| {
+                self.need(n);
+                format!("{n}({})", v[0])
+            };
+            self.need(lt);
+            let min = |a: &str, b: &str| format!("select({a}, {b}, {lt}({b}, {a}))");
+            let max = |a: &str, b: &str| format!("select({a}, {b}, {lt}({a}, {b}))");
+            return Ok(match (b, unsigned) {
+                ("min", _) => min(&v[0], &v[1]),
+                ("max", _) => max(&v[0], &v[1]),
+                ("clamp", _) => min(&max(&v[0], &v[1]), &v[2]),
+                ("abs", true) => v[0].clone(),
+                ("abs", false) => call("abs64"),
+                ("clz", _) => call("clz64"),
+                ("ctz", _) => call("ctz64"),
+                ("popcount", _) => call("popcount64"),
+                (b, _) => bail!("the builtin {b} on 64-bit integers"),
+            });
+        }
         if w > 32 {
-            bail!("64-bit integers");
+            bail!("integers of {w} bits");
         }
         let lanes = t.lanes();
         let s = |x: &str| sext_signed(x, w, lanes);
         let back = |e: String| self.wrap_signed(t, e);
         let m = |n: u64| self.splat(t, &format!("{n}u"));
+        let ones = |lanes: u32| if lanes > 1 { format!("vec{lanes}<i32>(1i)") } else { "1i".into() };
         Ok(match (b, unsigned) {
             ("min", true) => format!("min({}, {})", v[0], v[1]),
             ("max", true) => format!("max({}, {})", v[0], v[1]),
@@ -1362,6 +1781,8 @@ impl Gen<'_> {
             ("add_sat", true) if w < 32 => format!("min({} + {}, {})", v[0], v[1], m(mask(w) as u64)),
             ("add_sat", true) => format!("select({a} + {b}, {}, {a} + {b} < {a})", m(u32::MAX as u64), a = v[0], b = v[1]),
             ("sub_sat", true) => format!("select({a} - {b}, {}, {b} > {a})", m(0), a = v[0], b = v[1]),
+            ("hadd", false) => back(format!("(({a} >> {u1}) + ({b} >> {u1}) + ({a} & {b} & {i1}))", a = s(&v[0]), b = s(&v[1]), u1 = m(1), i1 = ones(lanes))),
+            ("rhadd", false) => back(format!("(({a} >> {u1}) + ({b} >> {u1}) + (({a} | {b}) & {i1}))", a = s(&v[0]), b = s(&v[1]), u1 = m(1), i1 = ones(lanes))),
             ("hadd", true) => format!("(({a} >> {one}) + ({b} >> {one}) + ({a} & {b} & {one}))", a = v[0], b = v[1], one = m(1)),
             ("rhadd", true) => format!("(({a} >> {one}) + ({b} >> {one}) + (({a} | {b}) & {one}))", a = v[0], b = v[1], one = m(1)),
             ("mul24", _) => format!("({} * {})", v[0], v[1]),
@@ -1383,7 +1804,70 @@ impl Gen<'_> {
         })
     }
 
-    fn convert(&self, b: &str, t: &Type, a: &Operand, v: &str) -> Res<String> {
+
+    /// convert_* to or from a 64-bit integer (one lane).
+    fn convert64(&self, b: &str, t: &Type, a: &Operand, v: &str, unsigned: bool) -> Res<String> {
+        let sat = b.contains("_sat");
+        let to_unsigned = b.trim_start_matches("convert_").starts_with('u');
+        let (from_w, to_w) = (bits(&a.ty), bits(t));
+        let call = |n: &'static str, x: &str| {
+            self.need(n);
+            format!("{n}({x})")
+        };
+        let rounded = if b.contains("_rte") {
+            format!("round({v})")
+        } else if b.contains("_rtp") {
+            format!("ceil({v})")
+        } else if b.contains("_rtn") {
+            format!("floor({v})")
+        } else {
+            v.to_string()
+        };
+        let lt = |s: bool| {
+            let n = if s { "slt64" } else { "ult64" };
+            self.need(n);
+            n
+        };
+        let wide = |c: i64| format!("vec2<u32>({}u, {}u)", c as u32, ((c as u64) >> 32) as u32);
+        Ok(match (a.ty.scalar().is_float(), t.scalar().is_float()) {
+            (true, false) => call(if to_unsigned { "f32tou64" } else { "f32tos64" }, &rounded),
+            (false, true) => call(if unsigned { "u64tof32" } else { "s64tof32" }, v),
+            _ if from_w == 64 && to_w == 64 => {
+                if sat && unsigned && !to_unsigned {
+                    format!("select({v}, vec2<u32>(0xffffffffu, 0x7fffffffu), ({v}.y >> 31u) != 0u)")
+                } else if sat && !unsigned && to_unsigned {
+                    format!("select({v}, vec2<u32>(0u, 0u), bitcast<i32>({v}.y) < 0i)")
+                } else {
+                    v.to_string()
+                }
+            }
+            _ if to_w == 64 => {
+                // Widening: sign-extended from a signed source.
+                if unsigned || from_w == 1 {
+                    format!("vec2<u32>({v}, 0u)")
+                } else {
+                    let s = sext_signed(v, from_w, 1);
+                    let s = if sat && to_unsigned { format!("max({s}, 0i)") } else { s };
+                    format!("vec2<u32>(bitcast<u32>({s}), select(0u, 0xffffffffu, {s} < 0i))")
+                }
+            }
+            _ => {
+                // Narrowing: the low bits, or clamped.
+                let m = mask(to_w);
+                let low = format!("({v}.x & {m}u)");
+                if !sat {
+                    low
+                } else {
+                    let (lo, hi): (i64, i64) = if to_unsigned { (0, m as i64) } else { (-(1i64 << (to_w - 1)), (1i64 << (to_w - 1)) - 1) };
+                    let l = lt(!unsigned);
+                    let hi_clamped = format!("select({low}, {}u, {l}({}, {v}))", hi as u64 as u32 & m, wide(hi));
+                    if unsigned { hi_clamped } else { format!("select({hi_clamped}, {}u, {l}({v}, {}))", lo as u32 & m, wide(lo)) }
+                }
+            }
+        })
+    }
+    /// convert_T[_sat][_rtX]: `unsigned` if the source is (its mangled parameter).
+    fn convert(&self, b: &str, t: &Type, a: &Operand, v: &str, unsigned: bool) -> Res<String> {
         let sat = b.contains("_sat");
         let from_float = a.ty.scalar().is_float();
         let to_float = t.scalar().is_float();
@@ -1394,8 +1878,11 @@ impl Gen<'_> {
         let target = b.trim_start_matches("convert_");
         let to_unsigned = target.starts_with('u');
         let from_w = bits(&a.ty);
+        if (!from_float && from_w == 64) || (!to_float && to_w == 64) {
+            return self.convert64(b, t, a, v, unsigned);
+        }
         if (!from_float && from_w > 32) || (!to_float && to_w > 32) {
-            bail!("64-bit integers");
+            bail!("integers of {} bits", from_w.max(to_w));
         }
         let rounded = if b.contains("_rte") {
             format!("round({v})")
@@ -1409,9 +1896,8 @@ impl Gen<'_> {
         Ok(match (from_float, to_float) {
             (true, true) => v.to_string(),
             (false, true) => {
-                // The source's signedness isn't in a convert's name; the
-                // parameter's mangling was checked by the caller (unsigned).
-                format!("{}({v})", vt("f32"))
+                // (Signed or not as the parameter is mangled.)
+                if unsigned { format!("{}({v})", vt("f32")) } else { format!("{}({})", vt("f32"), sext_signed(v, from_w, lanes)) }
             }
             (true, false) => {
                 let (lo, hi): (i64, i64) = if to_unsigned { (0, mask(to_w) as i64) } else { (-(1i64 << (to_w - 1)), (1i64 << (to_w - 1)) - 1) };
@@ -1419,13 +1905,31 @@ impl Gen<'_> {
                 let e = if to_unsigned { format!("{}({x})", vt("u32")) } else { format!("{}({}({x}))", vt("u32"), vt("i32")) };
                 if to_w < 32 { format!("({e} & {})", self.splat(t, &format!("{}u", mask(to_w)))) } else { e }
             }
+            (false, false) if sat => {
+                // Clamped to the target's range, the source read as signed or not.
+                let hi = if to_unsigned { mask(to_w) } else { mask(to_w - 1) };
+                let (i, u) = (vt("i32"), vt("u32"));
+                let e = if unsigned {
+                    if to_w < 32 || !to_unsigned { format!("min({v}, {})", self.splat(t, &format!("{hi}u"))) } else { v.to_string() }
+                } else {
+                    let s = sext_signed(v, from_w, lanes);
+                    let s = if to_unsigned { format!("max({s}, {i}(0))") } else { s };
+                    let s = if to_w < 32 || !to_unsigned {
+                        let lo = if to_unsigned { 0 } else { -(1i64 << (to_w - 1)) };
+                        format!("clamp({s}, {i}({lo}), {i}({}))", hi as i64)
+                    } else {
+                        s
+                    };
+                    format!("{u}({s})")
+                };
+                if to_w < 32 { format!("({e} & {})", self.splat(t, &format!("{}u", mask(to_w)))) } else { e }
+            }
             (false, false) => {
                 if to_w < 32 {
                     format!("({v} & {})", self.splat(t, &format!("{}u", mask(to_w))))
                 } else if from_w < 32 {
-                    // Widening: sign-extend unless the source is unsigned
-                    // (the call's first parameter is mangled h/t).
-                    format!("{}({})", vt("u32"), sext_signed(v, from_w, lanes))
+                    // Widening: sign-extend unless the source is unsigned.
+                    if unsigned { v.to_string() } else { format!("{}({})", vt("u32"), sext_signed(v, from_w, lanes)) }
                 } else {
                     v.to_string()
                 }
@@ -1553,10 +2057,13 @@ fn float(x: f32) -> String {
     }
 }
 
-/// Functions generated code may call, by name.
-const LIBRARY: &[(&str, &str)] = &[(
-    "mul_hi_u32",
-    "fn mul_hi_u32(a: u32, b: u32) -> u32 {
+/// Functions generated code may call: name, the functions it calls, code.
+/// 64-bit integers are `vec2<u32>` (low word, high word).
+const LIBRARY: &[(&str, &[&str], &str)] = &[
+    (
+        "mul_hi_u32",
+        &[],
+        "fn mul_hi_u32(a: u32, b: u32) -> u32 {
     let al = a & 0xffffu;
     let ah = a >> 16u;
     let bl = b & 0xffffu;
@@ -1566,7 +2073,93 @@ const LIBRARY: &[(&str, &str)] = &[(
     let mid = ((al * bl) >> 16u) + (lh & 0xffffu) + (hl & 0xffffu);
     return ah * bh + (lh >> 16u) + (hl >> 16u) + (mid >> 16u);
 }",
-)];
+    ),
+    ("add64", &[], "fn add64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let lo = a.x + b.x;
+    return vec2<u32>(lo, a.y + b.y + select(0u, 1u, lo < a.x));
+}"),
+    ("sub64", &[], "fn sub64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(a.x - b.x, a.y - b.y - select(0u, 1u, a.x < b.x));
+}"),
+    ("neg64", &["sub64"], "fn neg64(a: vec2<u32>) -> vec2<u32> { return sub64(vec2<u32>(0u, 0u), a); }"),
+    ("mul64", &["mul_hi_u32"], "fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(a.x * b.x, mul_hi_u32(a.x, b.x) + a.x * b.y + a.y * b.x);
+}"),
+    ("shl64", &[], "fn shl64(a: vec2<u32>, s: u32) -> vec2<u32> {
+    let n = s & 63u;
+    if (n == 0u) { return a; }
+    if (n >= 32u) { return vec2<u32>(0u, a.x << (n - 32u)); }
+    return vec2<u32>(a.x << n, (a.y << n) | (a.x >> (32u - n)));
+}"),
+    ("lshr64", &[], "fn lshr64(a: vec2<u32>, s: u32) -> vec2<u32> {
+    let n = s & 63u;
+    if (n == 0u) { return a; }
+    if (n >= 32u) { return vec2<u32>(a.y >> (n - 32u), 0u); }
+    return vec2<u32>((a.x >> n) | (a.y << (32u - n)), a.y >> n);
+}"),
+    ("ashr64", &[], "fn ashr64(a: vec2<u32>, s: u32) -> vec2<u32> {
+    let n = s & 63u;
+    let h = bitcast<i32>(a.y);
+    if (n == 0u) { return a; }
+    if (n >= 32u) { return vec2<u32>(bitcast<u32>(h >> (n - 32u)), bitcast<u32>(h >> 31u)); }
+    return vec2<u32>((a.x >> n) | (a.y << (32u - n)), bitcast<u32>(h >> n));
+}"),
+    ("ult64", &[], "fn ult64(a: vec2<u32>, b: vec2<u32>) -> bool { return a.y < b.y || (a.y == b.y && a.x < b.x); }"),
+    ("slt64", &[], "fn slt64(a: vec2<u32>, b: vec2<u32>) -> bool {
+    let ah = bitcast<i32>(a.y);
+    let bh = bitcast<i32>(b.y);
+    return ah < bh || (ah == bh && a.x < b.x);
+}"),
+    ("abs64", &["neg64"], "fn abs64(a: vec2<u32>) -> vec2<u32> { return select(a, neg64(a), bitcast<i32>(a.y) < 0i); }"),
+    ("udivrem64", &["ult64", "sub64", "shl64"], "fn udivrem64(a: vec2<u32>, b: vec2<u32>) -> array<vec2<u32>, 2> {
+    var q = vec2<u32>(0u, 0u);
+    var r = vec2<u32>(0u, 0u);
+    for (var i = 63i; i >= 0i; i--) {
+        r = shl64(r, 1u);
+        let word = select(a.x, a.y, i >= 32i);
+        r.x = r.x | ((word >> (u32(i) & 31u)) & 1u);
+        if (!ult64(r, b)) {
+            r = sub64(r, b);
+            if (i >= 32i) { q.y = q.y | (1u << (u32(i) - 32u)); } else { q.x = q.x | (1u << u32(i)); }
+        }
+    }
+    return array<vec2<u32>, 2>(q, r);
+}"),
+    ("udiv64", &["udivrem64"], "fn udiv64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> { return udivrem64(a, b)[0]; }"),
+    ("urem64", &["udivrem64"], "fn urem64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> { return udivrem64(a, b)[1]; }"),
+    ("sdiv64", &["udivrem64", "abs64", "neg64"], "fn sdiv64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let q = udivrem64(abs64(a), abs64(b))[0];
+    return select(q, neg64(q), (bitcast<i32>(a.y) < 0i) != (bitcast<i32>(b.y) < 0i));
+}"),
+    ("srem64", &["udivrem64", "abs64", "neg64"], "fn srem64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let r = udivrem64(abs64(a), abs64(b))[1];
+    return select(r, neg64(r), bitcast<i32>(a.y) < 0i);
+}"),
+    ("u64tof32", &[], "fn u64tof32(a: vec2<u32>) -> f32 { return f32(a.y) * 4294967296.0 + f32(a.x); }"),
+    ("s64tof32", &["u64tof32", "neg64"], "fn s64tof32(a: vec2<u32>) -> f32 {
+    if (bitcast<i32>(a.y) < 0i) { return -u64tof32(neg64(a)); }
+    return u64tof32(a);
+}"),
+    ("f32tou64", &[], "fn f32tou64(f: f32) -> vec2<u32> {
+    let x = max(f, 0.0);
+    if (x >= 18446744073709551616.0) { return vec2<u32>(0xffffffffu, 0xffffffffu); }
+    let hi = floor(x / 4294967296.0);
+    return vec2<u32>(u32(x - hi * 4294967296.0), u32(hi));
+}"),
+    ("f32tos64", &["f32tou64", "neg64"], "fn f32tos64(f: f32) -> vec2<u32> {
+    if (f >= 9223372036854775808.0) { return vec2<u32>(0xffffffffu, 0x7fffffffu); }
+    if (f <= -9223372036854775808.0) { return vec2<u32>(0u, 0x80000000u); }
+    if (f < 0.0) { return neg64(f32tou64(-f)); }
+    return f32tou64(f);
+}"),
+    ("clz64", &[], "fn clz64(a: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(select(32u + countLeadingZeros(a.x), countLeadingZeros(a.y), a.y != 0u), 0u);
+}"),
+    ("ctz64", &[], "fn ctz64(a: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(select(32u + min(countTrailingZeros(a.y), 32u), countTrailingZeros(a.x), a.x != 0u), 0u);
+}"),
+    ("popcount64", &[], "fn popcount64(a: vec2<u32>) -> vec2<u32> { return vec2<u32>(countOneBits(a.x) + countOneBits(a.y), 0u); }"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -1575,7 +2168,7 @@ mod tests {
 
     /// A kernel's WGSL, checked by naga as wgpu would.
     pub(crate) fn wgsl(src: &str, kernel: &str, launch: &Launch) -> String {
-        let m = build(&test_clang(), src, "").unwrap();
+        let m = build(&test_clang(), src, "", None).unwrap();
         let w = compile(&m, kernel, launch).unwrap_or_else(|e| panic!("{kernel}: {e}"));
         let module = naga::front::wgsl::parse_str(&w).unwrap_or_else(|e| panic!("{}\n{w}", e.emit_to_string(&w)));
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
@@ -1606,6 +2199,49 @@ __kernel void bytes(__global uchar *p, float4 v, __global float4 *q) {
 }
 static void helper(__global float * restrict a, __global const float * restrict b, int i) { a[i] += b[i]; }
 __kernel void restricted(__global float * restrict a, __global const float * restrict b) { helper(a, b, get_global_id(0)); }
+__kernel void builtins(__global float4 *f, __global int4 *i, __global long *l) {
+    int k = get_global_id(0);
+    prefetch(f, 4);
+    float4 x = f[k];
+    f[k] = normalize(x) + (float4)(length(x), fast_length(x.xy), distance(x, f[k + 1]), nextafter(x.x, 0.0f))
+        + shuffle(x, (uint4)(3, 2, 1, 0)) + shuffle2(x, f[k + 2], (uint4)(7, 0, 5, 2)) + nextafter(x, (float4)(1.0f));
+    i[k] = hadd(i[k], i[k + 1]) + rhadd(i[k], (int4)(3)) + isnan(x) + isless(x, (float4)(0.0f)) + (x != x);
+    l[k] = l[k] * 3 + (long)i[k].x;
+}
+__kernel void longargs(long l, ulong ul, long2 l2, ulong16 ul16, __global float *result, __global float2 *r2, __global float16 *r16) {
+    result[0] = convert_float(l);
+    result[1] = convert_float(ul);
+    r2[0] = convert_float2(l2);
+    r16[0] = convert_float16(ul16);
+}
+__kernel void scalars(__global float4 *f, __global int4 *i) {
+    int k = get_global_id(0);
+    f[k + 1] = cross(f[k], f[k + 2]) + (float4)(dot(f[k].x, f[k].y), dot(f[k], f[k]), length(f[k].x), 0.0f);
+    f[k] = fmax(f[k], 1.0f) + mix(f[k], f[k + 1], 0.25f) + step(0.5f, f[k]) + smoothstep(0.0f, 1.0f, f[k]) + clamp(f[k], 0.0f, 2.0f);
+    i[k] = clamp(i[k], 0, 9) + min(i[k], 3) + max(i[k], -3);
+}
+__kernel void selects(__global uchar4 *a, __global char4 *m, __global float4 *f, __global int4 *i, __global long2 *l, __global short *s) {
+    int k = get_global_id(0);
+    i[k + 1] = isnotequal(f[k], f[k + 1]) + islessgreater(f[k], f[k + 2]) + bitselect(i[k], i[k + 1], i[k + 2]) + (int4)(any(i[k]), all(m[k]), any(l[k]), isunordered(f[k].x, 1.0f));
+    f[k + 2] = bitselect(f[k], f[k + 1], f[k + 2]);
+    a[k] = select(a[k], a[k + 1], m[k]);
+    f[k] = select(f[k], f[k + 1], i[k]);
+    l[k] = select(l[k], l[k + 1], l[k + 2]);
+    s[k] = select(s[k], s[k + 1], s[k + 2]);
+}
+__kernel void reduces(__global int4 *a, __global int *out) {
+    int k = get_global_id(0);
+    int4 v = a[k];
+    out[k] = (v.x | v.y | v.z | v.w) + (v.x + v.y + v.z + v.w) + max(max(v.x, v.y), max(v.z, v.w));
+}
+__kernel void addresses(__global ulong *out) {
+    __local int l[4];
+    __local long m[2];
+    out[0] = (ulong)&l[1] % 4;
+    out[1] = ((ulong)m) & 7;
+    l[get_local_id(0) & 3] = 1;
+    m[0] = 2;
+}
 __constant int table[4] = {3, 1, 4, 1};
 typedef struct { int a; float b; char c; } params;
 __kernel void misc(__global int *out, params p, __global short *s) {
@@ -1630,14 +2266,14 @@ __kernel void misc(__global int *out, params p, __global short *s) {
     #[test]
     fn kernels_become_valid_wgsl() {
         let launch = Launch { local: [64, 1, 1], local_bytes: vec![(2, 256)] };
-        for k in ["add", "reduce", "bytes", "misc", "restricted"] {
+        for k in ["add", "reduce", "bytes", "misc", "restricted", "builtins", "longargs", "scalars", "selects", "reduces", "addresses"] {
             wgsl(KERNELS, k, &launch);
         }
     }
 
     #[test]
     fn arguments_are_laid_out_as_opencl_does() {
-        let m = build(&test_clang(), KERNELS, "").unwrap();
+        let m = build(&test_clang(), KERNELS, "", None).unwrap();
         let info = kernel_info(&m, "misc").unwrap();
         let h = HEADER_WORDS * 4;
         assert_eq!(info.args.iter().map(|a| (a.kind.clone(), a.offset)).collect::<Vec<_>>(), [
@@ -1650,9 +2286,161 @@ __kernel void misc(__global int *out, params p, __global short *s) {
     }
 
     #[test]
+    fn kernel_attributes_read_as_written() {
+        let src = "__kernel __attribute__((vec_type_hint(uint4))) __attribute__((reqd_work_group_size(4, 2, 1))) void k(__global int *p) { p[0] = 1; }\n\
+                   __kernel __attribute__((vec_type_hint(float))) __attribute__((work_group_size_hint(8, 1, 1))) void j(__global int *p) { p[0] = 2; }";
+        let m = build(&test_clang(), src, "", None).unwrap();
+        assert_eq!(kernel_info(&m, "k").unwrap().attributes, "reqd_work_group_size(4,2,1) vec_type_hint(uint4)");
+        assert_eq!(kernel_info(&m, "j").unwrap().attributes, "work_group_size_hint(8,1,1) vec_type_hint(float)");
+    }
+
+    #[test]
     fn builtins_demangle() {
         assert_eq!(demangle("_Z13get_global_idj"), Some(("get_global_id".into(), vec!['j'])));
         assert_eq!(demangle("_Z3minDv4_iS_"), Some(("min".into(), vec!['i'])));
         assert_eq!(demangle("_Z10atomic_addPU3AS1Vii"), Some(("atomic_add".into(), vec!['i', 'i'])));
     }
+}
+
+/// Builtins written for one lane: vector calls go a lane at a time.
+const SCALAR_ONLY: &[&str] = &["nextafter"];
+
+/// The size of the elements an async copy's first parameter points to,
+/// from its mangled name (`PU3AS3Dv4_f`: float4, 16 bytes; three-element
+/// vectors take four elements' room).
+fn elem_size(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("_Z")?;
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    let len: usize = rest[..digits].parse().ok()?;
+    let mut p = rest[digits + len..].chars().peekable();
+    let scalar = |c: char| match c {
+        'c' | 'h' => Some(1),
+        's' | 't' | 'D' => Some(2),
+        'i' | 'j' | 'f' => Some(4),
+        'l' | 'm' | 'd' => Some(8),
+        _ => None,
+    };
+    while let Some(c) = p.next() {
+        match c {
+            'P' | 'K' | 'V' => {}
+            'U' => {
+                let n: String = std::iter::from_fn(|| p.next_if(|c| c.is_ascii_digit())).collect();
+                for _ in 0..n.parse::<usize>().ok()? {
+                    p.next();
+                }
+            }
+            'D' if p.peek() == Some(&'v') => {
+                p.next();
+                let n: String = std::iter::from_fn(|| p.next_if(|c| c.is_ascii_digit())).collect();
+                let n: u32 = n.parse().ok()?;
+                p.next(); // '_'
+                let e = if p.peek() == Some(&'D') {
+                    p.next();
+                    p.next();
+                    2
+                } else {
+                    scalar(p.next()?)?
+                };
+                return Some(e * if n == 3 { 4 } else { n });
+            }
+            'D' => return Some(2),
+            c => return scalar(c),
+        }
+    }
+    None
+}
+
+/// Values a `let` can hold: defined once by a single assignment (not a
+/// phi, an insertelement, a lane-at-a-time wide vector, a cmpxchg's
+/// pair), and used only in their own block (WGSL scopes nest as blocks'
+/// code does, but a use in another block may be in a scope the `let`
+/// doesn't reach).
+fn local_values(f: &Function) -> BTreeSet<usize> {
+    let mut block_of = HashMap::new();
+    let mut candidates = BTreeSet::new();
+    for (b, block) in f.blocks.iter().enumerate() {
+        for i in &block.insts {
+            let Some(r) = i.result else { continue };
+            block_of.insert(r, b);
+            let constant_lane = matches!(&i.op, Op::InsertElement(_, _, k) if matches!(k.v, Value::Const(Const::Int(_))));
+            let single = !matches!(i.op, Op::Phi(_) | Op::CmpXchg(..)) && (constant_lane || !matches!(i.op, Op::InsertElement(..))) && Gen::wide(i).is_none();
+            if single {
+                candidates.insert(r);
+            }
+        }
+    }
+    let mut uses = |o: &Operand, b: usize, phi: bool| {
+        if let Value::Local(r) = o.v
+            && (phi || block_of.get(&r) != Some(&b))
+        {
+            candidates.remove(&r);
+        }
+    };
+    for (b, block) in f.blocks.iter().enumerate() {
+        for i in &block.insts {
+            let phi = matches!(i.op, Op::Phi(_));
+            for o in operands(&i.op) {
+                uses(o, b, phi);
+            }
+        }
+        match &block.term {
+            Term::CondBr(c, ..) | Term::Switch(c, ..) | Term::Ret(Some(c)) => uses(c, b, false),
+            _ => {}
+        }
+    }
+    candidates
+}
+
+fn operands(op: &Op) -> Vec<&Operand> {
+    match op {
+        Op::Bin(_, a, b) | Op::ICmp(_, a, b) | Op::FCmp(_, a, b) | Op::Store(a, b, _) | Op::ExtractElement(a, b) | Op::AtomicRmw(_, a, b) => vec![a, b],
+        Op::FNeg(a) | Op::Cast(_, a) | Op::Load(a, _) | Op::Freeze(a) | Op::ExtractValue(a, _) => vec![a],
+        Op::Select(a, b, c) | Op::InsertElement(a, b, c) | Op::CmpXchg(a, b, c) => vec![a, b, c],
+        Op::Shuffle(a, b, _) | Op::InsertValue(a, b, _) => vec![a, b],
+        Op::Gep(_, a, idx) => std::iter::once(a).chain(idx).collect(),
+        Op::Phi(inc) => inc.iter().map(|(o, _)| o).collect(),
+        Op::Call(_, args) => args.iter().collect(),
+        Op::Alloca(..) | Op::Fence => vec![],
+    }
+}
+
+/// Builtins whose vector forms take scalars for some arguments.
+const SPLATTED: &[&str] = &["min", "max", "clamp", "mix", "step", "smoothstep", "fmin", "fmax", "fdim", "fmod", "pow", "powr", "atan2", "hypot", "copysign"];
+
+/// A kernel's attributes from its metadata, as OpenCL C spells them.
+fn attributes(m: &Module, f: &Function, required: Option<[u32; 3]>) -> String {
+    let mut out = Vec::new();
+    if let Some([x, y, z]) = required {
+        out.push(format!("reqd_work_group_size({x},{y},{z})"));
+    }
+    if let Some(&n) = f.metadata.get("work_group_size_hint")
+        && let [x, y, z] = m.meta_ints(n)[..]
+    {
+        out.push(format!("work_group_size_hint({x},{y},{z})"));
+    }
+    // vec_type_hint: !{<4 x i32> undef, i32 1}: the type, and 1 if signed.
+    if let Some(text) = f.metadata.get("vec_type_hint").and_then(|n| m.metadata_text.get(n)) {
+        let (ty, signed) = text.rsplit_once(',').map_or((text.as_str(), "1"), |(t, s)| (t, s.trim()));
+        let ty = ty.trim().trim_end_matches("undef").trim_end_matches("poison").trim();
+        let (lanes, scalar) = match ty.strip_prefix('<').and_then(|t| t.strip_suffix('>')).and_then(|t| t.split_once(" x ")) {
+            Some((n, e)) => (n.trim().to_string(), e.trim()),
+            None => (String::new(), ty),
+        };
+        let unsigned = signed.ends_with('0');
+        let name = match scalar {
+            "i8" => "char",
+            "i16" => "short",
+            "i32" => "int",
+            "i64" => "long",
+            "half" => "half",
+            "float" => "float",
+            "double" => "double",
+            _ => "",
+        };
+        if !name.is_empty() {
+            let u = if unsigned && scalar.starts_with('i') { "u" } else { "" };
+            out.push(format!("vec_type_hint({u}{name}{lanes})"));
+        }
+    }
+    out.join(" ")
 }

@@ -501,6 +501,10 @@ impl Process {
             nr::READLINKAT => {
                 let path = mem::cstr(data, ub)?;
                 let dir = self.dir_of(a, &path)?;
+                if let Some(exe) = self.proc_exe(&dir, &path) {
+                    let n = exe.len().min(d as usize);
+                    return mem::write(data, uc, &exe.as_bytes()[..n]).map(|_| n as i64);
+                }
                 let guest = self.fs.resolve(&dir, &path, false)?;
                 let target = fs::links::read(&self.fs.host(&guest)).map_err(|e| match fs::errno(&e) {
                     ENOENT => ENOENT,
@@ -1142,6 +1146,14 @@ impl Process {
         Ok(self.fs.host(&self.fs.resolve(&dir, &path, follow)?))
     }
 
+    /// /proc/self/exe (or /proc/PID/exe for this process): the program's
+    /// path, which the link leads to.
+    fn proc_exe(&self, dir: &str, path: &str) -> Option<String> {
+        let full = if path.starts_with('/') { path.to_string() } else { format!("{}/{path}", dir.trim_end_matches('/')) };
+        let own = format!("/proc/{}/exe", self.pid);
+        (full == "/proc/self/exe" || full == own).then(|| self.exe.clone())
+    }
+
     /// The guest directory an *at() call is relative to: none for an
     /// absolute path, whose descriptor Linux ignores (hwloc passes -1).
     fn dir_of(&self, dirfd: i64, path: &str) -> SysResult<String> {
@@ -1307,6 +1319,7 @@ impl Process {
             pending: None,
             trace: self.trace,
             start: self.start,
+            exe: self.exe.clone(),
             module: self.module.clone(),
             clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid as u64 } else { 0 },
             started: None,
@@ -1516,6 +1529,9 @@ impl Process {
 
     fn openat(&mut self, dirfd: i64, path: &str, flags: i64) -> SysResult<i64> {
         let dir = self.dir_of(dirfd, &path)?;
+        if let Some(exe) = self.proc_exe(&dir, path) {
+            return self.openat(AT_FDCWD, &exe, flags);
+        }
         match self.fs.device(&dir, path) {
             Some(DevPath::Device(Device::Gpu)) => {
                 let open = Arc::new(Mutex::new(Open::Gpu(Arc::new(crate::gpu::Session::open()?))));
@@ -1702,6 +1718,9 @@ impl Process {
             return self.fstat(dirfd);
         }
         let dir = self.dir_of(dirfd, &path)?;
+        if let Some(exe) = self.proc_exe(&dir, path) {
+            return self.fstatat(AT_FDCWD, &exe, flags & !AT_SYMLINK_NOFOLLOW);
+        }
         match self.fs.device(&dir, path) {
             Some(DevPath::Device(d)) => return Ok(fs::device_stat_bytes(d)),
             Some(DevPath::Fd(n)) => return self.fstat(n),
@@ -1905,7 +1924,8 @@ impl Process {
                 Open::Gpu(s) => s.clone(),
                 _ => return Err(ENOTTY),
             };
-            return session.call(data, arg);
+            let guest = wasm_env_gpu::opencl::Guest { root: self.fs.host("/"), cwd: self.fs.host(&self.fs.cwd()) };
+            return session.call(data, arg, &guest);
         }
         const TIOCGWINSZ: i64 = 0x5413;
         const FIONREAD: i64 = 0x541b;
