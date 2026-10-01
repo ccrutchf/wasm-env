@@ -34,6 +34,10 @@ use crate::structure::{Node, structure};
 /// global size (3), the work dimension, and the group offset (3) of this
 /// dispatch (a launch larger than one dispatch allows is several).
 pub const HEADER_WORDS: u32 = 16;
+/// What every pointer's value adds to its byte offset, so that only a null
+/// pointer is 0 (a buffer's start is a pointer like any other, and kernels
+/// compare pointers with NULL). A page, so alignments are kept.
+const BIAS: u32 = 4096;
 const GLOBAL_OFFSET: u32 = 0;
 const GLOBAL_SIZE: u32 = 3;
 const WORK_DIM: u32 = 6;
@@ -57,6 +61,10 @@ pub struct Arg {
     /// OpenCL's description, for clGetKernelArgInfo.
     pub type_name: String,
     pub name: String,
+    /// OpenCL's qualifiers: the type's (CL_KERNEL_ARG_TYPE_CONST 1, RESTRICT 2,
+    /// VOLATILE 4, PIPE 8) and the access (CL_KERNEL_ARG_ACCESS_*, or 0).
+    pub type_qualifiers: u32,
+    pub access: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +78,8 @@ pub struct KernelInfo {
     /// The kernel's attributes, as clGetKernelInfo gives them:
     /// "reqd_work_group_size(X,Y,Z) vec_type_hint(T)" and the like.
     pub attributes: String,
+    /// Bytes of `__local` variables the kernel declares (not its arguments).
+    pub static_local: u32,
 }
 
 /// A kernel's arguments and their layout.
@@ -77,6 +87,8 @@ pub fn kernel_info(m: &Module, name: &str) -> Res<KernelInfo> {
     let f = m.function(name).filter(|f| f.kernel).ok_or_else(|| format!("no kernel {name}"))?;
     let types = f.metadata.get("kernel_arg_type").map(|&n| m.meta_strings(n)).unwrap_or_default();
     let names = f.metadata.get("kernel_arg_name").map(|&n| m.meta_strings(n)).unwrap_or_default();
+    let quals = f.metadata.get("kernel_arg_type_qual").map(|&n| m.meta_strings(n)).unwrap_or_default();
+    let access = f.metadata.get("kernel_arg_access_qual").map(|&n| m.meta_strings(n)).unwrap_or_default();
     let mut offset = HEADER_WORDS * 4;
     let mut args = Vec::new();
     for (k, t) in f.params.iter().enumerate() {
@@ -101,13 +113,27 @@ pub fn kernel_info(m: &Module, name: &str) -> Res<KernelInfo> {
             kind,
             offset,
             type_name: types.get(k).cloned().unwrap_or_default(),
+            type_qualifiers: quals.get(k).map_or(0, |q| {
+                let has = |w: &str| q.split_whitespace().any(|x| x == w);
+                has("const") as u32 | (has("restrict") as u32) << 1 | (has("volatile") as u32) << 2 | (has("pipe") as u32) << 3
+            }),
+            access: match access.get(k).map(String::as_str) {
+                Some("read_only") => 0x11A0,
+                Some("write_only") => 0x11A1,
+                Some("read_write") => 0x11A2,
+                Some("none") => 0x11A3,
+                _ => 0,
+            },
             name: names.get(k).cloned().unwrap_or_default(),
         });
         offset += size;
     }
     let required_local = f.metadata.get("reqd_work_group_size").map(|&n| m.meta_ints(n)).filter(|v| v.len() == 3).map(|v| [v[0] as u32, v[1] as u32, v[2] as u32]);
     let attributes = attributes(m, f, required_local);
-    Ok(KernelInfo { name: name.to_string(), args, block_size: offset.next_multiple_of(4), required_local, attributes })
+    // (clang names a kernel's __local variables "kernel.variable".)
+    let prefix = format!("{name}.");
+    let static_local = m.globals.iter().filter(|g| g.space == 3 && g.name.starts_with(&prefix)).map(|g| m.layout(&g.ty).map_or(0, |(s, _)| s as u32)).sum();
+    Ok(KernelInfo { name: name.to_string(), args, block_size: offset.next_multiple_of(4), required_local, attributes, static_local })
 }
 
 /// A byval argument's struct type: recorded by the parser from the
@@ -402,10 +428,11 @@ impl Gen<'_> {
         for (k, t) in self.f.params.iter().enumerate() {
             let a = &self.info.args[k];
             let v = match (&a.kind, t) {
-                (ArgKind::Buffer { .. }, _) => format!("args[{}]", a.offset / 4),
-                (ArgKind::Local, _) => "0u".into(),
-                (_, Type::Ptr(0)) => format!("{}u", a.offset),
-                (_, t) => self.load_expr(Base::Block, &format!("{}u", a.offset), t, 4)?,
+                // (A null buffer is 0xffffffff in the block: the pointer 0.)
+                (ArgKind::Buffer { .. }, _) => format!("select(args[{o}] + {BIAS}u, 0u, args[{o}] == 0xffffffffu)", o = a.offset / 4),
+                (ArgKind::Local, _) => format!("{BIAS}u"),
+                (_, Type::Ptr(0)) => format!("{}u", a.offset + BIAS),
+                (_, t) => self.load_expr(Base::Block, &format!("{}u", a.offset + BIAS), t, 4)?,
             };
             writeln!(o, "    let a{k} = {v};").unwrap();
         }
@@ -442,7 +469,7 @@ impl Gen<'_> {
         let rd = |i: &str| if atomic { format!("atomicLoad(&{n}[{i}])") } else { format!("{n}[{i}]") };
         writeln!(
             o,
-            "fn ld_{n}(p: u32) -> u32 {{\n    let i = p >> 2u;\n    let s = (p & 3u) * 8u;\n    if (s == 0u) {{ return {}; }}\n    return ({} >> s) | ({} << (32u - s));\n}}",
+            "fn ld_{n}(p: u32) -> u32 {{\n    let i = (p - 4096u) >> 2u;\n    let s = (p & 3u) * 8u;\n    if (s == 0u) {{ return {}; }}\n    return ({} >> s) | ({} << (32u - s));\n}}",
             rd("i"),
             rd("i"),
             rd("i + 1u")
@@ -456,10 +483,10 @@ impl Gen<'_> {
         } else {
             format!("{n}[i] = ({n}[i] & ~(0xffu << s)) | (((v >> (8u * k)) & 0xffu) << s);")
         };
-        let whole = if atomic { format!("atomicStore(&{n}[p >> 2u], v)") } else { format!("{n}[p >> 2u] = v") };
+        let whole = if atomic { format!("atomicStore(&{n}[(p - 4096u) >> 2u], v)") } else { format!("{n}[(p - 4096u) >> 2u] = v") };
         writeln!(
             o,
-            "fn st_{n}(p: u32, v: u32, bytes: u32) {{\n    if ((p & 3u) == 0u && bytes == 4u) {{ {whole}; return; }}\n    for (var k = 0u; k < bytes; k++) {{\n        let q = p + k;\n        let i = q >> 2u;\n        let s = (q & 3u) * 8u;\n        {set_byte}\n    }}\n}}"
+            "fn st_{n}(p: u32, v: u32, bytes: u32) {{\n    if ((p & 3u) == 0u && bytes == 4u) {{ {whole}; return; }}\n    for (var k = 0u; k < bytes; k++) {{\n        let q = p + k;\n        let i = (q - 4096u) >> 2u;\n        let s = (q & 3u) * 8u;\n        {set_byte}\n    }}\n}}"
         )
         .unwrap();
     }
@@ -536,7 +563,7 @@ impl Gen<'_> {
                 let items: Vec<String> = items.iter().map(|i| self.constant(e, i)).collect::<Res<_>>()?;
                 format!("{}({})", self.wty(t)?, items.join(", "))
             }
-            (Const::Global(_), Type::Ptr(_)) => "0u".into(),
+            (Const::Global(_), Type::Ptr(_)) => format!("{BIAS}u"),
             (Const::Gep(src, ops), Type::Ptr(_)) => {
                 let base = self.val(&ops[0])?;
                 let off = self.gep_offset(src, &ops[1..])?;
@@ -817,7 +844,7 @@ impl Gen<'_> {
                 let e = format!("{} + {}", self.val(base)?, self.gep_offset(src, idx)?);
                 self.set(i, e);
             }
-            Op::Alloca(..) => self.set(i, "0u".into()),
+            Op::Alloca(..) => self.set(i, format!("{BIAS}u")),
             Op::Load(p, align) => {
                 if matches!(i.ty, Type::Ptr(_)) {
                     bail!("a pointer loaded from memory");
@@ -913,12 +940,12 @@ impl Gen<'_> {
         }
         let w = bits(t);
         if w == 1 {
-            // i1 as bool.
+            // i1 as bool (`&` and `|`: WGSL's bool vectors have no `&&`, `||`).
             return Ok(match op {
-                "and" => format!("{x} && {y}"),
-                "or" => format!("{x} || {y}"),
+                "and" => format!("({x} & {y})"),
+                "or" => format!("({x} | {y})"),
                 "xor" | "add" | "sub" => format!("{x} != {y}"),
-                "mul" => format!("{x} && {y}"),
+                "mul" => format!("({x} & {y})"),
                 o => bail!("{o} on i1"),
             });
         }
@@ -1150,7 +1177,7 @@ impl Gen<'_> {
     fn word_at(&self, b: Base, p: &str, align: u32) -> String {
         let n = name(b);
         if align.is_multiple_of(4) {
-            if self.atomic.contains(&b) { format!("atomicLoad(&{n}[({p}) >> 2u])") } else { format!("{n}[({p}) >> 2u]") }
+            if self.atomic.contains(&b) { format!("atomicLoad(&{n}[(({p}) - 4096u) >> 2u])") } else { format!("{n}[(({p}) - 4096u) >> 2u]") }
         } else {
             format!("ld_{n}({p})")
         }
@@ -1208,9 +1235,9 @@ impl Gen<'_> {
                 let atomic = self.atomic.contains(&b);
                 if s == 4 && align.is_multiple_of(4) {
                     if atomic {
-                        self.line(&format!("atomicStore(&{n}[({p}) >> 2u], {w});"));
+                        self.line(&format!("atomicStore(&{n}[(({p}) - 4096u) >> 2u], {w});"));
                     } else {
-                        self.line(&format!("{n}[({p}) >> 2u] = {w};"));
+                        self.line(&format!("{n}[(({p}) - 4096u) >> 2u] = {w};"));
                     }
                 } else if s == 1 || (s == 2 && align >= 2) {
                     // Within one word: its bits replaced, inline.
@@ -1219,10 +1246,10 @@ impl Gen<'_> {
                     self.line(&format!("    let q = {p};"));
                     self.line("    let s = (q & 3u) * 8u;");
                     if atomic {
-                        self.line(&format!("    atomicAnd(&{n}[q >> 2u], ~({m} << s));"));
-                        self.line(&format!("    atomicOr(&{n}[q >> 2u], (({w}) & {m}) << s);"));
+                        self.line(&format!("    atomicAnd(&{n}[(q - 4096u) >> 2u], ~({m} << s));"));
+                        self.line(&format!("    atomicOr(&{n}[(q - 4096u) >> 2u], (({w}) & {m}) << s);"));
                     } else {
-                        self.line(&format!("    {n}[q >> 2u] = ({n}[q >> 2u] & ~({m} << s)) | ((({w}) & {m}) << s);"));
+                        self.line(&format!("    {n}[(q - 4096u) >> 2u] = ({n}[(q - 4096u) >> 2u] & ~({m} << s)) | ((({w}) & {m}) << s);"));
                     }
                     self.line("}");
                 } else {
@@ -1240,7 +1267,7 @@ impl Gen<'_> {
         self.temp += 1;
         self.line(&format!("var old{t}: u32;"));
         self.line("loop {");
-        self.line(&format!("    let r = atomicCompareExchangeWeak(&{n}[({p}) >> 2u], {cmp}, {new});"));
+        self.line(&format!("    let r = atomicCompareExchangeWeak(&{n}[(({p}) - 4096u) >> 2u], {cmp}, {new});"));
         self.line(&format!("    if (r.exchanged || r.old_value != {cmp}) {{ old{t} = r.old_value; break; }}"));
         self.line("}");
         format!("old{t}")
@@ -1248,7 +1275,7 @@ impl Gen<'_> {
 
     fn atomic_rmw(&mut self, b: Base, kind: &str, p: &str, v: &str, t: &Type) -> Res<String> {
         let n = name(b);
-        let at = format!("&{n}[({p}) >> 2u]");
+        let at = format!("&{n}[(({p}) - 4096u) >> 2u]");
         let w = self.to_word(v, t)?;
         let simple = match kind {
             "add" => Some("atomicAdd"),
@@ -2112,6 +2139,8 @@ const LIBRARY: &[(&str, &[&str], &str)] = &[
 }"),
     ("abs64", &["neg64"], "fn abs64(a: vec2<u32>) -> vec2<u32> { return select(a, neg64(a), bitcast<i32>(a.y) < 0i); }"),
     ("udivrem64", &["ult64", "sub64", "shl64"], "fn udivrem64(a: vec2<u32>, b: vec2<u32>) -> array<vec2<u32>, 2> {
+    // (Both 32-bit: natively.)
+    if (a.y == 0u && b.y == 0u && b.x != 0u) { return array<vec2<u32>, 2>(vec2<u32>(a.x / b.x, 0u), vec2<u32>(a.x % b.x, 0u)); }
     var q = vec2<u32>(0u, 0u);
     var r = vec2<u32>(0u, 0u);
     for (var i = 63i; i >= 0i; i--) {
@@ -2242,6 +2271,12 @@ __kernel void addresses(__global ulong *out) {
     l[get_local_id(0) & 3] = 1;
     m[0] = 2;
 }
+__kernel void longlogic(__global long4 *a, __global long4 *b, __global long *s, __global long2 *c) {
+    int k = get_global_id(0);
+    a[k] = (a[k] && b[k]) + (a[k] || b[k]) + !a[k] + (a[k] < b[k]) + (a[k] == b[k]);
+    s[k] = (s[k] && s[k + 1]) + !s[k];
+    c[k] = c[k] > c[k + 1] ? c[k] : c[k + 1];
+}
 __constant int table[4] = {3, 1, 4, 1};
 typedef struct { int a; float b; char c; } params;
 __kernel void misc(__global int *out, params p, __global short *s) {
@@ -2266,7 +2301,7 @@ __kernel void misc(__global int *out, params p, __global short *s) {
     #[test]
     fn kernels_become_valid_wgsl() {
         let launch = Launch { local: [64, 1, 1], local_bytes: vec![(2, 256)] };
-        for k in ["add", "reduce", "bytes", "misc", "restricted", "builtins", "longargs", "scalars", "selects", "reduces", "addresses"] {
+        for k in ["add", "reduce", "bytes", "misc", "restricted", "builtins", "longargs", "scalars", "selects", "reduces", "addresses", "longlogic"] {
             wgsl(KERNELS, k, &launch);
         }
     }

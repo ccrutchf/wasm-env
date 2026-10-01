@@ -25,7 +25,9 @@
 //!              r0: number of arguments, r2: argument block size, r3..r5:
 //!              reqd_work_group_size (0 if none); the arguments as 128-byte
 //!              records: kind (u32: 0 buffer, 1 constant buffer, 2 local,
-//!              3 value), size (u32), offset in the block (u32), 0 (u32),
+//!              3 value), size (u32), offset in the block (u32), qualifiers
+//!              (u32: the type's, CL_KERNEL_ARG_TYPE_*, and above them the
+//!              access, CL_KERNEL_ARG_ACCESS_* - 0x1100 or 0),
 //!              type name (56 bytes), name (56 bytes)
 //!  12 RUN      a0: program, a1: name, a2: length, a3: dimensions,
 //!              a4: sizes (u32 × 9: global, offset, local; local 0 to let
@@ -34,7 +36,8 @@
 //!              a8: per argument, local memory bytes (u32)
 //!  13 FINISH
 //!  14 ATTRIBUTES a0: program, a1: name, a2: length, a3: address, a4: capacity
-//!              r0: the length of the kernel's attributes ("reqd_work_group_size(…)…")
+//!              r0: the length of the kernel's attributes ("reqd_work_group_size(…)…"),
+//!              r2: bytes of its own __local variables
 //!  15 COMPILE  a0: source, a1: length, a2: options, a3: length, a4: headers
 //!              (u64 × 4 each: source, length, name, length), a5: their number
 //!              r0: program handle (an object: clCompileProgram)
@@ -251,6 +254,7 @@ impl Session {
                     rec[0..4].copy_from_slice(&kind.to_le_bytes());
                     rec[4..8].copy_from_slice(&size.to_le_bytes());
                     rec[8..12].copy_from_slice(&(arg.offset - wgsl::HEADER_WORDS * 4).to_le_bytes());
+                    rec[12..16].copy_from_slice(&(arg.type_qualifiers | arg.access << 16).to_le_bytes());
                     let t = arg.type_name.as_bytes();
                     rec[16..16 + t.len().min(55)].copy_from_slice(&t[..t.len().min(55)]);
                     let nm = arg.name.as_bytes();
@@ -262,6 +266,7 @@ impl Session {
                 let name = String::from_utf8_lossy(mem::slice(data, a[1], a[2])?).into_owned();
                 let info = wgsl::kernel_info(&m, &name).map_err(|_| Failure::Cl(CL_INVALID_KERNEL_NAME))?;
                 r[0] = info.attributes.len() as u64;
+                r[2] = info.static_local as u64;
                 let n = info.attributes.len().min(a[4] as usize);
                 mem::slice_mut(data, a[3], n as u64)?.copy_from_slice(&info.attributes.as_bytes()[..n]);
             }

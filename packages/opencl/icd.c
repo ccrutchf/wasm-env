@@ -102,7 +102,7 @@ struct _cl_program {
     int prebuilt;
 };
 struct arg {
-    uint32_t kind, size, offset, zero;
+    uint32_t kind, size, offset, qualifiers;
     char type[56], name[56];
 };
 struct _cl_kernel {
@@ -119,6 +119,7 @@ struct _cl_kernel {
     uint8_t *set;
     size_t required[3];
     char *attributes;
+    size_t static_local;
 };
 struct _cl_event {
     struct _cl_icd_dispatch *d;
@@ -441,7 +442,7 @@ static cl_context CreateContext(const cl_context_properties *props, cl_uint n, c
                                 void(CL_CALLBACK *notify)(const char *, const void *, size_t, void *), void *user, cl_int *err) {
     (void)notify, (void)user;
     cl_int e = CL_SUCCESS;
-    if (!n || !devices)
+    if (!n || !devices || (!notify && user))
         e = CL_INVALID_VALUE;
     for (cl_uint i = 0; e == CL_SUCCESS && i < n; i++)
         if (devices[i] != &device)
@@ -1343,6 +1344,8 @@ static cl_kernel CreateKernel(cl_program p, const char *name, cl_int *err) {
                 retain(&p->refs);
                 retain(&p->kernels);
                 struct request q = {ATTRIBUTES, {p->handle, (uintptr_t)name, strlen(name), 0, 0}};
+                if (call(&q) == CL_SUCCESS)
+                    k->static_local = q.r[2];
                 if (call(&q) == CL_SUCCESS && (k->attributes = calloc(1, q.r[0] + 1))) {
                     q = (struct request){ATTRIBUTES, {p->handle, (uintptr_t)name, strlen(name), (uintptr_t)k->attributes, q.r[0]}};
                     call(&q);
@@ -1421,10 +1424,10 @@ static cl_int SetKernelArg(cl_kernel k, cl_uint i, size_t size, const void *valu
         if (size != sizeof(cl_mem))
             return CL_INVALID_ARG_SIZE;
         cl_mem m = value ? *(const cl_mem *)value : NULL;
-        // A null buffer argument: the kernel mustn't use it; offset 0 in
-        // no buffer (the device reports it if it does).
+        // A null buffer argument (allowed: the kernel may test for it, not
+        // use it): 0xffffffff, which the kernel sees as a null pointer.
         k->handles[i] = m ? base_handle(m) : 0;
-        uint32_t offset = m ? (uint32_t)base_offset(m) : 0;
+        uint32_t offset = m ? (uint32_t)base_offset(m) : 0xffffffffu;
         memcpy(k->block + a->offset, &offset, 4);
         break;
     }
@@ -1477,7 +1480,7 @@ static cl_int GetKernelWorkGroupInfo(cl_kernel k, cl_device_id d, cl_kernel_work
     case CL_KERNEL_COMPILE_WORK_GROUP_SIZE:
         return info(k->required, sizeof k->required, cap, out, size_ret);
     case CL_KERNEL_LOCAL_MEM_SIZE: {
-        cl_ulong total = 0;
+        cl_ulong total = k->static_local;
         for (cl_uint i = 0; i < k->nargs; i++)
             total += k->locals[i];
         INFO_OF(cl_ulong, total);
@@ -1504,11 +1507,11 @@ static cl_int GetKernelArgInfo(cl_kernel k, cl_uint i, cl_kernel_arg_info what, 
                 : a->kind == 2 ? CL_KERNEL_ARG_ADDRESS_LOCAL
                                : CL_KERNEL_ARG_ADDRESS_PRIVATE);
     case CL_KERNEL_ARG_ACCESS_QUALIFIER:
-        INFO_OF(cl_kernel_arg_access_qualifier, CL_KERNEL_ARG_ACCESS_NONE);
+        INFO_OF(cl_kernel_arg_access_qualifier, (a->qualifiers >> 16) ? (a->qualifiers >> 16) : CL_KERNEL_ARG_ACCESS_NONE);
     case CL_KERNEL_ARG_TYPE_NAME:
         INFO_STR(a->type);
     case CL_KERNEL_ARG_TYPE_QUALIFIER:
-        INFO_OF(cl_kernel_arg_type_qualifier, a->kind == 1 ? CL_KERNEL_ARG_TYPE_CONST : CL_KERNEL_ARG_TYPE_NONE);
+        INFO_OF(cl_kernel_arg_type_qualifier, a->qualifiers & 0xffff);
     case CL_KERNEL_ARG_NAME:
         if (!a->name[0])
             return CL_KERNEL_ARG_INFO_NOT_AVAILABLE;
