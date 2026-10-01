@@ -542,7 +542,7 @@ fn check_kernels(m: &Module) -> String {
         // Checked with a trivial launch: what the kernel's code needs is the
         // same for every launch.
         let locals = f.params.iter().enumerate().filter(|(_, t)| **t == wasm_env_gpu::ir::Type::Ptr(3)).map(|(k, _)| (k, 4)).collect();
-        if let Err(e) = wgsl::compile(m, &f.name, &Launch { local: [1, 1, 1], local_bytes: locals }) {
+        if let Err(e) = wgsl::compile(m, &f.name, &Launch { local: [1, 1, 1], local_bytes: locals }, Default::default()) {
             log.push_str(&format!("kernel {}: not supported here: {e}\n", f.name));
         }
     }

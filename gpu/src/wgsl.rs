@@ -142,6 +142,17 @@ fn byval_type(_m: &Module, f: &Function, k: usize) -> Option<Type> {
     f.byval.get(&k).cloned()
 }
 
+/// What a device does that OpenCL doesn't allow, which kernels make up for
+/// (`Gpu::open` finds out).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Quirks {
+    /// Products just under the smallest normal number flushed to zero where
+    /// rounding them (to the denormals' precision) gives that number: x86's
+    /// flush to zero, which lavapipe has, takes a result as tiny after
+    /// rounding it with an unbounded exponent.
+    pub flushes_rounded_up_products: bool,
+}
+
 /// What a launch fixes that the shader depends on.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Launch {
@@ -164,7 +175,7 @@ enum Base {
     Global(usize),
 }
 
-pub fn compile(m: &Module, name: &str, launch: &Launch) -> Res<String> {
+pub fn compile(m: &Module, name: &str, launch: &Launch, quirks: Quirks) -> Res<String> {
     let f = m.function(name).filter(|f| f.kernel).ok_or_else(|| format!("no kernel {name}"))?;
     let info = kernel_info(m, name)?;
     for b in &f.blocks {
@@ -177,7 +188,7 @@ pub fn compile(m: &Module, name: &str, launch: &Launch) -> Res<String> {
         }
     }
     let tree = structure(f)?;
-    let mut g = Gen { m, f, info: &info, launch, out: String::new(), bases: HashMap::new(), atomic: BTreeSet::new(), private: BTreeMap::new(), depth: 1, temp: 0, lets: BTreeSet::new(), vector_call: false, loop_exit: None, lane: None, needs: Default::default() };
+    let mut g = Gen { m, f, info: &info, launch, quirks, out: String::new(), bases: HashMap::new(), atomic: BTreeSet::new(), private: BTreeMap::new(), depth: 1, temp: 0, lets: BTreeSet::new(), vector_call: false, loop_exit: None, lane: None, needs: Default::default() };
     g.provenance()?;
     g.lets = local_values(f);
     g.find_atomic_bases()?;
@@ -194,6 +205,7 @@ struct Gen<'a> {
     f: &'a Function,
     info: &'a KernelInfo,
     launch: &'a Launch,
+    quirks: Quirks,
     out: String,
     /// Each pointer value's base.
     bases: HashMap<Value, Base>,
@@ -936,6 +948,15 @@ impl Gen<'_> {
                 "frem" => "%",
                 o => bail!("{o} on floats"),
             };
+            if op == "fmul" && self.quirks.flushes_rounded_up_products && *t.scalar() == Type::Float {
+                self.need("fmul_ftz");
+                let lanes = t.lanes();
+                if lanes == 1 {
+                    return Ok(format!("fmul_ftz({x}, {y})"));
+                }
+                let l: Vec<String> = (0..lanes).map(|k| format!("fmul_ftz(({x})[{k}], ({y})[{k}])")).collect();
+                return Ok(format!("vec{lanes}<f32>({})", l.join(", ")));
+            }
             return Ok(format!("{x} {o} {y}"));
         }
         let w = bits(t);
@@ -1838,7 +1859,45 @@ impl Gen<'_> {
                 ("clz", _) => call("clz64"),
                 ("ctz", _) => call("ctz64"),
                 ("popcount", _) => call("popcount64"),
-                (b, _) => bail!("the builtin {b} on 64-bit integers"),
+                _ => {
+                    let f = |n: &'static str, k: usize| {
+                        self.need(n);
+                        format!("{n}({})", v[..k].join(", "))
+                    };
+                    let u = unsigned;
+                    match b {
+                        "mul_hi" => f(if u { "umulhi64" } else { "smulhi64" }, 2),
+                        "mad_hi" => {
+                            self.need("add64");
+                            format!("add64({}, {})", f(if u { "umulhi64" } else { "smulhi64" }, 2), v[2])
+                        }
+                        "add_sat" => f(if u { "uaddsat64" } else { "saddsat64" }, 2),
+                        "sub_sat" => f(if u { "usubsat64" } else { "ssubsat64" }, 2),
+                        "mad_sat" => f(if u { "umadsat64" } else { "smadsat64" }, 3),
+                        "abs_diff" => {
+                            self.need("sub64");
+                            let (a, c) = (&v[0], &v[1]);
+                            format!("select(sub64({a}, {c}), sub64({c}, {a}), {lt}({a}, {c}))")
+                        }
+                        // (a >> 1) + (b >> 1) + the carry of their low bits.
+                        "hadd" | "rhadd" => {
+                            let sh = if u { "lshr64" } else { "ashr64" };
+                            self.need(sh);
+                            self.need("add64");
+                            let (a, c) = (&v[0], &v[1]);
+                            let low = if b == "hadd" { format!("({a}.x & {c}.x & 1u)") } else { format!("(({a}.x | {c}.x) & 1u)") };
+                            format!("add64(add64({sh}({a}, 1u), {sh}({c}, 1u)), vec2<u32>({low}, 0u))")
+                        }
+                        "rotate" => {
+                            self.need("shl64");
+                            self.need("lshr64");
+                            let (a, s) = (&v[0], format!("({}.x & 63u)", v[1]));
+                            // (Shifts take their counts mod 64: a rotation by 0 is a | a.)
+                            format!("(shl64({a}, {s}) | lshr64({a}, 64u - {s}))")
+                        }
+                        b => bail!("the builtin {b} on 64-bit integers"),
+                    }
+                }
             });
         }
         if w > 32 {
@@ -1859,7 +1918,9 @@ impl Gen<'_> {
             ("abs", true) => v[0].clone(),
             ("abs", false) => back(format!("abs({})", s(&v[0]))),
             ("abs_diff", true) => format!("(max({a}, {b}) - min({a}, {b}))", a = v[0], b = v[1]),
-            ("abs_diff", false) => back(format!("abs({} - {})", s(&v[0]), s(&v[1]))),
+            // (Unsigned, so a - b or b - a wrapping: exact, where abs of the
+            // signed difference overflows.)
+            ("abs_diff", false) => format!("(select({a} - {b}, {b} - {a}, {} < {}) & {})", s(&v[0]), s(&v[1]), m(mask(w) as u64), a = v[0], b = v[1]),
             ("add_sat" | "sub_sat", u) => self.saturating(t, b == "add_sat", u, &v[0], &v[1]),
             ("hadd", false) => back(format!("(({a} >> {u1}) + ({b} >> {u1}) + ({a} & {b} & {i1}))", a = s(&v[0]), b = s(&v[1]), u1 = m(1), i1 = ones(lanes))),
             ("rhadd", false) => back(format!("(({a} >> {u1}) + ({b} >> {u1}) + (({a} | {b}) & {i1}))", a = s(&v[0]), b = s(&v[1]), u1 = m(1), i1 = ones(lanes))),
@@ -1894,6 +1955,31 @@ impl Gen<'_> {
             }
             ("mul_hi", true) => format!("(({} * {}) >> {})", v[0], v[1], m(w as u64)),
             ("mul_hi", false) => back(format!("(({} * {}) >> {})", s(&v[0]), s(&v[1]), m(w as u64))),
+            ("mad_hi", u) => {
+                let hi = self.integer("mul_hi", t, &args[..2], &v[..2], u)?;
+                format!("(({hi} + {}) & {})", v[2], m(mask(w) as u64))
+            }
+            ("mad_sat", u) if w == 32 => {
+                // (A function a lane at a time.)
+                let n = if u { "umadsat32" } else { "smadsat32" };
+                self.need(n);
+                if lanes > 1 {
+                    let l: Vec<String> = (0..lanes).map(|k| format!("{n}(({})[{k}], ({})[{k}], ({})[{k}])", v[0], v[1], v[2])).collect();
+                    format!("vec{lanes}<u32>({})", l.join(", "))
+                } else {
+                    format!("{n}({}, {}, {})", v[0], v[1], v[2])
+                }
+            }
+            // (Narrower: exact in 32 bits.)
+            ("mad_sat", true) => format!("min({} * {} + {}, {})", v[0], v[1], v[2], m(mask(w) as u64)),
+            ("mad_sat", false) => {
+                let it = if lanes > 1 { format!("vec{lanes}<i32>") } else { "i32".into() };
+                let (lo, hi) = (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1);
+                back(format!("clamp({} * {} + {}, {it}({lo}), {it}({hi}))", s(&v[0]), s(&v[1]), s(&v[2])))
+            }
+            // upsample(hi, lo): hi's bits above lo's, twice the width.
+            ("upsample", _) if w == 32 => format!("vec2<u32>({}, {})", v[1], v[0]),
+            ("upsample", _) => format!("(({} << {}) | {})", v[0], m(w as u64), v[1]),
             (b, u) => bail!("the builtin {b} ({})", if u { "unsigned" } else { "signed" }),
         })
     }
@@ -2154,6 +2240,28 @@ fn float(x: f32) -> String {
 /// Functions generated code may call: name, the functions it calls, code.
 /// 64-bit integers are `vec2<u32>` (low word, high word).
 const LIBRARY: &[(&str, &[&str], &str)] = &[
+    // (Quirks::flushes_rounded_up_products.) A product flushed to zero
+    // that, rounded to the denormals' precision, is the smallest normal
+    // number: that number. Scaled by 2^60 to see (the threshold is
+    // 2^-126 - 2^-150), with fma's exact remainder for products that round
+    // onto it from below. (Zero by its bits: a driver may take NaN != 0 to
+    // be false.)
+    (
+        "fmul_ftz",
+        &[],
+        "fn fmul_ftz(a: f32, b: f32) -> f32 {
+    let p = a * b;
+    if ((bitcast<u32>(p) & 0x7fffffffu) != 0u || a == 0.0 || b == 0.0) { return p; }
+    let s = min(abs(a), abs(b)) * 0x1p60f;
+    let l = max(abs(a), abs(b));
+    let r = s * l;
+    let t = 0x1.fffffep-67f;
+    if (r > t || (r == t && fma(s, l, -r) >= 0.0)) {
+        return bitcast<f32>(((bitcast<u32>(a) ^ bitcast<u32>(b)) & 0x80000000u) | 0x00800000u);
+    }
+    return p;
+}",
+    ),
     (
         "mul_hi_u32",
         &[],
@@ -2208,9 +2316,12 @@ const LIBRARY: &[(&str, &[&str], &str)] = &[
     ("udivrem64", &["ult64", "sub64", "shl64"], "fn udivrem64(a: vec2<u32>, b: vec2<u32>) -> array<vec2<u32>, 2> {
     // (Both 32-bit: natively.)
     if (a.y == 0u && b.y == 0u && b.x != 0u) { return array<vec2<u32>, 2>(vec2<u32>(a.x / b.x, 0u), vec2<u32>(a.x % b.x, 0u)); }
+    if (ult64(a, b)) { return array<vec2<u32>, 2>(vec2<u32>(0u, 0u), a); }
     var q = vec2<u32>(0u, 0u);
     var r = vec2<u32>(0u, 0u);
-    for (var i = 63i; i >= 0i; i--) {
+    // Bit by bit from a's highest (none of the quotient's are above it).
+    let top = 63i - i32(select(32u + countLeadingZeros(a.x), countLeadingZeros(a.y), a.y != 0u));
+    for (var i = top; i >= 0i; i--) {
         r = shl64(r, 1u);
         let word = select(a.x, a.y, i >= 32i);
         r.x = r.x | ((word >> (u32(i) & 31u)) & 1u);
@@ -2220,6 +2331,74 @@ const LIBRARY: &[(&str, &[&str], &str)] = &[
         }
     }
     return array<vec2<u32>, 2>(q, r);
+}"),
+    // The high 64 bits of a 128-bit product, from 32-bit partial products
+    // (bits 32-95: p00's high word, p01 and p10, with a carry out).
+    ("umulhi64", &["mul_hi_u32", "add64", "ult64"], "fn umulhi64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let p01 = vec2<u32>(a.x * b.y, mul_hi_u32(a.x, b.y));
+    let p10 = vec2<u32>(a.y * b.x, mul_hi_u32(a.y, b.x));
+    let p11 = vec2<u32>(a.y * b.y, mul_hi_u32(a.y, b.y));
+    let m1 = add64(p01, vec2<u32>(mul_hi_u32(a.x, b.x), 0u));
+    let m2 = add64(m1, p10);
+    let carry = select(0u, 1u, ult64(m2, m1));
+    return add64(p11, vec2<u32>(m2.y, carry));
+}"),
+    // Signed: less b where a < 0 and a where b < 0.
+    ("smulhi64", &["umulhi64", "sub64"], "fn smulhi64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let z = vec2<u32>(0u, 0u);
+    return sub64(sub64(umulhi64(a, b), select(z, b, (a.y >> 31u) != 0u)), select(z, a, (b.y >> 31u) != 0u));
+}"),
+    ("uaddsat64", &["add64", "ult64"], "fn uaddsat64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let r = add64(a, b);
+    return select(r, vec2<u32>(0xffffffffu, 0xffffffffu), ult64(r, a));
+}"),
+    // (Signed overflow: the result's sign differs from both operands', or
+    // for a subtraction, from a's where b's differs from a's.)
+    ("saddsat64", &["add64"], "fn saddsat64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let r = add64(a, b);
+    let sat = select(vec2<u32>(0xffffffffu, 0x7fffffffu), vec2<u32>(0u, 0x80000000u), (a.y >> 31u) != 0u);
+    return select(r, sat, (((a.y ^ r.y) & (b.y ^ r.y)) >> 31u) != 0u);
+}"),
+    ("usubsat64", &["sub64", "ult64"], "fn usubsat64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    return select(sub64(a, b), vec2<u32>(0u, 0u), ult64(a, b));
+}"),
+    ("ssubsat64", &["sub64"], "fn ssubsat64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let r = sub64(a, b);
+    let sat = select(vec2<u32>(0xffffffffu, 0x7fffffffu), vec2<u32>(0u, 0x80000000u), (a.y >> 31u) != 0u);
+    return select(r, sat, (((a.y ^ b.y) & (a.y ^ r.y)) >> 31u) != 0u);
+}"),
+    // a * b + c saturated: the 128-bit sum fits when its high half is the
+    // low half's sign (or zero, unsigned).
+    ("umadsat64", &["umulhi64", "mul64", "add64", "ult64"], "fn umadsat64(a: vec2<u32>, b: vec2<u32>, c: vec2<u32>) -> vec2<u32> {
+    let hi = umulhi64(a, b);
+    let lo = mul64(a, b);
+    let r = add64(lo, c);
+    return select(r, vec2<u32>(0xffffffffu, 0xffffffffu), (hi.x | hi.y) != 0u || ult64(r, lo));
+}"),
+    ("smadsat64", &["smulhi64", "mul64", "add64", "ult64"], "fn smadsat64(a: vec2<u32>, b: vec2<u32>, c: vec2<u32>) -> vec2<u32> {
+    let lo = mul64(a, b);
+    let r = add64(lo, c);
+    let ones = vec2<u32>(0xffffffffu, 0xffffffffu);
+    let z = vec2<u32>(0u, 0u);
+    let hi = add64(add64(smulhi64(a, b), select(z, ones, (c.y >> 31u) != 0u)), vec2<u32>(select(0u, 1u, ult64(r, lo)), 0u));
+    let fits = all(hi == select(z, ones, (r.y >> 31u) != 0u));
+    let sat = select(vec2<u32>(0xffffffffu, 0x7fffffffu), vec2<u32>(0u, 0x80000000u), (hi.y >> 31u) != 0u);
+    return select(sat, r, fits);
+}"),
+    ("umadsat32", &["mul_hi_u32"], "fn umadsat32(a: u32, b: u32, c: u32) -> u32 {
+    let lo = a * b;
+    let r = lo + c;
+    return select(r, 0xffffffffu, mul_hi_u32(a, b) != 0u || r < lo);
+}"),
+    // (In 64 bits, where a * b + c is exact.)
+    ("smadsat32", &["mul64", "add64", "slt64"], "fn smadsat32(a: u32, b: u32, c: u32) -> u32 {
+    let x = vec2<u32>(a, select(0u, 0xffffffffu, (a >> 31u) != 0u));
+    let y = vec2<u32>(b, select(0u, 0xffffffffu, (b >> 31u) != 0u));
+    let z = vec2<u32>(c, select(0u, 0xffffffffu, (c >> 31u) != 0u));
+    let r = add64(mul64(x, y), z);
+    if (slt64(r, vec2<u32>(0x80000000u, 0xffffffffu))) { return 0x80000000u; }
+    if (slt64(vec2<u32>(0x7fffffffu, 0u), r)) { return 0x7fffffffu; }
+    return r.x;
 }"),
     ("udiv64", &["udivrem64"], "fn udiv64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> { return udivrem64(a, b)[0]; }"),
     ("urem64", &["udivrem64"], "fn urem64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> { return udivrem64(a, b)[1]; }"),
@@ -2262,10 +2441,10 @@ mod tests {
     use super::*;
     use crate::opencl::{build, test_clang};
 
-    /// A kernel's WGSL, checked by naga as wgpu would.
+    /// A kernel's WGSL, checked by naga as wgpu would (with the quirks' code too).
     pub(crate) fn wgsl(src: &str, kernel: &str, launch: &Launch) -> String {
         let m = build(&test_clang(), src, "", None).unwrap();
-        let w = compile(&m, kernel, launch).unwrap_or_else(|e| panic!("{kernel}: {e}"));
+        let w = compile(&m, kernel, launch, Quirks { flushes_rounded_up_products: true }).unwrap_or_else(|e| panic!("{kernel}: {e}"));
         let module = naga::front::wgsl::parse_str(&w).unwrap_or_else(|e| panic!("{}\n{w}", e.emit_to_string(&w)));
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
             .validate(&module)

@@ -59,7 +59,7 @@
             dontConfigure = true;
             buildPhase = ''
               ln -s cmake-21.1.8.src cmake
-              patch -d libclc-21.1.8.src -p1 < ${./packages/libclc/signed-zeros.patch}
+              patch -d libclc-21.1.8.src -p1 < ${./packages/libclc/conformance.patch}
               cmake -S libclc-21.1.8.src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLIBCLC_TARGETS_TO_BUILD=clspv-- \
                 -DLLVM_DIR=${llvm.llvm.dev}/lib/cmake/llvm -DLLVM_TOOLS_BINARY_DIR=${llvm.llvm}/bin \
                 -DLLVM_TOOL_clang=${llvm.clang-unwrapped}/bin/clang

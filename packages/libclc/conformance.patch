@@ -36,13 +36,99 @@
    return __CLC_AS_GENTYPE(ir);
 --- a/clc/lib/generic/math/clc_tgamma.cl
 +++ b/clc/lib/generic/math/clc_tgamma.cl
-@@ -25,7 +25,8 @@
-     float z = __clc_sinpi(x);
-     g = g * absx * z;
-     g = pi / g;
+@@ -10,26 +10,83 @@
+ #include <clc/float/definitions.h>
+ #include <clc/internal/clc.h>
+ #include <clc/math/clc_exp.h>
++#include <clc/math/clc_copysign.h>
+ #include <clc/math/clc_fabs.h>
++#include <clc/math/clc_floor.h>
++#include <clc/math/clc_fma.h>
+ #include <clc/math/clc_lgamma.h>
+ #include <clc/math/clc_sinpi.h>
+ #include <clc/math/math.h>
++#include <clc/relational/clc_isinf.h>
++#include <clc/relational/clc_isnan.h>
++
++// Gamma(t) is exp(lgamma(t)) only on [1, 2), where lgamma is small
++// (elsewhere rounding lgamma costs exp tens of ulps): above,
++// Gamma(t) = (t-1)...(y) Gamma(y) for y in [1, 2), the factors exact,
++// multiplied in double-float (fma's exact products); below 0,
++// Gamma(x) = pi / (sinpi(x) Gamma(1-x)) with Gamma(1-x) = -x Gamma(-x) the
++// same way.
++
++// (h, l) *= f, as a double-float.
++static void __clc_tgamma_mul(float *h, float *l, float f) {
++  float p = *h * f;
++  if (__clc_isinf(p)) {
++    *h = p;
++    *l = 0.0f;
++    return;
++  }
++  float e = __clc_fma(*h, f, -p) + *l * f;
++  *h = p + e;
++  *l = e - (*h - p);
++}
+ 
+ _CLC_OVERLOAD _CLC_DEF float __clc_tgamma(float x) {
+-  const float pi = 3.1415926535897932384626433832795f;
+-  float absx = __clc_fabs(x);
+-  float lg = __clc_lgamma(absx);
+-  float g = __clc_exp(lg);
+-
+-  if (x < 0.0f) {
+-    float z = __clc_sinpi(x);
+-    g = g * absx * z;
+-    g = pi / g;
 -    g = g == 0 ? INFINITY : g;
-+    // (pi / g is 0 only where g overflowed: tgamma underflows to a zero of
-+    // the right sign there, not infinity.)
-     g = z == 0 ? FLT_NAN : g;
+-    g = z == 0 ? FLT_NAN : g;
++  const float pi_hi = 0x1.921fb6p+1f, pi_lo = -0x1.777a5cp-24f;
++  if (__clc_isnan(x))
++    return x;
++  // (A denormal is a zero to the device, if it has no denormals.)
++  x = __clc_flush_denormal_if_not_supported(x);
++  if (x == 0.0f)
++    return __clc_copysign(INFINITY, x);
++  if (__clc_isinf(x))
++    return x > 0.0f ? x : FLT_NAN;
++  if (x > 36.0f)
++    return INFINITY;
++  if (x < 0.0f && __clc_floor(x) == x)
++    return FLT_NAN;
++  // (Beyond -40 it underflows: a zero of sinpi(x)'s sign.)
++  if (x < -40.0f)
++    return __clc_copysign(0.0f, __clc_sinpi(x));
++
++  float t = __clc_fabs(x);
++  float h, l = 0.0f;
++  // (Below -30, -x Gamma(-x) would overflow: it's scaled down by 2^-64, and
++  // the result up.)
++  float scale = x < -30.0f ? 0x1p-64f : 1.0f;
++  if (t < 1.0f) {
++    // Gamma(1 + t), 1 + t rounded: Gamma' is under 0.6 on [1, 2], so that
++    // costs under an ulp.
++    h = __clc_exp(__clc_lgamma(1.0f + t));
++    if (x > 0.0f)
++      return h / t;
++  } else {
++    float y = t - (__clc_floor(t) - 1.0f);
++    h = __clc_exp(__clc_lgamma(y)) * scale;
++    for (; y < t; y += 1.0f)
++      __clc_tgamma_mul(&h, &l, y);
++    if (x > 0.0f)
++      return h + l;
++    // -x Gamma(-x)
++    __clc_tgamma_mul(&h, &l, t);
    }
  
+-  return g;
++  // pi / (sinpi(x) (h + l))
++  float s = __clc_sinpi(x);
++  float dh = s * h;
++  float dl = __clc_fma(s, h, -dh) + s * l;
++  float q = pi_hi / dh;
++  float r = __clc_fma(-q, dh, pi_hi) + pi_lo - q * dl;
++  return (q + r / dh) * scale;
+ }
+ 
+ #define __FLOAT_ONLY

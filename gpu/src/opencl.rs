@@ -93,6 +93,7 @@ pub fn clang_ir(cc: &Compiler, source: &str, options: &str, guest: Option<&Guest
         .collect();
     // Everything inlined: the WGSL is one function per kernel.
     args.extend(["-mllvm", "-inline-threshold=100000"].map(String::from));
+    args.extend(extra_builtins(&dir)?);
     args.extend(passed(options));
     args.extend(cc.builtin_args());
     if let Some(g) = guest {
@@ -142,6 +143,7 @@ pub fn compile(cc: &Compiler, source: &str, options: &str, headers: &[(String, V
         .map(|s| s.to_string())
         .collect();
     args.extend(["-I".to_string(), dir.0.display().to_string()]);
+    args.extend(extra_builtins(&dir)?);
     args.extend(passed(options));
     if let Some(g) = guest {
         args.extend(g.args(&dir)?);
@@ -268,4 +270,22 @@ mod guest_tests {
         assert!(m.function("k").is_some());
         assert!(build(&test_clang(), src, "", None).is_err());
     }
+}
+
+/// Builtins the device has beyond OpenCL C 1.2's, declared for programs
+/// built as 1.2: 2.0's ctz (the conformance tests use it on 1.2 devices too).
+const EXTRA_BUILTINS: &str = "#if __OPENCL_C_VERSION__ < 200
+#define __WENV_D(T) T __attribute__((overloadable, const)) ctz(T);
+#define __WENV_V(T) __WENV_D(T) __WENV_D(T##2) __WENV_D(T##3) __WENV_D(T##4) __WENV_D(T##8) __WENV_D(T##16)
+__WENV_V(char) __WENV_V(uchar) __WENV_V(short) __WENV_V(ushort) __WENV_V(int) __WENV_V(uint) __WENV_V(long) __WENV_V(ulong)
+#undef __WENV_V
+#undef __WENV_D
+#endif
+";
+
+/// clang's arguments including `EXTRA_BUILTINS` (written into `dir`).
+fn extra_builtins(dir: &Scratch) -> Result<Vec<String>, String> {
+    let path = dir.0.join("wasm-env-builtins.h");
+    std::fs::write(&path, EXTRA_BUILTINS).map_err(|e| e.to_string())?;
+    Ok(vec!["-include".into(), path.display().to_string()])
 }

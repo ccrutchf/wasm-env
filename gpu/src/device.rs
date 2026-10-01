@@ -10,13 +10,14 @@ use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
 
 use crate::ir::{Module, Res};
-use crate::wgsl::{self, ArgKind, HEADER_WORDS, KernelInfo, Launch};
+use crate::wgsl::{self, ArgKind, HEADER_WORDS, KernelInfo, Launch, Quirks};
 
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
     pub limits: wgpu::Limits,
+    pub quirks: Quirks,
     pipelines: Mutex<HashMap<(usize, String, Launch), Arc<Pipeline>>>,
     lost: std::sync::atomic::AtomicBool,
 }
@@ -64,7 +65,44 @@ impl Gpu {
         .map_err(|e| format!("can't open {}: {e}", info.name))?;
         // Errors are reported to the caller (error scopes), not panics.
         device.on_uncaptured_error(Arc::new(|e| eprintln!("wasm-env: GPU: {}", chain(&e))));
-        Ok(Gpu { device, queue, info, limits, pipelines: Mutex::new(HashMap::new()), lost: Default::default() })
+        let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), lost: Default::default() };
+        g.quirks = g.probe_quirks()?;
+        Ok(g)
+    }
+
+    /// What the device does that kernels must make up for (`Quirks`), by
+    /// trying it: -2^-126 * -(1 - 2^-24), 2^-126 rounded to the denormals'
+    /// precision, from a buffer (so no compiler folds it).
+    fn probe_quirks(&self) -> Res<Quirks> {
+        let code = "@group(0) @binding(0) var<storage, read_write> b: array<f32>;
+@compute @workgroup_size(1) fn main() { b[2] = b[0] * b[1]; }";
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("probe"), source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("probe"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let b = self.buffer(12)?;
+        let words = [(-f32::MIN_POSITIVE).to_bits(), (-(1.0f32 - f32::EPSILON / 2.0)).to_bits(), 1];
+        self.write(&b, 0, &words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>())?;
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: b.as_entire_binding() }],
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        self.queue.submit([enc.finish()]);
+        let product = f32::from_le_bytes(self.read(&b, 8, 4)?.try_into().unwrap());
+        Ok(Quirks { flushes_rounded_up_products: product == 0.0 })
     }
 
     pub fn buffer(&self, size: u64) -> Res<wgpu::Buffer> {
@@ -135,7 +173,15 @@ impl Gpu {
         }
         if (src_offset | dst_offset | len) % 4 == 0 {
             let mut enc = self.device.create_command_encoder(&Default::default());
-            enc.copy_buffer_to_buffer(src, src_offset, dst, dst_offset, len);
+            if src == dst {
+                // Between sub-buffers of one buffer: wgpu copies only
+                // between two, so through another.
+                let temp = self.buffer(len)?;
+                enc.copy_buffer_to_buffer(src, src_offset, &temp, 0, len);
+                enc.copy_buffer_to_buffer(&temp, 0, dst, dst_offset, len);
+            } else {
+                enc.copy_buffer_to_buffer(src, src_offset, dst, dst_offset, len);
+            }
             self.queue.submit([enc.finish()]);
             return Ok(());
         }
@@ -170,7 +216,7 @@ impl Gpu {
             return Ok(p.clone());
         }
         let start = std::time::Instant::now();
-        let code = wgsl::compile(m, &info.name, launch)?;
+        let code = wgsl::compile(m, &info.name, launch, self.quirks)?;
         let translated = start.elapsed();
         if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
             eprintln!("wasm-env: kernel {} for {launch:?}:\n{code}", info.name);
@@ -667,6 +713,154 @@ __kernel void k(__global const int *a, __global const int *b, __global int *o) {
                 .collect();
             assert_eq!(got, want, "add_sat etc. of {x:#x}, {y:#x}");
         }
+    }
+
+    #[test]
+    fn products_round_up_to_the_smallest_normal() {
+        let Some(g) = gpu() else { return };
+        let src = r#"
+__kernel void k(__global const float *a, __global const float *b, __global float *o) {
+    int i = get_global_id(0);
+    o[i] = a[i] * b[i];
+    float2 v = (float2)(a[i], 1.0f) * (float2)(b[i], 2.0f);
+    o[i + 6] = v.x;
+}
+"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let min = f32::MIN_POSITIVE;
+        // 2^-126 - 2^-150 (a tie, to even: 2^-126); 2^-126 (1 - 2^-24 - 3 2^-47)
+        // (just under the tie, a denormal, but scaled up it rounds onto it); 2^-126 * 0.75; 2 * 3; NaN and
+        // infinity by something tiny.
+        let a = [-min, f32::from_bits(0x0080_0001), min, 2.0f32, f32::NAN, f32::INFINITY];
+        let b = [-(1.0 - f32::EPSILON / 2.0), 1.0 - 3.0 * f32::EPSILON / 2.0, 0.75, 3.0, -1e-30, 1e-30];
+        let bytes = |v: &[f32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<_>>();
+        let (ba, bb, bo) = (g.buffer(24).unwrap(), g.buffer(24).unwrap(), g.buffer(48).unwrap());
+        g.write(&ba, 0, &bytes(&a)).unwrap();
+        g.write(&bb, 0, &bytes(&b)).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: [6, 1, 1], local_bytes: vec![] };
+        g.run(1, &m, &info, &launch, 1, [6, 1, 1], [0; 3], &[0u8; 12], &[(0, &ba), (1, &bb), (2, &bo)]).unwrap();
+        let out: Vec<f32> = words(&g.read(&bo, 0, 48).unwrap()).into_iter().map(f32::from_bits).collect();
+        for k in [0, 6] {
+            assert_eq!(out[k], min, "the tie");
+            // (A denormal, or flushed.)
+            assert!(out[k + 1] < min && out[k + 1] >= 0.0, "under the tie: {:e}", out[k + 1]);
+            assert!(out[k + 2] < min, "three quarters");
+            assert_eq!(out[k + 3], 6.0);
+            assert!(out[k + 4].is_nan(), "NaN");
+            assert_eq!(out[k + 5], f32::INFINITY);
+        }
+    }
+
+    #[test]
+    fn integer_builtins_agree_with_the_cpu() {
+        let Some(g) = gpu() else { return };
+        let src = r#"
+__kernel void k(__global const long *a, __global const long *b, __global const long *c, __global long *o) {
+    int i = get_global_id(0);
+    long x = a[i], y = b[i], z = c[i];
+    ulong ux = x, uy = y, uz = z;
+    int xi = (int)x, yi = (int)y, zi = (int)z;
+    __global long *r = o + i * 24;
+    r[0] = mul_hi(x, y);
+    r[1] = (long)mul_hi(ux, uy);
+    r[2] = mad_hi(x, y, z);
+    r[3] = add_sat(x, y);
+    r[4] = (long)add_sat(ux, uy);
+    r[5] = sub_sat(x, y);
+    r[6] = (long)sub_sat(ux, uy);
+    r[7] = mad_sat(x, y, z);
+    r[8] = (long)mad_sat(ux, uy, uz);
+    r[9] = (long)abs_diff(x, y);
+    r[10] = (long)abs_diff(ux, uy);
+    r[11] = hadd(x, y);
+    r[12] = (long)rhadd(ux, uy);
+    r[13] = (long)rotate(ux, uy);
+    r[14] = (long)ctz(ux);
+    r[15] = mad_sat(xi, yi, zi);
+    r[16] = mad_sat((uint)xi, (uint)yi, (uint)zi);
+    r[17] = abs_diff(xi, yi);
+    r[18] = upsample(xi, (uint)yi);
+    r[19] = upsample((short)xi, (ushort)yi);
+    r[20] = mad_hi(xi, yi, zi);
+    r[21] = mad_sat((short)xi, (short)yi, (short)zi);
+    long2 v = mul_hi((long2)(x, y), (long2)(y, z));
+    r[22] = v.y;
+    r[23] = abs_diff((char)xi, (char)yi);
+}
+"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 64usize;
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut v: Vec<[i64; 3]> = (0..n).map(|_| [next() as i64 >> (next() % 40), next() as i64 >> (next() % 40), next() as i64]).collect();
+        v[0] = [i64::MAX, i64::MAX, 1];
+        v[1] = [i64::MIN, -1, -1];
+        v[2] = [i64::MIN, i64::MIN, i64::MAX];
+        v[3] = [0x8c7f0aac, 0x1902f8c8, 0];
+        let col = |k: usize| v.iter().flat_map(|t| t[k].to_le_bytes()).collect::<Vec<u8>>();
+        let (ba, bb, bc, bo) = (g.buffer(n as u64 * 8).unwrap(), g.buffer(n as u64 * 8).unwrap(), g.buffer(n as u64 * 8).unwrap(), g.buffer(n as u64 * 192).unwrap());
+        g.write(&ba, 0, &col(0)).unwrap();
+        g.write(&bb, 0, &col(1)).unwrap();
+        g.write(&bc, 0, &col(2)).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![] };
+        g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 16], &[(0, &ba), (1, &bb), (2, &bc), (3, &bo)]).unwrap();
+        let out: Vec<i64> = g.read(&bo, 0, n as u64 * 192).unwrap().chunks(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+        let sat = |r: i128| r.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        let usat = |r: u128| r.min(u64::MAX as u128) as u64 as i64;
+        for (i, &[x, y, z]) in v.iter().enumerate() {
+            let (ux, uy, uz) = (x as u64, y as u64, z as u64);
+            let (xi, yi, zi) = (x as i32, y as i32, z as i32);
+            let want = [
+                ((x as i128 * y as i128) >> 64) as i64,
+                ((ux as u128 * uy as u128) >> 64) as i64,
+                (((x as i128 * y as i128) >> 64) as i64).wrapping_add(z),
+                x.saturating_add(y),
+                ux.saturating_add(uy) as i64,
+                x.saturating_sub(y),
+                ux.saturating_sub(uy) as i64,
+                sat(x as i128 * y as i128 + z as i128),
+                usat(ux as u128 * uy as u128 + uz as u128),
+                (x as i128 - y as i128).unsigned_abs() as u64 as i64,
+                ux.abs_diff(uy) as i64,
+                ((x as i128 + y as i128) >> 1) as i64,
+                ((ux as u128 + uy as u128 + 1) >> 1) as u64 as i64,
+                ux.rotate_left((uy % 64) as u32) as i64,
+                ux.trailing_zeros() as i64,
+                (xi as i64 * yi as i64 + zi as i64).clamp(i32::MIN as i64, i32::MAX as i64),
+                (xi as u32 as u64 * yi as u32 as u64 + zi as u32 as u64).min(u32::MAX as u64) as i64,
+                xi.abs_diff(yi) as i64,
+                ((xi as i64) << 32) | yi as u32 as i64,
+                (((xi as i16 as i32) << 16) | yi as u16 as i32) as i64,
+                (((xi as i64 * yi as i64) >> 32) as i32).wrapping_add(zi) as i64,
+                (xi as i16 as i32 * yi as i16 as i32 + zi as i16 as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16 as i64,
+                ((y as i128 * z as i128) >> 64) as i64,
+                (xi as i8).abs_diff(yi as i8) as i64,
+            ];
+            assert_eq!(out[i * 24..i * 24 + 24], want, "builtins of {x:#x}, {y:#x}, {z:#x}");
+        }
+    }
+
+    #[test]
+    fn copies_within_a_buffer() {
+        let Some(g) = gpu() else { return };
+        // (Sub-buffers of one buffer copied to each other.)
+        let b = g.buffer(64).unwrap();
+        let data: Vec<u8> = (0..64).collect();
+        g.write(&b, 0, &data).unwrap();
+        g.copy(&b, 0, &b, 32, 16).unwrap();
+        g.copy(&b, 49, &b, 1, 7).unwrap();
+        let out = g.read(&b, 0, 64).unwrap();
+        let mut want = data.clone();
+        want.copy_within(0..16, 32);
+        want.copy_within(49..56, 1);
+        assert_eq!(out, want);
     }
 
     #[test]

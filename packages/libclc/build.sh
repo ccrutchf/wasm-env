@@ -21,9 +21,9 @@ for p in libclc cmake; do
 	[ -d $p-$version.src ] || tar -xf $p-$version.src.tar.xz
 done
 ln -sfn cmake-$version.src cmake
-# OpenCL's zeros: signed ones in sinpi, cospi and tanpi; tgamma's underflow
-# for large negative arguments (the CTS checks them).
-rm -rf libclc && cp -r libclc-$version.src libclc && patch -s -d libclc -p1 < "$root/packages/libclc/signed-zeros.patch"
+# Fixes for OpenCL's conformance tests: signed zeros in sinpi, cospi and
+# tanpi, and a tgamma accurate to a few ulps (libclc's is exp(lgamma)).
+rm -rf libclc && cp -r libclc-$version.src libclc && patch -s -d libclc -p1 < "$root/packages/libclc/conformance.patch"
 store() { nix build --no-link --print-out-paths "nixpkgs#$1" | tail -1; }
 llvm=$(store llvmPackages_21.llvm)
 clang=$(store llvmPackages_21.clang-unwrapped)
