@@ -2,12 +2,13 @@
 // Khronos loader (Ubuntu's ocl-icd), implementing OpenCL 1.2 on the
 // runtime's GPU service through /dev/wasm-env-gpu (runtime/src/gpu.rs has
 // the requests). One platform, one device. Commands run in order as
-// they're enqueued, so events are complete when made; reads wait for the
-// work before them.
+// they're enqueued, so their events are complete when made, but for those
+// waiting on events not done yet (user events): those wait (`command`).
+// Reads wait for the work before them.
 //
 // It uses nothing from the C library but allocation, a few string
-// functions, open, ioctl and close, resolved when it's loaded: the same
-// library serves glibc and musl programs.
+// functions, open, ioctl, close and sched_yield, resolved when it's loaded:
+// the same library serves glibc and musl programs.
 #define CL_TARGET_OPENCL_VERSION 300
 #define CL_USE_DEPRECATED_OPENCL_1_2_APIS
 #include <CL/cl.h>
@@ -32,6 +33,7 @@ int memcmp(const void *, const void *, size_t);
 int open(const char *, int, ...);
 int ioctl(int, unsigned long, ...);
 int close(int);
+int sched_yield(void);
 struct timespec {
     long tv_sec, tv_nsec;
 };
@@ -68,6 +70,11 @@ struct _cl_command_queue {
     cl_uint refs;
     cl_context ctx;
     cl_command_queue_properties props;
+    // Its commands waiting (`command`), whether one is running, and the
+    // last scan of them that saw it (under the commands' lock).
+    cl_uint pending;
+    int running;
+    unsigned scan;
 };
 struct _cl_mem {
     struct _cl_icd_dispatch *d;
@@ -247,6 +254,254 @@ static cl_int done(cl_command_queue q, cl_command_type type, cl_event *ev) {
     // (The next request begins another command.)
     beginning = 1;
     return e;
+}
+
+// ---- Commands ----
+
+// A command runs as it's enqueued, unless an event in its wait list isn't
+// done yet (a user event's, or a command's still waiting) or its queue has
+// commands waiting (queues run in order): then it waits, its event queued,
+// and runs once they're done (`drain`), or fails if one of them failed.
+struct command {
+    cl_int (*run)(struct command *);
+    uintptr_t a[8];
+    // What it owns (copies made when it was enqueued), and the objects it
+    // uses (retained while it waits).
+    void *data;
+    cl_mem mem[2];
+    cl_kernel kernel;
+    // Waiting: its queue, its event and its wait list (retained).
+    cl_command_queue q;
+    cl_event ev;
+    cl_uint nw;
+    cl_event *wait;
+    struct command *next;
+};
+
+static struct command *commands;
+static int commands_lock;
+static void lock_commands(void) {
+    while (__atomic_exchange_n(&commands_lock, 1, __ATOMIC_ACQUIRE))
+        sched_yield();
+}
+static void unlock_commands(void) { __atomic_store_n(&commands_lock, 0, __ATOMIC_RELEASE); }
+
+static cl_int ReleaseMemObject(cl_mem m);
+static cl_int ReleaseKernel(cl_kernel k);
+static cl_int ReleaseEvent(cl_event e);
+
+// A wait list: well formed, and events of the queue's context.
+static cl_int waits(cl_command_queue q, cl_uint n, const cl_event *wait) {
+    if ((n && !wait) || (!n && wait))
+        return CL_INVALID_EVENT_WAIT_LIST;
+    for (cl_uint i = 0; i < n; i++) {
+        if (!wait[i])
+            return CL_INVALID_EVENT_WAIT_LIST;
+        if (wait[i]->ctx != q->ctx)
+            return CL_INVALID_CONTEXT;
+    }
+    return CL_SUCCESS;
+}
+
+static cl_int status_of(cl_event e) { return __atomic_load_n(&e->status, __ATOMIC_ACQUIRE); }
+
+// Whether a wait list's events are all done (complete, or failed: then
+// `failed` is set).
+static int settled(cl_uint n, const cl_event *wait, int *failed) {
+    for (cl_uint i = 0; i < n; i++) {
+        cl_int s = status_of(wait[i]);
+        if (s > CL_COMPLETE)
+            return 0;
+        if (s < 0)
+            *failed = 1;
+    }
+    return 1;
+}
+
+// An event's new status, and the callbacks waiting for it (complete, or an
+// error: past running).
+static void set_status(cl_event e, cl_int status) {
+    lock_commands();
+    __atomic_store_n(&e->status, status, __ATOMIC_RELEASE);
+    struct waiting *due = NULL;
+    for (struct waiting **at = &e->waiting; *at;) {
+        struct waiting *w = *at;
+        if (status <= w->type) {
+            *at = w->next;
+            w->next = due;
+            due = w;
+        } else {
+            at = &w->next;
+        }
+    }
+    unlock_commands();
+    while (due) {
+        struct waiting *w = due;
+        due = w->next;
+        w->f(e, status, w->user);
+        free(w);
+    }
+}
+
+// What a command owns, once it has run.
+static void drop(struct command *c) {
+    free(c->data);
+    c->data = NULL;
+}
+
+// A command that can't run yet, queued (the caller holds the lock). `held`
+// takes a reference to its event too (for a blocking call to wait on).
+static cl_int defer(cl_command_queue q, cl_command_type type, struct command *c, cl_uint nw, const cl_event *wait, cl_event *ev, cl_event *held) {
+    struct command *d = malloc(sizeof *d);
+    cl_event e = event(q, type);
+    cl_event *w = nw ? malloc(nw * sizeof *w) : NULL;
+    if (!d || !e || (nw && !w)) {
+        free(d);
+        free(w);
+        if (e)
+            ReleaseEvent(e);
+        drop(c);
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+    *d = *c;
+    e->status = CL_QUEUED;
+    for (cl_uint i = 0; i < nw; i++) {
+        w[i] = wait[i];
+        retain(&w[i]->refs);
+    }
+    for (int i = 0; i < 2; i++)
+        if (d->mem[i])
+            retain(&d->mem[i]->refs);
+    if (d->kernel)
+        retain(&d->kernel->refs);
+    d->q = q;
+    d->ev = e;
+    d->nw = nw;
+    d->wait = w;
+    d->next = NULL;
+    struct command **at = &commands;
+    while (*at)
+        at = &(*at)->next;
+    *at = d;
+    q->pending++;
+    if (ev) {
+        retain(&e->refs);
+        *ev = e;
+    }
+    if (held) {
+        retain(&e->refs);
+        *held = e;
+    }
+    beginning = 1;
+    return CL_SUCCESS;
+}
+
+// Runs the waiting commands that can run now: the first waiting of each
+// queue, once its wait list is done. (Each that finishes can let others
+// run.)
+static void drain(void) {
+    static unsigned scan;
+    for (;;) {
+        struct command *c = NULL;
+        int failed = 0;
+        lock_commands();
+        scan++;
+        for (struct command **at = &commands; *at; at = &(*at)->next) {
+            struct command *x = *at;
+            if (x->q->scan == scan)
+                continue;
+            x->q->scan = scan;
+            if (!x->q->running && settled(x->nw, x->wait, &failed)) {
+                c = x;
+                *at = x->next;
+                x->q->running = 1;
+                break;
+            }
+            failed = 0;
+        }
+        unlock_commands();
+        if (!c)
+            return;
+        cl_int status = CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST;
+        if (!failed) {
+            set_status(c->ev, CL_RUNNING);
+            beginning = 1;
+            cl_ulong start = now();
+            cl_int e = c->run(c);
+            c->ev->began = beginning ? start : began;
+            c->ev->ended = now();
+            beginning = 1;
+            status = e == CL_SUCCESS ? CL_COMPLETE : e;
+        }
+        set_status(c->ev, status);
+        lock_commands();
+        c->q->running = 0;
+        c->q->pending--;
+        unlock_commands();
+        drop(c);
+        for (cl_uint i = 0; i < c->nw; i++)
+            ReleaseEvent(c->wait[i]);
+        free(c->wait);
+        for (int i = 0; i < 2; i++)
+            if (c->mem[i])
+                ReleaseMemObject(c->mem[i]);
+        if (c->kernel)
+            ReleaseKernel(c->kernel);
+        ReleaseEvent(c->ev);
+        free(c);
+    }
+}
+
+// Until an event is done: CL_SUCCESS, or the error for a failed one.
+static cl_int wait_for(cl_event e) {
+    while (status_of(e) > CL_COMPLETE) {
+        drain();
+        sched_yield();
+    }
+    return status_of(e) < 0 ? CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST : CL_SUCCESS;
+}
+
+// A command enqueued: run now, or waiting (see `command`). A blocking one
+// returns once it has run.
+static cl_int submit(cl_command_queue q, cl_command_type type, struct command *c, cl_uint nw, const cl_event *wait, cl_event *ev, int blocking) {
+    cl_int e = waits(q, nw, wait);
+    if (e != CL_SUCCESS) {
+        drop(c);
+        return e;
+    }
+    int failed = 0;
+    lock_commands();
+    if (q->pending || !settled(nw, wait, &failed)) {
+        cl_event held = NULL;
+        e = defer(q, type, c, nw, wait, ev, blocking ? &held : NULL);
+        unlock_commands();
+        if (e != CL_SUCCESS || !held)
+            return e;
+        e = wait_for(held);
+        ReleaseEvent(held);
+        return e;
+    }
+    unlock_commands();
+    if (failed) {
+        // (Not run: its event says why.)
+        drop(c);
+        if (ev && (*ev = event(q, type)))
+            (*ev)->status = CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST;
+        beginning = 1;
+        return blocking ? CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST : CL_SUCCESS;
+    }
+    e = c->run(c);
+    drop(c);
+    if (e != CL_SUCCESS) {
+        beginning = 1;
+        return e;
+    }
+    return done(q, type, ev);
+}
+
+static cl_int run_nothing(struct command *c) {
+    (void)c;
+    return CL_SUCCESS;
 }
 
 // ---- Platform and device ----
@@ -481,6 +736,12 @@ static cl_context CreateContext(const cl_context_properties *props, cl_uint n, c
 
 static cl_context CreateContextFromType(const cl_context_properties *props, cl_device_type type,
                                         void(CL_CALLBACK *notify)(const char *, const void *, size_t, void *), void *user, cl_int *err) {
+    const cl_device_type known = CL_DEVICE_TYPE_DEFAULT | CL_DEVICE_TYPE_CPU | CL_DEVICE_TYPE_GPU | CL_DEVICE_TYPE_ACCELERATOR | CL_DEVICE_TYPE_CUSTOM;
+    if (type != CL_DEVICE_TYPE_ALL && (!type || (type & ~known))) {
+        if (err)
+            *err = CL_INVALID_DEVICE_TYPE;
+        return NULL;
+    }
     if (!(type == CL_DEVICE_TYPE_ALL || type == CL_DEVICE_TYPE_DEFAULT || (type & desc.type))) {
         if (err)
             *err = CL_DEVICE_NOT_FOUND;
@@ -585,6 +846,11 @@ static cl_int Flush(cl_command_queue q) { return q ? CL_SUCCESS : CL_INVALID_COM
 static cl_int Finish(cl_command_queue q) {
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
+    // (Its commands waiting too.)
+    while (__atomic_load_n(&q->pending, __ATOMIC_ACQUIRE)) {
+        drain();
+        sched_yield();
+    }
     struct request r = {FINISH};
     return call(&r);
 }
@@ -758,9 +1024,16 @@ static cl_int GetSupportedImageFormats(cl_context c, cl_mem_flags flags, cl_mem_
     return CL_SUCCESS;
 }
 
+// A read or a write: a[0] whether a write, a[1] the offset, a[2] the size,
+// a[3] the host memory.
+static cl_int run_transfer(struct command *c) {
+    if (c->a[0])
+        return write_mem(c->mem[0], c->a[1], c->a[2], (const void *)c->a[3]);
+    return read_mem(c->mem[0], c->a[1], c->a[2], (void *)c->a[3]);
+}
+
 static cl_int EnqueueReadBuffer(cl_command_queue q, cl_mem m, cl_bool blocking, size_t offset, size_t size, void *p, cl_uint nw, const cl_event *wait,
                                 cl_event *ev) {
-    (void)blocking, (void)nw, (void)wait;
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
     if (!m)
@@ -769,13 +1042,12 @@ static cl_int EnqueueReadBuffer(cl_command_queue q, cl_mem m, cl_bool blocking, 
         return CL_INVALID_OPERATION;
     if (!p || offset + size > m->size)
         return CL_INVALID_VALUE;
-    cl_int e = read_mem(m, offset, size, p);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_READ_BUFFER, ev);
+    struct command c = {run_transfer, {0, offset, size, (uintptr_t)p}, .mem = {m}};
+    return submit(q, CL_COMMAND_READ_BUFFER, &c, nw, wait, ev, blocking);
 }
 
 static cl_int EnqueueWriteBuffer(cl_command_queue q, cl_mem m, cl_bool blocking, size_t offset, size_t size, const void *p, cl_uint nw,
                                  const cl_event *wait, cl_event *ev) {
-    (void)blocking, (void)nw, (void)wait;
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
     if (!m)
@@ -784,36 +1056,51 @@ static cl_int EnqueueWriteBuffer(cl_command_queue q, cl_mem m, cl_bool blocking,
         return CL_INVALID_OPERATION;
     if (!p || offset + size > m->size)
         return CL_INVALID_VALUE;
-    cl_int e = write_mem(m, offset, size, p);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_WRITE_BUFFER, ev);
+    struct command c = {run_transfer, {1, offset, size, (uintptr_t)p}, .mem = {m}};
+    return submit(q, CL_COMMAND_WRITE_BUFFER, &c, nw, wait, ev, blocking);
+}
+
+// a[0] and a[1] the offsets in mem[0] and mem[1], a[2] the size.
+static cl_int run_copy(struct command *c) {
+    cl_mem src = c->mem[0], dst = c->mem[1];
+    struct request r = {COPY, {base_handle(src), base_offset(src) + c->a[0], base_handle(dst), base_offset(dst) + c->a[1], c->a[2]}};
+    return call(&r);
 }
 
 static cl_int EnqueueCopyBuffer(cl_command_queue q, cl_mem src, cl_mem dst, size_t so, size_t dof, size_t size, cl_uint nw, const cl_event *wait,
                                 cl_event *ev) {
-    (void)nw, (void)wait;
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
     if (!src || !dst)
         return CL_INVALID_MEM_OBJECT;
     if (so + size > src->size || dof + size > dst->size)
         return CL_INVALID_VALUE;
-    struct request r = {COPY, {base_handle(src), base_offset(src) + so, base_handle(dst), base_offset(dst) + dof, size}};
-    cl_int e = call(&r);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_COPY_BUFFER, ev);
+    struct command c = {run_copy, {so, dof, size}, .mem = {src, dst}};
+    return submit(q, CL_COMMAND_COPY_BUFFER, &c, nw, wait, ev, 0);
+}
+
+// a[0] the offset, a[1] the pattern's size, a[2] the size; data the
+// pattern.
+static cl_int run_fill(struct command *c) {
+    cl_mem m = c->mem[0];
+    struct request r = {FILL, {base_handle(m), base_offset(m) + c->a[0], (uintptr_t)c->data, c->a[1], c->a[2]}};
+    return call(&r);
 }
 
 static cl_int EnqueueFillBuffer(cl_command_queue q, cl_mem m, const void *pattern, size_t psize, size_t offset, size_t size, cl_uint nw,
                                 const cl_event *wait, cl_event *ev) {
-    (void)nw, (void)wait;
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
     if (!m)
         return CL_INVALID_MEM_OBJECT;
     if (!pattern || !psize || offset + size > m->size || size % psize || offset % psize)
         return CL_INVALID_VALUE;
-    struct request r = {FILL, {base_handle(m), base_offset(m) + offset, (uintptr_t)pattern, psize, size}};
-    cl_int e = call(&r);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_FILL_BUFFER, ev);
+    // (The pattern may change once this returns.)
+    void *copy = dup_bytes(pattern, psize);
+    if (!copy)
+        return CL_OUT_OF_HOST_MEMORY;
+    struct command c = {run_fill, {offset, psize, size}, copy, {m}};
+    return submit(q, CL_COMMAND_FILL_BUFFER, &c, nw, wait, ev, 0);
 }
 
 // Rectangles: row by row.
@@ -840,30 +1127,53 @@ static cl_int rect(cl_mem m, int writing, const size_t *bo, const size_t *ho, co
     return CL_SUCCESS;
 }
 
-static cl_int EnqueueReadBufferRect(cl_command_queue q, cl_mem m, cl_bool blocking, const size_t *bo, const size_t *ho, const size_t *reg, size_t brp,
-                                    size_t bsp, size_t hrp, size_t hsp, void *p, cl_uint nw, const cl_event *wait, cl_event *ev) {
-    (void)blocking, (void)nw, (void)wait;
+// The three origins and sizes of a rectangle command, copied (data: two
+// origins, then the region).
+static size_t *rect_copy(const size_t *a, const size_t *b, const size_t *reg) {
+    size_t *d = malloc(9 * sizeof *d);
+    if (d) {
+        memcpy(d, a, 3 * sizeof *d);
+        memcpy(d + 3, b, 3 * sizeof *d);
+        memcpy(d + 6, reg, 3 * sizeof *d);
+    }
+    return d;
+}
+
+// a[0] whether a write, a[1]-a[4] the pitches, a[5] the host memory.
+static cl_int run_rect(struct command *c) {
+    size_t *d = c->data;
+    return rect(c->mem[0], (int)c->a[0], d, d + 3, d + 6, c->a[1], c->a[2], c->a[3], c->a[4], (void *)c->a[5]);
+}
+
+static cl_int rect_command(cl_command_queue q, cl_mem m, int writing, cl_bool blocking, const size_t *bo, const size_t *ho, const size_t *reg, size_t brp,
+                           size_t bsp, size_t hrp, size_t hsp, const void *p, cl_uint nw, const cl_event *wait, cl_event *ev) {
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
     if (!m)
         return CL_INVALID_MEM_OBJECT;
-    if (!host_reads(m))
+    if (writing ? !host_writes(m) : !host_reads(m))
         return CL_INVALID_OPERATION;
-    cl_int e = rect(m, 0, bo, ho, reg, brp, bsp, hrp, hsp, p);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_READ_BUFFER_RECT, ev);
+    if (!bo || !ho || !reg || !p || !reg[0] || !reg[1] || !reg[2])
+        return CL_INVALID_VALUE;
+    // (Checked now, as a command that waits finds out only when it runs.)
+    size_t rp = brp ? brp : reg[0], sp = bsp ? bsp : reg[1] * rp;
+    if ((bo[2] + reg[2] - 1) * sp + (bo[1] + reg[1] - 1) * rp + bo[0] + reg[0] > m->size)
+        return CL_INVALID_VALUE;
+    size_t *d = rect_copy(bo, ho, reg);
+    if (!d)
+        return CL_OUT_OF_HOST_MEMORY;
+    struct command c = {run_rect, {writing, brp, bsp, hrp, hsp, (uintptr_t)p}, d, {m}};
+    return submit(q, writing ? CL_COMMAND_WRITE_BUFFER_RECT : CL_COMMAND_READ_BUFFER_RECT, &c, nw, wait, ev, blocking);
+}
+
+static cl_int EnqueueReadBufferRect(cl_command_queue q, cl_mem m, cl_bool blocking, const size_t *bo, const size_t *ho, const size_t *reg, size_t brp,
+                                    size_t bsp, size_t hrp, size_t hsp, void *p, cl_uint nw, const cl_event *wait, cl_event *ev) {
+    return rect_command(q, m, 0, blocking, bo, ho, reg, brp, bsp, hrp, hsp, p, nw, wait, ev);
 }
 
 static cl_int EnqueueWriteBufferRect(cl_command_queue q, cl_mem m, cl_bool blocking, const size_t *bo, const size_t *ho, const size_t *reg, size_t brp,
                                      size_t bsp, size_t hrp, size_t hsp, const void *p, cl_uint nw, const cl_event *wait, cl_event *ev) {
-    (void)blocking, (void)nw, (void)wait;
-    if (!q)
-        return CL_INVALID_COMMAND_QUEUE;
-    if (!m)
-        return CL_INVALID_MEM_OBJECT;
-    if (!host_writes(m))
-        return CL_INVALID_OPERATION;
-    cl_int e = rect(m, 1, bo, ho, reg, brp, bsp, hrp, hsp, (void *)p);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_WRITE_BUFFER_RECT, ev);
+    return rect_command(q, m, 1, blocking, bo, ho, reg, brp, bsp, hrp, hsp, p, nw, wait, ev);
 }
 
 
@@ -884,9 +1194,30 @@ static void lock_mappings(void) {
 }
 static void unlock_mappings(void) { __atomic_store_n(&mappings_lock, 0, __ATOMIC_RELEASE); }
 
+// a[0]-a[3] the pitches (source row and slice, destination row and slice);
+// data the origins and region.
+static cl_int run_copy_rect(struct command *c) {
+    cl_mem src = c->mem[0], dst = c->mem[1];
+    const size_t *so = c->data, *dor = so + 3, *reg = so + 6;
+    size_t srp = c->a[0], ssp = c->a[1], drp = c->a[2], dsp = c->a[3];
+    // Row by row, through the host.
+    char *row = malloc(reg[0]);
+    if (!row)
+        return CL_OUT_OF_HOST_MEMORY;
+    cl_int e = CL_SUCCESS;
+    for (size_t z = 0; e == CL_SUCCESS && z < reg[2]; z++)
+        for (size_t y = 0; e == CL_SUCCESS && y < reg[1]; y++) {
+            size_t s = (so[2] + z) * ssp + (so[1] + y) * srp + so[0];
+            size_t d = (dor[2] + z) * dsp + (dor[1] + y) * drp + dor[0];
+            if ((e = read_mem(src, s, reg[0], row)) == CL_SUCCESS)
+                e = write_mem(dst, d, reg[0], row);
+        }
+    free(row);
+    return e;
+}
+
 static cl_int EnqueueCopyBufferRect(cl_command_queue q, cl_mem src, cl_mem dst, const size_t *so, const size_t *dor, const size_t *reg, size_t srp, size_t ssp,
                                     size_t drp, size_t dsp, cl_uint nw, const cl_event *wait, cl_event *ev) {
-    (void)nw, (void)wait;
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
     if (!src || !dst)
@@ -901,78 +1232,18 @@ static cl_int EnqueueCopyBufferRect(cl_command_queue q, cl_mem src, cl_mem dst, 
         drp = reg[0];
     if (!dsp)
         dsp = reg[1] * drp;
-    // Row by row, through the host.
-    char *row = malloc(reg[0]);
-    if (!row)
+    if ((so[2] + reg[2] - 1) * ssp + (so[1] + reg[1] - 1) * srp + so[0] + reg[0] > src->size ||
+        (dor[2] + reg[2] - 1) * dsp + (dor[1] + reg[1] - 1) * drp + dor[0] + reg[0] > dst->size)
+        return CL_INVALID_VALUE;
+    size_t *d = rect_copy(so, dor, reg);
+    if (!d)
         return CL_OUT_OF_HOST_MEMORY;
-    cl_int e = CL_SUCCESS;
-    for (size_t z = 0; e == CL_SUCCESS && z < reg[2]; z++)
-        for (size_t y = 0; e == CL_SUCCESS && y < reg[1]; y++) {
-            size_t s = (so[2] + z) * ssp + (so[1] + y) * srp + so[0];
-            size_t d = (dor[2] + z) * dsp + (dor[1] + y) * drp + dor[0];
-            if (s + reg[0] > src->size || d + reg[0] > dst->size)
-                e = CL_INVALID_VALUE;
-            else if ((e = read_mem(src, s, reg[0], row)) == CL_SUCCESS)
-                e = write_mem(dst, d, reg[0], row);
-        }
-    free(row);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_COPY_BUFFER_RECT, ev);
+    struct command c = {run_copy_rect, {srp, ssp, drp, dsp}, d, {src, dst}};
+    return submit(q, CL_COMMAND_COPY_BUFFER_RECT, &c, nw, wait, ev, 0);
 }
 
-static void *EnqueueMapBuffer(cl_command_queue q, cl_mem m, cl_bool blocking, cl_map_flags flags, size_t offset, size_t size, cl_uint nw,
-                              const cl_event *wait, cl_event *ev, cl_int *err) {
-    (void)blocking, (void)nw, (void)wait;
-    cl_int e = !q ? CL_INVALID_COMMAND_QUEUE : !m ? CL_INVALID_MEM_OBJECT : offset + size > m->size ? CL_INVALID_VALUE : CL_SUCCESS;
-    if (e == CL_SUCCESS && (((flags & CL_MAP_READ) && !host_reads(m)) || ((flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION)) && !host_writes(m))))
-        e = CL_INVALID_OPERATION;
-    void *p = NULL;
-    struct mapping *map = NULL;
-    if (e == CL_SUCCESS) {
-        // A buffer made from the host's memory maps to it.
-        p = m->host ? (char *)m->host + offset : malloc(size ? size : 1);
-        map = m->host ? NULL : malloc(sizeof *map);
-        if (!p || (!m->host && !map))
-            e = CL_MAP_FAILURE;
-        else if (!(flags & CL_MAP_WRITE_INVALIDATE_REGION))
-            e = read_mem(m, offset, size, p);
-    }
-    if (e == CL_SUCCESS) {
-        __atomic_add_fetch(&m->maps, 1, __ATOMIC_RELAXED);
-        int write = (flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION)) != 0;
-        if (map) {
-            lock_mappings();
-            *map = (struct mapping){p, offset, size, m, write, mappings};
-            mappings = map;
-            unlock_mappings();
-        } else if (write) {
-            // (Written back from the host memory at unmap too.)
-            struct mapping *h = malloc(sizeof *h);
-            if (h) {
-                lock_mappings();
-                *h = (struct mapping){p, offset, size, m, write, mappings};
-                mappings = h;
-                unlock_mappings();
-            }
-        }
-        e = done(q, CL_COMMAND_MAP_BUFFER, ev);
-    } else {
-        if (!m || !m->host)
-            free(p);
-        free(map);
-    }
-    if (err)
-        *err = e;
-    return e == CL_SUCCESS ? p : NULL;
-}
-
-static cl_int EnqueueUnmapMemObject(cl_command_queue q, cl_mem m, void *p, cl_uint nw, const cl_event *wait, cl_event *ev) {
-    (void)nw, (void)wait;
-    if (!q)
-        return CL_INVALID_COMMAND_QUEUE;
-    if (!m || !m->maps)
-        return CL_INVALID_MEM_OBJECT;
-    cl_int e = CL_SUCCESS;
-    // (Unlinked under the lock; written back and freed after it.)
+// The mapping of a buffer at p, unlinked (NULL if there's none).
+static struct mapping *unlink_mapping(cl_mem m, void *p) {
     struct mapping *found = NULL;
     lock_mappings();
     for (struct mapping **at = &mappings; *at; at = &(*at)->next) {
@@ -983,6 +1254,61 @@ static cl_int EnqueueUnmapMemObject(cl_command_queue q, cl_mem m, void *p, cl_ui
         }
     }
     unlock_mappings();
+    return found;
+}
+
+// a[0] the offset, a[1] the size, a[2] where it's mapped.
+static cl_int run_map(struct command *c) { return read_mem(c->mem[0], c->a[0], c->a[1], (void *)c->a[2]); }
+
+static void *EnqueueMapBuffer(cl_command_queue q, cl_mem m, cl_bool blocking, cl_map_flags flags, size_t offset, size_t size, cl_uint nw,
+                              const cl_event *wait, cl_event *ev, cl_int *err) {
+    cl_int e = !q ? CL_INVALID_COMMAND_QUEUE : !m ? CL_INVALID_MEM_OBJECT : offset + size > m->size ? CL_INVALID_VALUE : CL_SUCCESS;
+    if (e == CL_SUCCESS && (((flags & CL_MAP_READ) && !host_reads(m)) || ((flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION)) && !host_writes(m))))
+        e = CL_INVALID_OPERATION;
+    if (e == CL_SUCCESS)
+        e = waits(q, nw, wait);
+    void *p = NULL;
+    if (e == CL_SUCCESS) {
+        // A buffer made from the host's memory maps to it; others to a copy,
+        // written back at unmap (as the host's is too, if mapped to write).
+        int write = (flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION)) != 0;
+        p = m->host ? (char *)m->host + offset : malloc(size ? size : 1);
+        struct mapping *map = !m->host || write ? malloc(sizeof *map) : NULL;
+        if (!p || ((!m->host || write) && !map)) {
+            if (!m->host)
+                free(p);
+            free(map);
+            e = CL_MAP_FAILURE;
+        } else {
+            __atomic_add_fetch(&m->maps, 1, __ATOMIC_RELAXED);
+            if (map) {
+                lock_mappings();
+                *map = (struct mapping){p, offset, size, m, write, mappings};
+                mappings = map;
+                unlock_mappings();
+            }
+            // The contents, once the work before is done.
+            struct command c = {flags & CL_MAP_WRITE_INVALIDATE_REGION ? run_nothing : run_map, {offset, size, (uintptr_t)p}, .mem = {m}};
+            e = submit(q, CL_COMMAND_MAP_BUFFER, &c, nw, wait, ev, blocking);
+            if (e != CL_SUCCESS) {
+                free(unlink_mapping(m, p));
+                __atomic_sub_fetch(&m->maps, 1, __ATOMIC_RELAXED);
+                if (!m->host)
+                    free(p);
+            }
+        }
+    }
+    if (err)
+        *err = e;
+    return e == CL_SUCCESS ? p : NULL;
+}
+
+// a[0] the mapped memory: written back (if mapped to write) and unmapped.
+static cl_int run_unmap(struct command *c) {
+    cl_mem m = c->mem[0];
+    void *p = (void *)c->a[0];
+    cl_int e = CL_SUCCESS;
+    struct mapping *found = unlink_mapping(m, p);
     if (found) {
         if (found->write)
             e = write_mem(m, found->offset, found->size, p);
@@ -991,7 +1317,16 @@ static cl_int EnqueueUnmapMemObject(cl_command_queue q, cl_mem m, void *p, cl_ui
         free(found);
     }
     __atomic_sub_fetch(&m->maps, 1, __ATOMIC_RELAXED);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_UNMAP_MEM_OBJECT, ev);
+    return e;
+}
+
+static cl_int EnqueueUnmapMemObject(cl_command_queue q, cl_mem m, void *p, cl_uint nw, const cl_event *wait, cl_event *ev) {
+    if (!q)
+        return CL_INVALID_COMMAND_QUEUE;
+    if (!m || !m->maps)
+        return CL_INVALID_MEM_OBJECT;
+    struct command c = {run_unmap, {(uintptr_t)p}, .mem = {m}};
+    return submit(q, CL_COMMAND_UNMAP_MEM_OBJECT, &c, nw, wait, ev, 0);
 }
 
 // ---- Programs ----
@@ -1520,9 +1855,19 @@ static cl_int GetKernelArgInfo(cl_kernel k, cl_uint i, cl_kernel_arg_info what, 
     return CL_INVALID_VALUE;
 }
 
+// a[0] the dimensions; data the arguments (see EnqueueNDRangeKernel).
+static cl_int run_kernel(struct command *c) {
+    cl_kernel k = c->kernel;
+    uint8_t *sizes = c->data, *handles = sizes + 9 * sizeof(uint32_t);
+    uint8_t *locals = handles + k->nargs * sizeof *k->handles, *block = locals + k->nargs * sizeof *k->locals;
+    struct request r = {RUN,
+                        {k->program->handle, (uintptr_t)k->name, strlen(k->name), c->a[0], (uintptr_t)sizes, (uintptr_t)block, k->block_size,
+                         (uintptr_t)handles, (uintptr_t)locals}};
+    return call(&r);
+}
+
 static cl_int EnqueueNDRangeKernel(cl_command_queue q, cl_kernel k, cl_uint dims, const size_t *offset, const size_t *global, const size_t *local,
                                    cl_uint nw, const cl_event *wait, cl_event *ev) {
-    (void)nw, (void)wait;
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
     if (!k)
@@ -1544,11 +1889,23 @@ static cl_int EnqueueNDRangeKernel(cl_command_queue q, cl_kernel k, cl_uint dims
         if (local && (!local[d] || global[d] % local[d]))
             return CL_INVALID_WORK_GROUP_SIZE;
     }
-    struct request r = {RUN,
-                        {k->program->handle, (uintptr_t)k->name, strlen(k->name), dims, (uintptr_t)sizes, (uintptr_t)k->block, k->block_size,
-                         (uintptr_t)k->handles, (uintptr_t)k->locals}};
-    cl_int e = call(&r);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_NDRANGE_KERNEL, ev);
+    // Its arguments as they are now (they may be set again once this
+    // returns): the sizes, the block, the buffers' handles and the local
+    // memory sizes, one after another.
+    size_t n = sizeof sizes + k->block_size + k->nargs * (sizeof *k->handles + sizeof *k->locals);
+    uint8_t *d = malloc(n);
+    if (!d)
+        return CL_OUT_OF_HOST_MEMORY;
+    uint8_t *at = d;
+    memcpy(at, sizes, sizeof sizes);
+    at += sizeof sizes;
+    memcpy(at, k->handles, k->nargs * sizeof *k->handles);
+    at += k->nargs * sizeof *k->handles;
+    memcpy(at, k->locals, k->nargs * sizeof *k->locals);
+    at += k->nargs * sizeof *k->locals;
+    memcpy(at, k->block, k->block_size);
+    struct command c = {run_kernel, {dims}, d, .kernel = k};
+    return submit(q, CL_COMMAND_NDRANGE_KERNEL, &c, nw, wait, ev, 0);
 }
 
 static cl_int EnqueueTask(cl_command_queue q, cl_kernel k, cl_uint nw, const cl_event *wait, cl_event *ev) {
@@ -1568,52 +1925,50 @@ static cl_int EnqueueMigrateMemObjects(cl_command_queue q, cl_uint n, const cl_m
             return CL_INVALID_MEM_OBJECT;
     if (flags & ~(cl_mem_migration_flags)(CL_MIGRATE_MEM_OBJECT_HOST | CL_MIGRATE_MEM_OBJECT_CONTENT_UNDEFINED))
         return CL_INVALID_VALUE;
-    (void)nw, (void)wait;
-    return done(q, CL_COMMAND_MIGRATE_MEM_OBJECTS, ev);
+    struct command c = {run_nothing};
+    return submit(q, CL_COMMAND_MIGRATE_MEM_OBJECTS, &c, nw, wait, ev, 0);
 }
 
 // ---- Events and synchronization ----
 
-// A wait list: well formed, and events of the queue's context.
-static cl_int waits(cl_command_queue q, cl_uint n, const cl_event *wait) {
-    if ((n && !wait) || (!n && wait))
-        return CL_INVALID_EVENT_WAIT_LIST;
-    for (cl_uint i = 0; i < n; i++) {
-        if (!wait[i])
-            return CL_INVALID_EVENT_WAIT_LIST;
-        if (wait[i]->ctx != q->ctx)
-            return CL_INVALID_CONTEXT;
-    }
-    return CL_SUCCESS;
-}
-
+// (Queues are in order: a marker or a barrier waits for the commands
+// before it, and its wait list.)
 static cl_int EnqueueMarkerWithWaitList(cl_command_queue q, cl_uint nw, const cl_event *wait, cl_event *ev) {
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
-    cl_int e = waits(q, nw, wait);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_MARKER, ev);
+    struct command c = {run_nothing};
+    return submit(q, CL_COMMAND_MARKER, &c, nw, wait, ev, 0);
 }
 
 static cl_int EnqueueBarrierWithWaitList(cl_command_queue q, cl_uint nw, const cl_event *wait, cl_event *ev) {
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
-    cl_int e = waits(q, nw, wait);
-    return e != CL_SUCCESS ? e : done(q, CL_COMMAND_BARRIER, ev);
+    struct command c = {run_nothing};
+    return submit(q, CL_COMMAND_BARRIER, &c, nw, wait, ev, 0);
 }
 
 static cl_int EnqueueMarker(cl_command_queue q, cl_event *ev) { return EnqueueMarkerWithWaitList(q, 0, NULL, ev); }
 static cl_int EnqueueBarrier(cl_command_queue q) { return q ? CL_SUCCESS : CL_INVALID_COMMAND_QUEUE; }
 static cl_int EnqueueWaitForEvents(cl_command_queue q, cl_uint n, const cl_event *events) {
-    (void)n, (void)events;
-    return q ? CL_SUCCESS : CL_INVALID_COMMAND_QUEUE;
+    if (!q)
+        return CL_INVALID_COMMAND_QUEUE;
+    if (!n || !events)
+        return CL_INVALID_VALUE;
+    return EnqueueBarrierWithWaitList(q, n, events, NULL);
 }
 
 static cl_int WaitForEvents(cl_uint n, const cl_event *events) {
     if (!n || !events)
         return CL_INVALID_VALUE;
     for (cl_uint i = 0; i < n; i++)
-        if (events[i]->status < 0)
-            return CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST;
+        if (!events[i])
+            return CL_INVALID_EVENT;
+    cl_int e = CL_SUCCESS;
+    for (cl_uint i = 0; i < n; i++)
+        if (wait_for(events[i]) != CL_SUCCESS)
+            e = CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST;
+    if (e != CL_SUCCESS)
+        return e;
     struct request r = {FINISH};
     return call(&r);
 }
@@ -1629,7 +1984,7 @@ static cl_int GetEventInfo(cl_event e, cl_event_info what, size_t cap, void *out
     case CL_EVENT_COMMAND_TYPE:
         INFO_OF(cl_command_type, e->type);
     case CL_EVENT_COMMAND_EXECUTION_STATUS:
-        INFO_OF(cl_int, e->status);
+        INFO_OF(cl_int, status_of(e));
     case CL_EVENT_REFERENCE_COUNT:
         INFO_OF(cl_uint, e->refs);
     }
@@ -1672,20 +2027,11 @@ static cl_int SetUserEventStatus(cl_event e, cl_int status) {
         return CL_INVALID_EVENT;
     if (status > CL_COMPLETE)
         return CL_INVALID_VALUE;
-    if (e->status <= CL_COMPLETE)
+    if (status_of(e) <= CL_COMPLETE)
         return CL_INVALID_OPERATION;
-    e->status = status;
-    // The callbacks for this status (complete, or an error: past running).
-    for (struct waiting **at = &e->waiting; *at;) {
-        struct waiting *w = *at;
-        if (status <= w->type) {
-            *at = w->next;
-            w->f(e, status, w->user);
-            free(w);
-        } else {
-            at = &w->next;
-        }
-    }
+    set_status(e, status);
+    // The commands that waited for it.
+    drain();
     return CL_SUCCESS;
 }
 
@@ -1696,17 +2042,22 @@ static cl_int SetEventCallback(cl_event e, cl_int type, void(CL_CALLBACK *notify
         return CL_INVALID_VALUE;
     if (type != CL_COMPLETE && type != CL_RUNNING && type != CL_SUBMITTED)
         return CL_INVALID_VALUE;
-    // Events are complete when made (user events aside): the callback runs
-    // now, or when a user event gets there.
-    if (e->status <= type) {
-        notify(e, e->status, user);
-        return CL_SUCCESS;
-    }
     struct waiting *w = malloc(sizeof *w);
     if (!w)
         return CL_OUT_OF_HOST_MEMORY;
-    *w = (struct waiting){notify, user, type, e->waiting};
-    e->waiting = w;
+    // Now, if the event is there already; else when it gets there
+    // (`set_status`).
+    lock_commands();
+    cl_int s = e->status;
+    if (s > type) {
+        *w = (struct waiting){notify, user, type, e->waiting};
+        e->waiting = w;
+    }
+    unlock_commands();
+    if (s <= type) {
+        free(w);
+        notify(e, s, user);
+    }
     return CL_SUCCESS;
 }
 
