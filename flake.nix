@@ -38,6 +38,40 @@
             done
             llvm-ar rcs $out/lib/libclang_rt.builtins.a $TMPDIR/obj/*.o
           '';
+          # OpenCL's builtins (LLVM's libclc, its clspv target: math in
+          # software, for the GPU service), as packages/libclc/build.sh
+          # builds them: marked to be inlined into kernels.
+          libclc = pkgs.stdenv.mkDerivation {
+            pname = "wasm-env-libclc";
+            version = llvm.llvm.version;
+            srcs = [
+              (pkgs.fetchurl {
+                url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/libclc-21.1.8.src.tar.xz";
+                hash = "sha256-bCZ3NipTUxw17fSCvckXHqBHHKCh6ROKybWheCklYW8=";
+              })
+              (pkgs.fetchurl {
+                url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/cmake-21.1.8.src.tar.xz";
+                hash = "sha256-hXNfIP2MgeywoJq7DCZwGEdUIOk7ZQUMxbdjTqt0Tek=";
+              })
+            ];
+            sourceRoot = ".";
+            nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 llvm.llvm llvm.clang-unwrapped ];
+            dontConfigure = true;
+            buildPhase = ''
+              ln -s cmake-21.1.8.src cmake
+              patch -d libclc-21.1.8.src -p1 < ${./packages/libclc/signed-zeros.patch}
+              cmake -S libclc-21.1.8.src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLIBCLC_TARGETS_TO_BUILD=clspv-- \
+                -DLLVM_DIR=${llvm.llvm.dev}/lib/cmake/llvm -DLLVM_TOOLS_BINARY_DIR=${llvm.llvm}/bin \
+                -DLLVM_TOOL_clang=${llvm.clang-unwrapped}/bin/clang
+              ninja -C build
+            '';
+            installPhase = ''
+              mkdir -p $out/lib/wasm-env/clc
+              llvm-dis build/clspv--.bc -o - |
+                sed -E '/^attributes #/{s/ noinline//g; s/ "no-builtins"//g; /"frame-pointer"/s/^(attributes #[0-9]+ = \{ )/\1alwaysinline /}' |
+                llvm-as -o $out/lib/wasm-env/clc/clspv--.bc
+            '';
+          };
           # Libraries the compositor's host windows (winit) load at run time
           # on Linux: the host's window system, Wayland or X11, and the Vulkan
           # loader the GPU service (wgpu) opens.
@@ -48,7 +82,7 @@
           };
         in
         rec {
-          inherit builtins;
+          inherit builtins libclc;
           wasm-env = pkgs.rustPlatform.buildRustPackage {
             pname = "wasm-env";
             version = "0.1.0";
@@ -67,6 +101,9 @@
               ln -s ${llvm.clang-unwrapped}/bin/clang $tc/bin/clang
               ln -s ${llvm.lld}/bin/wasm-ld $tc/bin/wasm-ld
               ln -s ${builtins}/lib/libclang_rt.builtins.a $tc/lib/libclang_rt.builtins.a
+              # OpenCL's builtins (runtime/src/gpu.rs looks here).
+              mkdir -p $out/lib/wasm-env/clc
+              ln -s ${libclc}/lib/wasm-env/clc/clspv--.bc $out/lib/wasm-env/clc/clspv--.bc
               # The guest's OpenCL driver (packages/opencl), for environments.
               mkdir -p $out/lib/wasm-env/guest
               ${llvm.clang-unwrapped}/bin/clang --target=aarch64-linux-gnu -ffreestanding -nostdlib -shared -fPIC \

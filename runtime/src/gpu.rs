@@ -523,9 +523,16 @@ fn build(source: &str, options: &str, guest: &wasm_env_gpu::opencl::Guest) -> (O
     if log.is_empty() { (Some(m), log) } else { (None, log) }
 }
 
-/// The clang that compiles OpenCL C: the translation toolchain's.
-fn toolchain() -> Result<std::path::PathBuf, String> {
-    wasm_env_translate::link::Toolchain::from_env().map(|t| t.cc).ok_or_else(|| "wasm-env: no toolchain (clang) to compile OpenCL C with".into())
+/// What compiles OpenCL C: the translation toolchain's clang, and OpenCL's
+/// builtins (libclc, packages/libclc) from `$WASM_ENV_LIBCLC`, beside the
+/// program (`../lib/wasm-env/clc`, as flake.nix installs them), or the
+/// source tree's build; without them, math is the GPU's own.
+fn toolchain() -> Result<wasm_env_gpu::opencl::Compiler, String> {
+    let clang = wasm_env_translate::link::Toolchain::from_env().map(|t| t.cc).ok_or("wasm-env: no toolchain (clang) to compile OpenCL C with")?;
+    let installed = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("../lib/wasm-env/clc/clspv--.bc")));
+    let source_tree = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../build/libclc/clspv--.bc");
+    let builtins = std::env::var_os("WASM_ENV_LIBCLC").map(Into::into).into_iter().chain(installed).chain([source_tree]).find(|p: &std::path::PathBuf| p.exists());
+    Ok(wasm_env_gpu::opencl::Compiler { clang, builtins })
 }
 
 /// What a module's kernels use that the device can't do: the build log.

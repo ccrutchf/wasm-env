@@ -1141,6 +1141,17 @@ impl Gen<'_> {
             "sitofp" if from_w == 1 => format!("select({}(0.0), {}(-1.0), {x})", vt("f32"), vt("f32")),
             "sitofp" => format!("{}({})", vt("f32"), sext_signed(&x, from_w, lanes)),
             "fpext" | "fptrunc" => x,
+            // <N x i1> to and from an N-bit mask, lane k in bit k.
+            "bitcast" if a.ty.lanes() > 1 && from_w == 1 && to.lanes() == 1 => {
+                let n = a.ty.lanes();
+                let weights: Vec<String> = (0..n).map(|k| format!("{}u", 1u32 << k)).collect();
+                format!("dot(select(vec{n}<u32>(0u), vec{n}<u32>({}), {x}), vec{n}<u32>(1u))", weights.join(", "))
+            }
+            "bitcast" if to.lanes() > 1 && to_w == 1 && a.ty.lanes() == 1 => {
+                let n = to.lanes();
+                let weights: Vec<String> = (0..n).map(|k| format!("{}u", 1u32 << k)).collect();
+                format!("(vec{n}<u32>({x}) & vec{n}<u32>({})) != vec{n}<u32>(0u)", weights.join(", "))
+            }
             "bitcast" => {
                 if a.ty.lanes() != to.lanes() {
                     bail!("a bitcast from {:?} to {to:?}", a.ty);
@@ -1324,6 +1335,9 @@ impl Gen<'_> {
             return self.intrinsic(i, intr, args, &vals);
         }
         let (base, params) = demangle(name).ok_or_else(|| format!("a call to {name}"))?;
+        // (libclc's clspv build leaves a few of its own to the target:
+        // __clc_mul_hi and the like, the builtins of the same name.)
+        let base = base.strip_prefix("__clc_").map_or(base.clone(), str::to_string);
         let unsigned = params.first().is_some_and(|p| matches!(p, 'h' | 't' | 'j' | 'm' | 'b'));
         let dim = |g: &Self, what: &str, v: &str| -> String {
             let _ = g;
@@ -1466,8 +1480,10 @@ impl Gen<'_> {
                             let c = self.icmp(&format!("{}{}", &op[..1], if op.ends_with("max") { "gt" } else { "lt" }), &acc, &lane(k))?;
                             format!("select({}, {}, {c})", self.val(&lane(k))?, self.val(&acc)?)
                         }
-                        "fmax" | "fmaximum" => format!("max({}, {})", self.val(&acc)?, self.val(&lane(k))?),
-                        "fmin" | "fminimum" => format!("min({}, {})", self.val(&acc)?, self.val(&lane(k))?),
+                        "fmax" => min_max_num("max", &self.val(&acc)?, &self.val(&lane(k))?, 1),
+                        "fmaximum" => format!("max({}, {})", self.val(&acc)?, self.val(&lane(k))?),
+                        "fmin" => min_max_num("min", &self.val(&acc)?, &self.val(&lane(k))?, 1),
+                        "fminimum" => format!("min({}, {})", self.val(&acc)?, self.val(&lane(k))?),
                         o => bail!("the reduction {o}"),
                     };
                     acc = Operand { ty: et.clone(), v: Value::Wgsl(format!("({e})")) };
@@ -1482,8 +1498,10 @@ impl Gen<'_> {
             "sqrt" | "floor" | "ceil" | "trunc" | "exp2" | "log2" | "exp" | "log" | "sin" | "cos" | "pow" => format!("{base}({})", v.join(", ")),
             "rint" | "nearbyint" | "roundeven" => format!("round({})", v[0]),
             "round" => format!("trunc({x} + sign({x}) * 0.5)", x = v[0]),
-            "minnum" | "minimum" => format!("min({}, {})", v[0], v[1]),
-            "maxnum" | "maximum" => format!("max({}, {})", v[0], v[1]),
+            "minnum" | "maxnum" => min_max_num(&base[..3], &v[0], &v[1], t.lanes()),
+            "minimum" => format!("min({}, {})", v[0], v[1]),
+            "maximum" => format!("max({}, {})", v[0], v[1]),
+            "sadd" | "ssub" | "uadd" | "usub" if name.contains(".sat.") => self.saturating(t, base.ends_with("add"), base.starts_with('u'), &v[0], &v[1]),
             "copysign" => {
                 let lanes = t.lanes();
                 let u = if lanes > 1 { format!("vec{lanes}<u32>") } else { "u32".into() };
@@ -1571,6 +1589,39 @@ impl Gen<'_> {
         Ok(())
     }
 
+    /// add_sat and sub_sat (and llvm's sadd.sat etc.) on integers of up
+    /// to 32 bits.
+    fn saturating(&self, t: &Type, add: bool, unsigned: bool, a: &str, b: &str) -> String {
+        let w = bits(t);
+        let n = t.lanes();
+        let s = |x: &str| self.splat(t, x);
+        let op = if add { "+" } else { "-" };
+        if unsigned {
+            return if !add {
+                format!("select({a} - {b}, {}, {b} > {a})", s("0u"))
+            } else if w < 32 {
+                format!("min({a} + {b}, {})", s(&format!("{}u", mask(w))))
+            } else {
+                format!("select({a} + {b}, {}, {a} + {b} < {a})", s("0xffffffffu"))
+            };
+        }
+        let (x, y) = (sext_signed(a, w, n), sext_signed(b, w, n));
+        let it = if n > 1 { format!("vec{n}<i32>") } else { "i32".into() };
+        let e = if w < 32 {
+            let (lo, hi) = (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1);
+            format!("clamp({x} {op} {y}, {it}({lo}), {it}({hi}))")
+        } else {
+            // Overflow when the result's sign differs from a's, and b's
+            // sign agrees with it (or, for subtraction, differs).
+            let r = format!("({x} {op} {y})");
+            let yy = if add { y.clone() } else { format!("(~{y})") };
+            let over = format!("(({x} ^ {r}) & ({yy} ^ {r})) < {it}(0)");
+            let sat = format!("select({it}(2147483647), {it}(-2147483647 - 1), {x} < {it}(0))");
+            format!("select({r}, {sat}, {over})")
+        };
+        self.wrap_signed(t, e)
+    }
+
     /// A signed result (i32 lanes) back to the zero-extended representation.
     fn wrap_signed(&self, t: &Type, e: String) -> String {
         let w = bits(t);
@@ -1615,8 +1666,10 @@ impl Gen<'_> {
             "rootn" => format!("pow({}, 1.0 / {}(bitcast<i32>({})))", v[0], self.wty(t)?, v[1]),
             "atan2" => format!("atan2({}, {})", v[0], v[1]),
             "hypot" => format!("sqrt({a} * {a} + {b} * {b})", a = v[0], b = v[1]),
-            "fmin" | "min" if float => format!("min({}, {})", v[0], v[1]),
-            "fmax" | "max" if float => format!("max({}, {})", v[0], v[1]),
+            "fmin" if float => min_max_num("min", &v[0], &v[1], t.lanes()),
+            "fmax" if float => min_max_num("max", &v[0], &v[1], t.lanes()),
+            "min" if float => format!("min({}, {})", v[0], v[1]),
+            "max" if float => format!("max({}, {})", v[0], v[1]),
             "fmod" => format!("({} % {})", v[0], v[1]),
             "fdim" => format!("max({} - {}, {}(0.0))", v[0], v[1], self.wty(t)?),
             "fma" | "mad" => format!("fma({}, {}, {})", v[0], v[1], v[2]),
@@ -1660,7 +1713,9 @@ impl Gen<'_> {
                 let (x, y) = (&v[0], &v[1]);
                 let bx = format!("bitcast<u32>({x})");
                 let step = format!("select({bx} - 1u, {bx} + 1u, ({y} > {x}) == ({x} > 0.0))");
-                format!("select(select(bitcast<f32>({step}), bitcast<f32>(select(1u, 0x80000001u, {y} < 0.0)), {x} == 0.0), {y}, {x} == {y} || {x} != {x} || {y} != {y})")
+                let near = format!("select(select(bitcast<f32>({step}), bitcast<f32>(select(1u, 0x80000001u, {y} < 0.0)), {x} == 0.0), {y}, {x} == {y})");
+                // (A NaN either side gives a NaN.)
+                format!("select({near}, {x} + {y}, {} | {})", is_nan(x, 1), is_nan(y, 1))
             }
             "copysign" => {
                 let lanes = t.lanes();
@@ -1684,7 +1739,7 @@ impl Gen<'_> {
                     "isinf" => format!("({bitsx} & {}) == {}", s(0x7fffffff), s(0x7f800000)),
                     "isfinite" => format!("({bitsx} & {}) < {}", s(0x7fffffff), s(0x7f800000)),
                     "signbit" => format!("({bitsx} >> {}) != {}", s(31), s(0)),
-                    _ => format!("(({bitsx} & {}) < {}) && (({bitsx} & {}) >= {})", s(0x7fffffff), s(0x7f800000), s(0x7fffffff), s(0x00800000)),
+                    _ => format!("(({bitsx} & {}) < {}) & (({bitsx} & {}) >= {})", s(0x7fffffff), s(0x7f800000), s(0x7fffffff), s(0x00800000)),
                 };
                 // Scalars: 1 or 0; vectors: -1 (all bits) or 0.
                 let yes = if lanes > 1 || self.vector_call { self.splat(t, &format!("{}u", mask(bits(t)))) } else { "1u".into() };
@@ -1805,9 +1860,7 @@ impl Gen<'_> {
             ("abs", false) => back(format!("abs({})", s(&v[0]))),
             ("abs_diff", true) => format!("(max({a}, {b}) - min({a}, {b}))", a = v[0], b = v[1]),
             ("abs_diff", false) => back(format!("abs({} - {})", s(&v[0]), s(&v[1]))),
-            ("add_sat", true) if w < 32 => format!("min({} + {}, {})", v[0], v[1], m(mask(w) as u64)),
-            ("add_sat", true) => format!("select({a} + {b}, {}, {a} + {b} < {a})", m(u32::MAX as u64), a = v[0], b = v[1]),
-            ("sub_sat", true) => format!("select({a} - {b}, {}, {b} > {a})", m(0), a = v[0], b = v[1]),
+            ("add_sat" | "sub_sat", u) => self.saturating(t, b == "add_sat", u, &v[0], &v[1]),
             ("hadd", false) => back(format!("(({a} >> {u1}) + ({b} >> {u1}) + ({a} & {b} & {i1}))", a = s(&v[0]), b = s(&v[1]), u1 = m(1), i1 = ones(lanes))),
             ("rhadd", false) => back(format!("(({a} >> {u1}) + ({b} >> {u1}) + (({a} | {b}) & {i1}))", a = s(&v[0]), b = s(&v[1]), u1 = m(1), i1 = ones(lanes))),
             ("hadd", true) => format!("(({a} >> {one}) + ({b} >> {one}) + ({a} & {b} & {one}))", a = v[0], b = v[1], one = m(1)),
@@ -1821,12 +1874,26 @@ impl Gen<'_> {
                 let sh = format!("({} % {})", v[1], m(w as u64));
                 format!("((({a} << {sh}) | ({a} >> (({} - {sh}) % {}))) & {})", m(w as u64), m(w as u64), m(mask(w) as u64), a = v[0])
             }
-            ("mul_hi", true) if w == 32 => {
-                // The high word of a 32x32 product, from 16-bit halves.
+            ("mul_hi", u) if w == 32 => {
+                // The high word of a 32x32 product, from 16-bit halves (lane
+                // by lane); signed, less b where a < 0 and a where b < 0.
                 self.needs.borrow_mut().insert("mul_hi_u32");
-                format!("mul_hi_u32({}, {})", v[0], v[1])
+                let hi = if lanes > 1 {
+                    let l: Vec<String> = (0..lanes).map(|k| format!("mul_hi_u32(({})[{k}], ({})[{k}])", v[0], v[1])).collect();
+                    format!("vec{lanes}<u32>({})", l.join(", "))
+                } else {
+                    format!("mul_hi_u32({}, {})", v[0], v[1])
+                };
+                if u {
+                    hi
+                } else {
+                    let (a, b, z) = (&v[0], &v[1], m(0));
+                    let neg = |x: &str| format!("(bitcast<{}>({x}) < {})", if lanes > 1 { format!("vec{lanes}<i32>") } else { "i32".into() }, if lanes > 1 { format!("vec{lanes}<i32>(0)") } else { "0i".into() });
+                    format!("({hi} - select({z}, {b}, {}) - select({z}, {a}, {}))", neg(a), neg(b))
+                }
             }
             ("mul_hi", true) => format!("(({} * {}) >> {})", v[0], v[1], m(w as u64)),
+            ("mul_hi", false) => back(format!("(({} * {}) >> {})", s(&v[0]), s(&v[1]), m(w as u64))),
             (b, u) => bail!("the builtin {b} ({})", if u { "unsigned" } else { "signed" }),
         })
     }
@@ -2478,4 +2545,17 @@ fn attributes(m: &Module, f: &Function, required: Option<[u32; 3]>) -> String {
         }
     }
     out.join(" ")
+}
+
+/// Whether a float (or each lane) is a NaN, by its bits: a driver may take
+/// `x != x` to be false.
+fn is_nan(v: &str, lanes: u32) -> String {
+    let u = if lanes > 1 { format!("vec{lanes}<u32>") } else { "u32".into() };
+    format!("((bitcast<{u}>({v}) & {u}(0x7fffffffu)) > {u}(0x7f800000u))")
+}
+
+/// fmin or fmax (`f`: "min" or "max") the way OpenCL and llvm.minnum have
+/// it: a NaN operand gives the other one (WGSL leaves NaNs unspecified).
+fn min_max_num(f: &str, a: &str, b: &str, lanes: u32) -> String {
+    format!("select(select({f}({a}, {b}), {b}, {}), {a}, {})", is_nan(a, lanes), is_nan(b, lanes))
 }

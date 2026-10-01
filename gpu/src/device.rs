@@ -591,6 +591,85 @@ __kernel void cas(__global int *dest, __global int *old, __local int *l) {
     }
 
     #[test]
+    fn saturation_and_nan_rules() {
+        let Some(g) = gpu() else { return };
+        let src = r#"
+__kernel void k(__global const int *a, __global const int *b, __global int *o) {
+    int i = get_global_id(0);
+    int x = a[i], y = b[i];
+    __global int *r = o + i * 12;
+    r[0] = add_sat(x, y);
+    r[1] = sub_sat(x, y);
+    r[2] = add_sat((uint)x, (uint)y);
+    r[3] = sub_sat((uint)x, (uint)y);
+    r[4] = add_sat((char)x, (char)y);
+    r[5] = sub_sat((uchar)x, (uchar)y);
+    float fx = as_float(x), fy = as_float(y);
+    r[6] = as_int(fmin(fx, fy));
+    r[7] = as_int(fmax(fx, fy));
+    float2 v = (float2)(fx, fy);
+    int2 n = isnormal(v);
+    r[8] = n.x;
+    r[9] = n.y;
+    r[10] = as_int(fmax(v, (float2)(fy, fx)).x);
+    r[11] = mul_hi((int2)(x, y), (int2)(y, x)).y;
+}
+"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let nan = 0x7fc0_0000u32 as i32;
+        let pairs: [(i32, i32); 8] = [
+            (i32::MAX, 1),
+            (i32::MIN, 1),
+            (-5, i32::MAX),
+            (100, 100),
+            (-100, -100),
+            (1.5f32.to_bits() as i32, nan),
+            (nan, (-2.0f32).to_bits() as i32),
+            (1, 0x0080_0000),
+        ];
+        let n = pairs.len() as u32;
+        let (a, b, o) = (g.buffer(n as u64 * 4).unwrap(), g.buffer(n as u64 * 4).unwrap(), g.buffer(n as u64 * 48).unwrap());
+        g.write(&a, 0, &pairs.iter().flat_map(|p| p.0.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        g.write(&b, 0, &pairs.iter().flat_map(|p| p.1.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: [n, 1, 1], local_bytes: vec![] };
+        g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &[0u8; 12], &[(0, &a), (1, &b), (2, &o)]).unwrap();
+        let out = words(&g.read(&o, 0, n as u64 * 48).unwrap());
+        let fmin = |x: f32, y: f32| if x.is_nan() { y } else if y.is_nan() { x } else { x.min(y) };
+        let fmax = |x: f32, y: f32| if x.is_nan() { y } else if y.is_nan() { x } else { x.max(y) };
+        let normal = |x: f32| if x.is_normal() { -1 } else { 0 };
+        for (k, &(x, y)) in pairs.iter().enumerate() {
+            let (fx, fy) = (f32::from_bits(x as u32), f32::from_bits(y as u32));
+            let want = [
+                x.saturating_add(y),
+                x.saturating_sub(y),
+                (x as u32).saturating_add(y as u32) as i32,
+                (x as u32).saturating_sub(y as u32) as i32,
+                (x as i8).saturating_add(y as i8) as i32,
+                (x as u8).saturating_sub(y as u8) as i32,
+                fmin(fx, fy).to_bits() as i32,
+                fmax(fx, fy).to_bits() as i32,
+                normal(fx),
+                normal(fy),
+                fmax(fx, fy).to_bits() as i32,
+                ((y as i64 * x as i64) >> 32) as i32,
+            ];
+            let got: Vec<i32> = out[k * 12..k * 12 + 12].iter().map(|&w| w as i32).collect();
+            // fmin and fmax only of normal numbers and NaNs (a device
+            // without denormals may flush them, and zeros' signs may go
+            // either way).
+            let plain = |f: f32| f.is_normal() || f.is_nan();
+            let either_nan = |j: usize, w: i32| f32::from_bits(w as u32).is_nan() && f32::from_bits(got[j] as u32).is_nan();
+            let want: Vec<i32> = want
+                .iter()
+                .enumerate()
+                .map(|(j, &w)| if [6, 7, 10].contains(&j) && (!(plain(fx) && plain(fy)) || either_nan(j, w)) { got[j] } else { w })
+                .collect();
+            assert_eq!(got, want, "add_sat etc. of {x:#x}, {y:#x}");
+        }
+    }
+
+    #[test]
     fn a_work_group_size_divides_the_global_size() {
         assert_eq!(choose_local([1000, 1, 1], 1, 64), [50, 1, 1]);
         assert_eq!(choose_local([64, 64, 1], 2, 256), [64, 4, 1]);

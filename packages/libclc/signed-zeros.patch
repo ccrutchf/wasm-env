@@ -1,0 +1,48 @@
+--- a/clc/lib/generic/math/clc_cospi.inc
++++ b/clc/lib/generic/math/clc_cospi.inc
+@@ -50,6 +50,9 @@
+   __clc_sincos_piby4(a * M_PI_F, &sinval, &cosval);
+   __CLC_INTN jr = s ^ __CLC_AS_INTN(e != 0 ? cosval : sinval);
+ 
++  // Odd multiples of 0.5: +0 (OpenCL).
++  jr = r == 0.5f ? 0 : jr;
++
+   ir = ix < 0x4b000000 ? jr : ir;
+ 
+   return __CLC_AS_GENTYPE(ir);
+--- a/clc/lib/generic/math/clc_sinpi.inc
++++ b/clc/lib/generic/math/clc_sinpi.inc
+@@ -48,6 +48,9 @@
+   __clc_sincos_piby4(a * M_PI_F, &sinval, &cosval);
+   __CLC_INTN jr = xodd ^ __CLC_AS_INTN(e != 0 ? cosval : sinval);
+ 
++  // Integers: a zero of x's sign (OpenCL; sin(0) is +0).
++  jr = r == 0.0f ? xsgn : jr;
++
+   ir = ix < 0x4b000000 ? jr : ir;
+ 
+   return __CLC_AS_GENTYPE(ir);
+--- a/clc/lib/generic/math/clc_tanpi.inc
++++ b/clc/lib/generic/math/clc_tanpi.inc
+@@ -57,6 +57,9 @@
+ 
+   jr = r == 0.5f ? xodd | 0x7f800000 : jr;
+ 
++  // Integers: a zero of x's sign, the other sign for odd ones (OpenCL).
++  jr = r == 0.0f ? xodd : jr;
++
+   ir = ix < 0x4b000000 ? jr : ir;
+ 
+   return __CLC_AS_GENTYPE(ir);
+--- a/clc/lib/generic/math/clc_tgamma.cl
++++ b/clc/lib/generic/math/clc_tgamma.cl
+@@ -25,7 +25,8 @@
+     float z = __clc_sinpi(x);
+     g = g * absx * z;
+     g = pi / g;
+-    g = g == 0 ? INFINITY : g;
++    // (pi / g is 0 only where g overflowed: tgamma underflows to a zero of
++    // the right sign there, not infinity.)
+     g = z == 0 ? FLT_NAN : g;
+   }
+ 

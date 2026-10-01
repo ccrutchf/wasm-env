@@ -8,8 +8,22 @@ use std::process::{Command, Stdio};
 
 use crate::ir::{Module, Res, parse};
 
-/// A program's source compiled: its module, or clang's messages (the build
-/// log) on failure.
+/// What compiles OpenCL C: clang, and OpenCL's builtins as LLVM bitcode
+/// (libclc, packages/libclc), linked into programs for accurate math. Without
+/// them, the math builtins are the GPU's own (WGSL's), looser than OpenCL
+/// wants.
+pub struct Compiler {
+    pub clang: std::path::PathBuf,
+    pub builtins: Option<std::path::PathBuf>,
+}
+
+impl Compiler {
+    /// clang's arguments linking the builtins in (only what's used).
+    fn builtin_args(&self) -> Vec<String> {
+        self.builtins.iter().flat_map(|b| ["-Xclang".to_string(), "-mlink-builtin-bitcode".into(), "-Xclang".into(), b.display().to_string()]).collect()
+    }
+}
+
 /// Where the program that builds is: its environment's root on the host,
 /// and its working directory (on the host). clang runs on the host, so the
 /// program's paths (`-I /opt/include`, `#include "/abs/path.h"`, relative
@@ -41,8 +55,10 @@ impl Guest {
     }
 }
 
-pub fn build(clang: &Path, source: &str, options: &str, guest: Option<&Guest>) -> Result<Module, String> {
-    let ir = clang_ir(clang, source, options, guest)?;
+/// A program's source compiled: its module, or clang's messages (the build
+/// log) on failure.
+pub fn build(cc: &Compiler, source: &str, options: &str, guest: Option<&Guest>) -> Result<Module, String> {
+    let ir = clang_ir(cc, source, options, guest)?;
     parse(&ir)
 }
 
@@ -66,7 +82,8 @@ fn passed(options: &str) -> Vec<String> {
     out
 }
 
-pub fn clang_ir(clang: &Path, source: &str, options: &str, guest: Option<&Guest>) -> Res<String> {
+pub fn clang_ir(cc: &Compiler, source: &str, options: &str, guest: Option<&Guest>) -> Res<String> {
+    let clang = &cc.clang;
     let dir = Scratch::new()?;
     // (No __IMAGE_SUPPORT__: the device has no images. __OPENCL_VERSION__ is
     // the device's, which clang leaves to the driver.)
@@ -77,6 +94,7 @@ pub fn clang_ir(clang: &Path, source: &str, options: &str, guest: Option<&Guest>
     // Everything inlined: the WGSL is one function per kernel.
     args.extend(["-mllvm", "-inline-threshold=100000"].map(String::from));
     args.extend(passed(options));
+    args.extend(cc.builtin_args());
     if let Some(g) = guest {
         args.extend(g.args(&dir)?);
     }
@@ -97,14 +115,19 @@ pub fn clang_ir(clang: &Path, source: &str, options: &str, guest: Option<&Guest>
 }
 
 #[cfg(test)]
-pub(crate) fn test_clang() -> std::path::PathBuf {
-    std::env::var_os("WASM_CC").map_or_else(|| "clang".into(), Into::into)
+pub(crate) fn test_clang() -> Compiler {
+    let clang = std::env::var_os("WASM_CC").map_or_else(|| "clang".into(), Into::into);
+    // (The builtins too, if packages/libclc/build.sh has built them.)
+    let builtins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../build/libclc/clspv--.bc");
+    Compiler { clang, builtins: builtins.exists().then_some(builtins) }
 }
 
 /// Separate compilation (clCompileProgram): a program's source, with the
 /// headers it includes by name, to an object: LLVM bitcode, unoptimized
 /// (and not marked unoptimizable) so that linking optimizes the whole.
-pub fn compile(clang: &Path, source: &str, options: &str, headers: &[(String, Vec<u8>)], guest: Option<&Guest>) -> Result<Vec<u8>, String> {
+pub fn compile(cc: &Compiler, source: &str, options: &str, headers: &[(String, Vec<u8>)], guest: Option<&Guest>) -> Result<Vec<u8>, String> {
+    // (The builtins come in when it's linked.)
+    let clang = &cc.clang;
     let dir = Scratch::new()?;
     for (name, text) in headers {
         let path = dir.0.join(name);
@@ -136,7 +159,8 @@ pub enum Linked {
 
 /// Linking (clLinkProgram): objects into one module, optimized and
 /// inlined as a built program is, or into a library.
-pub fn link(clang: &Path, objects: &[Vec<u8>], library: bool) -> Result<Linked, String> {
+pub fn link(cc: &Compiler, objects: &[Vec<u8>], library: bool) -> Result<Linked, String> {
+    let clang = &cc.clang;
     let dir = Scratch::new()?;
     let mut args: Vec<String> = ["-x", "ir", "-target", "spir"].map(String::from).to_vec();
     for (k, o) in objects.iter().enumerate() {
@@ -159,17 +183,17 @@ pub fn link(clang: &Path, objects: &[Vec<u8>], library: bool) -> Result<Linked, 
     if library {
         return Ok(Linked::Library(linked));
     }
-    let m = from_bitcode(clang, &linked)?;
+    let m = from_bitcode(cc, &linked)?;
     Ok(Linked::Executable(m, linked))
 }
 
 /// An executable's module from its bitcode (a linked program's binary).
-pub fn from_bitcode(clang: &Path, bitcode: &[u8]) -> Result<Module, String> {
+pub fn from_bitcode(cc: &Compiler, bitcode: &[u8]) -> Result<Module, String> {
     let dir = Scratch::new()?;
     let path = dir.0.join("program.bc");
     std::fs::write(&path, bitcode).map_err(|e| e.to_string())?;
-    let args: Vec<String> = ["-x", "ir", "-target", "spir", "-O2", "-mllvm", "-inline-threshold=100000", "-S", "-emit-llvm", "-o", "-"].map(String::from).into_iter().chain([path.display().to_string()]).collect();
-    let ir = run(clang, &args, &[])?;
+    let args: Vec<String> = ["-x", "ir", "-target", "spir", "-O2", "-mllvm", "-inline-threshold=100000", "-S", "-emit-llvm", "-o", "-"].map(String::from).into_iter().chain([path.display().to_string()]).chain(cc.builtin_args()).collect();
+    let ir = run(&cc.clang, &args, &[])?;
     parse(&String::from_utf8(ir).map_err(|e| e.to_string())?)
 }
 
