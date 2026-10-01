@@ -158,8 +158,13 @@ static cl_ulong now(void) {
 }
 
 // When the command being enqueued began: its first request to the device.
-static cl_ulong began;
-static int beginning = 1;
+static _Thread_local cl_ulong began;
+static _Thread_local int beginning = 1;
+
+// The API is called from many threads at once (the spec allows it, the CTS
+// does it): reference counts are atomic, and so is what's shared.
+static void retain(cl_uint *refs) { __atomic_add_fetch(refs, 1, __ATOMIC_RELAXED); }
+static cl_uint release(cl_uint *refs) { return __atomic_sub_fetch(refs, 1, __ATOMIC_ACQ_REL); }
 
 static int call(struct request *r) {
     if (beginning) {
@@ -169,20 +174,30 @@ static int call(struct request *r) {
     return ioctl(gpu, GPU_CALL, r) == 0 ? (int)(int64_t)r->r[1] : CL_OUT_OF_RESOURCES;
 }
 
+// The device, opened once: 0 not yet, 1 opening, 2 open, 3 none.
+static int gpu_state;
+
 static int open_gpu(void) {
-    if (gpu >= 0)
-        return 1;
-    int fd = open("/dev/wasm-env-gpu", O_RDWR | O_CLOEXEC);
-    if (fd < 0)
-        return 0;
-    gpu = fd;
-    struct request r = {INFO, {(uintptr_t)&desc, sizeof desc}};
-    if (call(&r) != CL_SUCCESS) {
-        close(fd);
-        gpu = -1;
-        return 0;
+    int s = __atomic_load_n(&gpu_state, __ATOMIC_ACQUIRE);
+    if (s == 0 && __atomic_compare_exchange_n(&gpu_state, &s, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        int fd = open("/dev/wasm-env-gpu", O_RDWR | O_CLOEXEC);
+        int ok = fd >= 0;
+        if (ok) {
+            gpu = fd;
+            struct request r = {INFO, {(uintptr_t)&desc, sizeof desc}};
+            ok = call(&r) == CL_SUCCESS;
+            if (!ok) {
+                close(fd);
+                gpu = -1;
+            }
+        }
+        __atomic_store_n(&gpu_state, ok ? 2 : 3, __ATOMIC_RELEASE);
+        return ok;
     }
-    return 1;
+    // (Another thread is opening it: wait for that.)
+    while ((s = __atomic_load_n(&gpu_state, __ATOMIC_ACQUIRE)) == 1) {
+    }
+    return s == 2;
 }
 
 // clGet*Info's contract: the value if there's room, its size.
@@ -219,7 +234,7 @@ static cl_event event(cl_command_queue q, cl_command_type type) {
         e->ended = now();
         e->began = beginning ? e->ended : began;
         if (q)
-            q->refs++;
+            retain(&q->refs);
     }
     return e;
 }
@@ -477,14 +492,14 @@ static cl_context CreateContextFromType(const cl_context_properties *props, cl_d
 static cl_int RetainContext(cl_context c) {
     if (!c)
         return CL_INVALID_CONTEXT;
-    c->refs++;
+    retain(&c->refs);
     return CL_SUCCESS;
 }
 
 static cl_int ReleaseContext(cl_context c) {
     if (!c)
         return CL_INVALID_CONTEXT;
-    if (--c->refs == 0)
+    if (release(&c->refs) == 0)
         free(c);
     return CL_SUCCESS;
 }
@@ -510,7 +525,7 @@ static cl_command_queue queue(cl_context c, cl_device_id d, cl_command_queue_pro
     cl_command_queue q = e == CL_SUCCESS ? calloc(1, sizeof *q) : NULL;
     if (q) {
         *q = (struct _cl_command_queue){&dispatch, 1, c, props};
-        c->refs++;
+        retain(&c->refs);
     } else if (e == CL_SUCCESS) {
         e = CL_OUT_OF_HOST_MEMORY;
     }
@@ -534,14 +549,14 @@ static cl_command_queue CreateCommandQueueWithProperties(cl_context c, cl_device
 static cl_int RetainCommandQueue(cl_command_queue q) {
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
-    q->refs++;
+    retain(&q->refs);
     return CL_SUCCESS;
 }
 
 static cl_int ReleaseCommandQueue(cl_command_queue q) {
     if (!q)
         return CL_INVALID_COMMAND_QUEUE;
-    if (--q->refs == 0) {
+    if (release(&q->refs) == 0) {
         ReleaseContext(q->ctx);
         free(q);
     }
@@ -613,7 +628,7 @@ static cl_mem CreateBuffer(cl_context c, cl_mem_flags flags, size_t size, void *
         if (m) {
             *m = (struct _cl_mem){&dispatch, 1, c, flags ? flags : CL_MEM_READ_WRITE, size, 0, r.r[0]};
             m->host = flags & CL_MEM_USE_HOST_PTR ? host : NULL;
-            c->refs++;
+            retain(&c->refs);
             if (host && (e = write_mem(m, 0, size, host)) != CL_SUCCESS) {
                 struct request f = {FREE, {m->handle}};
                 call(&f);
@@ -656,8 +671,8 @@ static cl_mem CreateSubBuffer(cl_mem parent, cl_mem_flags flags, cl_buffer_creat
         *m = (struct _cl_mem){&dispatch, 1, parent->ctx, f, region->size, region->origin, 0, parent};
         if (parent->host)
             m->host = (char *)parent->host + region->origin;
-        parent->refs++;
-        parent->ctx->refs++;
+        retain(&parent->refs);
+        retain(&parent->ctx->refs);
     } else if (e == CL_SUCCESS) {
         e = CL_OUT_OF_HOST_MEMORY;
     }
@@ -669,14 +684,14 @@ static cl_mem CreateSubBuffer(cl_mem parent, cl_mem_flags flags, cl_buffer_creat
 static cl_int RetainMemObject(cl_mem m) {
     if (!m)
         return CL_INVALID_MEM_OBJECT;
-    m->refs++;
+    retain(&m->refs);
     return CL_SUCCESS;
 }
 
 static cl_int ReleaseMemObject(cl_mem m) {
     if (!m)
         return CL_INVALID_MEM_OBJECT;
-    if (--m->refs == 0) {
+    if (release(&m->refs) == 0) {
         for (struct callback *c = m->callbacks, *next; c; c = next) {
             next = c->next;
             c->f(m, c->user);
@@ -861,6 +876,12 @@ struct mapping {
     struct mapping *next;
 };
 static struct mapping *mappings;
+static int mappings_lock;
+static void lock_mappings(void) {
+    while (__atomic_exchange_n(&mappings_lock, 1, __ATOMIC_ACQUIRE)) {
+    }
+}
+static void unlock_mappings(void) { __atomic_store_n(&mappings_lock, 0, __ATOMIC_RELEASE); }
 
 static cl_int EnqueueCopyBufferRect(cl_command_queue q, cl_mem src, cl_mem dst, const size_t *so, const size_t *dor, const size_t *reg, size_t srp, size_t ssp,
                                     size_t drp, size_t dsp, cl_uint nw, const cl_event *wait, cl_event *ev) {
@@ -915,17 +936,21 @@ static void *EnqueueMapBuffer(cl_command_queue q, cl_mem m, cl_bool blocking, cl
             e = read_mem(m, offset, size, p);
     }
     if (e == CL_SUCCESS) {
-        m->maps++;
+        __atomic_add_fetch(&m->maps, 1, __ATOMIC_RELAXED);
         int write = (flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION)) != 0;
         if (map) {
+            lock_mappings();
             *map = (struct mapping){p, offset, size, m, write, mappings};
             mappings = map;
+            unlock_mappings();
         } else if (write) {
             // (Written back from the host memory at unmap too.)
             struct mapping *h = malloc(sizeof *h);
             if (h) {
+                lock_mappings();
                 *h = (struct mapping){p, offset, size, m, write, mappings};
                 mappings = h;
+                unlock_mappings();
             }
         }
         e = done(q, CL_COMMAND_MAP_BUFFER, ev);
@@ -946,19 +971,25 @@ static cl_int EnqueueUnmapMemObject(cl_command_queue q, cl_mem m, void *p, cl_ui
     if (!m || !m->maps)
         return CL_INVALID_MEM_OBJECT;
     cl_int e = CL_SUCCESS;
+    // (Unlinked under the lock; written back and freed after it.)
+    struct mapping *found = NULL;
+    lock_mappings();
     for (struct mapping **at = &mappings; *at; at = &(*at)->next) {
-        struct mapping *map = *at;
-        if (map->m != m || map->p != p)
-            continue;
-        if (map->write)
-            e = write_mem(m, map->offset, map->size, p);
-        *at = map->next;
+        if ((*at)->m == m && (*at)->p == p) {
+            found = *at;
+            *at = found->next;
+            break;
+        }
+    }
+    unlock_mappings();
+    if (found) {
+        if (found->write)
+            e = write_mem(m, found->offset, found->size, p);
         if (!m->host)
             free(p);
-        free(map);
-        break;
+        free(found);
     }
-    m->maps--;
+    __atomic_sub_fetch(&m->maps, 1, __ATOMIC_RELAXED);
     return e != CL_SUCCESS ? e : done(q, CL_COMMAND_UNMAP_MEM_OBJECT, ev);
 }
 
@@ -968,7 +999,7 @@ static cl_program program(cl_context c, char *source, size_t len, cl_int *err) {
     cl_program p = source ? calloc(1, sizeof *p) : NULL;
     if (p) {
         *p = (struct _cl_program){&dispatch, 1, c, source, NULL, len, 0, CL_BUILD_NONE};
-        c->refs++;
+        retain(&c->refs);
     } else {
         free(source);
     }
@@ -1049,14 +1080,14 @@ static char *object_binary(cl_program p, size_t *len) {
 static cl_int RetainProgram(cl_program p) {
     if (!p)
         return CL_INVALID_PROGRAM;
-    p->refs++;
+    retain(&p->refs);
     return CL_SUCCESS;
 }
 
 static cl_int ReleaseProgram(cl_program p) {
     if (!p)
         return CL_INVALID_PROGRAM;
-    if (--p->refs == 0) {
+    if (release(&p->refs) == 0) {
         if (p->handle) {
             struct request r = {FREE, {p->handle}};
             call(&r);
@@ -1309,8 +1340,8 @@ static cl_kernel CreateKernel(cl_program p, const char *name, cl_int *err) {
                 free(k->name), free(k->args), free(k->block), free(k->handles), free(k->locals), free(k->set), free(k->attributes), free(k);
                 k = NULL;
             } else {
-                p->refs++;
-                p->kernels++;
+                retain(&p->refs);
+                retain(&p->kernels);
                 struct request q = {ATTRIBUTES, {p->handle, (uintptr_t)name, strlen(name), 0, 0}};
                 if (call(&q) == CL_SUCCESS && (k->attributes = calloc(1, q.r[0] + 1))) {
                     q = (struct request){ATTRIBUTES, {p->handle, (uintptr_t)name, strlen(name), (uintptr_t)k->attributes, q.r[0]}};
@@ -1363,15 +1394,15 @@ static cl_int CreateKernelsInProgram(cl_program p, cl_uint n, cl_kernel *kernels
 static cl_int RetainKernel(cl_kernel k) {
     if (!k)
         return CL_INVALID_KERNEL;
-    k->refs++;
+    retain(&k->refs);
     return CL_SUCCESS;
 }
 
 static cl_int ReleaseKernel(cl_kernel k) {
     if (!k)
         return CL_INVALID_KERNEL;
-    if (--k->refs == 0) {
-        k->program->kernels--;
+    if (release(&k->refs) == 0) {
+        release(&k->program->kernels);
         ReleaseProgram(k->program);
         free(k->name), free(k->args), free(k->block), free(k->handles), free(k->locals), free(k->set), free(k->attributes), free(k);
     }
@@ -1626,7 +1657,7 @@ static cl_event CreateUserEvent(cl_context c, cl_int *err) {
     if (e) {
         e->ctx = c;
         e->status = CL_SUBMITTED;
-        c->refs++;
+        retain(&c->refs);
     }
     if (err)
         *err = !c ? CL_INVALID_CONTEXT : e ? CL_SUCCESS : CL_OUT_OF_HOST_MEMORY;
@@ -1679,14 +1710,14 @@ static cl_int SetEventCallback(cl_event e, cl_int type, void(CL_CALLBACK *notify
 static cl_int RetainEvent(cl_event e) {
     if (!e)
         return CL_INVALID_EVENT;
-    e->refs++;
+    retain(&e->refs);
     return CL_SUCCESS;
 }
 
 static cl_int ReleaseEvent(cl_event e) {
     if (!e)
         return CL_INVALID_EVENT;
-    if (--e->refs == 0) {
+    if (release(&e->refs) == 0) {
         if (e->queue)
             ReleaseCommandQueue(e->queue);
         else if (e->ctx)
