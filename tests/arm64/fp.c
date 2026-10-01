@@ -193,6 +193,13 @@ int main(void)
 	float lane3;
 	__asm__("mov %s0, %1.s[3]" : "=w"(lane3) : "w"(fs));
 	printf("mov s, v.s[3]: %g\n", (double)lane3);
+	// Scalar by element: the named lane, not lane 0.
+	float fe;
+	__asm__("fmul %s0, %s1, %2.s[2]" : "=w"(fe) : "w"(2.0f), "w"(fs));
+	float64x2_t dv2 = { 3.0, 5.0 };
+	double de;
+	__asm__("fmul %d0, %d1, %2.d[1]" : "=w"(de) : "w"(1.5), "w"(dv2));
+	printf("fmul by element: %g %g\n", (double)fe, de);
 	print_v("fcvtzs.4s", vreinterpretq_u8_s32(vcvtq_s32_f32(fs)));
 
 	// Interleaved and multi-register loads and stores.

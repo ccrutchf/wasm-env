@@ -1913,8 +1913,14 @@ fn fp_ty(bits: u32) -> Result<(&'static str, &'static str)> {
 
 /// Reads a scalar FP operand as an LLVM float/double value.
 fn read_fp(b: &mut Block, op: &Operand, bits: u32) -> Result<String> {
-    let (n, _) = fp_reg(op)?;
     let ty = fp_ty(bits)?.0;
+    // Scalar by element (fmul d1, d3, v3.d[1]): that lane, not lane 0.
+    if let Some((n, _, lane)) = elem_of(op) {
+        let v = b.read_v(n, 128);
+        let iv = vlane(b, &v, bits, lane);
+        return Ok(b.val(format!("bitcast i{bits} {iv} to {ty}")));
+    }
+    let (n, _) = fp_reg(op)?;
     let iv = b.read_v(n, bits);
     Ok(b.val(format!("bitcast i{bits} {iv} to {ty}")))
 }
