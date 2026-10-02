@@ -205,6 +205,11 @@ impl Module {
             Type::Int(16) | Type::Half => (2, 2),
             Type::Int(32) | Type::Float | Type::Ptr(_) => (4, 4),
             Type::Int(64) | Type::Double => (8, 8),
+            // (Other widths, which LLVM narrows values to, take the room of
+            // the next of those.)
+            Type::Int(2..=7) => (1, 1),
+            Type::Int(9..=15) => (2, 2),
+            Type::Int(17..=31) => (4, 4),
             Type::Int(n) => bail!("unsupported integer type i{n}"),
             Type::Vector(n, e) => {
                 let (s, _) = self.layout(e)?;

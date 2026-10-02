@@ -35,6 +35,15 @@ pub type Bound<'a> = (usize, &'a wgpu::Buffer);
 
 impl Gpu {
     pub fn open() -> Res<Gpu> {
+        // lavapipe (llvmpipe) at its default 256-bit width miscompiles
+        // large shaders (software doubles: wrong results, and builds four
+        // times as long); at 128 bits it doesn't. It reads this when it
+        // starts, so before the instance is made.
+        if std::env::var_os("LP_NATIVE_VECTOR_WIDTH").is_none() {
+            // SAFETY: while the GPU opens, before wgpu or its drivers read the
+            // environment from other threads.
+            unsafe { std::env::set_var("LP_NATIVE_VECTOR_WIDTH", "128") };
+        }
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
         // WASM_ENV_GPU: "software", or part of an adapter's name ("intel") to
@@ -56,9 +65,14 @@ impl Gpu {
         let adapter = adapters.into_iter().filter(|a| a.get_info().backend != wgpu::Backend::Gl).max_by_key(rank).ok_or("no GPU adapter (not even a software one)")?;
         let info = adapter.get_info();
         let limits = adapter.limits();
+        // Doubles natively where the device has f64 and 64-bit integers (to
+        // get at their bits), unless WASM_ENV_GPU_SOFT_F64 asks for the
+        // software ones (f64.rs) everywhere.
+        let f64_features = wgpu::Features::SHADER_F64 | wgpu::Features::SHADER_INT64;
+        let native_f64 = adapter.features().contains(f64_features) && std::env::var_os("WASM_ENV_GPU_SOFT_F64").is_none();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("wasm-env"),
-            required_features: wgpu::Features::empty(),
+            required_features: if native_f64 { f64_features } else { wgpu::Features::empty() },
             required_limits: limits.clone(),
             ..Default::default()
         }))
@@ -66,7 +80,7 @@ impl Gpu {
         // Errors are reported to the caller (error scopes), not panics.
         device.on_uncaptured_error(Arc::new(|e| eprintln!("wasm-env: GPU: {}", chain(&e))));
         let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), lost: Default::default() };
-        g.quirks = g.probe_quirks()?;
+        g.quirks = Quirks { native_f64: native_f64 && g.native_doubles_conform()?, ..g.probe_quirks()? };
         Ok(g)
     }
 
@@ -102,7 +116,52 @@ impl Gpu {
         }
         self.queue.submit([enc.finish()]);
         let product = f32::from_le_bytes(self.read(&b, 8, 4)?.try_into().unwrap());
-        Ok(Quirks { flushes_rounded_up_products: product == 0.0 })
+        Ok(Quirks { flushes_rounded_up_products: product == 0.0, ..Quirks::default() })
+    }
+
+    /// Whether the device's own doubles are OpenCL's: denormals kept
+    /// (5e-324 + 0) and conversions not folded away ((double)(float)0.1 is
+    /// not 0.1). lavapipe's are neither, so it gets f64.rs's.
+    fn native_doubles_conform(&self) -> Res<bool> {
+        let code = format!(
+            "{}\n@group(0) @binding(0) var<storage, read_write> b: array<u32>;
+@compute @workgroup_size(1) fn main() {{
+    let x = vec2<u32>(b[0], b[1]);
+    let y = vec2<u32>(b[2], b[3]);
+    let s = f64_add(x, vec2<u32>(0u, 0u));
+    let r = f64_from_f32(f64_to_f32(y));
+    b[4] = s.x; b[5] = s.y; b[6] = r.x; b[7] = r.y;
+}}",
+            wgsl::library_code(&["f64_add", "f64_from_f32", "f64_to_f32"].into_iter().collect(), true)
+        );
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("probe"), source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("probe"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let b = self.buffer(32)?;
+        let (tiny, tenth) = (1u64, 0.1f64.to_bits());
+        let words = [tiny as u32, (tiny >> 32) as u32, tenth as u32, (tenth >> 32) as u32, 0, 0, 0, 0];
+        self.write(&b, 0, &words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>())?;
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: b.as_entire_binding() }],
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        self.queue.submit([enc.finish()]);
+        let out: Vec<u64> = self.read(&b, 16, 16)?.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        Ok(out[0] == tiny && out[1] == (0.1f32 as f64).to_bits())
     }
 
     pub fn buffer(&self, size: u64) -> Res<wgpu::Buffer> {
@@ -845,6 +904,588 @@ __kernel void k(__global const long *a, __global const long *b, __global const l
             ];
             assert_eq!(out[i * 24..i * 24 + 24], want, "builtins of {x:#x}, {y:#x}, {z:#x}");
         }
+    }
+
+    /// Runs WGSL with `input` at binding 0 and `out` words at binding 1, in
+    /// `n` invocations of `main` (workgroups of 64).
+    fn run_wgsl(g: &Gpu, code: &str, input: &[u32], out: usize, n: u32) -> Vec<u32> {
+        let module = g.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let pipeline = g.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let (bi, bo) = (g.buffer(input.len() as u64 * 4).unwrap(), g.buffer(out as u64 * 4).unwrap());
+        g.write(&bi, 0, &input.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        let group = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: bi.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: bo.as_entire_binding() }],
+        });
+        let mut enc = g.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(n.div_ceil(64), 1, 1);
+        }
+        g.queue.submit([enc.finish()]);
+        words(&g.read(&bo, 0, out as u64 * 4).unwrap())
+    }
+
+    #[test]
+    fn doubles_agree_with_the_cpu() {
+        let Some(g) = gpu() else { return };
+        check_doubles(&g, false);
+        if g.quirks.native_f64 {
+            check_doubles(&g, true);
+        }
+    }
+
+    /// f64.rs's library, in software or native, against the CPU.
+    fn check_doubles(g: &Gpu, native: bool) {
+        let ops = [
+            "f64_add(a, b)", "f64_sub(a, b)", "f64_mul(a, b)", "f64_div(a, b)", "f64_fma(a, b, c)", "f64_sqrt(a)", "f64_min(a, b)", "f64_max(a, b)",
+            "f64_trunc(a)", "f64_floor(a)", "f64_ceil(a)", "f64_rint(a)", "f64_round_half_away(a)", "vec2<u32>(bitcast<u32>(f64_to_f32(a)), 0u)",
+            "f64_from_f32(bitcast<f32>(a.y))", "vec2<u32>(select(0u, 1u, f64_lt(a, b)), select(0u, 1u, f64_eq(a, b)))", "f64_to_i64(a)", "f64_to_u64(a)",
+            "f64_from_i64(a)", "f64_from_u64(a)",
+        ];
+        let names: std::collections::BTreeSet<&str> = ops.iter().flat_map(|o| o.split(|c: char| !c.is_alphanumeric() && c != '_')).filter(|w| w.starts_with("f64_")).collect();
+        let mut code = wgsl::library_code(&names, native);
+        code.push_str("@group(0) @binding(0) var<storage, read> inp: array<u32>;\n@group(0) @binding(1) var<storage, read_write> out: array<u32>;\n");
+        code.push_str("fn put(k: u32, v: vec2<u32>) { out[k] = v.x; out[k + 1u] = v.y; }\n");
+        code.push_str(&format!("@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{\n    let i = id.x;\n    if (i * 6u >= arrayLength(&inp)) {{ return; }}\n    let a = vec2<u32>(inp[i * 6u], inp[i * 6u + 1u]);\n    let b = vec2<u32>(inp[i * 6u + 2u], inp[i * 6u + 3u]);\n    let c = vec2<u32>(inp[i * 6u + 4u], inp[i * 6u + 5u]);\n    let o = i * {}u;\n", ops.len() * 2));
+        for (k, op) in ops.iter().enumerate() {
+            code.push_str(&format!("    put(o + {}u, {op});\n", k * 2));
+        }
+        code.push_str("}\n");
+        let mut seed = 0x853c49e6748fea9bu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let special = [0.0, -0.0, 1.0, -1.0, 0.5, 1.5, 2.5, -2.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, f64::MAX, f64::MIN_POSITIVE, 5e-324, -5e-324, 2.2250738585072009e-308, 4503599627370496.5, 9.2233720368547758e18, 1e300, 1e-300, 3.0, 0.1];
+        let mut cases: Vec<[f64; 3]> = Vec::new();
+        for &x in &special {
+            for &y in &special {
+                cases.push([x, y, special[cases.len() % special.len()]]);
+            }
+        }
+        for k in 0..6000 {
+            let r = |n: &mut dyn FnMut() -> u64| f64::from_bits(n());
+            let c = match k % 6 {
+                // Random bits.
+                0 => [r(&mut next), r(&mut next), r(&mut next)],
+                // Nearby exponents (cancellation), and c near a * b.
+                1 => {
+                    let x = r(&mut next);
+                    let y = f64::from_bits(x.to_bits() ^ (next() & 0xf_ffff_ffff));
+                    [x, y, -(x * y) * (1.0 + (next() % 7) as f64 * f64::EPSILON)]
+                }
+                // Moderate values.
+                2 => [(next() as i64 >> 11) as f64 / 1e6, (next() as i64 >> 20) as f64 / 3.0, (next() as i64 >> 30) as f64],
+                // Denormals.
+                3 => [f64::from_bits(next() >> 12), f64::from_bits(next() >> 12 | (next() & 1) << 63), f64::from_bits(next() >> 13)],
+                // Small and huge exponents.
+                4 => [f64::from_bits((next() & 0x800f_ffff_ffff_ffff) | (next() % 60) << 52), f64::from_bits((next() & 0x800f_ffff_ffff_ffff) | (2000 + next() % 46) << 52), r(&mut next)],
+                // Integers, halves.
+                _ => [(next() % 2000) as f64 / 2.0 - 500.0, (next() as i64) as f64, f64::from_bits(next() & 0x433f_ffff_ffff_ffff)],
+            };
+            cases.push(c);
+        }
+        let input: Vec<u32> = cases.iter().flat_map(|c| c.iter().flat_map(|x| [x.to_bits() as u32, (x.to_bits() >> 32) as u32])).collect();
+        let n = cases.len();
+        let out = run_wgsl(g, &code, &input, n * ops.len() * 2, n as u32);
+        let mut failures = Vec::new();
+        for (i, &[a, b, c]) in cases.iter().enumerate() {
+            let got = |k: usize| out[i * ops.len() * 2 + k * 2] as u64 | (out[i * ops.len() * 2 + k * 2 + 1] as u64) << 32;
+            let af = f32::from_bits((a.to_bits() >> 32) as u32);
+            let ai = a.to_bits() as i64;
+            let want: [u64; 20] = [
+                (a + b).to_bits(),
+                (a - b).to_bits(),
+                (a * b).to_bits(),
+                (a / b).to_bits(),
+                a.mul_add(b, c).to_bits(),
+                a.sqrt().to_bits(),
+                a.min(b).to_bits(),
+                a.max(b).to_bits(),
+                a.trunc().to_bits(),
+                a.floor().to_bits(),
+                a.ceil().to_bits(),
+                a.round_ties_even().to_bits(),
+                a.round().to_bits(),
+                (a as f32).to_bits() as u64,
+                (af as f64).to_bits(),
+                (a < b) as u64 | ((a == b) as u64) << 32,
+                a as i64 as u64,
+                a as u64,
+                ai as f64 as u64 as u64,
+                (a.to_bits() as f64).to_bits(),
+            ];
+            let want = {
+                let mut w = want;
+                w[18] = (ai as f64).to_bits();
+                w
+            };
+            for (k, &w) in want.iter().enumerate() {
+                let r = got(k);
+                let same = if k == 13 {
+                    let (x, y) = (f32::from_bits(r as u32), f32::from_bits(w as u32));
+                    r == w || (x.is_nan() && y.is_nan())
+                } else if [15, 16, 17].contains(&k) {
+                    r == w
+                } else {
+                    let (x, y) = (f64::from_bits(r), f64::from_bits(w));
+                    // (Any NaN for a NaN; min and max of zeros, either zero.)
+                    r == w || (x.is_nan() && y.is_nan()) || ((k == 6 || k == 7) && x == 0.0 && y == 0.0)
+                };
+                if !same && failures.len() < 20 {
+                    failures.push(format!("{}: {a:e} ({:#x}), {b:e}, {c:e}: got {r:#x}, want {w:#x}", ops[k], a.to_bits()));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "native {native}:\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn floats_round_to_halves() {
+        let Some(g) = gpu() else { return };
+        let mut code = wgsl::library_code(&["f32_to_f16"].into_iter().collect(), false);
+        code.push_str("@group(0) @binding(0) var<storage, read> inp: array<u32>;\n@group(0) @binding(1) var<storage, read_write> out: array<u32>;\n");
+        code.push_str("@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n    if (id.x < arrayLength(&inp)) { out[id.x] = f32_to_f16(bitcast<f32>(inp[id.x])); }\n}\n");
+        // The reference: every half's value; the nearest, ties to the even.
+        let decode = |h: u16| {
+            let (s, e, m) = (if h & 0x8000 != 0 { -1.0 } else { 1.0 }, (h >> 10) & 0x1f, (h & 0x3ff) as f64);
+            s * if e == 0 { m * 2f64.powi(-24) } else { (1024.0 + m) * 2f64.powi(e as i32 - 25) }
+        };
+        let mut finite: Vec<(f64, u16)> = (0..=0x7bffu16).map(|h| (decode(h), h)).collect();
+        finite.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let reference = |f: f32| -> u16 {
+            let sign = if f.is_sign_negative() { 0x8000 } else { 0 };
+            if f.is_nan() {
+                return 0x7e00;
+            }
+            let v = (f as f64).abs();
+            // (Past the largest half by half its last bit: infinity.)
+            if v >= 65520.0 {
+                return sign | 0x7c00;
+            }
+            let k = finite.partition_point(|p| p.0 < v);
+            let pick = if k == finite.len() {
+                finite[k - 1].1
+            } else if finite[k].0 == v || k == 0 {
+                finite[k].1
+            } else {
+                let (lo, hi) = (finite[k - 1], finite[k]);
+                let (dl, dh) = (v - lo.0, hi.0 - v);
+                if dl < dh || (dl == dh && lo.1 & 1 == 0) { lo.1 } else { hi.1 }
+            };
+            sign | pick
+        };
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut input: Vec<u32> = (0..40000).map(|_| next() as u32).collect();
+        // Every half and its neighbours as floats, and the midpoints.
+        for h in 0..=0x7c00u16 {
+            let v = decode(h) as f32;
+            input.extend([v.to_bits(), v.to_bits() + 1, v.to_bits().saturating_sub(1), (-v).to_bits()]);
+            if h < 0x7c00 {
+                input.push((((decode(h) + decode(h + 1)) / 2.0) as f32).to_bits());
+            }
+        }
+        let out = run_wgsl(&g, &code, &input, input.len(), input.len() as u32);
+        let mut bad = Vec::new();
+        for (k, &u) in input.iter().enumerate() {
+            let f = f32::from_bits(u);
+            let want = reference(f);
+            let got = out[k] as u16;
+            let same = got == want || (f.is_nan() && got & 0x7c00 == 0x7c00 && got & 0x3ff != 0);
+            if !same && bad.len() < 10 {
+                bad.push(format!("{f:e} ({u:#x}): got {got:#x}, want {want:#x}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// A float rounded to the nearest half (ties to even), by search among
+    /// every half's value: (its bits, its value).
+    fn nearest_half(f: f32) -> (u16, f32) {
+        let decode = |h: u16| {
+            let (s, e, m) = (if h & 0x8000 != 0 { -1.0 } else { 1.0 }, (h >> 10) & 0x1f, (h & 0x3ff) as f64);
+            s * if e == 0 { m * 2f64.powi(-24) } else { (1024.0 + m) * 2f64.powi(e as i32 - 25) }
+        };
+        let sign = if f.is_sign_negative() { 0x8000 } else { 0 };
+        let v = (f as f64).abs();
+        if f.is_nan() {
+            return (0x7e00, f32::NAN);
+        }
+        if v >= 65520.0 {
+            return (sign | 0x7c00, if sign != 0 { f32::NEG_INFINITY } else { f32::INFINITY });
+        }
+        let k = (0..=0x7bffu16).position(|h| decode(h) >= v).unwrap_or(0x7bff) as u16;
+        let pick = if decode(k) == v || k == 0 {
+            k
+        } else {
+            let (dl, dh) = (v - decode(k - 1), decode(k) - v);
+            if dl < dh || (dl == dh && (k - 1) & 1 == 0) { k - 1 } else { k }
+        };
+        let h = sign | pick;
+        (h, decode(h) as f32)
+    }
+
+    #[test]
+    fn halves_in_kernels() {
+        let Some(g) = gpu() else { return };
+        let src = r#"
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void k(__global const float *a, __global const half *hs, __global float *o, __global half *ho) {
+    int i = get_global_id(0);
+    half x = (half)a[2 * i], y = (half)a[2 * i + 1];
+    __global float *r = o + i * 8;
+    r[0] = x + y;
+    r[1] = x * y;
+    r[2] = x / y;
+    r[3] = sqrt(fabs(x));
+    r[4] = fma(x, y, (half)1.0f);
+    r[5] = vload_half(i, hs);
+    r[6] = (float)(int)x;
+    r[7] = sin(x);
+    vstore_half_rtz(a[2 * i], i, ho);
+}
+"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 64usize;
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let a: Vec<f32> = (0..2 * n).map(|_| (next() as i64 >> 40) as f32 / 1000.0).collect();
+        let hs: Vec<u16> = (0..n).map(|_| next() as u16 & 0x7bff).collect();
+        let (ba, bh, bo, bho) = (g.buffer(n as u64 * 8).unwrap(), g.buffer(n as u64 * 2).unwrap(), g.buffer(n as u64 * 32).unwrap(), g.buffer(n as u64 * 2).unwrap());
+        g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        g.write(&bh, 0, &hs.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![] };
+        g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 16], &[(0, &ba), (1, &bh), (2, &bo), (3, &bho)]).unwrap();
+        let o: Vec<f32> = words(&g.read(&bo, 0, n as u64 * 32).unwrap()).into_iter().map(f32::from_bits).collect();
+        let ho: Vec<u16> = g.read(&bho, 0, n as u64 * 2).unwrap().chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let h = |f: f32| nearest_half(f).1;
+        let mut bad = Vec::new();
+        for i in 0..n {
+            let (x, y) = (h(a[2 * i]), h(a[2 * i + 1]));
+            let want = [h(x + y), h(x * y), h(x / y), h(x.abs().sqrt()), h(x.mul_add(y, 1.0)), nearest_half_value(hs[i]), x as i32 as f32, h(x.sin())];
+            for (k, &w) in want.iter().enumerate() {
+                let got = o[i * 8 + k];
+                // (sin from libclc: within 2 half ulps.)
+                let ok = got.to_bits() == w.to_bits() || (got.is_nan() && w.is_nan()) || (k == 7 && (got - w).abs() <= 2.0 * 2f32.powi(-10) * w.abs().max(2f32.powi(-14)));
+                if !ok {
+                    bad.push(format!("o[{i}][{k}] for {x}, {y}: got {got:e}, want {w:e}"));
+                }
+            }
+            // Toward zero: the nearest, or the one below it in magnitude.
+            let (near, nv) = nearest_half(a[2 * i]);
+            let rtz = if nv.abs() > a[2 * i].abs() { near - 1 } else { near };
+            if ho[i] != rtz {
+                bad.push(format!("vstore_half_rtz({}): got {:#x}, want {rtz:#x}", a[2 * i], ho[i]));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn pointers_chosen_between_buffers() {
+        let Some(g) = gpu() else { return };
+        // (pyopencl's if_positive: clang selects the pointer, then loads.)
+        let src = r#"
+__kernel void k(__global int *r, __global const int *c, __global int *a, __global int *b) {
+    int i = get_global_id(0);
+    r[i] = c[i] > 0 ? a[i] : b[i];
+    *(c[i] > 0 ? &a[i] : &b[i]) = -i;
+}
+"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 64u32;
+        let bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let c: Vec<i32> = (0..n as i32).map(|i| (i % 3) - 1).collect();
+        let a: Vec<i32> = (0..n as i32).map(|i| 1000 + i).collect();
+        let b: Vec<i32> = (0..n as i32).map(|i| 2000 + i).collect();
+        let bufs: Vec<_> = (0..4).map(|_| g.buffer(n as u64 * 4).unwrap()).collect();
+        g.write(&bufs[1], 0, &bytes(&c)).unwrap();
+        g.write(&bufs[2], 0, &bytes(&a)).unwrap();
+        g.write(&bufs[3], 0, &bytes(&b)).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: [n, 1, 1], local_bytes: vec![] };
+        g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &[0u8; 16], &[(0, &bufs[0]), (1, &bufs[1]), (2, &bufs[2]), (3, &bufs[3])]).unwrap();
+        let get = |k: usize| words(&g.read(&bufs[k], 0, n as u64 * 4).unwrap()).into_iter().map(|w| w as i32).collect::<Vec<i32>>();
+        let (r, a2, b2) = (get(0), get(2), get(3));
+        for i in 0..n as usize {
+            let pos = c[i] > 0;
+            assert_eq!(r[i], if pos { a[i] } else { b[i] }, "r[{i}]");
+            assert_eq!((a2[i], b2[i]), if pos { (-(i as i32), b[i]) } else { (a[i], -(i as i32)) }, "stores {i}");
+        }
+    }
+
+    #[test]
+    fn double_vectors_from_bits() {
+        let Some(g) = gpu() else { return };
+        // (libclc's sincos ends this way once LLVM vectorizes it: doubles
+        // built from words as <2 x i64>, subtracted, scaled by a splat.)
+        let ir = r#"
+define spir_kernel void @k(ptr addrspace(1) %o, ptr addrspace(1) %a) {
+  %i = call i32 @_Z13get_global_idj(i32 0)
+  %b = mul i32 %i, 6
+  %p0 = getelementptr i32, ptr addrspace(1) %a, i32 %b
+  %w0 = load i32, ptr addrspace(1) %p0, align 4
+  %b1 = add i32 %b, 1
+  %p1 = getelementptr i32, ptr addrspace(1) %a, i32 %b1
+  %w1 = load i32, ptr addrspace(1) %p1, align 4
+  %b2 = add i32 %b, 2
+  %p2 = getelementptr i32, ptr addrspace(1) %a, i32 %b2
+  %w2 = load i32, ptr addrspace(1) %p2, align 4
+  %b3 = add i32 %b, 3
+  %p3 = getelementptr i32, ptr addrspace(1) %a, i32 %b3
+  %w3 = load i32, ptr addrspace(1) %p3, align 4
+  %b4 = add i32 %b, 4
+  %p4 = getelementptr i32, ptr addrspace(1) %a, i32 %b4
+  %w4 = load i32, ptr addrspace(1) %p4, align 4
+  %b5 = add i32 %b, 5
+  %p5 = getelementptr i32, ptr addrspace(1) %a, i32 %b5
+  %w5 = load i32, ptr addrspace(1) %p5, align 4
+  %h0 = zext i32 %w0 to i64
+  %h1 = zext i32 %w1 to i64
+  %l0 = zext i32 %w2 to i64
+  %l1 = zext i32 %w3 to i64
+  %e0 = zext i32 %w4 to i64
+  %e1 = zext i32 %w5 to i64
+  %v0 = insertelement <2 x i64> poison, i64 %e0, i64 0
+  %v1 = insertelement <2 x i64> %v0, i64 %e1, i64 1
+  %v2 = shl nuw nsw <2 x i64> %v1, splat (i64 32)
+  %v3 = bitcast <2 x i64> %v2 to <2 x double>
+  %u0 = insertelement <2 x i64> poison, i64 %h0, i64 0
+  %u1 = insertelement <2 x i64> %u0, i64 %h1, i64 1
+  %u2 = shl nuw nsw <2 x i64> %u1, splat (i64 32)
+  %t0 = insertelement <2 x i64> poison, i64 %l0, i64 0
+  %t1 = insertelement <2 x i64> %t0, i64 %l1, i64 1
+  %u3 = or disjoint <2 x i64> %u2, %t1
+  %u4 = bitcast <2 x i64> %u3 to <2 x double>
+  %d = fsub <2 x double> %u4, %v3
+  %x = fmul double 2.0, 1.5
+  %s0 = insertelement <2 x double> poison, double %x, i64 0
+  %s1 = shufflevector <2 x double> %s0, <2 x double> poison, <2 x i32> zeroinitializer
+  %m = fmul <2 x double> %s1, %d
+  %m0 = extractelement <2 x double> %m, i64 0
+  %m1 = extractelement <2 x double> %m, i64 1
+  %b6 = mul i32 %i, 2
+  %q0 = getelementptr double, ptr addrspace(1) %o, i32 %b6
+  store double %m0, ptr addrspace(1) %q0, align 8
+  %b7 = add i32 %b6, 1
+  %q1 = getelementptr double, ptr addrspace(1) %o, i32 %b7
+  store double %m1, ptr addrspace(1) %q1, align 8
+  ret void
+}
+declare i32 @_Z13get_global_idj(i32)
+"#;
+        let m = crate::ir::parse(ir).unwrap();
+        let n = 16usize;
+        let mut seed = 0x51f1u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Per item: high words, low words, the subtrahends' high words.
+        let a: Vec<u32> = (0..n * 6).map(|k| if k % 6 < 2 || k % 6 >= 4 { 0x3fe0_0000 | (next() as u32 & 0xf_ffff) } else { next() as u32 }).collect();
+        let (bo, ba) = (g.buffer(n as u64 * 16).unwrap(), g.buffer(n as u64 * 24).unwrap());
+        g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: [n as u32, 1, 1], local_bytes: vec![] };
+        g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 8], &[(0, &bo), (1, &ba)]).unwrap();
+        let o: Vec<f64> = g.read(&bo, 0, n as u64 * 16).unwrap().chunks(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+        for i in 0..n {
+            let w = &a[i * 6..i * 6 + 6];
+            for lane in 0..2 {
+                let u = f64::from_bits((w[lane] as u64) << 32 | w[2 + lane] as u64);
+                let v = f64::from_bits((w[4 + lane] as u64) << 32);
+                assert_eq!(o[i * 2 + lane], 3.0 * (u - v), "item {i} lane {lane}");
+            }
+        }
+    }
+
+    #[test]
+    fn odd_width_integers() {
+        let Some(g) = gpu() else { return };
+        // (LLVM narrows values to such widths; OpenCL C has none to write.)
+        let ir = r#"
+define spir_kernel void @k(ptr addrspace(1) %o, ptr addrspace(1) %a) {
+  %i = call i32 @_Z13get_global_idj(i32 0)
+  %p = getelementptr i32, ptr addrspace(1) %a, i32 %i
+  %v = load i32, ptr addrspace(1) %p, align 4
+  %t = trunc i32 %v to i2
+  %s = add i2 %t, 1
+  %u = sext i2 %s to i32
+  %w = trunc i32 %v to i11
+  %x = mul i11 %w, 3
+  %y = zext i11 %x to i32
+  %z = add i32 %u, %y
+  %q = getelementptr i32, ptr addrspace(1) %o, i32 %i
+  store i32 %z, ptr addrspace(1) %q, align 4
+  ret void
+}
+declare i32 @_Z13get_global_idj(i32)
+"#;
+        let m = crate::ir::parse(ir).unwrap();
+        let n = 64u32;
+        let a: Vec<u32> = (0..n).map(|i| i * 2654435761).collect();
+        let (bo, ba) = (g.buffer(n as u64 * 4).unwrap(), g.buffer(n as u64 * 4).unwrap());
+        g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: [n, 1, 1], local_bytes: vec![] };
+        g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &[0u8; 8], &[(0, &bo), (1, &ba)]).unwrap();
+        let out = words(&g.read(&bo, 0, n as u64 * 4).unwrap());
+        for (k, &v) in a.iter().enumerate() {
+            // i2: (v + 1) mod 4, sign-extended; i11: v * 3 mod 2^11.
+            let two = ((v + 1) & 3) as i32;
+            let two = if two >= 2 { two - 4 } else { two };
+            let want = (two + ((v.wrapping_mul(3)) & 0x7ff) as i32) as u32;
+            assert_eq!(out[k], want, "for {v:#x}");
+        }
+    }
+
+    #[test]
+    fn halves_stored() {
+        let Some(g) = gpu() else { return };
+        let src = "__kernel void k(__global const float *a, __global half *ho, __global half *hz) { int i = get_global_id(0); vstore_half(a[i], i, ho); vstore_half_rtz(a[i], i, hz); }";
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 64usize;
+        let a: Vec<f32> = (0..n).map(|i| i as f32 * 1.37 - 20.0).collect();
+        let (ba, bo, bz) = (g.buffer(n as u64 * 4).unwrap(), g.buffer(n as u64 * 2).unwrap(), g.buffer(n as u64 * 2).unwrap());
+        g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![] };
+        g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 12], &[(0, &ba), (1, &bo), (2, &bz)]).unwrap();
+        let read = |b| g.read(b, 0, n as u64 * 2).unwrap().chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<u16>>();
+        let (ho, hz) = (read(&bo), read(&bz));
+        for i in 0..n {
+            let (near, nv) = nearest_half(a[i]);
+            let rtz = if nv.abs() > a[i].abs() { near - 1 } else { near };
+            assert_eq!((ho[i], hz[i]), (near, rtz), "vstore_half of {}", a[i]);
+        }
+    }
+
+    /// A half's value.
+    fn nearest_half_value(h: u16) -> f32 {
+        let (s, e, m) = (if h & 0x8000 != 0 { -1.0 } else { 1.0 }, (h >> 10) & 0x1f, (h & 0x3ff) as f64);
+        (s * if e == 0 { m * 2f64.powi(-24) } else { (1024.0 + m) * 2f64.powi(e as i32 - 25) }) as f32
+    }
+
+    #[test]
+    fn doubles_in_kernels() {
+        let Some(g) = gpu() else { return };
+        let src = r#"
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+__kernel void k(__global const double *a, __global const double *b, __global double *o, __global long *l) {
+    int i = get_global_id(0);
+    double x = a[i], y = b[i];
+    __global double *r = o + i * 16;
+    r[0] = x + y;
+    r[1] = x * y - x / y;
+    r[2] = fma(x, y, -1.0);
+    r[3] = sqrt(fabs(x));
+    r[4] = exp(y / 1e3);
+    r[5] = sin(x);
+    r[6] = pow(fabs(x), 0.5);
+    r[7] = floor(x) + ceil(y) * 2.0;
+    double2 v = (double2)(x, y) * (double2)(3.0, -0.25) + (double2)(1.0);
+    r[8] = v.x;
+    r[9] = v.y;
+    r[10] = (double)(float)x;
+    r[11] = (double)(i * 7 - 300);
+    r[12] = fmax(x, y);
+    r[13] = dot((double2)(x, y), (double2)(y, x));
+    r[14] = x < y ? 1.0 : 2.0;
+    r[15] = (double)convert_int_rtn(y);
+    __global long *s = l + i * 4;
+    s[0] = (long)x;
+    s[1] = convert_long_sat(y * 1e10);
+    s[2] = as_long(x);
+    s[3] = isnan(x) + 2 * isless(x, y);
+}
+"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 64usize;
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut a: Vec<f64> = (0..n).map(|_| (next() as i64 >> 20) as f64 / 1e9).collect();
+        let mut b: Vec<f64> = (0..n).map(|_| (next() as i64 >> 22) as f64 / 7e8).collect();
+        a[0] = f64::NAN;
+        b[1] = 0.0;
+        a[2] = -0.0;
+        let bytes = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (ba, bb, bo, bl) = (g.buffer(n as u64 * 8).unwrap(), g.buffer(n as u64 * 8).unwrap(), g.buffer(n as u64 * 128).unwrap(), g.buffer(n as u64 * 32).unwrap());
+        g.write(&ba, 0, &bytes(&a)).unwrap();
+        g.write(&bb, 0, &bytes(&b)).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![] };
+        g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 16], &[(0, &ba), (1, &bb), (2, &bo), (3, &bl)]).unwrap();
+        let o: Vec<f64> = g.read(&bo, 0, n as u64 * 128).unwrap().chunks(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+        let l: Vec<i64> = g.read(&bl, 0, n as u64 * 32).unwrap().chunks(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+        // Within ulps (libclc's transcendental functions are within 4).
+        let close = |got: f64, want: f64, ulps: u64| {
+            got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()) || (got - want).abs() <= ulps as f64 * f64::EPSILON * want.abs().max(f64::MIN_POSITIVE)
+        };
+        let mut bad = Vec::new();
+        for i in 0..n {
+            let (x, y) = (a[i], b[i]);
+            let want = [
+                (x + y, 0),
+                // (Contracted: OpenCL allows it, clang does it.)
+                (x.mul_add(y, -(x / y)), 0),
+                (x.mul_add(y, -1.0), 0),
+                (x.abs().sqrt(), 0),
+                ((y / 1e3).exp(), 4),
+                (x.sin(), 4),
+                (x.abs().powf(0.5), 16),
+                (x.floor() + y.ceil() * 2.0, 0),
+                (x * 3.0 + 1.0, 0),
+                (y * -0.25 + 1.0, 0),
+                (x as f32 as f64, 0),
+                ((i as i32 * 7 - 300) as f64, 0),
+                (if x.is_nan() { y } else { x.max(y) }, 0),
+                (x * y + y * x, 0),
+                (if x < y { 1.0 } else { 2.0 }, 0),
+                (y.floor() as i32 as f64, 0),
+            ];
+            for (k, &(w, u)) in want.iter().enumerate() {
+                if !close(o[i * 16 + k], w, u) {
+                    bad.push(format!("o[{i}][{k}] for {x:e}, {y:e}: got {:e}, want {w:e}", o[i * 16 + k]));
+                }
+            }
+            let lwant = [x as i64, (y * 1e10) as i64, x.to_bits() as i64, x.is_nan() as i64 + 2 * (x < y) as i64];
+            if l[i * 4..i * 4 + 4] != lwant {
+                bad.push(format!("l[{i}] for {x:e}, {y:e}: got {:?}, want {lwant:?}", &l[i * 4..i * 4 + 4]));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     #[test]

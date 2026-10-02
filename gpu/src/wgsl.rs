@@ -151,6 +151,9 @@ pub struct Quirks {
     /// flush to zero, which lavapipe has, takes a result as tiny after
     /// rounding it with an unbounded exponent.
     pub flushes_rounded_up_products: bool,
+    /// Whether doubles are the device's own (f64 and 64-bit integers),
+    /// rather than f64.rs's software.
+    pub native_f64: bool,
 }
 
 /// What a launch fixes that the shader depends on.
@@ -188,7 +191,7 @@ pub fn compile(m: &Module, name: &str, launch: &Launch, quirks: Quirks) -> Res<S
         }
     }
     let tree = structure(f)?;
-    let mut g = Gen { m, f, info: &info, launch, quirks, out: String::new(), bases: HashMap::new(), atomic: BTreeSet::new(), private: BTreeMap::new(), depth: 1, temp: 0, lets: BTreeSet::new(), vector_call: false, loop_exit: None, lane: None, needs: Default::default() };
+    let mut g = Gen { m, f, info: &info, launch, quirks, out: String::new(), bases: HashMap::new(), split: HashMap::new(), atomic: BTreeSet::new(), private: BTreeMap::new(), depth: 1, temp: 0, lets: BTreeSet::new(), vector_call: false, loop_exit: None, lane: None, needs: Default::default() };
     g.provenance()?;
     g.lets = local_values(f);
     g.find_atomic_bases()?;
@@ -209,6 +212,11 @@ struct Gen<'a> {
     out: String,
     /// Each pointer value's base.
     bases: HashMap<Value, Base>,
+    /// Pointers selected from ones into different buffers (`c ? a : b`, and
+    /// GEPs from those): the condition and the two buffers. A pointer is an
+    /// offset into its buffer, so loads through them read both at it and
+    /// select; stores store to the one.
+    split: HashMap<Value, (Operand, Base, Base)>,
     atomic: BTreeSet<Base>,
     /// Allocas: their size in words.
     private: BTreeMap<usize, u64>,
@@ -284,9 +292,20 @@ impl Gen<'_> {
                             self.private.insert(r, (s * n).div_ceil(4) + 4);
                             Some(Base::Private(r))
                         }
-                        Op::Gep(_, p, _) | Op::Cast(_, p) | Op::Freeze(p) => self.base_of(&p.v),
+                        Op::Gep(_, p, _) | Op::Cast(_, p) | Op::Freeze(p) => {
+                            if let Some(s) = self.split.get(&p.v).cloned() {
+                                self.split.insert(Value::Local(r), s);
+                            }
+                            self.base_of(&p.v)
+                        }
                         Op::Phi(inc) => self.common_base(inc.iter().map(|(o, _)| &o.v))?,
-                        Op::Select(_, a, b) => self.common_base([&a.v, &b.v].into_iter())?,
+                        Op::Select(c, a, b) => match (self.base_of(&a.v), self.base_of(&b.v)) {
+                            (Some(x), Some(y)) if x != y => {
+                                self.split.insert(Value::Local(r), (c.clone(), x, y));
+                                None
+                            }
+                            _ => self.common_base([&a.v, &b.v].into_iter())?,
+                        },
                         _ => None,
                     };
                     if let Some(base) = base {
@@ -338,10 +357,15 @@ impl Gen<'_> {
                         self.atomic.insert(b);
                     }
                     Op::Store(v, p, _) => {
-                        let b = self.base(p)?;
+                        let bases = match self.split.get(&p.v) {
+                            Some((_, x, y)) => vec![*x, *y],
+                            None => vec![self.base(p)?],
+                        };
                         let (size, _) = self.m.layout(&v.ty)?;
-                        if size % 4 != 0 && matches!(b, Base::Buffer(_) | Base::LocalArg(_) | Base::Global(_)) {
-                            self.atomic.insert(b);
+                        for b in bases {
+                            if size % 4 != 0 && matches!(b, Base::Buffer(_) | Base::LocalArg(_) | Base::Global(_)) {
+                                self.atomic.insert(b);
+                            }
                         }
                     }
                     Op::Call(name, args) if demangle(name).is_some_and(|(b, _)| b.starts_with("async_work_group")) => {
@@ -354,7 +378,8 @@ impl Gen<'_> {
                     // other work-items write share its words.
                     Op::Call(name, args) if demangle(name).is_some_and(|(b, _)| b.starts_with("vstore")) && args.len() == 3 => {
                         let b = self.base(&args[2])?;
-                        let (size, _) = self.m.layout(args[0].ty.scalar())?;
+                        // (vstore_half: floats, as halves.)
+                        let (size, _) = if name.contains("_half") { (2, 2) } else { self.m.layout(args[0].ty.scalar())? };
                         if size % 4 != 0 && matches!(b, Base::Buffer(_) | Base::LocalArg(_) | Base::Global(_)) {
                             self.atomic.insert(b);
                         }
@@ -416,20 +441,7 @@ impl Gen<'_> {
             self.helpers(*b, &mut o);
         }
         // (With what they call: WGSL takes functions in any order.)
-        let mut needed = self.needs.borrow().clone();
-        loop {
-            let more: BTreeSet<&str> = LIBRARY.iter().filter(|(n, _, _)| needed.contains(n)).flat_map(|(_, deps, _)| deps.iter().copied()).collect();
-            if more.is_subset(&needed) {
-                break;
-            }
-            needed.extend(more);
-        }
-        for (n, _, code) in LIBRARY {
-            if needed.contains(n) {
-                o.push_str(code);
-                o.push('\n');
-            }
-        }
+        o.push_str(&library_code(&self.needs.borrow(), self.quirks.native_f64));
         let [x, y, z] = self.launch.local;
         writeln!(o, "\n@compute @workgroup_size({x}, {y}, {z})").unwrap();
         o.push_str("fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {\n");
@@ -512,6 +524,8 @@ impl Gen<'_> {
                 out[at..at + size as usize].copy_from_slice(&n.to_le_bytes()[..size as usize]);
             }
             (Const::Float(x), Type::Float) => out[at..at + 4].copy_from_slice(&(*x as f32).to_le_bytes()),
+            (Const::Float(x), Type::Double) => out[at..at + 8].copy_from_slice(&x.to_le_bytes()),
+            (Const::Float(x), Type::Half) => out[at..at + 2].copy_from_slice(&half_bits(*x).to_le_bytes()),
             (Const::Bytes(b), _) => out[at..at + b.len()].copy_from_slice(b),
             (Const::Array(items), Type::Array(_, e)) | (Const::Vector(items), Type::Vector(_, e)) => {
                 let (s, _) = self.m.layout(e)?;
@@ -540,11 +554,13 @@ impl Gen<'_> {
         Ok(Some(match self.m.resolve(t)? {
             Type::Void | Type::Struct(..) | Type::Array(..) | Type::Label | Type::Metadata => return Ok(None),
             Type::Int(1) => "bool".into(),
-            Type::Int(8 | 16 | 32) | Type::Ptr(_) => "u32".into(),
-            // 64-bit integers: (low word, high word); vectors of them, arrays.
-            Type::Int(64) => "vec2<u32>".into(),
-            Type::Vector(n, e) if **e == Type::Int(64) => format!("array<vec2<u32>, {n}>"),
-            Type::Float => "f32".into(),
+            Type::Int(2..=32) | Type::Ptr(_) => "u32".into(),
+            // 64-bit integers and doubles (f64.rs): (low word, high word);
+            // vectors of them, arrays.
+            Type::Int(64) | Type::Double => "vec2<u32>".into(),
+            Type::Vector(n, e) if is64(e) => format!("array<vec2<u32>, {n}>"),
+            // Halves: floats rounded to half precision (f64.rs, f16_round).
+            Type::Float | Type::Half => "f32".into(),
             Type::Vector(n @ 2..=4, e) => format!("vec{n}<{}>", self.wty(e)?),
             // Wider vectors (8 and 16 lanes): arrays, operated on lane by lane.
             Type::Vector(n @ (8 | 16), e) => format!("array<{}, {n}>", self.wty(e)?),
@@ -568,7 +584,8 @@ impl Gen<'_> {
             (Const::Int(n), Type::Int(1)) => (if n & 1 != 0 { "true" } else { "false" }).into(),
             (Const::Int(n), Type::Int(64)) => format!("vec2<u32>({}u, {}u)", *n as u32, (*n >> 32) as u32),
             (Const::Int(n), Type::Int(b)) => format!("{}u", n & mask(*b) as u64),
-            (Const::Float(x), Type::Float) => float(*x as f32),
+            (Const::Float(x), Type::Float | Type::Half) => float(*x as f32),
+            (Const::Float(x), Type::Double) => format!("vec2<u32>({}u, {}u)", x.to_bits() as u32, (x.to_bits() >> 32) as u32),
             (Const::Undef | Const::Zero | Const::Null, Type::Ptr(_)) => "0u".into(),
             (Const::Undef | Const::Zero | Const::Null, t) => format!("{}()", self.wty(t)?),
             (Const::Vector(items), Type::Vector(_, e)) => {
@@ -775,15 +792,16 @@ impl Gen<'_> {
     /// Whether an instruction works on vectors wider than WGSL's (as arrays),
     /// so it's done a lane at a time.
     fn wide(i: &Inst) -> Option<u32> {
-        // (Vectors of 64-bit integers are arrays of vec2<u32> at any width.)
-        let wide = |t: &Type| matches!(t, Type::Vector(n, e) if *n > 4 || **e == Type::Int(64));
+        // (Vectors of 64-bit integers and doubles are arrays of vec2<u32> at
+        // any width.)
+        let wide = |t: &Type| matches!(t, Type::Vector(n, e) if *n > 4 || is64(e));
         let lanes = |t: &Type| t.lanes();
         match &i.op {
             Op::Bin(..) | Op::FNeg(_) | Op::Select(..) | Op::Freeze(_) | Op::Cast(..) if wide(&i.ty) => Some(lanes(&i.ty)),
             Op::Cast(_, a) if wide(&a.ty) && a.ty.lanes() == i.ty.lanes() => Some(lanes(&i.ty)),
             Op::ICmp(_, a, _) | Op::FCmp(_, a, _) if wide(&a.ty) => Some(lanes(&a.ty)),
             Op::Call(name, _) if i.ty.lanes() > 1 && demangle(name).is_some_and(|(b, _)| SCALAR_ONLY.contains(&b.as_str())) => Some(lanes(&i.ty)),
-            Op::Call(name, args) if (wide(&i.ty) || (i.ty.lanes() > 1 && args.iter().any(|a| wide(&a.ty) && a.ty.lanes() == i.ty.lanes()))) && !name.starts_with("llvm.mem") && !demangle(name).is_some_and(|(b, _)| b.starts_with("vload") || b.starts_with("shuffle")) => {
+            Op::Call(name, args) if (wide(&i.ty) || (i.ty.lanes() > 1 && args.iter().any(|a| wide(&a.ty) && a.ty.lanes() == i.ty.lanes()))) && !name.starts_with("llvm.mem") && !demangle(name).is_some_and(|(b, _)| b.starts_with("vload") || b.starts_with("shuffle") || GEOMETRIC.contains(&b.as_str())) => {
                 let _ = args;
                 Some(lanes(&i.ty))
             }
@@ -829,7 +847,8 @@ impl Gen<'_> {
                 self.set(i, e);
             }
             Op::FNeg(a) => {
-                let e = format!("-{}", self.val(a)?);
+                let x = self.val(a)?;
+                let e = if a.ty == Type::Double { format!("vec2<u32>({x}.x, {x}.y ^ 0x80000000u)") } else { format!("-{x}") };
                 self.set(i, e);
             }
             Op::ICmp(p, a, b) => {
@@ -861,6 +880,15 @@ impl Gen<'_> {
                 if matches!(i.ty, Type::Ptr(_)) {
                     bail!("a pointer loaded from memory");
                 }
+                if let Some((c, x, y)) = self.split.get(&p.v).cloned() {
+                    // From both, the one wanted selected.
+                    let pv = self.val(p)?;
+                    let lx = self.load_expr(x, &pv, &i.ty, *align)?;
+                    let ly = self.load_expr(y, &pv, &i.ty, *align)?;
+                    let e = format!("select({ly}, {lx}, {})", self.val(&c)?);
+                    self.set(i, e);
+                    return Ok(());
+                }
                 let b = self.base(p)?;
                 let e = self.load_expr(b, &self.val(p)?, &i.ty, *align)?;
                 self.set(i, e);
@@ -868,6 +896,19 @@ impl Gen<'_> {
             Op::Store(v, p, align) => {
                 if matches!(v.ty, Type::Ptr(_)) && self.base_of(&v.v).is_some() {
                     bail!("a pointer stored to memory");
+                }
+                if let Some((c, x, y)) = self.split.get(&p.v).cloned() {
+                    let (pv, vv) = (self.val(p)?, self.val(v)?);
+                    self.line(&format!("if ({}) {{", self.val(&c)?));
+                    self.depth += 1;
+                    self.store(x, &pv, &v.ty, &vv, *align)?;
+                    self.depth -= 1;
+                    self.line("} else {");
+                    self.depth += 1;
+                    self.store(y, &pv, &v.ty, &vv, *align)?;
+                    self.depth -= 1;
+                    self.line("}");
+                    return Ok(());
                 }
                 let b = self.base(p)?;
                 let (pv, vv) = (self.val(p)?, self.val(v)?);
@@ -939,6 +980,17 @@ impl Gen<'_> {
     fn binary(&self, op: &str, a: &Operand, b: &Operand) -> Res<String> {
         let (x, y) = (self.val(a)?, self.val(b)?);
         let t = &a.ty;
+        if *t == Type::Double {
+            let f = match op {
+                "fadd" => "f64_add",
+                "fsub" => "f64_sub",
+                "fmul" => "f64_mul",
+                "fdiv" => "f64_div",
+                o => bail!("{o} on doubles"),
+            };
+            self.need(f);
+            return Ok(format!("{f}({x}, {y})"));
+        }
         if t.scalar().is_float() {
             let o = match op {
                 "fadd" => "+",
@@ -957,7 +1009,7 @@ impl Gen<'_> {
                 let l: Vec<String> = (0..lanes).map(|k| format!("fmul_ftz(({x})[{k}], ({y})[{k}])")).collect();
                 return Ok(format!("vec{lanes}<f32>({})", l.join(", ")));
             }
-            return Ok(format!("{x} {o} {y}"));
+            return Ok(self.half_round(t, format!("{x} {o} {y}")));
         }
         let w = bits(t);
         if w == 1 {
@@ -1067,6 +1119,32 @@ impl Gen<'_> {
 
     fn fcmp(&self, p: &str, a: &Operand, b: &Operand) -> Res<String> {
         let (x, y) = (self.val(a)?, self.val(b)?);
+        if a.ty == Type::Double {
+            for n in ["f64_lt", "f64_eq", "f64_is_nan"] {
+                self.need(n);
+            }
+            let (lt, gt, eq) = (format!("f64_lt({x}, {y})"), format!("f64_lt({y}, {x})"), format!("f64_eq({x}, {y})"));
+            let uno = format!("(f64_is_nan({x}) | f64_is_nan({y}))");
+            return Ok(match p {
+                "oeq" => eq,
+                "one" => format!("({lt} | {gt})"),
+                "olt" => lt,
+                "ole" => format!("({lt} | {eq})"),
+                "ogt" => gt,
+                "oge" => format!("({gt} | {eq})"),
+                "ord" => format!("!{uno}"),
+                "uno" => uno,
+                "ueq" => format!("({uno} | {eq})"),
+                "une" => format!("!{eq}"),
+                "ult" => format!("!({gt} | {eq})"),
+                "ule" => format!("!{gt}"),
+                "ugt" => format!("!({lt} | {eq})"),
+                "uge" => format!("!{lt}"),
+                "true" => "true".into(),
+                "false" => "false".into(),
+                p => bail!("fcmp {p}"),
+            });
+        }
         // NaN by its bits (a driver may take `x == x` to be true), and `&`,
         // `|` rather than `&&`, `||`, which WGSL's bool vectors don't have.
         let lanes = a.ty.lanes();
@@ -1101,6 +1179,50 @@ impl Gen<'_> {
         let (from_w, to_w) = (bits(&a.ty), bits(to));
         let lanes = to.lanes();
         let vt = |s: &str| if lanes > 1 { format!("vec{lanes}<{s}>") } else { s.to_string() };
+        // To and from doubles (f64.rs): integers through 64 bits.
+        if *to == Type::Double || a.ty == Type::Double {
+            let call = |n: &'static str, x: &str| {
+                self.need(n);
+                format!("{n}({x})")
+            };
+            let long = |signed: bool| -> String {
+                if from_w == 64 {
+                    x.clone()
+                } else if from_w == 1 && signed {
+                    format!("select(vec2<u32>(0u, 0u), vec2<u32>(0xffffffffu, 0xffffffffu), {x})")
+                } else if from_w == 1 {
+                    format!("vec2<u32>(select(0u, 1u, {x}), 0u)")
+                } else if signed {
+                    let s = sext_signed(&x, from_w, 1);
+                    format!("vec2<u32>(bitcast<u32>({s}), select(0u, 0xffffffffu, {s} < 0i))")
+                } else {
+                    format!("vec2<u32>({x}, 0u)")
+                }
+            };
+            let narrow = |v: String| -> String {
+                match to_w {
+                    64 => v,
+                    32 => format!("{v}.x"),
+                    1 => format!("(({v}.x & 1u) != 0u)"),
+                    w => format!("({v}.x & {}u)", mask(w)),
+                }
+            };
+            return Ok(match (op, a.ty.scalar(), to.scalar()) {
+                ("fpext", Type::Float | Type::Half, _) => call("f64_from_f32", &x),
+                ("fptrunc", _, Type::Float) => call("f64_to_f32", &x),
+                // (Through a float: rounded twice, which is off by one in rare ties.)
+                ("fptrunc", _, Type::Half) => self.half_round(to, call("f64_to_f32", &x)),
+                ("sitofp", ..) => call("f64_from_i64", &long(true)),
+                ("uitofp", ..) => call("f64_from_u64", &long(false)),
+                ("fptosi", ..) => narrow(call("f64_to_i64", &x)),
+                ("fptoui", ..) => narrow(call("f64_to_u64", &x)),
+                ("bitcast", Type::Float, _) => format!("bitcast<vec2<u32>>({x})"),
+                ("bitcast", _, Type::Float) => format!("bitcast<vec2<f32>>({x})"),
+                // (A long, <2 x i32>, or a double: the same vec2<u32>.)
+                ("bitcast", ..) => x,
+                (op, f, t) => bail!("{op} from {f:?} to {t:?}"),
+            });
+        }
         let int64 = |t: &Type| *t == Type::Int(64);
         if int64(to) || int64(&a.ty) {
             let call = |n: &'static str| {
@@ -1136,8 +1258,31 @@ impl Gen<'_> {
         if (from_w > 32 && !a.ty.scalar().is_float() && !matches!(a.ty.scalar(), Type::Ptr(_))) || (to_w > 32 && !to.scalar().is_float() && !matches!(to.scalar(), Type::Ptr(_))) {
             bail!("integers of {} bits", from_w.max(to_w));
         }
-        if matches!(a.ty.scalar(), Type::Double | Type::Half) || matches!(to.scalar(), Type::Double | Type::Half) {
-            bail!("{op} with {:?} or {to:?}", a.ty);
+        // Halves: floats rounded to half precision (with integers, as floats).
+        if *a.ty.scalar() == Type::Half || *to.scalar() == Type::Half {
+            let float = |t: &Type| if t.lanes() > 1 { Type::Vector(t.lanes(), Box::new(Type::Float)) } else { Type::Float };
+            return Ok(match op {
+                "fpext" => x,
+                "fptrunc" => self.half_round(to, x),
+                "bitcast" if *to.scalar() == Type::Half => {
+                    if lanes > 1 {
+                        bail!("a bitcast to {to:?}");
+                    }
+                    format!("unpack2x16float({x} & 0xffffu).x")
+                }
+                "bitcast" => {
+                    if lanes > 1 {
+                        bail!("a bitcast from {:?}", a.ty);
+                    }
+                    self.need("f32_to_f16");
+                    format!("f32_to_f16({x})")
+                }
+                "sitofp" | "uitofp" => {
+                    let e = self.cast(op, a, &float(to))?;
+                    self.half_round(to, e)
+                }
+                _ => self.cast(op, &Operand { ty: float(&a.ty), v: a.v.clone() }, to)?,
+            });
         }
         Ok(match op {
             "zext" if from_w == 1 => format!("select({}, {}, {x})", self.splat(to, "0u"), self.splat(to, "1u")),
@@ -1190,6 +1335,10 @@ impl Gen<'_> {
     fn to_word(&self, v: &str, t: &Type) -> Res<String> {
         Ok(match t {
             Type::Float => format!("bitcast<u32>({v})"),
+            Type::Half => {
+                self.need("f32_to_f16");
+                format!("f32_to_f16({v})")
+            }
             Type::Int(1) => format!("select(0u, 1u, {v})"),
             Type::Int(_) | Type::Ptr(_) => v.to_string(),
             t => bail!("a {t:?} as a word"),
@@ -1199,6 +1348,7 @@ impl Gen<'_> {
     fn from_word(&self, w: &str, t: &Type) -> Res<String> {
         Ok(match t {
             Type::Float => format!("bitcast<f32>({w})"),
+            Type::Half => format!("unpack2x16float({w} & 0xffffu).x"),
             Type::Int(1) => format!("(({w} & 1u) != 0u)"),
             Type::Int(b) if *b < 32 => format!("({w} & {}u)", mask(*b)),
             Type::Int(_) | Type::Ptr(_) => w.to_string(),
@@ -1226,7 +1376,7 @@ impl Gen<'_> {
             }
             _ => {
                 let (s, _) = self.m.layout(t)?;
-                if *t == Type::Int(64) {
+                if is64(t) {
                     let word = |q: String| if align.is_multiple_of(4) { self.word_at(b, &q, 4) } else { format!("ld_{}({q})", name(b)) };
                     return Ok(format!("vec2<u32>({}, {})", word(p.to_string()), word(format!("({p} + 4u)"))));
                 }
@@ -1255,7 +1405,7 @@ impl Gen<'_> {
                     self.store(b, &format!("({p} + {}u)", k as u64 * s), e, &format!("{v}[{k}]"), if align as u64 >= s { s as u32 } else { align })?;
                 }
             }
-            Type::Int(64) => {
+            Type::Int(64) | Type::Double => {
                 let a = align.min(4);
                 self.store(b, p, &Type::Int(32), &format!("{v}.x"), a)?;
                 self.store(b, &format!("({p} + 4u)"), &Type::Int(32), &format!("{v}.y"), a)?;
@@ -1433,6 +1583,43 @@ impl Gen<'_> {
                 };
                 e
             }
+            b if b.starts_with("vstore") && b.contains("_half") => {
+                // vstore_halfN(v, offset, p): N floats (or doubles) as halves at
+                // p + offset * N (vstorea_half3: as if 4), rounded to nearest
+                // or as the name says.
+                let n = args[0].ty.lanes();
+                let stride = if b.starts_with("vstorea") && n == 3 { 4 } else { n } as u64 * 2;
+                let bse = self.base(&args[2])?;
+                let p = format!("({} + {} * {stride}u)", vals[2], vals[1]);
+                let mem = if n > 1 { Type::Vector(n, Box::new(Type::Half)) } else { Type::Half };
+                let mode = ["_rte", "_rtz", "_rtp", "_rtn"].iter().position(|m| b.contains(m));
+                let lane = |k: u32| if n > 1 { format!("{}[{k}]", vals[0]) } else { vals[0].clone() };
+                let float = |x: String| -> String {
+                    if *args[0].ty.scalar() == Type::Double {
+                        self.need("f64_to_f32");
+                        format!("f64_to_f32({x})")
+                    } else {
+                        x
+                    }
+                };
+                let lanes: Vec<String> = (0..n)
+                    .map(|k| match mode {
+                        None | Some(0) => float(lane(k)),
+                        Some(m) => {
+                            self.need("f16_round_dir");
+                            format!("f16_round_dir({}, {m}u)", float(lane(k)))
+                        }
+                    })
+                    .collect();
+                let value = if n == 1 {
+                    lanes[0].clone()
+                } else if n <= 4 {
+                    format!("vec{n}<f32>({})", lanes.join(", "))
+                } else {
+                    format!("array<f32, {n}>({})", lanes.join(", "))
+                };
+                return self.store(bse, &p, &mem, &value, 2);
+            }
             b if b.starts_with("vstore") => {
                 // vstoreN(v, offset, p): N elements at p + offset * N.
                 let n = args[0].ty.lanes();
@@ -1454,6 +1641,7 @@ impl Gen<'_> {
                 self.math(b, i, args, &vals, unsigned)?
             }
         };
+        let e = self.half_round(&i.ty, e);
         self.set(i, e);
         Ok(())
     }
@@ -1461,6 +1649,71 @@ impl Gen<'_> {
     fn intrinsic(&mut self, i: &Inst, name: &str, args: &[Operand], v: &[String]) -> Res<()> {
         let base = name.split('.').next().unwrap_or(name);
         let t = &i.ty;
+        if name.starts_with("is.fpclass") {
+            // Whether x is in the classes of the mask: bit 0 signaling NaN,
+            // 1 quiet NaN, then -inf, -normal, -denormal, -0, +0,
+            // +denormal, +normal, +inf.
+            let Value::Const(Const::Int(mask)) = args[1].v else { bail!("llvm.is.fpclass with a mask that isn't constant") };
+            let double = *args[0].ty.scalar() == Type::Double;
+            let class = |x: &str| -> String {
+                // (The high word, its exponent, whether the significand is zero, and the quiet bit.)
+                let (h, e, zero, quiet) = if double {
+                    (format!("{x}.y"), format!("(({x}.y >> 20u) & 0x7ffu)"), format!("(({x}.y & 0xfffffu) | {x}.x) == 0u"), format!("(({x}.y & 0x80000u) != 0u)"))
+                } else {
+                    let u = format!("bitcast<u32>({x})");
+                    (u.clone(), format!("(({u} >> 23u) & 0xffu)"), format!("({u} & 0x7fffffu) == 0u"), format!("(({u} & 0x400000u) != 0u)"))
+                };
+                let top = if double { "0x7ffu" } else { "0xffu" };
+                let neg = format!("(({h} >> 31u) != 0u)");
+                let classes = [
+                    format!("({e} == {top} && !({zero}) && !{quiet})"),
+                    format!("({e} == {top} && !({zero}) && {quiet})"),
+                    format!("({neg} && {e} == {top} && ({zero}))"),
+                    format!("({neg} && {e} != 0u && {e} != {top})"),
+                    format!("({neg} && {e} == 0u && !({zero}))"),
+                    format!("({neg} && {e} == 0u && ({zero}))"),
+                    format!("(!{neg} && {e} == 0u && ({zero}))"),
+                    format!("(!{neg} && {e} == 0u && !({zero}))"),
+                    format!("(!{neg} && {e} != 0u && {e} != {top})"),
+                    format!("(!{neg} && {e} == {top} && ({zero}))"),
+                ];
+                let any: Vec<&String> = classes.iter().enumerate().filter(|(k, _)| mask >> k & 1 != 0).map(|(_, c)| c).collect();
+                if any.is_empty() { "false".into() } else { format!("({})", any.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(" || ")) }
+            };
+            let lanes = args[0].ty.lanes();
+            let e = if lanes > 1 {
+                let l: Vec<String> = (0..lanes).map(|k| class(&format!("{}[{k}]", v[0]))).collect();
+                format!("vec{lanes}<bool>({})", l.join(", "))
+            } else {
+                class(&v[0])
+            };
+            self.set(i, e);
+            return Ok(());
+        }
+        if *t == Type::Double {
+            let f = |n: &'static str, k: usize| {
+                self.need(n);
+                format!("{n}({})", v[..k].join(", "))
+            };
+            let e = match base {
+                "lifetime" | "assume" | "experimental" | "dbg" | "invariant" => return Ok(()),
+                "fabs" => format!("vec2<u32>({x}.x, {x}.y & 0x7fffffffu)", x = v[0]),
+                "copysign" => format!("vec2<u32>({x}.x, ({x}.y & 0x7fffffffu) | ({y}.y & 0x80000000u))", x = v[0], y = v[1]),
+                "floor" => f("f64_floor", 1),
+                "ceil" => f("f64_ceil", 1),
+                "trunc" => f("f64_trunc", 1),
+                "rint" | "nearbyint" | "roundeven" => f("f64_rint", 1),
+                "round" => f("f64_round_half_away", 1),
+                "sqrt" => f("f64_sqrt", 1),
+                "fma" | "fmuladd" => f("f64_fma", 3),
+                "minnum" | "minimum" => f("f64_min", 2),
+                "maxnum" | "maximum" => f("f64_max", 2),
+                "canonicalize" | "arithmetic" => v[0].clone(),
+                n => bail!("the intrinsic llvm.{n} on doubles"),
+            };
+            self.set(i, e);
+            return Ok(());
+        }
         if bits(t) == 64 && !t.scalar().is_float() {
             let lt = |s: bool| {
                 let n = if s { "slt64" } else { "ult64" };
@@ -1606,6 +1859,7 @@ impl Gen<'_> {
             }
             n => bail!("the intrinsic llvm.{n}"),
         };
+        let e = self.half_round(t, e);
         self.set(i, e);
         Ok(())
     }
@@ -1643,6 +1897,21 @@ impl Gen<'_> {
         self.wrap_signed(t, e)
     }
 
+    /// A half result (a float) rounded to half precision.
+    fn half_round(&self, t: &Type, e: String) -> String {
+        if *t.scalar() != Type::Half {
+            return e;
+        }
+        let n = match t.lanes() {
+            1 => "f16_round",
+            2 => "f16_round2",
+            3 => "f16_round3",
+            _ => "f16_round4",
+        };
+        self.need(n);
+        format!("{n}({e})")
+    }
+
     /// A signed result (i32 lanes) back to the zero-extended representation.
     fn wrap_signed(&self, t: &Type, e: String) -> String {
         let w = bits(t);
@@ -1652,6 +1921,9 @@ impl Gen<'_> {
 
     fn math(&mut self, b: &str, i: &Inst, args: &[Operand], v: &[String], unsigned: bool) -> Res<String> {
         let t = &i.ty;
+        if (*t.scalar() == Type::Double || args.first().is_some_and(|a| *a.ty.scalar() == Type::Double)) && DOUBLE_BUILTINS.contains(&b.trim_start_matches("native_").trim_start_matches("half_").trim_start_matches("fast_")) {
+            return self.math64(b, args, v);
+        }
         let float = t.scalar().is_float() || args.first().is_some_and(|a| a.ty.scalar().is_float());
         let b = b.trim_start_matches("native_").trim_start_matches("half_");
         let b = b.trim_start_matches("fast_");
@@ -1799,7 +2071,7 @@ impl Gen<'_> {
             "bitselect" => {
                 // (a & ~c) | (b & c), on the bits.
                 let t0 = &args[0].ty;
-                if t0.scalar().is_float() {
+                if t0.scalar().is_float() && *t0.scalar() != Type::Double {
                     let lanes = t0.lanes();
                     let u = if lanes > 1 { format!("vec{lanes}<u32>") } else { "u32".into() };
                     format!("bitcast<{}>((bitcast<{u}>({a}) & ~bitcast<{u}>({c})) | (bitcast<{u}>({b}) & bitcast<{u}>({c})))", self.wty(t0)?, a = v[0], b = v[1], c = v[2])
@@ -1822,6 +2094,16 @@ impl Gen<'_> {
             "min" | "max" | "clamp" | "abs" | "abs_diff" | "add_sat" | "sub_sat" | "hadd" | "rhadd" | "mad24" | "mul24" | "mad_hi" | "mul_hi" | "rotate" | "clz" | "ctz"
             | "popcount" | "upsample" | "mad_sat" => self.integer(b, t, args, v, unsigned)?,
             b if b.starts_with("convert_") => self.convert(b, t, &args[0], &v[0], unsigned)?,
+            b if b.starts_with("vload") && b.contains("_half") => {
+                // vload_halfN(offset, p): N halves at p + offset * N, as
+                // floats (vloada_half3: as if 4).
+                let n = t.lanes();
+                let stride = if b.starts_with("vloada") && n == 3 { 4 } else { n } as u64 * 2;
+                let bse = self.base(&args[1])?;
+                let p = format!("({} + {} * {stride}u)", v[1], v[0]);
+                let mem = if n > 1 { Type::Vector(n, Box::new(Type::Half)) } else { Type::Half };
+                self.load_expr(bse, &p, &mem, 2)?
+            }
             b if b.starts_with("vload") => {
                 // vloadN(offset, p): N elements at p + offset * N.
                 let n: u32 = b[5..].trim_start_matches("_half").parse().map_err(|_| format!("{b}"))?;
@@ -1833,6 +2115,111 @@ impl Gen<'_> {
             }
             b => bail!("the builtin {b}"),
         })
+    }
+
+    /// The builtins on doubles libclc leaves to the target (DOUBLE_BUILTINS),
+    /// on f64.rs's arithmetic. Vectors of doubles go a lane at a time, but
+    /// for the geometric functions, which take them whole (as arrays).
+    fn math64(&mut self, b: &str, args: &[Operand], v: &[String]) -> Res<String> {
+        let b = b.trim_start_matches("native_").trim_start_matches("half_").trim_start_matches("fast_");
+        let c = |x: f64| format!("vec2<u32>({}u, {}u)", x.to_bits() as u32, (x.to_bits() >> 32) as u32);
+        let x = v[0].as_str();
+        let y = v.get(1).map_or("", |s| s.as_str());
+        // A relational result: 1 or 0 for a scalar, -1 or 0 for a vector's
+        // lane (a long, as the doubles are).
+        let truth = |e: String, g: &Self| if g.vector_call { format!("select(vec2<u32>(0u, 0u), vec2<u32>(0xffffffffu, 0xffffffffu), {e})") } else { format!("select(0u, 1u, {e})") };
+        let lanes = args[0].ty.lanes();
+        let lane = |s: &str, k: u32| if lanes > 1 { format!("{s}[{k}]") } else { s.to_string() };
+        let dot = |g: &Self, a: &str, b: &str| -> String {
+            g.need("f64_add");
+            g.need("f64_mul");
+            (1..lanes).fold(format!("f64_mul({}, {})", lane(a, 0), lane(b, 0)), |s, k| format!("f64_add({s}, f64_mul({}, {}))", lane(a, k), lane(b, k)))
+        };
+        Ok(match b {
+            "fabs" => format!("vec2<u32>({x}.x, {x}.y & 0x7fffffffu)"),
+            "copysign" => format!("vec2<u32>({x}.x, ({x}.y & 0x7fffffffu) | ({y}.y & 0x80000000u))"),
+            "floor" => self.f64call("f64_floor", &[x]),
+            "ceil" => self.f64call("f64_ceil", &[x]),
+            "trunc" => self.f64call("f64_trunc", &[x]),
+            "rint" => self.f64call("f64_rint", &[x]),
+            "round" => self.f64call("f64_round_half_away", &[x]),
+            "sqrt" => self.f64call("f64_sqrt", &[x]),
+            "rsqrt" => self.f64call("f64_div", &[&c(1.0), &self.f64call("f64_sqrt", &[x])]),
+            "fma" | "mad" => self.f64call("f64_fma", &[x, y, &v[2]]),
+            "fmin" | "min" => self.f64call("f64_min", &[x, y]),
+            "fmax" | "max" => self.f64call("f64_max", &[x, y]),
+            "clamp" => self.f64call("f64_min", &[&self.f64call("f64_max", &[x, y]), &v[2]]),
+            // x + (y - x) * a
+            "mix" => self.f64call("f64_fma", &[&self.f64call("f64_sub", &[y, x]), &v[2], x]),
+            // step(edge, x): 0 below the edge, else 1.
+            "step" => format!("select({}, {}, {})", c(1.0), c(0.0), self.f64call("f64_lt", &[y, x])),
+            "smoothstep" => {
+                // t = clamp((x - e0) / (e1 - e0), 0, 1); t * t * (3 - 2t)
+                let (e0, e1, z) = (x, y, &v[2]);
+                let tt = self.f64call("f64_min", &[&self.f64call("f64_max", &[&self.f64call("f64_div", &[&self.f64call("f64_sub", &[z, e0]), &self.f64call("f64_sub", &[e1, e0])]), &c(0.0)]), &c(1.0)]);
+                self.line(&format!("let st{} = {tt};", self.temp));
+                let t = format!("st{}", self.temp);
+                self.temp += 1;
+                self.f64call("f64_mul", &[&self.f64call("f64_mul", &[&t, &t]), &self.f64call("f64_sub", &[&c(3.0), &self.f64call("f64_mul", &[&c(2.0), &t])])])
+            }
+            // 1, -1, the zero itself, or 0 for a NaN.
+            "sign" => {
+                for n in ["f64_lt", "f64_is_nan"] {
+                    self.need(n);
+                }
+                format!("select(select(select({x}, {}, f64_lt({x}, {})), {}, f64_lt({}, {x})), {}, f64_is_nan({x}))", c(-1.0), c(0.0), c(1.0), c(0.0), c(0.0))
+            }
+            "degrees" => self.f64call("f64_mul", &[x, &c(180.0 / std::f64::consts::PI)]),
+            "radians" => self.f64call("f64_mul", &[x, &c(std::f64::consts::PI / 180.0)]),
+            // nan(nancode): a quiet NaN with the code's bits.
+            "nan" => format!("vec2<u32>({x}.x, ({x}.y & 0x7ffffu) | 0x7ff80000u)"),
+            "isnan" => truth(self.f64call("f64_is_nan", &[x]), self),
+            "isinf" => truth(self.f64call("f64_is_inf", &[x]), self),
+            "isfinite" => truth(format!("(({x}.y & 0x7fffffffu) < 0x7ff00000u)"), self),
+            "isnormal" => truth(format!("(((({x}.y >> 20u) & 0x7ffu) - 1u) < 0x7feu)"), self),
+            "signbit" => truth(format!("(({x}.y >> 31u) != 0u)"), self),
+            "isequal" => truth(self.f64call("f64_eq", &[x, y]), self),
+            "isnotequal" => truth(format!("!{}", self.f64call("f64_eq", &[x, y])), self),
+            "isgreater" => truth(self.f64call("f64_lt", &[y, x]), self),
+            "isgreaterequal" => truth(format!("({} | {})", self.f64call("f64_lt", &[y, x]), self.f64call("f64_eq", &[x, y])), self),
+            "isless" => truth(self.f64call("f64_lt", &[x, y]), self),
+            "islessequal" => truth(format!("({} | {})", self.f64call("f64_lt", &[x, y]), self.f64call("f64_eq", &[x, y])), self),
+            "islessgreater" => truth(format!("({} | {})", self.f64call("f64_lt", &[x, y]), self.f64call("f64_lt", &[y, x])), self),
+            "isordered" => truth(format!("!({} | {})", self.f64call("f64_is_nan", &[x]), self.f64call("f64_is_nan", &[y])), self),
+            "isunordered" => truth(format!("({} | {})", self.f64call("f64_is_nan", &[x]), self.f64call("f64_is_nan", &[y])), self),
+            "dot" => dot(self, x, y),
+            "length" => self.f64call("f64_sqrt", &[&dot(self, x, x)]),
+            "distance" => {
+                let d: Vec<String> = (0..lanes).map(|k| self.f64call("f64_sub", &[&lane(x, k), &lane(y, k)])).collect();
+                let d = if lanes > 1 { format!("array<vec2<u32>, {lanes}>({})", d.join(", ")) } else { d[0].clone() };
+                self.line(&format!("let dd{} = {d};", self.temp));
+                let d = format!("dd{}", self.temp);
+                self.temp += 1;
+                self.f64call("f64_sqrt", &[&dot(self, &d, &d)])
+            }
+            "normalize" => {
+                self.line(&format!("let nl{} = {};", self.temp, self.f64call("f64_sqrt", &[&dot(self, x, x)])));
+                let l = format!("nl{}", self.temp);
+                self.temp += 1;
+                let d: Vec<String> = (0..lanes).map(|k| self.f64call("f64_div", &[&lane(x, k), &l])).collect();
+                if lanes > 1 { format!("array<vec2<u32>, {lanes}>({})", d.join(", ")) } else { d[0].clone() }
+            }
+            "cross" => {
+                let (a, bb) = (|k: u32| format!("{x}[{k}]"), |k: u32| format!("{y}[{k}]"));
+                let term = |p: u32, q: u32| self.f64call("f64_sub", &[&self.f64call("f64_mul", &[&a(p), &bb(q)]), &self.f64call("f64_mul", &[&a(q), &bb(p)])]);
+                let mut l = vec![term(1, 2), term(2, 0), term(0, 1)];
+                if lanes == 4 {
+                    l.push(c(0.0));
+                }
+                format!("array<vec2<u32>, {lanes}>({})", l.join(", "))
+            }
+            b => bail!("the builtin {b} on doubles"),
+        })
+    }
+
+    fn f64call(&self, n: &'static str, a: &[&str]) -> String {
+        self.need(n);
+        format!("{n}({})", a.join(", "))
     }
 
     fn fsplat(&self, t: &Type, x: &str) -> String {
@@ -1985,6 +2372,68 @@ impl Gen<'_> {
     }
 
 
+    /// convert_* to or from a double (one lane: vectors of doubles are
+    /// done a lane at a time), with OpenCL's rounding modes and saturation.
+    fn convert_f64(&self, b: &str, t: &Type, a: &Operand, v: &str, unsigned: bool) -> Res<String> {
+        let call = |n: &'static str, args: &str| {
+            self.need(n);
+            format!("{n}({args})")
+        };
+        // 0 to nearest, 1 toward zero, 2 up, 3 down; to an integer, toward
+        // zero unless given.
+        let mode = ["_rte", "_rtz", "_rtp", "_rtn"].iter().position(|m| b.contains(m));
+        let sat = b.contains("_sat");
+        let to_unsigned = b.trim_start_matches("convert_").starts_with('u');
+        let (from_w, to_w) = (bits(&a.ty), bits(t));
+        Ok(match (a.ty.scalar(), t.scalar()) {
+            (Type::Double, Type::Double) => v.to_string(),
+            (Type::Float, Type::Double) => call("f64_from_f32", v),
+            (Type::Double, Type::Float) => match mode {
+                None | Some(0) => call("f64_to_f32", v),
+                Some(m) => call("f64_to_f32_dir", &format!("{v}, {m}u")),
+            },
+            (Type::Int(_), Type::Double) => {
+                let x = if from_w == 64 {
+                    v.to_string()
+                } else if unsigned {
+                    format!("vec2<u32>({v}, 0u)")
+                } else {
+                    let s = sext_signed(v, from_w, 1);
+                    format!("vec2<u32>(bitcast<u32>({s}), select(0u, 0xffffffffu, {s} < 0i))")
+                };
+                match mode {
+                    None | Some(0) => call(if unsigned { "f64_from_u64" } else { "f64_from_i64" }, &x),
+                    Some(m) => call("f64_from_int_dir", &format!("{x}, {}, {m}u", !unsigned)),
+                }
+            }
+            (Type::Double, Type::Int(_)) => {
+                let r = match mode {
+                    Some(0) => call("f64_rint", v),
+                    Some(2) => call("f64_ceil", v),
+                    Some(3) => call("f64_floor", v),
+                    _ => v.to_string(),
+                };
+                // Toward zero, saturating to 64 bits; narrower, clamped
+                // there (or wrapped: out of range is undefined).
+                let x = call(if to_unsigned { "f64_to_u64" } else { "f64_to_i64" }, &r);
+                if to_w == 64 {
+                    x
+                } else if sat && to_unsigned {
+                    self.need("ult64");
+                    format!("select({x}.x, {}u, !ult64({x}, vec2<u32>({}u, 0u)))", mask(to_w), mask(to_w))
+                } else if sat {
+                    self.need("slt64");
+                    let (lo, hi) = (-(1i64 << (to_w - 1)), (1i64 << (to_w - 1)) - 1);
+                    let c = |n: i64| format!("vec2<u32>({}u, {}u)", n as u32, (n >> 32) as u32);
+                    format!("(select(select({x}.x, {}u, slt64({}, {x})), {}u, slt64({x}, {})) & {}u)", hi as u32, c(hi), lo as u32, c(lo), mask(to_w))
+                } else {
+                    format!("({x}.x & {}u)", mask(to_w))
+                }
+            }
+            (f, to) => bail!("{b} from {f:?} to {to:?}"),
+        })
+    }
+
     /// convert_* to or from a 64-bit integer (one lane).
     fn convert64(&self, b: &str, t: &Type, a: &Operand, v: &str, unsigned: bool) -> Res<String> {
         let sat = b.contains("_sat");
@@ -2058,6 +2507,9 @@ impl Gen<'_> {
         let target = b.trim_start_matches("convert_");
         let to_unsigned = target.starts_with('u');
         let from_w = bits(&a.ty);
+        if *a.ty.scalar() == Type::Double || *t.scalar() == Type::Double {
+            return self.convert_f64(b, t, a, v, unsigned);
+        }
         if (!from_float && from_w == 64) || (!to_float && to_w == 64) {
             return self.convert64(b, t, a, v, unsigned);
         }
@@ -2239,6 +2691,33 @@ fn float(x: f32) -> String {
 
 /// Functions generated code may call: name, the functions it calls, code.
 /// 64-bit integers are `vec2<u32>` (low word, high word).
+/// The library: `LIBRARY`, and `double`'s (f64.rs: in software, or native
+/// where the device has f64).
+fn library(native_f64: bool) -> impl Iterator<Item = &'static (&'static str, &'static [&'static str], &'static str)> {
+    let native: &'static [(&str, &[&str], &str)] = if native_f64 { crate::f64::NATIVE } else { &[] };
+    native.iter().chain(LIBRARY.iter().chain(crate::f64::LIBRARY).filter(move |(n, _, _)| !native.iter().any(|(m, _, _)| m == n)))
+}
+
+/// The code of the library functions named (with what they call).
+pub(crate) fn library_code(names: &BTreeSet<&str>, native_f64: bool) -> String {
+    let mut needed = names.clone();
+    loop {
+        let more: BTreeSet<&str> = library(native_f64).filter(|(n, _, _)| needed.contains(n)).flat_map(|(_, deps, _)| deps.iter().copied()).collect();
+        if more.is_subset(&needed) {
+            break;
+        }
+        needed.extend(more);
+    }
+    let mut o = String::new();
+    for (n, _, code) in library(native_f64) {
+        if needed.contains(n) {
+            o.push_str(code);
+            o.push('\n');
+        }
+    }
+    o
+}
+
 const LIBRARY: &[(&str, &[&str], &str)] = &[
     // (Quirks::flushes_rounded_up_products.) A product flushed to zero
     // that, rounded to the denormals' precision, is the smallest normal
@@ -2444,7 +2923,7 @@ mod tests {
     /// A kernel's WGSL, checked by naga as wgpu would (with the quirks' code too).
     pub(crate) fn wgsl(src: &str, kernel: &str, launch: &Launch) -> String {
         let m = build(&test_clang(), src, "", None).unwrap();
-        let w = compile(&m, kernel, launch, Quirks { flushes_rounded_up_products: true }).unwrap_or_else(|e| panic!("{kernel}: {e}"));
+        let w = compile(&m, kernel, launch, Quirks { flushes_rounded_up_products: true, native_f64: false }).unwrap_or_else(|e| panic!("{kernel}: {e}"));
         let module = naga::front::wgsl::parse_str(&w).unwrap_or_else(|e| panic!("{}\n{w}", e.emit_to_string(&w)));
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
             .validate(&module)
@@ -2737,4 +3216,43 @@ fn is_nan(v: &str, lanes: u32) -> String {
 /// it: a NaN operand gives the other one (WGSL leaves NaNs unspecified).
 fn min_max_num(f: &str, a: &str, b: &str, lanes: u32) -> String {
     format!("select(select({f}({a}, {b}), {b}, {}), {a}, {})", is_nan(a, lanes), is_nan(b, lanes))
+}
+
+/// Whether values of a type are 64 bits (`vec2<u32>`): long and double.
+fn is64(t: &Type) -> bool {
+    matches!(t, Type::Int(64) | Type::Double)
+}
+
+/// The builtins on doubles `math64` does (those libclc leaves to the target).
+const DOUBLE_BUILTINS: &[&str] = &[
+    "fabs", "copysign", "floor", "ceil", "trunc", "rint", "round", "sqrt", "rsqrt", "fma", "mad", "fmin", "min", "fmax", "max", "clamp", "mix", "step", "smoothstep", "sign",
+    "degrees", "radians", "nan", "isnan", "isinf", "isfinite", "isnormal", "signbit", "isequal", "isnotequal", "isgreater", "isgreaterequal", "isless", "islessequal",
+    "islessgreater", "isordered", "isunordered", "dot", "length", "distance", "normalize", "cross",
+];
+
+/// Builtins that take vectors whole, never a lane at a time.
+const GEOMETRIC: &[&str] = &["dot", "cross", "length", "distance", "normalize", "fast_length", "fast_distance", "fast_normalize"];
+
+/// A half's bits, from its value (LLVM's half constants are exact).
+fn half_bits(x: f64) -> u16 {
+    let sign = if x.is_sign_negative() { 0x8000 } else { 0 };
+    if x.is_nan() {
+        return 0x7e00;
+    }
+    let a = x.abs();
+    if a.is_infinite() || a > 65504.0 {
+        return sign | 0x7c00;
+    }
+    if a == 0.0 {
+        return sign;
+    }
+    let bits = a.to_bits();
+    let e = ((bits >> 52) & 0x7ff) as i32 - 1023;
+    let m = bits & ((1 << 52) - 1);
+    if e >= -14 {
+        sign | (((e + 15) as u16) << 10) | (m >> 42) as u16
+    } else {
+        // (A denormal: in units of 2^-24.)
+        sign | (((1u64 << 52) | m) >> (52 - (e + 24))) as u16
+    }
 }

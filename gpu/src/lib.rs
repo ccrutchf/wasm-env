@@ -10,6 +10,7 @@
 pub mod ir;
 pub mod structure;
 pub mod wgsl;
+mod f64;
 pub mod opencl;
 pub mod device;
 pub use wgpu;

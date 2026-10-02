@@ -558,7 +558,7 @@ static cl_int GetDeviceIDs(cl_platform_id p, cl_device_type type, cl_uint n, cl_
 }
 
 static const char extensions[] = "cl_khr_global_int32_base_atomics cl_khr_global_int32_extended_atomics cl_khr_local_int32_base_atomics "
-                                 "cl_khr_local_int32_extended_atomics cl_khr_byte_addressable_store";
+                                 "cl_khr_local_int32_extended_atomics cl_khr_byte_addressable_store cl_khr_fp64 cl_khr_fp16";
 
 static cl_int GetDeviceInfo(cl_device_id dev, cl_device_info what, size_t cap, void *out, size_t *size_ret) {
     if (dev != &device)
@@ -590,12 +590,11 @@ static cl_int GetDeviceInfo(cl_device_id dev, cl_device_info what, size_t cap, v
     case CL_DEVICE_NATIVE_VECTOR_WIDTH_LONG:
     case CL_DEVICE_PREFERRED_VECTOR_WIDTH_FLOAT:
     case CL_DEVICE_NATIVE_VECTOR_WIDTH_FLOAT:
-        INFO_OF(cl_uint, 1);
     case CL_DEVICE_PREFERRED_VECTOR_WIDTH_DOUBLE:
     case CL_DEVICE_NATIVE_VECTOR_WIDTH_DOUBLE:
     case CL_DEVICE_PREFERRED_VECTOR_WIDTH_HALF:
     case CL_DEVICE_NATIVE_VECTOR_WIDTH_HALF:
-        INFO_OF(cl_uint, 0);
+        INFO_OF(cl_uint, 1);
     case CL_DEVICE_MAX_CLOCK_FREQUENCY:
         INFO_OF(cl_uint, 1000);
     case CL_DEVICE_ADDRESS_BITS:
@@ -639,9 +638,12 @@ static cl_int GetDeviceInfo(cl_device_id dev, cl_device_info what, size_t cap, v
         INFO_OF(cl_uint, 128);
     case CL_DEVICE_SINGLE_FP_CONFIG:
         INFO_OF(cl_device_fp_config, CL_FP_ROUND_TO_NEAREST | CL_FP_INF_NAN);
+    // (Doubles: the runtime's, IEEE in software where the device's aren't.)
     case CL_DEVICE_DOUBLE_FP_CONFIG:
+        INFO_OF(cl_device_fp_config, CL_FP_FMA | CL_FP_ROUND_TO_NEAREST | CL_FP_ROUND_TO_ZERO | CL_FP_ROUND_TO_INF | CL_FP_INF_NAN | CL_FP_DENORM);
+    // (Halves: floats rounded to half precision, denormals and all.)
     case CL_DEVICE_HALF_FP_CONFIG:
-        INFO_OF(cl_device_fp_config, 0);
+        INFO_OF(cl_device_fp_config, CL_FP_ROUND_TO_NEAREST | CL_FP_INF_NAN | CL_FP_DENORM);
     case CL_DEVICE_GLOBAL_MEM_CACHE_TYPE:
         INFO_OF(cl_device_mem_cache_type, CL_NONE);
     case CL_DEVICE_GLOBAL_MEM_CACHE_SIZE:
