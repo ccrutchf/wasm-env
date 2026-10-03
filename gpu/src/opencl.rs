@@ -85,9 +85,9 @@ fn passed(options: &str) -> Vec<String> {
 pub fn clang_ir(cc: &Compiler, source: &str, options: &str, guest: Option<&Guest>) -> Res<String> {
     let clang = &cc.clang;
     let dir = Scratch::new()?;
-    // (No __IMAGE_SUPPORT__: the device has no images. __OPENCL_VERSION__ is
+    // (__OPENCL_VERSION__ is
     // the device's, which clang leaves to the driver.)
-    let mut args: Vec<String> = ["-x", "cl", "-cl-std=CL1.2", "-target", "spir", "-O2", "-emit-llvm", "-S", "-Xclang", "-finclude-default-header", "-cl-kernel-arg-info", "-U__IMAGE_SUPPORT__", "-D__OPENCL_VERSION__=120"]
+    let mut args: Vec<String> = ["-x", "cl", "-cl-std=CL1.2", "-target", "spir", "-O2", "-emit-llvm", "-S", "-Xclang", "-finclude-default-header", "-cl-kernel-arg-info", "-D__OPENCL_VERSION__=120"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -112,7 +112,8 @@ pub fn clang_ir(cc: &Compiler, source: &str, options: &str, guest: Option<&Guest
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).replace("<stdin>", "program"));
     }
-    String::from_utf8(out.stdout).map_err(|e| e.to_string())
+    let ir = String::from_utf8(out.stdout).map_err(|e| e.to_string())?;
+    with_images(cc, ir)
 }
 
 #[cfg(test)]
@@ -139,7 +140,7 @@ pub fn compile(cc: &Compiler, source: &str, options: &str, headers: &[(String, V
     }
     let mut args: Vec<String> = ["-x", "cl", "-cl-std=CL1.2", "-target", "spir", "-O2", "-Xclang", "-disable-llvm-passes", "-c", "-emit-llvm"]
         .iter()
-        .chain(&["-Xclang", "-finclude-default-header", "-cl-kernel-arg-info", "-U__IMAGE_SUPPORT__", "-D__OPENCL_VERSION__=120"])
+        .chain(&["-Xclang", "-finclude-default-header", "-cl-kernel-arg-info", "-D__OPENCL_VERSION__=120"])
         .map(|s| s.to_string())
         .collect();
     args.extend(["-I".to_string(), dir.0.display().to_string()]);
@@ -196,7 +197,7 @@ pub fn from_bitcode(cc: &Compiler, bitcode: &[u8]) -> Result<Module, String> {
     std::fs::write(&path, bitcode).map_err(|e| e.to_string())?;
     let args: Vec<String> = ["-x", "ir", "-target", "spir", "-O2", "-mllvm", "-inline-threshold=100000", "-S", "-emit-llvm", "-o", "-"].map(String::from).into_iter().chain([path.display().to_string()]).chain(cc.builtin_args()).collect();
     let ir = run(&cc.clang, &args, &[])?;
-    parse(&String::from_utf8(ir).map_err(|e| e.to_string())?)
+    parse(&with_images(cc, String::from_utf8(ir).map_err(|e| e.to_string())?)?)
 }
 
 fn run(clang: &Path, args: &[String], input: &[u8]) -> Result<Vec<u8>, String> {
@@ -288,4 +289,169 @@ fn extra_builtins(dir: &Scratch) -> Result<Vec<String>, String> {
     let path = dir.0.join("wasm-env-builtins.h");
     std::fs::write(&path, EXTRA_BUILTINS).map_err(|e| e.to_string())?;
     Ok(vec!["-include".into(), path.display().to_string()])
+}
+
+// --- Images -------------------------------------------------------------------
+//
+// An image is a buffer: a header (its size, pitches and format), then its
+// pixels (see images.cl and packages/opencl/icd.c). A kernel compiled for
+// spir has image and sampler handles (`target("spirv.Image", ...)`,
+// `target("spirv.Sampler")`) and calls the image builtins, which nothing
+// defines. A program that uses them is compiled again: its handles become a
+// pointer to the image's buffer and the sampler's bits, its builtin calls
+// calls to images.cl's functions, which are linked in and inlined.
+
+const IMAGES_CL: &str = include_str!("images.cl");
+
+/// Whether a module's IR uses images or samplers.
+fn uses_images(ir: &str) -> bool {
+    ir.contains("target(\"spirv.Image\"") || ir.contains("target(\"spirv.Sampler\")")
+}
+
+/// The images.cl function for an image builtin's mangled name (after `@`, up
+/// to its `(`), or None if it isn't one: `__img_<builtin>_<image type>`, then
+/// for reads `_s` (with a sampler) or `_n`, and `_i` or `_f` for the
+/// coordinates' type; for writes `_i`.
+fn image_function(mangled: &str) -> Option<String> {
+    // A length-prefixed name at `s`: (name, rest).
+    fn source_name(s: &str) -> Option<(&str, &str)> {
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        let n: usize = s[..digits].parse().ok()?;
+        let rest = &s[digits..];
+        Some((rest.get(..n)?, &rest[n..]))
+    }
+    let (name, rest) = source_name(mangled.strip_prefix("_Z")?)?;
+    if !(name.starts_with("read_image") || name.starts_with("write_image") || name.starts_with("get_image_")) {
+        return None;
+    }
+    let (kind, rest) = source_name(rest)?;
+    let kind = kind.strip_prefix("ocl_")?;
+    if !kind.starts_with("image") {
+        return None;
+    }
+    // (The coordinates' type: an int or float scalar or vector.)
+    let coords = |rest: &str| {
+        let t = rest.strip_prefix("Dv").map(|r| r.split_once('_').map_or("", |(_, t)| t)).unwrap_or(rest);
+        if t.starts_with('f') { "f" } else { "i" }
+    };
+    Some(if name.starts_with("read_image") {
+        let (sampled, rest) = match rest.strip_prefix("11ocl_sampler") {
+            Some(r) => ("s", r),
+            None => ("n", rest),
+        };
+        format!("__img_{name}_{kind}_{sampled}_{}", coords(rest))
+    } else if name.starts_with("write_image") {
+        format!("__img_{name}_{kind}_i")
+    } else if name == "get_image_dim" {
+        let n = if kind.starts_with("image3d") { 4 } else { 2 };
+        format!("__img_get_image_dim{n}_{kind}")
+    } else {
+        format!("__img_{name}_{kind}")
+    })
+}
+
+/// A module's IR with its image and sampler handles as a pointer and the
+/// sampler's bits, and its image builtins images.cl's.
+fn rewrite_images(ir: &str) -> String {
+    let mut out = String::with_capacity(ir.len());
+    let mut rest = ir;
+    while let Some(at) = rest.find("target(\"spirv.") {
+        out.push_str(&rest[..at]);
+        let end = rest[at..].find(')').map_or(rest.len(), |e| at + e + 1);
+        let ty = &rest[at..end];
+        out.push_str(if ty.starts_with("target(\"spirv.Sampler\"") { "i32" } else { "ptr addrspace(1)" });
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    let ir = out;
+    let mut out = String::with_capacity(ir.len());
+    let mut rest = ir.as_str();
+    while let Some(at) = rest.find("@_Z") {
+        out.push_str(&rest[..at + 1]);
+        let name_end = rest[at + 1..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(rest.len(), |e| at + 1 + e);
+        let name = &rest[at + 1..name_end];
+        match image_function(name) {
+            Some(f) => out.push_str(&f),
+            None => out.push_str(name),
+        }
+        rest = &rest[name_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// images.cl as LLVM bitcode, compiled once per process.
+fn images_bitcode(cc: &Compiler) -> Result<std::path::PathBuf, String> {
+    static BUILT: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+    let mut built = BUILT.lock().unwrap();
+    if let Some(p) = built.as_ref().filter(|p| p.exists()) {
+        return Ok(p.clone());
+    }
+    let path = std::env::temp_dir().join(format!("wasm-env-images-{}.bc", std::process::id()));
+    let args: Vec<String> = ["-x", "cl", "-cl-std=CL1.2", "-target", "spir", "-O2", "-emit-llvm", "-c", "-Xclang", "-finclude-default-header", "-o"]
+        .map(String::from)
+        .into_iter()
+        .chain([path.display().to_string(), "-".into()])
+        .collect();
+    run(&cc.clang, &args, IMAGES_CL.as_bytes()).map_err(|e| format!("images.cl: {e}"))?;
+    *built = Some(path.clone());
+    Ok(path)
+}
+
+/// A module's optimized IR, with its images (if it uses any) as buffers.
+fn with_images(cc: &Compiler, ir: String) -> Res<String> {
+    if !uses_images(&ir) {
+        return Ok(ir);
+    }
+    let dir = Scratch::new()?;
+    let path = dir.0.join("program.ll");
+    std::fs::write(&path, rewrite_images(&ir)).map_err(|e| e.to_string())?;
+    let images = images_bitcode(cc)?;
+    let args: Vec<String> = ["-x", "ir", "-target", "spir", "-O2", "-mllvm", "-inline-threshold=100000", "-S", "-emit-llvm", "-o", "-"]
+        .map(String::from)
+        .into_iter()
+        .chain([path.display().to_string(), "-Xclang".into(), "-mlink-builtin-bitcode".into(), "-Xclang".into(), images.display().to_string()])
+        .chain(cc.builtin_args())
+        .collect();
+    let ir = run(&cc.clang, &args, &[])?;
+    String::from_utf8(ir).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn image_builtins_are_renamed() {
+        assert_eq!(image_function("_Z11read_imagef14ocl_image2d_ro11ocl_samplerDv2_f").as_deref(), Some("__img_read_imagef_image2d_ro_s_f"));
+        assert_eq!(image_function("_Z12read_imageui20ocl_image2d_array_roDv4_i").as_deref(), Some("__img_read_imageui_image2d_array_ro_n_i"));
+        assert_eq!(image_function("_Z11read_imagei14ocl_image1d_ro11ocl_sampleri").as_deref(), Some("__img_read_imagei_image1d_ro_s_i"));
+        assert_eq!(image_function("_Z12write_imagef14ocl_image3d_woDv4_iDv4_f").as_deref(), Some("__img_write_imagef_image3d_wo_i"));
+        assert_eq!(image_function("_Z13get_image_dim14ocl_image3d_ro").as_deref(), Some("__img_get_image_dim4_image3d_ro"));
+        assert_eq!(image_function("_Z15get_image_width20ocl_image1d_array_wo").as_deref(), Some("__img_get_image_width_image1d_array_wo"));
+        assert_eq!(image_function("_Z13get_global_idj"), None);
+    }
+
+    #[test]
+    fn every_image_builtin_resolves() {
+        // Each image type, access and builtin form, compiled: no image
+        // handle or builtin is left (other builtins are WGSL's, see wgsl.rs).
+        let mut src = String::from("const sampler_t s = CLK_NORMALIZED_COORDS_TRUE | CLK_ADDRESS_REPEAT | CLK_FILTER_LINEAR;\n");
+        for (t, ci, cf) in [("image1d_t", "int", "float"), ("image1d_array_t", "int2", "float2"), ("image2d_t", "int2", "float2"), ("image2d_array_t", "int4", "float4"), ("image3d_t", "int4", "float4")] {
+            let n = t.trim_end_matches("_t");
+            src.push_str(&format!(
+                "__kernel void k_{n}(read_only {t} r, write_only {t} w, sampler_t s2, __global float4 *o, __global int *d) {{
+    {ci} c = ({ci})(1); {cf} f = ({cf})(0.5f);
+    o[0] = read_imagef(r, s, f) + read_imagef(r, s2, c) + read_imagef(r, c) + convert_float4(read_imagei(r, s, f)) + convert_float4(read_imageui(r, c));
+    write_imagef(w, c, o[1]); write_imagei(w, c, (int4)(1)); write_imageui(w, c, (uint4)(2));
+    d[0] = get_image_width(r) + get_image_channel_order(w) + get_image_channel_data_type(r);
+}}\n"
+            ));
+        }
+        let ir = clang_ir(&test_clang(), &src, "", None).unwrap();
+        assert!(!ir.contains("spirv."), "image handles left");
+        for line in ir.lines().filter(|l| l.starts_with("declare")) {
+            assert!(!line.contains("image") && !line.contains("sampler"), "unresolved: {line}");
+        }
+    }
 }

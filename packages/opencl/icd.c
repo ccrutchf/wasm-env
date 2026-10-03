@@ -86,6 +86,17 @@ struct _cl_mem {
     cl_mem parent;
     void *host;
     cl_uint maps;
+    // An image's description (type 0: a buffer). Its buffer holds a header
+    // (see gpu/src/images.cl), then its pixels, packed: `size` covers both.
+    struct image {
+        cl_mem_object_type type;
+        cl_image_format format;
+        // Its extent in pixels (1 for dimensions it doesn't have), and its
+        // pixels' size and pitches in the buffer.
+        size_t width, height, depth, layers, elem, row, slice;
+        // A CL_MEM_USE_HOST_PTR image's memory's pitches.
+        size_t host_row, host_slice;
+    } image;
     // Destructor callbacks, the latest first (the order they run in).
     struct callback {
         void(CL_CALLBACK *f)(cl_mem, void *);
@@ -145,6 +156,11 @@ struct _cl_event {
         struct waiting *next;
     } *waiting;
 };
+
+// The device's image limits (OpenCL 1.2's minimums for a device with images).
+#define IMAGE2D_MAX 8192
+#define IMAGE3D_MAX 2048
+#define IMAGE_ARRAY_MAX 2048
 
 static struct _cl_platform_id platform = {&dispatch};
 static struct _cl_device_id device = {&dispatch};
@@ -605,6 +621,24 @@ static cl_int GetDeviceInfo(cl_device_id dev, cl_device_info what, size_t cap, v
     case CL_DEVICE_GLOBAL_MEM_SIZE:
         INFO_OF(cl_ulong, desc.global_mem);
     case CL_DEVICE_IMAGE_SUPPORT:
+        INFO_OF(cl_bool, CL_TRUE);
+    case CL_DEVICE_MAX_READ_IMAGE_ARGS:
+        INFO_OF(cl_uint, 128);
+    case CL_DEVICE_MAX_WRITE_IMAGE_ARGS:
+        INFO_OF(cl_uint, 64);
+    case CL_DEVICE_MAX_SAMPLERS:
+        INFO_OF(cl_uint, 16);
+    case CL_DEVICE_IMAGE2D_MAX_WIDTH:
+    case CL_DEVICE_IMAGE2D_MAX_HEIGHT:
+        INFO_OF(size_t, IMAGE2D_MAX);
+    case CL_DEVICE_IMAGE3D_MAX_WIDTH:
+    case CL_DEVICE_IMAGE3D_MAX_HEIGHT:
+    case CL_DEVICE_IMAGE3D_MAX_DEPTH:
+        INFO_OF(size_t, IMAGE3D_MAX);
+    case CL_DEVICE_IMAGE_MAX_ARRAY_SIZE:
+        INFO_OF(size_t, IMAGE_ARRAY_MAX);
+    case CL_DEVICE_IMAGE_MAX_BUFFER_SIZE:
+        INFO_OF(size_t, 65536);
     case CL_DEVICE_ERROR_CORRECTION_SUPPORT:
     case CL_DEVICE_HOST_UNIFIED_MEMORY:
         INFO_OF(cl_bool, CL_FALSE);
@@ -614,20 +648,10 @@ static cl_int GetDeviceInfo(cl_device_id dev, cl_device_info what, size_t cap, v
     case CL_DEVICE_LINKER_AVAILABLE:
     case CL_DEVICE_PREFERRED_INTEROP_USER_SYNC:
         INFO_OF(cl_bool, CL_TRUE);
-    case CL_DEVICE_MAX_READ_IMAGE_ARGS:
-    case CL_DEVICE_MAX_WRITE_IMAGE_ARGS:
-    case CL_DEVICE_MAX_SAMPLERS:
     case CL_DEVICE_GLOBAL_MEM_CACHELINE_SIZE:
     case CL_DEVICE_PARTITION_MAX_SUB_DEVICES:
     case CL_DEVICE_REFERENCE_COUNT - 0:
         INFO_OF(cl_uint, what == CL_DEVICE_REFERENCE_COUNT ? 1 : 0);
-    case CL_DEVICE_IMAGE2D_MAX_WIDTH:
-    case CL_DEVICE_IMAGE2D_MAX_HEIGHT:
-    case CL_DEVICE_IMAGE3D_MAX_WIDTH:
-    case CL_DEVICE_IMAGE3D_MAX_HEIGHT:
-    case CL_DEVICE_IMAGE3D_MAX_DEPTH:
-    case CL_DEVICE_IMAGE_MAX_BUFFER_SIZE:
-    case CL_DEVICE_IMAGE_MAX_ARRAY_SIZE:
     case CL_DEVICE_PRINTF_BUFFER_SIZE:
         INFO_OF(size_t, 0);
     case CL_DEVICE_MAX_PARAMETER_SIZE:
@@ -996,11 +1020,11 @@ static cl_int GetMemObjectInfo(cl_mem m, cl_mem_info what, size_t cap, void *out
         return CL_INVALID_MEM_OBJECT;
     switch (what) {
     case CL_MEM_TYPE:
-        INFO_OF(cl_mem_object_type, CL_MEM_OBJECT_BUFFER);
+        INFO_OF(cl_mem_object_type, m->image.type ? m->image.type : CL_MEM_OBJECT_BUFFER);
     case CL_MEM_FLAGS:
         INFO_OF(cl_mem_flags, m->flags);
     case CL_MEM_SIZE:
-        INFO_OF(size_t, m->size);
+        INFO_OF(size_t, m->image.type ? m->size - 64 : m->size);
     case CL_MEM_HOST_PTR:
         INFO_OF(void *, m->host);
     case CL_MEM_MAP_COUNT:
@@ -1017,13 +1041,570 @@ static cl_int GetMemObjectInfo(cl_mem m, cl_mem_info what, size_t cap, void *out
     return CL_INVALID_VALUE;
 }
 
+// ---- Images ----
+//
+// An image is a buffer: a header of 16 words (its extent, pitches and
+// format, which the kernel's image builtins read: gpu/src/images.cl), then
+// its pixels, packed. Its handle is a kernel's image argument, as a
+// buffer's is.
+
+#define IMAGE_HEADER 64
+
+static size_t *rect_copy(const size_t *a, const size_t *b, const size_t *reg);
+
+// Bytes per channel of a data type (0: a packed type), and channels of an
+// order.
+static size_t type_size(cl_channel_type t) {
+    switch (t) {
+    case CL_SNORM_INT8:
+    case CL_UNORM_INT8:
+    case CL_SIGNED_INT8:
+    case CL_UNSIGNED_INT8:
+        return 1;
+    case CL_SNORM_INT16:
+    case CL_UNORM_INT16:
+    case CL_SIGNED_INT16:
+    case CL_UNSIGNED_INT16:
+    case CL_HALF_FLOAT:
+        return 2;
+    case CL_SIGNED_INT32:
+    case CL_UNSIGNED_INT32:
+    case CL_FLOAT:
+        return 4;
+    }
+    return 0;
+}
+
+static size_t order_channels(cl_channel_order o) {
+    switch (o) {
+    case CL_R:
+    case CL_A:
+    case CL_INTENSITY:
+    case CL_LUMINANCE:
+        return 1;
+    case CL_RG:
+    case CL_RA:
+        return 2;
+    case CL_RGB:
+        return 3;
+    case CL_RGBA:
+    case CL_BGRA:
+    case CL_ARGB:
+        return 4;
+    }
+    return 0;
+}
+
+// The formats the device has: every order with every type it takes (see
+// image_format).
+static const cl_channel_order orders[] = {CL_R, CL_A, CL_RG, CL_RA, CL_RGB, CL_RGBA, CL_BGRA, CL_ARGB, CL_INTENSITY, CL_LUMINANCE};
+static const cl_channel_type types[] = {CL_SNORM_INT8,      CL_SNORM_INT16,      CL_UNORM_INT8,      CL_UNORM_INT16,     CL_UNORM_SHORT_565,
+                                        CL_UNORM_SHORT_555, CL_UNORM_INT_101010, CL_SIGNED_INT8,     CL_SIGNED_INT16,    CL_SIGNED_INT32,
+                                        CL_UNSIGNED_INT8,   CL_UNSIGNED_INT16,   CL_UNSIGNED_INT32,  CL_HALF_FLOAT,      CL_FLOAT};
+
+// A format's pixel size, or 0 if the device doesn't have it.
+static size_t image_format(const cl_image_format *f) {
+    cl_channel_order o = f->image_channel_order;
+    cl_channel_type t = f->image_channel_data_type;
+    int packed = t == CL_UNORM_SHORT_565 || t == CL_UNORM_SHORT_555 || t == CL_UNORM_INT_101010;
+    if (o == CL_RGB)
+        return packed ? (t == CL_UNORM_INT_101010 ? 4 : 2) : 0;
+    if (packed || !order_channels(o) || !type_size(t))
+        return 0;
+    int eight = t == CL_SNORM_INT8 || t == CL_UNORM_INT8 || t == CL_SIGNED_INT8 || t == CL_UNSIGNED_INT8;
+    if ((o == CL_BGRA || o == CL_ARGB) && !eight)
+        return 0;
+    if ((o == CL_INTENSITY || o == CL_LUMINANCE) &&
+        !(t == CL_UNORM_INT8 || t == CL_UNORM_INT16 || t == CL_SNORM_INT8 || t == CL_SNORM_INT16 || t == CL_HALF_FLOAT || t == CL_FLOAT))
+        return 0;
+    return order_channels(o) * type_size(t);
+}
+
+static int image_type(cl_mem_object_type t) {
+    return t == CL_MEM_OBJECT_IMAGE1D || t == CL_MEM_OBJECT_IMAGE1D_ARRAY || t == CL_MEM_OBJECT_IMAGE2D || t == CL_MEM_OBJECT_IMAGE2D_ARRAY ||
+           t == CL_MEM_OBJECT_IMAGE3D;
+}
+
 static cl_int GetSupportedImageFormats(cl_context c, cl_mem_flags flags, cl_mem_object_type type, cl_uint n, cl_image_format *formats, cl_uint *count) {
-    (void)flags, (void)type, (void)n, (void)formats;
+    (void)flags;
     if (!c)
         return CL_INVALID_CONTEXT;
+    if (n && !formats)
+        return CL_INVALID_VALUE;
+    if (!image_type(type) && type != CL_MEM_OBJECT_IMAGE1D_BUFFER)
+        return CL_INVALID_VALUE;
+    cl_uint k = 0;
+    // (Not yet: images made from buffers.)
+    if (type != CL_MEM_OBJECT_IMAGE1D_BUFFER)
+        for (size_t o = 0; o < sizeof orders / sizeof *orders; o++)
+            for (size_t t = 0; t < sizeof types / sizeof *types; t++) {
+                cl_image_format f = {orders[o], types[t]};
+                if (!image_format(&f))
+                    continue;
+                if (k < n)
+                    formats[k] = f;
+                k++;
+            }
     if (count)
-        *count = 0;
+        *count = k;
     return CL_SUCCESS;
+}
+
+static cl_mem CreateImage(cl_context c, cl_mem_flags flags, const cl_image_format *format, const cl_image_desc *desc_, void *host, cl_int *err) {
+    cl_int e = CL_SUCCESS;
+    size_t elem = format ? image_format(format) : 0;
+    int wants_host = (flags & (CL_MEM_USE_HOST_PTR | CL_MEM_COPY_HOST_PTR)) != 0;
+    cl_image_desc d = desc_ ? *desc_ : (cl_image_desc){0};
+    cl_mem_object_type t = d.image_type;
+    if (!c)
+        e = CL_INVALID_CONTEXT;
+    else if (!format)
+        e = CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
+    else if (!desc_ || !(image_type(t) || t == CL_MEM_OBJECT_IMAGE1D_BUFFER) || d.num_mip_levels || d.num_samples)
+        e = CL_INVALID_IMAGE_DESCRIPTOR;
+    else if (!order_channels(format->image_channel_order) || !(type_size(format->image_channel_data_type) || format->image_channel_order == CL_RGB))
+        e = CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
+    else if (!elem || t == CL_MEM_OBJECT_IMAGE1D_BUFFER)
+        e = CL_IMAGE_FORMAT_NOT_SUPPORTED;
+    else if (wants_host != (host != NULL))
+        e = CL_INVALID_HOST_PTR;
+    else if ((flags & CL_MEM_USE_HOST_PTR) && (flags & (CL_MEM_ALLOC_HOST_PTR | CL_MEM_COPY_HOST_PTR)))
+        e = CL_INVALID_VALUE;
+    size_t w = d.image_width, h = 1, depth = 1, layers = 1;
+    if (t == CL_MEM_OBJECT_IMAGE2D || t == CL_MEM_OBJECT_IMAGE2D_ARRAY || t == CL_MEM_OBJECT_IMAGE3D)
+        h = d.image_height;
+    if (t == CL_MEM_OBJECT_IMAGE3D)
+        depth = d.image_depth;
+    if (t == CL_MEM_OBJECT_IMAGE1D_ARRAY || t == CL_MEM_OBJECT_IMAGE2D_ARRAY)
+        layers = d.image_array_size;
+    size_t max = t == CL_MEM_OBJECT_IMAGE3D ? IMAGE3D_MAX : IMAGE2D_MAX;
+    if (e == CL_SUCCESS && (!w || !h || !depth || !layers || w > max || h > max || depth > IMAGE3D_MAX || layers > IMAGE_ARRAY_MAX))
+        e = CL_INVALID_IMAGE_SIZE;
+    // The host memory's pitches (the defaults, or given with the memory).
+    size_t row = w * elem, slice = t == CL_MEM_OBJECT_IMAGE1D_ARRAY ? row : row * h;
+    size_t host_row = d.image_row_pitch ? d.image_row_pitch : row;
+    size_t host_slice = d.image_slice_pitch ? d.image_slice_pitch : t == CL_MEM_OBJECT_IMAGE1D_ARRAY ? host_row : host_row * h;
+    if (e == CL_SUCCESS) {
+        if (!host && (d.image_row_pitch || d.image_slice_pitch))
+            e = CL_INVALID_IMAGE_DESCRIPTOR;
+        else if (host_row < row || host_row % elem || (d.image_slice_pitch && (host_slice < (t == CL_MEM_OBJECT_IMAGE1D_ARRAY ? host_row : host_row * h) ||
+                                                                               host_slice % host_row)))
+            e = CL_INVALID_IMAGE_DESCRIPTOR;
+    }
+    size_t planes = depth * layers, data = slice * planes;
+    if (e == CL_SUCCESS && data + IMAGE_HEADER > desc.max_alloc)
+        e = CL_INVALID_IMAGE_SIZE;
+    cl_mem m = NULL;
+    if (e == CL_SUCCESS) {
+        struct request r = {CREATE, {data + IMAGE_HEADER}};
+        e = call(&r);
+        if (e == CL_SUCCESS && !(m = calloc(1, sizeof *m))) {
+            struct request f = {FREE, {r.r[0]}};
+            call(&f);
+            e = CL_OUT_OF_HOST_MEMORY;
+        }
+        if (m) {
+            *m = (struct _cl_mem){&dispatch, 1, c, flags ? flags : CL_MEM_READ_WRITE, data + IMAGE_HEADER, 0, r.r[0]};
+            m->host = flags & CL_MEM_USE_HOST_PTR ? host : NULL;
+            m->image = (struct image){t, *format, w, h, depth, layers, elem, row, slice, host_row, host_slice};
+            retain(&c->refs);
+            uint32_t header[16] = {(uint32_t)w,     (uint32_t)h,   (uint32_t)depth, t == CL_MEM_OBJECT_IMAGE1D_ARRAY || t == CL_MEM_OBJECT_IMAGE2D_ARRAY ? (uint32_t)layers : 0,
+                                   (uint32_t)row,   (uint32_t)slice, format->image_channel_order, format->image_channel_data_type,
+                                   (uint32_t)elem,  (uint32_t)order_channels(format->image_channel_order)};
+            e = write_mem(m, 0, sizeof header, header);
+            // The host's pixels, row by row.
+            for (size_t z = 0; e == CL_SUCCESS && host && z < planes; z++)
+                for (size_t y = 0; e == CL_SUCCESS && y < h; y++)
+                    e = write_mem(m, IMAGE_HEADER + z * slice + y * row, row, (const char *)host + z * host_slice + y * host_row);
+            if (e != CL_SUCCESS) {
+                struct request f = {FREE, {m->handle}};
+                call(&f);
+                ReleaseContext(c);
+                free(m);
+                m = NULL;
+            }
+        }
+    }
+    if (err)
+        *err = e;
+    return m;
+}
+
+static cl_mem CreateImage2D(cl_context c, cl_mem_flags flags, const cl_image_format *format, size_t w, size_t h, size_t row, void *host, cl_int *err) {
+    cl_image_desc d = {CL_MEM_OBJECT_IMAGE2D, w, h, 0, 0, row, 0, 0, 0, {NULL}};
+    return CreateImage(c, flags, format, &d, host, err);
+}
+
+static cl_mem CreateImage3D(cl_context c, cl_mem_flags flags, const cl_image_format *format, size_t w, size_t h, size_t depth, size_t row, size_t slice,
+                            void *host, cl_int *err) {
+    cl_image_desc d = {CL_MEM_OBJECT_IMAGE3D, w, h, depth, 0, row, slice, 0, 0, {NULL}};
+    return CreateImage(c, flags, format, &d, host, err);
+}
+
+static cl_int GetImageInfo(cl_mem m, cl_image_info what, size_t cap, void *out, size_t *size_ret) {
+    if (!m || !m->image.type)
+        return CL_INVALID_MEM_OBJECT;
+    struct image *im = &m->image;
+    cl_mem_object_type t = im->type;
+    switch (what) {
+    case CL_IMAGE_FORMAT:
+        INFO_OF(cl_image_format, im->format);
+    case CL_IMAGE_ELEMENT_SIZE:
+        INFO_OF(size_t, im->elem);
+    case CL_IMAGE_ROW_PITCH:
+        INFO_OF(size_t, im->row);
+    case CL_IMAGE_SLICE_PITCH:
+        INFO_OF(size_t, t == CL_MEM_OBJECT_IMAGE1D || t == CL_MEM_OBJECT_IMAGE2D ? 0 : im->slice);
+    case CL_IMAGE_WIDTH:
+        INFO_OF(size_t, im->width);
+    case CL_IMAGE_HEIGHT:
+        INFO_OF(size_t, t == CL_MEM_OBJECT_IMAGE1D || t == CL_MEM_OBJECT_IMAGE1D_ARRAY ? 0 : im->height);
+    case CL_IMAGE_DEPTH:
+        INFO_OF(size_t, t == CL_MEM_OBJECT_IMAGE3D ? im->depth : 0);
+    case CL_IMAGE_ARRAY_SIZE:
+        INFO_OF(size_t, t == CL_MEM_OBJECT_IMAGE1D_ARRAY || t == CL_MEM_OBJECT_IMAGE2D_ARRAY ? im->layers : 0);
+    case CL_IMAGE_BUFFER:
+        INFO_OF(cl_mem, NULL);
+    case CL_IMAGE_NUM_MIP_LEVELS:
+    case CL_IMAGE_NUM_SAMPLES:
+        INFO_OF(cl_uint, 0);
+    }
+    return CL_INVALID_VALUE;
+}
+
+// An image region (an API's origin and region) in the buffer's terms:
+// pixels x, y and z (a 1D array's layers as z), checked against the
+// image's extent.
+static cl_int image_region(cl_mem m, const size_t *origin, const size_t *region, size_t o[3], size_t r[3]) {
+    struct image *im = &m->image;
+    if (!origin || !region)
+        return CL_INVALID_VALUE;
+    for (int k = 0; k < 3; k++)
+        o[k] = origin[k], r[k] = region[k];
+    switch (im->type) {
+    case CL_MEM_OBJECT_IMAGE1D:
+        if (o[1] || o[2] || r[1] != 1 || r[2] != 1)
+            return CL_INVALID_VALUE;
+        break;
+    case CL_MEM_OBJECT_IMAGE1D_ARRAY:
+        if (o[2] || r[2] != 1)
+            return CL_INVALID_VALUE;
+        o[2] = o[1], r[2] = r[1], o[1] = 0, r[1] = 1;
+        break;
+    case CL_MEM_OBJECT_IMAGE2D:
+        if (o[2] || r[2] != 1)
+            return CL_INVALID_VALUE;
+        break;
+    }
+    size_t planes = im->depth * im->layers;
+    if (!r[0] || !r[1] || !r[2] || o[0] + r[0] > im->width || o[1] + r[1] > im->height || o[2] + r[2] > planes)
+        return CL_INVALID_VALUE;
+    return CL_SUCCESS;
+}
+
+// Transfers a region (in the buffer's terms) between an image and host
+// memory with the given pitches, row by row.
+static cl_int image_rect(cl_mem m, int writing, const size_t o[3], const size_t r[3], size_t hrow, size_t hslice, void *p) {
+    struct image *im = &m->image;
+    size_t bytes = r[0] * im->elem;
+    for (size_t z = 0; z < r[2]; z++)
+        for (size_t y = 0; y < r[1]; y++) {
+            size_t b = IMAGE_HEADER + (o[2] + z) * im->slice + (o[1] + y) * im->row + o[0] * im->elem;
+            char *h = (char *)p + z * hslice + y * hrow;
+            cl_int e = writing ? write_mem(m, b, bytes, h) : read_mem(m, b, bytes, h);
+            if (e != CL_SUCCESS)
+                return e;
+        }
+    return CL_SUCCESS;
+}
+
+// The host pitches of a transfer: given, or packed. (A 1D array's layers
+// are its slices.)
+static void host_pitches(cl_mem m, const size_t r[3], size_t *row, size_t *slice) {
+    if (!*row)
+        *row = r[0] * m->image.elem;
+    if (!*slice)
+        *slice = m->image.type == CL_MEM_OBJECT_IMAGE1D_ARRAY ? *row : *row * r[1];
+}
+
+// a[0] whether a write, a[1]-a[2] the host pitches, a[3] the host memory;
+// data the origin and region (in the buffer's terms).
+static cl_int run_image_rect(struct command *c) {
+    size_t *d = c->data;
+    return image_rect(c->mem[0], (int)c->a[0], d, d + 3, c->a[1], c->a[2], (void *)c->a[3]);
+}
+
+static cl_int image_transfer(cl_command_queue q, cl_mem m, int writing, cl_bool blocking, const size_t *origin, const size_t *region, size_t row,
+                             size_t slice, const void *p, cl_uint nw, const cl_event *wait, cl_event *ev) {
+    if (!q)
+        return CL_INVALID_COMMAND_QUEUE;
+    if (!m || !m->image.type)
+        return CL_INVALID_MEM_OBJECT;
+    if (writing ? !host_writes(m) : !host_reads(m))
+        return CL_INVALID_OPERATION;
+    size_t o[3], r[3];
+    cl_int e = image_region(m, origin, region, o, r);
+    if (e != CL_SUCCESS)
+        return e;
+    if (!p)
+        return CL_INVALID_VALUE;
+    host_pitches(m, r, &row, &slice);
+    size_t *d = rect_copy(o, r, r);
+    if (!d)
+        return CL_OUT_OF_HOST_MEMORY;
+    struct command c = {run_image_rect, {writing, row, slice, (uintptr_t)p}, d, {m}};
+    return submit(q, writing ? CL_COMMAND_WRITE_IMAGE : CL_COMMAND_READ_IMAGE, &c, nw, wait, ev, blocking);
+}
+
+static cl_int EnqueueReadImage(cl_command_queue q, cl_mem m, cl_bool blocking, const size_t *origin, const size_t *region, size_t row, size_t slice, void *p,
+                               cl_uint nw, const cl_event *wait, cl_event *ev) {
+    return image_transfer(q, m, 0, blocking, origin, region, row, slice, p, nw, wait, ev);
+}
+
+static cl_int EnqueueWriteImage(cl_command_queue q, cl_mem m, cl_bool blocking, const size_t *origin, const size_t *region, size_t row, size_t slice,
+                                const void *p, cl_uint nw, const cl_event *wait, cl_event *ev) {
+    return image_transfer(q, m, 1, blocking, origin, region, row, slice, p, nw, wait, ev);
+}
+
+// Copies between images, and between images and buffers, through the host:
+// a[0] the source's kind and a[1] the destination's (1: an image, 0: a
+// buffer, at offset a[2] or a[3]); data the origins and region.
+static cl_int run_image_copy(struct command *c) {
+    cl_mem src = c->mem[0], dst = c->mem[1];
+    const size_t *so = c->data, *dor = so + 3, *r = so + 6;
+    struct image *im = src->image.type ? &src->image : &dst->image;
+    size_t row = r[0] * im->elem, slice = row * r[1];
+    char *tmp = malloc(slice * r[2] ? slice * r[2] : 1);
+    if (!tmp)
+        return CL_OUT_OF_HOST_MEMORY;
+    cl_int e = c->a[0] ? image_rect(src, 0, so, r, row, slice, tmp) : read_mem(src, c->a[2], slice * r[2], tmp);
+    if (e == CL_SUCCESS)
+        e = c->a[1] ? image_rect(dst, 1, dor, r, row, slice, tmp) : write_mem(dst, c->a[3], slice * r[2], tmp);
+    free(tmp);
+    return e;
+}
+
+static cl_int image_copy(cl_command_queue q, cl_mem src, cl_mem dst, const size_t *so, size_t soff, const size_t *dor, size_t doff, const size_t *region,
+                         cl_command_type type, cl_uint nw, const cl_event *wait, cl_event *ev) {
+    if (!q)
+        return CL_INVALID_COMMAND_QUEUE;
+    if (!src || !dst)
+        return CL_INVALID_MEM_OBJECT;
+    int si = src->image.type != 0, di = dst->image.type != 0;
+    if ((type != CL_COMMAND_COPY_BUFFER_TO_IMAGE) != si || (type != CL_COMMAND_COPY_IMAGE_TO_BUFFER) != di)
+        return CL_INVALID_MEM_OBJECT;
+    if (si && di && memcmp(&src->image.format, &dst->image.format, sizeof src->image.format))
+        return CL_IMAGE_FORMAT_MISMATCH;
+    size_t o[9] = {0}, *sr = o + 6, dr[3];
+    cl_int e = CL_SUCCESS;
+    if (si)
+        e = image_region(src, so, region, o, sr);
+    if (e == CL_SUCCESS && di)
+        e = image_region(dst, dor, region, o + 3, si ? dr : sr);
+    if (e != CL_SUCCESS)
+        return e;
+    if (si && di && (sr[0] != dr[0] || sr[1] != dr[1] || sr[2] != dr[2]))
+        return CL_INVALID_VALUE;
+    // The buffer side, packed.
+    struct image *im = si ? &src->image : &dst->image;
+    size_t bytes = sr[0] * sr[1] * sr[2] * im->elem;
+    if ((!si && soff + bytes > src->size) || (!di && doff + bytes > dst->size))
+        return CL_INVALID_VALUE;
+    // Overlapping copies within an image are an error.
+    if (src == dst) {
+        int overlap = 1;
+        for (int k = 0; k < 3; k++)
+            if (o[k] + sr[k] <= o[3 + k] || o[3 + k] + sr[k] <= o[k])
+                overlap = 0;
+        if (overlap)
+            return CL_MEM_COPY_OVERLAP;
+    }
+    size_t *d = malloc(9 * sizeof *d);
+    if (!d)
+        return CL_OUT_OF_HOST_MEMORY;
+    memcpy(d, o, 9 * sizeof *d);
+    struct command c = {run_image_copy, {si, di, soff, doff}, d, {src, dst}};
+    return submit(q, type, &c, nw, wait, ev, 0);
+}
+
+static cl_int EnqueueCopyImage(cl_command_queue q, cl_mem src, cl_mem dst, const size_t *so, const size_t *dor, const size_t *region, cl_uint nw,
+                               const cl_event *wait, cl_event *ev) {
+    return image_copy(q, src, dst, so, 0, dor, 0, region, CL_COMMAND_COPY_IMAGE, nw, wait, ev);
+}
+
+static cl_int EnqueueCopyImageToBuffer(cl_command_queue q, cl_mem src, cl_mem dst, const size_t *so, const size_t *region, size_t doff, cl_uint nw,
+                                       const cl_event *wait, cl_event *ev) {
+    return image_copy(q, src, dst, so, 0, NULL, doff, region, CL_COMMAND_COPY_IMAGE_TO_BUFFER, nw, wait, ev);
+}
+
+static cl_int EnqueueCopyBufferToImage(cl_command_queue q, cl_mem src, cl_mem dst, size_t soff, const size_t *dor, const size_t *region, cl_uint nw,
+                                       const cl_event *wait, cl_event *ev) {
+    return image_copy(q, src, dst, NULL, soff, dor, 0, region, CL_COMMAND_COPY_BUFFER_TO_IMAGE, nw, wait, ev);
+}
+
+// Rounding to the nearest integer, ties to even (no libm here).
+static float round_even(float x) {
+    if (!(x == x))
+        return 0;
+    if (x >= 8388608.0f || x <= -8388608.0f)
+        return x;
+    float r = (float)(long)(x + (x < 0 ? -0.5f : 0.5f));
+    if (r - x == 0.5f || x - r == 0.5f)
+        r = 2.0f * (float)(long)(x / 2.0f + (x < 0 ? -0.25f : 0.25f));
+    return r;
+}
+
+static long clamp_l(float x, long lo, long hi) { return x < lo ? lo : x > hi ? hi : (long)x; }
+
+// A float as a half, rounding to nearest even.
+static uint16_t to_half(float f) {
+    union {
+        float f;
+        uint32_t u;
+    } v = {f};
+    uint32_t sign = v.u >> 16 & 0x8000, e = v.u >> 23 & 0xff, m = v.u & 0x7fffff;
+    if (e == 0xff)
+        return (uint16_t)(sign | 0x7c00 | (m ? 0x200 : 0));
+    int ex = (int)e - 127 + 15;
+    if (ex >= 31)
+        return (uint16_t)(sign | 0x7c00);
+    if (ex <= 0) {
+        if (ex < -10)
+            return (uint16_t)sign;
+        m |= 0x800000;
+        int shift = 14 - ex;
+        uint32_t h = m >> shift, rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (h & 1)))
+            h++;
+        return (uint16_t)(sign | h);
+    }
+    uint32_t h = (uint32_t)ex << 10 | m >> 13, rem = m & 0x1fff;
+    if (rem > 0x1000 || (rem == 0x1000 && (h & 1)))
+        h++;
+    return (uint16_t)(sign | h);
+}
+
+// A fill color (float4, int4 or uint4 by the format's type) as a pixel.
+static void pixel_of(const struct image *im, const void *color, uint8_t *out) {
+    const float *f = color;
+    const int32_t *s = color;
+    const uint32_t *u = color;
+    cl_channel_order o = im->format.image_channel_order;
+    cl_channel_type t = im->format.image_channel_data_type;
+    // The stored channels' sources among r, g, b, a.
+    int src[4] = {0, 1, 2, 3};
+    if (o == CL_A)
+        src[0] = 3;
+    else if (o == CL_RA)
+        src[1] = 3;
+    else if (o == CL_BGRA)
+        src[0] = 2, src[2] = 0;
+    else if (o == CL_ARGB)
+        src[0] = 3, src[1] = 0, src[2] = 1, src[3] = 2;
+    size_t n = order_channels(o);
+    memset(out, 0, im->elem);
+    if (t == CL_UNORM_SHORT_565 || t == CL_UNORM_SHORT_555 || t == CL_UNORM_INT_101010) {
+        uint32_t c[3];
+        int bits[3] = {5, t == CL_UNORM_SHORT_565 ? 6 : 5, 5};
+        if (t == CL_UNORM_INT_101010)
+            bits[0] = bits[1] = bits[2] = 10;
+        for (int k = 0; k < 3; k++)
+            c[k] = (uint32_t)clamp_l(round_even(f[k] * (float)((1 << bits[k]) - 1)), 0, (1 << bits[k]) - 1);
+        uint32_t v = t == CL_UNORM_SHORT_565 ? c[0] << 11 | c[1] << 5 | c[2] : t == CL_UNORM_SHORT_555 ? c[0] << 10 | c[1] << 5 | c[2] : c[0] << 20 | c[1] << 10 | c[2];
+        memcpy(out, &v, im->elem);
+        return;
+    }
+    for (size_t k = 0; k < n; k++) {
+        int i = src[k];
+        uint8_t *p = out + k * type_size(t);
+        union {
+            int8_t i8;
+            uint8_t u8;
+            int16_t i16;
+            uint16_t u16;
+            int32_t i32;
+            uint32_t u32;
+            float f;
+        } v = {0};
+        switch (t) {
+        case CL_UNORM_INT8:
+            v.u8 = (uint8_t)clamp_l(round_even(f[i] * 255.0f), 0, 255);
+            break;
+        case CL_UNORM_INT16:
+            v.u16 = (uint16_t)clamp_l(round_even(f[i] * 65535.0f), 0, 65535);
+            break;
+        case CL_SNORM_INT8:
+            v.i8 = (int8_t)clamp_l(round_even(f[i] * 127.0f), -128, 127);
+            break;
+        case CL_SNORM_INT16:
+            v.i16 = (int16_t)clamp_l(round_even(f[i] * 32767.0f), -32768, 32767);
+            break;
+        case CL_SIGNED_INT8:
+            v.i8 = (int8_t)(s[i] < -128 ? -128 : s[i] > 127 ? 127 : s[i]);
+            break;
+        case CL_SIGNED_INT16:
+            v.i16 = (int16_t)(s[i] < -32768 ? -32768 : s[i] > 32767 ? 32767 : s[i]);
+            break;
+        case CL_SIGNED_INT32:
+            v.i32 = s[i];
+            break;
+        case CL_UNSIGNED_INT8:
+            v.u8 = (uint8_t)(u[i] > 255 ? 255 : u[i]);
+            break;
+        case CL_UNSIGNED_INT16:
+            v.u16 = (uint16_t)(u[i] > 65535 ? 65535 : u[i]);
+            break;
+        case CL_UNSIGNED_INT32:
+            v.u32 = u[i];
+            break;
+        case CL_HALF_FLOAT:
+            v.u16 = to_half(f[i]);
+            break;
+        default:
+            v.f = f[i];
+        }
+        memcpy(p, &v, type_size(t));
+    }
+}
+
+// a[0] the pixel (data: the origin and region, then one row of pixels).
+static cl_int run_image_fill(struct command *c) {
+    size_t *d = c->data;
+    struct image *im = &c->mem[0]->image;
+    uint8_t *row = (uint8_t *)(d + 6);
+    for (size_t z = 0; z < d[5]; z++)
+        for (size_t y = 0; y < d[4]; y++) {
+            size_t o[3] = {d[0], d[1] + y, d[2] + z}, r[3] = {d[3], 1, 1};
+            cl_int e = image_rect(c->mem[0], 1, o, r, d[3] * im->elem, 0, row);
+            if (e != CL_SUCCESS)
+                return e;
+        }
+    return CL_SUCCESS;
+}
+
+static cl_int EnqueueFillImage(cl_command_queue q, cl_mem m, const void *color, const size_t *origin, const size_t *region, cl_uint nw,
+                               const cl_event *wait, cl_event *ev) {
+    if (!q)
+        return CL_INVALID_COMMAND_QUEUE;
+    if (!m || !m->image.type)
+        return CL_INVALID_MEM_OBJECT;
+    if (!color)
+        return CL_INVALID_VALUE;
+    size_t o[3], r[3];
+    cl_int e = image_region(m, origin, region, o, r);
+    if (e != CL_SUCCESS)
+        return e;
+    size_t *d = malloc(6 * sizeof *d + r[0] * m->image.elem);
+    if (!d)
+        return CL_OUT_OF_HOST_MEMORY;
+    memcpy(d, o, 3 * sizeof *d);
+    memcpy(d + 3, r, 3 * sizeof *d);
+    uint8_t *row = (uint8_t *)(d + 6);
+    pixel_of(&m->image, color, row);
+    for (size_t x = 1; x < r[0]; x++)
+        memcpy(row + x * m->image.elem, row, m->image.elem);
+    struct command c = {run_image_fill, {0}, d, {m}};
+    return submit(q, CL_COMMAND_FILL_IMAGE, &c, nw, wait, ev, 0);
 }
 
 // A read or a write: a[0] whether a write, a[1] the offset, a[2] the size,
@@ -1186,6 +1767,10 @@ struct mapping {
     size_t offset, size;
     cl_mem m;
     int write;
+    // An image's: its region (in the buffer's terms) and the mapped
+    // memory's pitches.
+    int image;
+    size_t o[3], r[3], row, slice;
     struct mapping *next;
 };
 static struct mapping *mappings;
@@ -1285,7 +1870,7 @@ static void *EnqueueMapBuffer(cl_command_queue q, cl_mem m, cl_bool blocking, cl
             __atomic_add_fetch(&m->maps, 1, __ATOMIC_RELAXED);
             if (map) {
                 lock_mappings();
-                *map = (struct mapping){p, offset, size, m, write, mappings};
+                *map = (struct mapping){p, offset, size, m, write, .next = mappings};
                 mappings = map;
                 unlock_mappings();
             }
@@ -1313,7 +1898,7 @@ static cl_int run_unmap(struct command *c) {
     struct mapping *found = unlink_mapping(m, p);
     if (found) {
         if (found->write)
-            e = write_mem(m, found->offset, found->size, p);
+            e = found->image ? image_rect(m, 1, found->o, found->r, found->row, found->slice, p) : write_mem(m, found->offset, found->size, p);
         if (!m->host)
             free(p);
         free(found);
@@ -1329,6 +1914,158 @@ static cl_int EnqueueUnmapMemObject(cl_command_queue q, cl_mem m, void *p, cl_ui
         return CL_INVALID_MEM_OBJECT;
     struct command c = {run_unmap, {(uintptr_t)p}, .mem = {m}};
     return submit(q, CL_COMMAND_UNMAP_MEM_OBJECT, &c, nw, wait, ev, 0);
+}
+
+// a[0]-a[1] the mapped memory's pitches, a[2] where it's mapped; data the
+// region (in the buffer's terms).
+static cl_int run_map_image(struct command *c) {
+    size_t *d = c->data;
+    return image_rect(c->mem[0], 0, d, d + 3, c->a[0], c->a[1], (void *)c->a[2]);
+}
+
+static void *EnqueueMapImage(cl_command_queue q, cl_mem m, cl_bool blocking, cl_map_flags flags, const size_t *origin, const size_t *region, size_t *row,
+                             size_t *slice, cl_uint nw, const cl_event *wait, cl_event *ev, cl_int *err) {
+    size_t o[3], r[3];
+    cl_int e = !q ? CL_INVALID_COMMAND_QUEUE : !m || !m->image.type ? CL_INVALID_MEM_OBJECT : !row ? CL_INVALID_VALUE : image_region(m, origin, region, o, r);
+    cl_mem_object_type t = m && m->image.type ? m->image.type : 0;
+    if (e == CL_SUCCESS && !slice && (t == CL_MEM_OBJECT_IMAGE3D || t == CL_MEM_OBJECT_IMAGE2D_ARRAY || t == CL_MEM_OBJECT_IMAGE1D_ARRAY))
+        e = CL_INVALID_VALUE;
+    if (e == CL_SUCCESS && (((flags & CL_MAP_READ) && !host_reads(m)) || ((flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION)) && !host_writes(m))))
+        e = CL_INVALID_OPERATION;
+    if (e == CL_SUCCESS)
+        e = waits(q, nw, wait);
+    void *p = NULL;
+    size_t *d = NULL;
+    if (e == CL_SUCCESS) {
+        // An image made from the host's memory maps to it, with its pitches;
+        // others to a packed copy, written back at unmap.
+        struct image *im = &m->image;
+        size_t prow = m->host ? im->host_row : r[0] * im->elem;
+        size_t pslice = m->host ? im->host_slice : t == CL_MEM_OBJECT_IMAGE1D_ARRAY ? prow : prow * r[1];
+        int write = (flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION)) != 0;
+        p = m->host ? (char *)m->host + o[2] * pslice + o[1] * prow + o[0] * im->elem : malloc(pslice * r[2] ? pslice * r[2] : 1);
+        struct mapping *map = malloc(sizeof *map);
+        d = rect_copy(o, r, r);
+        if (!p || !map || !d) {
+            if (!m->host)
+                free(p);
+            free(map), free(d);
+            e = CL_MAP_FAILURE;
+        } else {
+            __atomic_add_fetch(&m->maps, 1, __ATOMIC_RELAXED);
+            lock_mappings();
+            *map = (struct mapping){p, 0, 0, m, write, 1, {o[0], o[1], o[2]}, {r[0], r[1], r[2]}, prow, pslice, mappings};
+            mappings = map;
+            unlock_mappings();
+            *row = prow;
+            if (slice)
+                *slice = t == CL_MEM_OBJECT_IMAGE1D || t == CL_MEM_OBJECT_IMAGE2D ? 0 : pslice;
+            struct command c = {flags & CL_MAP_WRITE_INVALIDATE_REGION ? run_nothing : run_map_image, {prow, pslice, (uintptr_t)p}, d, {m}};
+            e = submit(q, CL_COMMAND_MAP_IMAGE, &c, nw, wait, ev, blocking);
+            if (e != CL_SUCCESS) {
+                free(unlink_mapping(m, p));
+                __atomic_sub_fetch(&m->maps, 1, __ATOMIC_RELAXED);
+                if (!m->host)
+                    free(p);
+            }
+        }
+    }
+    if (err)
+        *err = e;
+    return e == CL_SUCCESS ? p : NULL;
+}
+
+// ---- Samplers ----
+//
+// A kernel's sampler argument is its bits, as OpenCL C's sampler
+// initializers are (CLK_NORMALIZED_COORDS_TRUE, CLK_ADDRESS_*,
+// CLK_FILTER_*).
+
+struct _cl_sampler {
+    struct _cl_icd_dispatch *d;
+    cl_uint refs;
+    cl_context ctx;
+    cl_bool normalized;
+    cl_addressing_mode addressing;
+    cl_filter_mode filter;
+};
+
+static uint32_t sampler_bits(cl_sampler s) {
+    return (s->normalized ? 1u : 0u) | (uint32_t)(s->addressing - CL_ADDRESS_NONE) * 2 | (s->filter == CL_FILTER_LINEAR ? 0x20u : 0x10u);
+}
+
+static cl_sampler CreateSampler(cl_context c, cl_bool normalized, cl_addressing_mode addressing, cl_filter_mode filter, cl_int *err) {
+    cl_int e = CL_SUCCESS;
+    if (!c)
+        e = CL_INVALID_CONTEXT;
+    else if (addressing < CL_ADDRESS_NONE || addressing > CL_ADDRESS_MIRRORED_REPEAT || (filter != CL_FILTER_NEAREST && filter != CL_FILTER_LINEAR) ||
+             (normalized != CL_TRUE && normalized != CL_FALSE))
+        e = CL_INVALID_VALUE;
+    cl_sampler s = e == CL_SUCCESS ? calloc(1, sizeof *s) : NULL;
+    if (s) {
+        *s = (struct _cl_sampler){&dispatch, 1, c, normalized, addressing, filter};
+        retain(&c->refs);
+    } else if (e == CL_SUCCESS) {
+        e = CL_OUT_OF_HOST_MEMORY;
+    }
+    if (err)
+        *err = e;
+    return s;
+}
+
+static cl_sampler CreateSamplerWithProperties(cl_context c, const cl_sampler_properties *props, cl_int *err) {
+    cl_bool normalized = CL_TRUE;
+    cl_addressing_mode addressing = CL_ADDRESS_CLAMP;
+    cl_filter_mode filter = CL_FILTER_NEAREST;
+    for (; props && props[0]; props += 2) {
+        if (props[0] == CL_SAMPLER_NORMALIZED_COORDS)
+            normalized = (cl_bool)props[1];
+        else if (props[0] == CL_SAMPLER_ADDRESSING_MODE)
+            addressing = (cl_addressing_mode)props[1];
+        else if (props[0] == CL_SAMPLER_FILTER_MODE)
+            filter = (cl_filter_mode)props[1];
+        else {
+            if (err)
+                *err = CL_INVALID_VALUE;
+            return NULL;
+        }
+    }
+    return CreateSampler(c, normalized, addressing, filter, err);
+}
+
+static cl_int RetainSampler(cl_sampler s) {
+    if (!s)
+        return CL_INVALID_SAMPLER;
+    retain(&s->refs);
+    return CL_SUCCESS;
+}
+
+static cl_int ReleaseSampler(cl_sampler s) {
+    if (!s)
+        return CL_INVALID_SAMPLER;
+    if (release(&s->refs) == 0) {
+        ReleaseContext(s->ctx);
+        free(s);
+    }
+    return CL_SUCCESS;
+}
+
+static cl_int GetSamplerInfo(cl_sampler s, cl_sampler_info what, size_t cap, void *out, size_t *size_ret) {
+    if (!s)
+        return CL_INVALID_SAMPLER;
+    switch (what) {
+    case CL_SAMPLER_REFERENCE_COUNT:
+        INFO_OF(cl_uint, s->refs);
+    case CL_SAMPLER_CONTEXT:
+        INFO_OF(cl_context, s->ctx);
+    case CL_SAMPLER_NORMALIZED_COORDS:
+        INFO_OF(cl_bool, s->normalized);
+    case CL_SAMPLER_ADDRESSING_MODE:
+        INFO_OF(cl_addressing_mode, s->addressing);
+    case CL_SAMPLER_FILTER_MODE:
+        INFO_OF(cl_filter_mode, s->filter);
+    }
+    return CL_INVALID_VALUE;
 }
 
 // ---- Programs ----
@@ -1776,6 +2513,16 @@ static cl_int SetKernelArg(cl_kernel k, cl_uint i, size_t size, const void *valu
         k->locals[i] = (uint32_t)size;
         break;
     default:
+        if (!strcmp(a->type, "sampler_t")) {
+            // (A sampler: its bits.)
+            if (size != sizeof(cl_sampler))
+                return CL_INVALID_ARG_SIZE;
+            if (!value || !*(const cl_sampler *)value)
+                return CL_INVALID_SAMPLER;
+            uint32_t bits = sampler_bits(*(const cl_sampler *)value);
+            memcpy(k->block + a->offset, &bits, 4);
+            break;
+        }
         if (size != a->size)
             return CL_INVALID_ARG_SIZE;
         if (!value)
@@ -2176,6 +2923,22 @@ __attribute__((constructor)) static void init(void) {
         .clEnqueueBarrierWithWaitList = EnqueueBarrierWithWaitList,
         .clGetExtensionFunctionAddressForPlatform = GetExtensionFunctionAddressForPlatform,
         .clCreateCommandQueueWithProperties = CreateCommandQueueWithProperties,
+        .clCreateImage = CreateImage,
+        .clCreateImage2D = CreateImage2D,
+        .clCreateImage3D = CreateImage3D,
+        .clGetImageInfo = GetImageInfo,
+        .clEnqueueReadImage = EnqueueReadImage,
+        .clEnqueueWriteImage = EnqueueWriteImage,
+        .clEnqueueCopyImage = EnqueueCopyImage,
+        .clEnqueueCopyImageToBuffer = EnqueueCopyImageToBuffer,
+        .clEnqueueCopyBufferToImage = EnqueueCopyBufferToImage,
+        .clEnqueueFillImage = EnqueueFillImage,
+        .clEnqueueMapImage = EnqueueMapImage,
+        .clCreateSampler = CreateSampler,
+        .clCreateSamplerWithProperties = CreateSamplerWithProperties,
+        .clRetainSampler = RetainSampler,
+        .clReleaseSampler = ReleaseSampler,
+        .clGetSamplerInfo = GetSamplerInfo,
     };
     // The rest fail cleanly rather than crash the loader's call.
     void **slots = (void **)&dispatch;

@@ -172,8 +172,11 @@ impl Session {
             }
             3 => {
                 let mut st = self.state.lock().unwrap();
-                if st.buffers.remove(&a[0]).is_none() && st.programs.remove(&a[0]).is_none() {
-                    return Err(Failure::Cl(CL_INVALID_MEM_OBJECT));
+                if st.buffers.remove(&a[0]).is_none() {
+                    match st.programs.remove(&a[0]) {
+                        Some(p) => self.gpu.forget(p.id),
+                        None => return Err(Failure::Cl(CL_INVALID_MEM_OBJECT)),
+                    }
                 }
             }
             4 => {

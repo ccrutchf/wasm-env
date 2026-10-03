@@ -313,6 +313,13 @@ impl Gpu {
         Ok(p)
     }
 
+    /// Drops a program's pipelines (it was freed): a program that builds
+    /// and frees many (the conformance tests, one per image format) would
+    /// otherwise keep them all, and a compiled pipeline is large.
+    pub fn forget(&self, program: usize) {
+        self.pipelines.lock().unwrap().retain(|k, _| k.0 != program);
+    }
+
     /// Runs a kernel over `global` work-items (with `offset`), in groups of
     /// `launch.local`. `block` is the argument block from the first
     /// argument on (its header is filled in here); `buffers` gives each
@@ -1509,6 +1516,89 @@ __kernel void k(__global const double *a, __global const double *b, __global dou
         assert_eq!(choose_local([1000, 1, 1], 1, 64), [50, 1, 1]);
         assert_eq!(choose_local([64, 64, 1], 2, 256), [64, 4, 1]);
         assert_eq!(choose_local([7, 1, 1], 1, 64), [7, 1, 1]);
+    }
+
+    /// An image's buffer as the OpenCL driver makes one (see images.cl):
+    /// the header, then the pixels.
+    fn image_buffer(w: u32, h: u32, d: u32, layers: u32, order: u32, ty: u32, elem: u32, channels: u32, pixels: &[u8]) -> Vec<u8> {
+        let row = w * elem;
+        let slice = row * h;
+        let mut header = [0u32; 16];
+        header[..10].copy_from_slice(&[w, h, d, layers, row, slice, order, ty, elem, channels]);
+        let mut b = bytes(&header);
+        b.extend_from_slice(pixels);
+        b
+    }
+
+    #[test]
+    fn images_read_sample_and_write() {
+        let Some(g) = gpu() else { return };
+        const RGBA: u32 = 0x10B5;
+        const UNORM_INT8: u32 = 0x10D2;
+        const FLOAT: u32 = 0x10DE;
+        let src = r#"
+const sampler_t near = CLK_NORMALIZED_COORDS_TRUE | CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_NEAREST;
+const sampler_t lin = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_LINEAR;
+__kernel void k(read_only image2d_t in, write_only image2d_t out, __global float4 *o, __global int *info) {
+    int x = get_global_id(0), y = get_global_id(1), w = get_image_width(in);
+    int2 p = (int2)(x, y);
+    float4 v = read_imagef(in, p);
+    write_imagef(out, p, v * 2.0f);
+    o[(y * w + x) * 3] = read_imagef(in, near, (float2)((x + 0.5f) / w, (y + 0.5f) / get_image_height(in)));
+    o[(y * w + x) * 3 + 1] = read_imagef(in, lin, (float2)(x + 1.0f, y + 0.75f));
+    o[(y * w + x) * 3 + 2] = read_imagef(in, near, (float2)(-3.0f, 9.0f));
+    if (x == 0 && y == 0) {
+        info[0] = get_image_width(in); info[1] = get_image_height(in);
+        info[2] = get_image_channel_order(in); info[3] = get_image_channel_data_type(out);
+        int2 d = get_image_dim(out); info[4] = d.x; info[5] = d.y;
+    }
+}"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let (w, h) = (4u32, 3u32);
+        let pixels: Vec<u8> = (0..w * h * 4).map(|k| (k * 37 % 256) as u8).collect();
+        let bin = g.buffer(64 + (w * h * 4) as u64).unwrap();
+        g.write(&bin, 0, &image_buffer(w, h, 1, 0, RGBA, UNORM_INT8, 4, 4, &pixels)).unwrap();
+        let bout = g.buffer(64 + (w * h * 16) as u64).unwrap();
+        g.write(&bout, 0, &image_buffer(w, h, 1, 0, RGBA, FLOAT, 16, 4, &vec![0; (w * h * 16) as usize])).unwrap();
+        let (bo, binfo) = (g.buffer((w * h * 48) as u64).unwrap(), g.buffer(64).unwrap());
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: choose_local([w, h, 1], 2, 64), local_bytes: vec![] };
+        g.run(1, &m, &info, &launch, 2, [w, h, 1], [0; 3], &[0u8; 16], &[(0, &bin), (1, &bout), (2, &bo), (3, &binfo)]).unwrap();
+        let floats = |b: &[u8]| b.chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<f32>>();
+        let o = floats(&g.read(&bo, 0, (w * h * 48) as u64).unwrap());
+        let written = floats(&g.read(&bout, 64, (w * h * 16) as u64).unwrap());
+        assert_eq!(&words(&g.read(&binfo, 0, 24).unwrap())[..], &[w, h, RGBA, FLOAT, w, h]);
+        // A texel as floats; out of range, CLAMP's border (transparent black).
+        let texel = |x: i32, y: i32| -> [f32; 4] {
+            if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                return [0.0; 4];
+            }
+            let k = ((y as u32 * w + x as u32) * 4) as usize;
+            std::array::from_fn(|c| pixels[k + c] as f32 / 255.0)
+        };
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let k = (y as u32 * w + x as u32) as usize;
+                let t = texel(x, y);
+                for c in 0..4 {
+                    assert_eq!(written[k * 4 + c], t[c] * 2.0, "write at {x},{y}");
+                    assert_eq!(o[k * 12 + c], t[c], "nearest at {x},{y}");
+                }
+                // Linear at (x + 1, y + 0.75): texels x and x + 1 weighted
+                // 0.5 each, rows y and y + 1 at 0.75 and 0.25.
+                let (a, b) = (0.5f32, 0.25f32);
+                for c in 0..4 {
+                    let want = (1.0 - a) * (1.0 - b) * texel(x, y)[c] + a * (1.0 - b) * texel(x + 1, y)[c]
+                        + (1.0 - a) * b * texel(x, y + 1)[c] + a * b * texel(x + 1, y + 1)[c];
+                    assert!((o[k * 12 + 4 + c] - want).abs() < 1e-5, "linear at {x},{y}: {} vs {want}", o[k * 12 + 4 + c]);
+                }
+                // Clamped to the edge: texel (0, h - 1).
+                let corner = ((h - 1) * w * 4) as usize;
+                for c in 0..4 {
+                    assert_eq!(o[k * 12 + 8 + c], pixels[corner + c] as f32 / 255.0, "clamped read at {x},{y}");
+                }
+            }
+        }
     }
 }
 
