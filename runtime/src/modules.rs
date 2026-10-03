@@ -43,6 +43,9 @@ pub struct Library {
     /// For a page of a program or library translated again at run time, the
     /// addresses it was made for (see patch); `path` just names it.
     pub patch: Option<Vec<u64>>,
+    /// The exact-FP version of a page of a program or library (see
+    /// exact_fp): `path` just names it.
+    pub exact: bool,
     /// Its region table: (addresses, functions, count), in guest memory.
     regions: OnceLock<(u64, u64, u64)>,
     /// For generated code that chains (see translate_code): the table slot
@@ -90,7 +93,7 @@ impl Libraries {
     /// The shared library (not generated code, not a patch) covering `addr`.
     pub fn library_at(&self, addr: u64) -> Option<Arc<Library>> {
         let list = self.list.lock().unwrap();
-        list.iter().find(|l| addr >= l.base && addr < l.end && l.code.is_none() && l.patch.is_none()).cloned()
+        list.iter().find(|l| addr >= l.base && addr < l.end && l.code.is_none() && l.patch.is_none() && !l.exact).cloned()
     }
 }
 
@@ -184,7 +187,7 @@ pub fn load(mut store: impl AsContextMut<Data = Process>, path: &Path) -> Result
         return Ok(lib.clone());
     }
     let (wasm, base, end) = crate::translate::ensure_library(&path, &kernel.root, trace).map_err(|e| anyhow::anyhow!("translating {}: errno {e}", path.display()))?;
-    add(&mut store, &mut next_slot, path, wasm, base, end, None, None)
+    add(&mut store, &mut next_slot, path, wasm, base, end, None, None, false)
 }
 
 /// Adds a translated module covering guest [base, end) to the process and
@@ -199,6 +202,7 @@ fn add(
     end: u64,
     code: Option<Code>,
     patch: Option<Vec<u64>>,
+    exact: bool,
 ) -> Result<Arc<Library>> {
     let process = store.as_context().data();
     let (kernel, group) = (process.kernel.clone(), process.group.clone());
@@ -277,6 +281,7 @@ fn add(
         got,
         code,
         patch,
+        exact,
         regions: OnceLock::new(),
         prev,
         slot,
@@ -364,7 +369,7 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64, obj
         let shares = !code_in(libraries, start, end).is_empty();
         let name = PathBuf::from(format!("[code {start:#x}]"));
         let code = Code { roots: vec![pc], bytes: bytes[(start - lo) as usize..(end.min(hi) - lo) as usize].to_vec() };
-        add(&mut store, &mut next_slot, name, wasm, start, end, Some(code), None).map_err(|e| {
+        add(&mut store, &mut next_slot, name, wasm, start, end, Some(code), None, false).map_err(|e| {
             eprintln!("wasm-env: loading code translated from {lo:#x}: {e:#}");
             EIO
         })?;
@@ -421,7 +426,7 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64, obj
     }
     let name = PathBuf::from(format!("[code {start:#x}]"));
     let code = Code { roots: roots.into_iter().collect(), bytes: bytes[(start - lo) as usize..(end.min(hi) - lo) as usize].to_vec() };
-    add(&mut store, &mut next_slot, name, wasm, start, end, Some(code), None).map_err(|e| {
+    add(&mut store, &mut next_slot, name, wasm, start, end, Some(code), None, false).map_err(|e| {
         eprintln!("wasm-env: loading code translated from {lo:#x}: {e:#}");
         EIO
     })?;
@@ -441,6 +446,89 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64, obj
 enum Owner {
     Program(String, u64),
     Library(Arc<Library>),
+}
+
+/// What translating a page of an owner's code again takes: its ELF file,
+/// its name, its base, its module (whose roots and leaders the page's
+/// translation reads) and the translator's arguments.
+struct OwnerObject {
+    elf: PathBuf,
+    object: String,
+    base: u64,
+    module: PathBuf,
+    args: Vec<String>,
+}
+
+/// ENOEXEC for a program translated together with its dynamic linker,
+/// whose image isn't one object's.
+fn owner_object(owner: &Owner, root: &Path, program: PathBuf) -> crate::memory::SysResult<OwnerObject> {
+    Ok(match owner {
+        Owner::Program(name, base) => {
+            let path = PathBuf::from(name);
+            let elf = if path.exists() { path } else { root.join(name.trim_start_matches('/')) };
+            let monolithic = crate::translate::monolithic();
+            if monolithic && std::fs::read(&elf).is_ok_and(|b| crate::process::has_interpreter(&b)) {
+                return Err(crate::abi::errno::ENOEXEC);
+            }
+            let args: Vec<String> = if monolithic { Vec::new() } else { vec!["--object".into()] };
+            OwnerObject { elf, object: name.clone(), base: *base, module: program, args }
+        }
+        Owner::Library(lib) => OwnerObject {
+            elf: lib.path.clone(),
+            object: lib.path.display().to_string(),
+            base: lib.base,
+            module: lib.wasm.clone(),
+            args: vec!["--object".into(), "--base".into(), format!("{:x}", lib.base)],
+        },
+    })
+}
+
+/// A block with FP results that FPCR changes, entered at `pc` while FPCR
+/// asks for a rounding mode, flush to zero or default NaNs: the wasm-env
+/// call behind the support code's `__wasm_env_exact_fp`. Translates its
+/// page again with every FP result exact (`--exact-fp`), and adds that to
+/// the module directory marked as exact, where only `__wasm_env_exact_fp`
+/// looks (see register). The program's or library's own translation stays
+/// as it is, so programs that never change FPCR pay nothing for this.
+/// `object` and `object_base` are as for translate_code. ENOEXEC if it
+/// can't be translated (generated code, whose blocks have both versions).
+pub fn exact_fp(mut store: impl AsContextMut<Data = Process>, pc: u64, object: u64, object_base: u64) -> crate::memory::SysResult<i64> {
+    use crate::abi::errno::*;
+    let process = store.as_context().data();
+    let (kernel, group, trace, program) = (process.kernel.clone(), process.group.clone(), process.trace, process.module.clone());
+    let threading = group.threading.get().ok_or(ENOEXEC)?;
+    let libraries = &group.libraries;
+    let mut next_slot = libraries.next_slot.lock().unwrap();
+    sync(&mut store).map_err(|_| EIO)?;
+    let page = pc & !(crate::abi::PAGE_SIZE - 1);
+    // Made already (by another thread, meanwhile).
+    if libraries.list.lock().unwrap().iter().any(|l| l.exact && l.base == page && !l.dead.load(Ordering::Relaxed)) {
+        return Ok(1);
+    }
+    let owner = if object != 0 {
+        let name = crate::memory::cstr(crate::syscall::shared_bytes(&threading.memory), object)?.to_string();
+        Owner::Program(name, object_base)
+    } else {
+        libraries.library_at(pc).map(Owner::Library).ok_or(ENOEXEC)?
+    };
+    let started = std::time::Instant::now();
+    let OwnerObject { elf, object, base, module, mut args } = owner_object(&owner, &kernel.root, program)?;
+    args.push("--exact-fp".into());
+    let wasm = crate::translate::translate_page(&elf, &module, &args, base, page, &kernel.root, trace)?;
+    let translated = started.elapsed();
+    let name = PathBuf::from(format!("[exact page {page:#x} of {object}]"));
+    add(&mut store, &mut next_slot, name, wasm, page, page + crate::abi::PAGE_SIZE, None, None, true).map_err(|e| {
+        eprintln!("wasm-env: loading the exact version of page {page:#x}: {e:#}");
+        EIO
+    })?;
+    if trace {
+        eprintln!(
+            "[wasm-env] translated page {page:#x} of {object} exactly (entered at {pc:#x}): {:.3} s, loaded in {:.3} s",
+            translated.as_secs_f64(),
+            (started.elapsed() - translated).as_secs_f64()
+        );
+    }
+    Ok(0)
 }
 
 /// A block the translation of the program or a library missed, reached at
@@ -467,22 +555,7 @@ fn patch(mut store: impl AsContextMut<Data = Process>, next_slot: &mut u64, pc: 
         return Ok(1);
     }
     let started = std::time::Instant::now();
-    let (elf, object, base, module, args) = match &owner {
-        Owner::Program(name, base) => {
-            let path = PathBuf::from(name);
-            let elf = if path.exists() { path } else { kernel.root.join(name.trim_start_matches('/')) };
-            let monolithic = crate::translate::monolithic();
-            if monolithic && std::fs::read(&elf).is_ok_and(|b| crate::process::has_interpreter(&b)) {
-                return Err(ENOEXEC);
-            }
-            let args: Vec<String> = if monolithic { Vec::new() } else { vec!["--object".into()] };
-            (elf, name.clone(), *base, program, args)
-        }
-        Owner::Library(lib) => {
-            let args = vec!["--object".into(), "--base".into(), format!("{:x}", lib.base)];
-            (lib.path.clone(), lib.path.display().to_string(), lib.base, lib.wasm.clone(), args)
-        }
-    };
+    let OwnerObject { elf, object, base, module, args } = owner_object(&owner, &kernel.root, program)?;
     // The next exec translates a small object again with the target (so it
     // needs no patch); a large one (libnode, libtorch: minutes) stays, and
     // runs patch the page from the cache.
@@ -494,7 +567,7 @@ fn patch(mut store: impl AsContextMut<Data = Process>, next_slot: &mut u64, pc: 
     let mut targets: Vec<u64> = current.iter().flat_map(|l| l.patch.clone().unwrap()).collect();
     targets.push(pc);
     let name = PathBuf::from(format!("[page {page:#x} of {object}]"));
-    let lib = add(&mut store, next_slot, name, wasm, page, page + crate::abi::PAGE_SIZE, None, Some(targets)).map_err(|e| {
+    let lib = add(&mut store, next_slot, name, wasm, page, page + crate::abi::PAGE_SIZE, None, Some(targets), false).map_err(|e| {
         eprintln!("wasm-env: loading page {page:#x} translated again: {e:#}");
         EIO
     })?;
@@ -530,8 +603,11 @@ fn patch(mut store: impl AsContextMut<Data = Process>, next_slot: &mut u64, pc: 
         }
     }
     // Earlier patches of the page go; every thread's cache drops the page's
-    // old function (retire bumps the epoch).
-    for old in &current {
+    // old function (retire bumps the epoch). So does the page's exact
+    // version, which lacks the new block (it's made again when needed).
+    let exact: Vec<Arc<Library>> =
+        libraries.list.lock().unwrap().iter().filter(|l| l.exact && l.base == page && !l.dead.load(Ordering::Relaxed)).cloned().collect();
+    for old in current.iter().chain(&exact) {
         retire(old, &threading.memory, libraries);
     }
     if current.is_empty()
@@ -724,7 +800,9 @@ fn register(mut store: impl AsContextMut<Data = Process>, instance: &Instance, l
     // the entry empty (a reused slot) or complete. (Adding is serialized:
     // the caller holds `next_slot`.)
     let atomic = |at: u64| atomic(memory, at).context("module directory out of bounds");
-    let generation = atomic(g.added)?.load(Ordering::Acquire) + 1;
+    // (An exact page's is marked, so dispatch passes over it: see
+    // __wasm_env_exact_fp in the translator's support code.)
+    let generation = (atomic(g.added)?.load(Ordering::Acquire) + 1) | (lib.exact as u64) << 63;
     for (i, v) in [addrs, fns, count, generation].into_iter().enumerate() {
         atomic(entry + 16 + 8 * i as u64)?.store(v, Ordering::Release);
     }

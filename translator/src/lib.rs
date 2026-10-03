@@ -46,7 +46,7 @@ pub fn translate_generated(bytes: &[u8], base: u64, roots: &[u64]) -> Result<Vec
     let prog = discover::discover(&image);
     let discovered = t.elapsed();
     let mut chunks = Vec::new();
-    lift::lift(&image, &prog, true, None, &mut |c| chunks.push(c));
+    lift::lift(&image, &prog, true, None, lift::FpMode::Inline, &mut |c| chunks.push(c));
     let lifted = t.elapsed();
     let wasm = wasmgen::compile(&chunks, true)?;
     if timings {

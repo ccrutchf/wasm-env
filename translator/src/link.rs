@@ -52,6 +52,13 @@ fn ld_args(image_end: u64) -> Vec<String> {
         "__wasm_env_svc",
         "__wasm_env_svc_at",
         "__wasm_env_fp_flags",
+        "__wasm_env_fpcr_op",
+        "__wasm_env_fpcr_flags",
+        "__wasm_env_exact_fp",
+        // Half precision conversions (compiler-rt): lifted code calls them
+        // (Block::round_half), and LLVM does for half arithmetic.
+        "__truncsfhf2",
+        "__extendhfsf2",
         "__wasm_env_fatal",
         "__wasm_env_bad_target",
         "__wasm_env_crc32",

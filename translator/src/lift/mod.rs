@@ -124,6 +124,52 @@ pub fn region_of(addr: u64) -> u64 {
     addr / REGION_SPAN * REGION_SPAN
 }
 
+/// FP operations FPCR changes the results of (see Block::fpcr). Must match
+/// __wasm_env_fpcr_op's in support/runtime.c.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FpOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Sqrt,
+    /// x*y + z, fused.
+    Fma,
+    /// -(x*y).
+    NMul,
+    /// Conversion between FP formats.
+    Cvt,
+    /// From a signed or unsigned integer (imm: fixed-point fraction bits).
+    SInt,
+    UInt,
+    /// Round to an integral value (imm: the rounding mode, as FPCR.RMode,
+    /// or 4 for ties away, or 7 for FPCR's).
+    Rint,
+    /// The input, zero if FZ flushes it (compares).
+    Flush,
+    Min,
+    Max,
+    MinNm,
+    MaxNm,
+}
+
+/// How blocks with FP results FPCR changes are lifted (see Block::fpcr).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FpMode {
+    /// As WebAssembly computes, and, when FPCR asks for more, through
+    /// their page's exact version, translated when first needed (`Exact`).
+    Lazy,
+    /// Both versions in the block (code generated at run time, whose
+    /// pages the runtime doesn't translate again).
+    Inline,
+    /// Exact only.
+    Exact,
+}
+
+/// FPCR's controls WebAssembly's arithmetic doesn't follow: RMode, FZ,
+/// FZ16 and DN.
+const FPCR_MODES: u32 = 0x03C8_0000;
+
 /// An FP result awaiting its exception check (see Block::check_fp).
 struct FpCheck {
     ty: String,
@@ -155,6 +201,18 @@ pub struct Block<'a> {
     /// and whether any of them was NaN or infinite (i1).
     fp_pending: Vec<FpCheck>,
     fp_special: Option<String>,
+    /// FPCR, as `fpcr_mode` gives it.
+    fpcr_mode: Option<(String, String, String)>,
+    /// The last result `fpcr` returned, and whether it was computed out of
+    /// line (i1), where its FPSR flags were raised too (see check_fp).
+    fpcr_slow: Option<(String, String)>,
+    /// Which version of the block this is (see `fpcr`): exact, or as
+    /// WebAssembly computes.
+    exact_fp: bool,
+    /// Whether the block has results FPCR changes, and whether it writes
+    /// FPCR.
+    fp_sensitive: bool,
+    writes_fpcr: bool,
     /// Flag liveness facts (see `lift`): whether the block reads NZCV before
     /// setting them, whether it sets them, the addresses it jumps to
     /// directly, and whether it jumps anywhere else.
@@ -193,6 +251,11 @@ impl<'a> Block<'a> {
             fpsr_raised: None,
             fp_pending: Vec::new(),
             fp_special: None,
+            fpcr_mode: None,
+            fpcr_slow: None,
+            exact_fp: false,
+            fp_sensitive: false,
+            writes_fpcr: false,
             flags_read_first: false,
             flags_set: false,
             succs: Vec::new(),
@@ -330,6 +393,7 @@ impl<'a> Block<'a> {
     /// the flags are worked out a few instructions later, only if some
     /// recorded result was NaN or infinite.
     pub fn check_fp(&mut self, ty: &str, inputs: &[&str], r: &str, div: bool) {
+        let inputs = self.unless_computed(ty, 0, inputs, r);
         let (s, inf) = match ty {
             "double" => ("f64", "0x7FF0000000000000"),
             "float" => ("f32", "0x7FF0000000000000"),
@@ -345,7 +409,7 @@ impl<'a> Block<'a> {
         self.fp_pending.push(FpCheck {
             ty: ty.to_string(),
             lanes: 0,
-            inputs: inputs.iter().map(|x| x.to_string()).collect(),
+            inputs,
             r: r.to_string(),
             div,
         });
@@ -374,6 +438,7 @@ impl<'a> Block<'a> {
     /// check_fp for vectors of `lanes` elements of type `ty`: one vector
     /// comparison, reduced to a bit.
     pub fn check_fp_vec(&mut self, ty: &str, lanes: u32, inputs: &[&str], r: &str, div: bool) {
+        let inputs = self.unless_computed(ty, lanes, inputs, r);
         let (s, inf) = if ty == "double" { ("f64", "0x7FF0000000000000") } else { ("f32", "0x7FF0000000000000") };
         let vt = format!("<{lanes} x {ty}>");
         let a = self.val(format!("call {vt} @llvm.fabs.v{lanes}{s}({vt} {r})"));
@@ -387,7 +452,7 @@ impl<'a> Block<'a> {
         self.fp_pending.push(FpCheck {
             ty: ty.to_string(),
             lanes,
-            inputs: inputs.iter().map(|x| x.to_string()).collect(),
+            inputs,
             r: r.to_string(),
             div,
         });
@@ -433,6 +498,197 @@ impl<'a> Block<'a> {
         self.raise_fp(raised);
     }
 
+    /// FPCR (i32), whether its rounding mode is other than to nearest (i1),
+    /// and whether it flushes denormals (FZ or FZ16, i1). Loaded once per
+    /// block, and again after `msr fpcr`.
+    fn fpcr_mode(&mut self) -> (String, String, String) {
+        if let Some(m) = &self.fpcr_mode {
+            return m.clone();
+        }
+        let v = self.val(format!("load i32, ptr %FPCR{FPCR_TAG}"));
+        let m = self.val(format!("and i32 {v}, {}", 3 << 22));
+        let rmode = self.val(format!("icmp ne i32 {m}, 0"));
+        let m = self.val(format!("and i32 {v}, {}", 1 << 24 | 1 << 19));
+        let fz = self.val(format!("icmp ne i32 {m}, 0"));
+        self.fpcr_mode = Some((v.clone(), rmode.clone(), fz.clone()));
+        (v, rmode, fz)
+    }
+
+    /// A half-precision result, rounded to half precision. LLVM's
+    /// WebAssembly backend keeps half values in single precision (it
+    /// promotes them) and rounds them only when their bits are needed, so a
+    /// result used as a float again (extended, compared, an operand of
+    /// another operation) would be unrounded (LLVM 21). Rounding through
+    /// compiler-rt's conversion, which LLVM doesn't see through, keeps
+    /// every result exact.
+    pub fn round_half(&mut self, r: &str) -> String {
+        let f = self.val(format!("fpext half {r} to float"));
+        let b = self.val(format!("call i16 @__truncsfhf2(float {f})"));
+        self.val(format!("bitcast i16 {b} to half"))
+    }
+
+    /// The guest wrote FPCR: its value is loaded again, and the block has
+    /// only its exact version (see `fpcr`).
+    pub fn fpcr_written(&mut self) {
+        self.fpcr_mode = None;
+        self.writes_fpcr = true;
+    }
+
+    /// An FP result `r` (of type `out_ty`) of `op` on `inputs` (of type
+    /// `in_ty`), computed with WebAssembly's arithmetic, as FPCR says it
+    /// should be. A block with such results has two versions (see
+    /// lift_region and FpMode), and FPCR picks one: when FPCR
+    /// asks for nothing WebAssembly doesn't do (rounding to nearest,
+    /// denormals kept, NaNs propagated: the default, as programs run), `r`
+    /// as it is; else (`exact_fp`), `r` checked, and computed again by
+    /// __wasm_env_fpcr_op in support/runtime.c, out of line, if FPCR
+    /// changes it or might: a rounding mode other than to nearest, a NaN
+    /// result (default NaNs, and arm64's choice among NaN operands), or,
+    /// flushing denormals, a denormal operand or a result that may have been
+    /// tiny before rounding (denormal, or the smallest normal). `lanes`: for
+    /// vectors, how many lanes they have and how many of them the operation
+    /// computes (the rest are kept). `imm`: the operation's immediate (see
+    /// __wasm_env_fpcr_op).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fpcr(&mut self, op: FpOp, in_ty: &str, out_ty: &str, lanes: Option<(u32, u32)>, inputs: &[&str], r: &str, imm: u32) -> String {
+        fn bits(ty: &str) -> u32 {
+            match ty {
+                "half" => 16,
+                "float" => 32,
+                "double" => 64,
+                t => t[1..].parse().expect("an integer type"),
+            }
+        }
+        let r = &if out_ty == "half" && lanes.is_none() { self.round_half(r) } else { r.to_string() };
+        self.fp_sensitive = true;
+        // Half precision fused multiply-adds are computed in single
+        // precision (see insn::fused), which rounds twice: always out of line,
+        // in either version (the branch folds away).
+        let half_fma = op == FpOp::Fma && out_ty == "half";
+        if !self.exact_fp && !half_fma {
+            return r.clone();
+        }
+        let (fpcr, rmode, fz) = self.fpcr_mode();
+        let int_in = matches!(op, FpOp::SInt | FpOp::UInt);
+        let mut set = if half_fma { "true".to_string() } else { rmode };
+        // Whether any lane of `v` is NaN, or (`tiny`) denormal or the
+        // smallest normal.
+        let any = |b: &mut Self, ty: &str, v: &str, tiny: bool| {
+            let n = bits(ty);
+            let (vt, it) = match lanes {
+                Some((l, _)) => (format!("<{l} x {ty}>"), format!("<{l} x i{n}>")),
+                None => (ty.to_string(), format!("i{n}")),
+            };
+            let c = if tiny {
+                let k = |c: u64| if lanes.is_some() { format!("splat (i{n} {c})") } else { c.to_string() };
+                let i = b.val(format!("bitcast {vt} {v} to {it}"));
+                let mag = b.val(format!("and {it} {i}, {}", k((1u64 << (n - 1)) - 1)));
+                // The smallest normal: 2^(precision - 1) as bits.
+                let min_normal = 1u64 << (match n { 16 => 11, 32 => 24, _ => 53 } - 1);
+                let small = b.val(format!("icmp ule {it} {mag}, {}", k(min_normal)));
+                let nz = b.val(format!("icmp ne {it} {mag}, {}", k(0)));
+                b.val(format!("and {} {small}, {nz}", it.replace(&format!("i{n}"), "i1")))
+            } else if lanes.is_none() {
+                return b.fcmp("uno", ty, v, v);
+            } else {
+                b.val(format!("fcmp uno {vt} {v}, {v}"))
+            };
+            match lanes {
+                Some((l, _)) => b.val(format!("call i1 @llvm.vector.reduce.or.v{l}i1(<{l} x i1> {c})")),
+                None => c,
+            }
+        };
+        if !int_in {
+            let mut nan_checked = vec![r.as_str()];
+            // The NM forms of minimum and maximum may hide a NaN operand.
+            if matches!(op, FpOp::MinNm | FpOp::MaxNm) {
+                nan_checked.extend(inputs);
+            }
+            for v in nan_checked {
+                let c = any(self, out_ty, v, false);
+                set = self.val(format!("or i1 {set}, {c}"));
+            }
+        }
+        let mut tiny = any(self, out_ty, r, true);
+        if !int_in {
+            for x in inputs {
+                let c = any(self, in_ty, x, true);
+                tiny = self.val(format!("or i1 {tiny}, {c}"));
+            }
+        }
+        let flush = self.val(format!("and i1 {fz}, {tiny}"));
+        let set = self.val(format!("or i1 {set}, {flush}"));
+        let (ib, ob) = (bits(in_ty), bits(out_ty));
+        let code = op as u32 | ib << 8 | ob << 16 | imm << 24;
+        let (pre, slow, done) = (self.label(), self.label(), self.label());
+        self.line(format!("br label %{pre}"));
+        self.place_label(&pre);
+        self.line(format!("br i1 {set}, label %{slow}, label %{done}, !prof !909"));
+        self.place_label(&slow);
+        // Each value as the i64 of its bits (integers extended as `op` reads them).
+        let as_i64 = |b: &mut Self, ty: &str, v: &str, k: u32| {
+            let v = match lanes {
+                Some((n, _)) => b.val(format!("extractelement <{n} x {ty}> {v}, i32 {k}")),
+                None => v.to_string(),
+            };
+            let n = bits(ty);
+            let i = if ty.starts_with('i') { v } else { b.val(format!("bitcast {ty} {v} to i{n}")) };
+            match n {
+                64 => i,
+                _ if op == FpOp::SInt => b.val(format!("sext i{n} {i} to i64")),
+                _ => b.val(format!("zext i{n} {i} to i64")),
+            }
+        };
+        let (n, used) = lanes.unwrap_or((1, 1));
+        let mut out = r.to_string();
+        let mut flags = "0".to_string();
+        for k in 0..used {
+            let mut args: Vec<String> = inputs.iter().map(|x| as_i64(self, in_ty, x, k)).collect();
+            args.resize(3, "0".into());
+            let rk = as_i64(self, out_ty, r, k);
+            let v = self.val(format!(
+                "call i64 @__wasm_env_fpcr_op(i32 {code}, i64 {}, i64 {}, i64 {}, i64 {rk}, i32 {fpcr})",
+                args[0], args[1], args[2]
+            ));
+            let f = self.val("call i32 @__wasm_env_fpcr_flags()");
+            flags = self.val(format!("or i32 {flags}, {f}"));
+            let v = if ob == 64 { v } else { self.val(format!("trunc i64 {v} to i{ob}")) };
+            let f = self.val(format!("bitcast i{ob} {v} to {out_ty}"));
+            out = match lanes {
+                Some(_) => self.val(format!("insertelement <{n} x {out_ty}> {out}, {out_ty} {f}, i32 {k}")),
+                None => f,
+            };
+        }
+        self.line(format!("br label %{done}"));
+        self.place_label(&done);
+        let vt = match lanes {
+            Some(_) => format!("<{n} x {out_ty}>"),
+            None => out_ty.to_string(),
+        };
+        let result = self.val(format!("phi {vt} [ {r}, %{pre} ], [ {out}, %{slow} ]"));
+        let computed = self.val(format!("phi i1 [ false, %{pre} ], [ true, %{slow} ]"));
+        let raised = self.val(format!("phi i32 [ 0, %{pre} ], [ {flags}, %{slow} ]"));
+        self.raise_fp(raised);
+        self.fpcr_slow = Some((result.clone(), computed));
+        result
+    }
+
+    /// `inputs` of an FP result `r` to check (see check_fp): if `fpcr`
+    /// computed `r` out of line, which raised its flags, the first is a NaN,
+    /// for which __wasm_env_fp_flags raises none.
+    fn unless_computed(&mut self, ty: &str, lanes: u32, inputs: &[&str], r: &str) -> Vec<String> {
+        let mut inputs: Vec<String> = inputs.iter().map(|x| x.to_string()).collect();
+        if let Some((v, computed)) = self.fpcr_slow.take()
+            && v == r
+            && let Some(first) = inputs.first_mut()
+        {
+            let nan = if ty == "half" { "0xH7E00" } else { "0x7FF8000000000000" };
+            let (t, nan) = if lanes == 0 { (ty.to_string(), nan.to_string()) } else { (format!("<{lanes} x {ty}>"), format!("splat ({ty} {nan})")) };
+            *first = self.val(format!("select i1 {computed}, {t} {nan}, {t} {first}"));
+        }
+        inputs
+    }
+
     /// Raises FPSR cumulative exception flags (an i32 of FPSR bits).
     pub fn raise_fp(&mut self, bits: String) {
         let v = match self.fpsr_raised.take() {
@@ -444,6 +700,7 @@ impl<'a> Block<'a> {
 
     /// Forgets cached values, after a call that may have changed the globals.
     pub fn invalidate(&mut self) {
+        self.fpcr_mode = None;
         self.gpr = Default::default();
         self.flags = Default::default();
         self.vec = Default::default();
@@ -948,6 +1205,9 @@ struct LiftedBlock {
     body: String,
     facts: FlagFacts,
     stores: bool,
+    /// Its FP results go exact through its page's exact version (see
+    /// lift_region).
+    fp_lazy: bool,
 }
 
 /// A region's blocks, lifted, with what its function needs besides.
@@ -959,53 +1219,90 @@ struct RegionIr {
     cross: Vec<u64>,
     /// Backward branches within the region: (target, block, end of block).
     loop_edges: Vec<(u64, u64, u64)>,
+    /// Whether the region function's entry checks FPCR (see lift_region).
+    fp_entry: bool,
+}
+
+/// Lifts the block at `start`, numbering its temporaries from `tmp`:
+/// returns it, the address after it, and its last instruction's mnemonic.
+/// `exact_fp`: its version with FP results exact (see Block::fpcr).
+fn lift_block<'a>(
+    prog: &'a Program,
+    start: u64,
+    tmp: usize,
+    alone: bool,
+    exact_fp: bool,
+    unsupported: &mut BTreeMap<String, (usize, String)>,
+) -> (Block<'a>, u64, &'static str) {
+    let mut b = Block::new(start, tmp, &prog.leaders, alone);
+    b.exact_fp = exact_fp;
+    let mut pc = start;
+    let mut last = "";
+    loop {
+        let Some(i) = prog.insns.get(&pc) else {
+            b.fail(pc, "undecodable instruction");
+            break;
+        };
+        last = i.op().mnem();
+        match insn::lift(&mut b, &i) {
+            Ok(true) => break,
+            // FP exception checks resolve every few instructions (one
+            // branch for all of them), and at the block's end: often
+            // enough that their values needn't stay live across a large
+            // block (clang's time grows fast with that), rarely enough
+            // not to split an unrolled kernel into tiny blocks.
+            Ok(false) => {
+                if b.pending_fp_checks() >= 16 {
+                    b.resolve_fp_checks();
+                }
+            }
+            Err(e) => {
+                unsupported.entry(i.op().mnem().to_string()).or_insert_with(|| (0, format!("`{i}`: {e}"))).0 += 1;
+                b.fail(pc, &format!("unsupported instruction `{i}`: {e}"));
+                break;
+            }
+        }
+        pc += 4;
+        if prog.leaders.contains(&pc) || is_control(&i) {
+            b.jump(pc);
+            break;
+        }
+    }
+    (b, pc, last)
 }
 
 /// Lifts a region's blocks (the same text every time: the lifting is
 /// deterministic). Instructions it can't lift are counted in `unsupported`.
-fn lift_region(prog: &Program, region: u64, leaders: &[u64], alone: bool, unsupported: &mut BTreeMap<String, (usize, String)>) -> RegionIr {
+fn lift_region(prog: &Program, region: u64, leaders: &[u64], alone: bool, fp: FpMode, unsupported: &mut BTreeMap<String, (usize, String)>) -> RegionIr {
     let mut out = RegionIr {
         blocks: Vec::new(),
         strings: Vec::new(),
         calls: Default::default(),
         cross: Vec::new(),
         loop_edges: Vec::new(),
+        fp_entry: false,
     };
     let mut tmp = 0;
+    let mut writes_fpcr = false;
     for &start in leaders {
-        let mut b = Block::new(start, tmp, &prog.leaders, alone);
-        let mut pc = start;
-        let mut last = "";
-        loop {
-            let Some(i) = prog.insns.get(&pc) else {
-                b.fail(pc, "undecodable instruction");
-                break;
-            };
-            last = i.op().mnem();
-            match insn::lift(&mut b, &i) {
-                Ok(true) => break,
-                // FP exception checks resolve every few instructions (one
-                // branch for all of them), and at the block's end: often
-                // enough that their values needn't stay live across a large
-                // block (clang's time grows fast with that), rarely enough
-                // not to split an unrolled kernel into tiny blocks.
-                Ok(false) => {
-                    if b.pending_fp_checks() >= 16 {
-                        b.resolve_fp_checks();
-                    }
-                }
-                Err(e) => {
-                    unsupported.entry(i.op().mnem().to_string()).or_insert_with(|| (0, format!("`{i}`: {e}"))).0 += 1;
-                    b.fail(pc, &format!("unsupported instruction `{i}`: {e}"));
-                    break;
+        let (mut b, pc, last) = lift_block(prog, start, tmp, alone, fp == FpMode::Exact, unsupported);
+        // Its version with FP results exact (see Block::fpcr): only that one
+        // if the block writes FPCR; else, inline, both, FPCR picking one when
+        // the block starts; else (lazy) its page's, through the region
+        // function's entry (see `fp_entry`).
+        let sensitive = b.fp_sensitive && fp != FpMode::Exact;
+        if sensitive && (b.writes_fpcr || fp == FpMode::Inline) {
+            let (x, _, _) = lift_block(prog, start, b.next_tmp, alone, true, &mut BTreeMap::new());
+            b.next_tmp = x.next_tmp;
+            for s in x.strings {
+                if !b.strings.iter().any(|(n, _)| *n == s.0) {
+                    b.strings.push(s);
                 }
             }
-            pc += 4;
-            if prog.leaders.contains(&pc) || is_control(&i) {
-                b.jump(pc);
-                break;
-            }
+            b.calls.extend(x.calls);
+            b.body = if b.writes_fpcr { x.body } else { fpcr_picks(start, &b.body, &x.body) };
         }
+        writes_fpcr |= b.writes_fpcr;
         tmp = b.next_tmp;
         out.cross.extend(b.succs.iter().copied().filter(|&s| region_of(s) != region));
         out.loop_edges.extend(b.succs.iter().filter(|&&s| region_of(s) == region && s <= start).map(|&s| (s, start, pc)));
@@ -1032,11 +1329,36 @@ fn lift_region(prog: &Program, region: u64, leaders: &[u64], alone: bool, unsupp
             body,
             facts: FlagFacts { read_first: b.flags_read_first, set: b.flags_set, succs, unknown },
             stores,
+            fp_lazy: sensitive && fp == FpMode::Lazy && !b.writes_fpcr,
         });
         out.strings.append(&mut b.strings);
         out.calls.append(&mut b.calls);
     }
+    // Lazily exact blocks go to their page's exact version (translated when
+    // first needed: see __wasm_env_exact_fp in support/runtime.c) when FPCR
+    // asks for it. FPCR changes only at an `msr fpcr` or where control
+    // passes through a region function's entry (dispatch, calls, returns,
+    // signal handlers), so the entry checks it, once, outside the region's
+    // loops; in a region with an `msr fpcr`, each such block checks.
+    let lazy = out.blocks.iter().any(|b| b.fp_lazy);
+    if writes_fpcr {
+        for b in out.blocks.iter_mut().filter(|b| b.fp_lazy) {
+            let exact = format!("  musttail call void @__wasm_env_exact_fp(i64 {})\n  ret void\n", b.start as i64);
+            b.body = fpcr_picks(b.start, &b.body, &exact);
+        }
+    } else {
+        out.fp_entry = lazy;
+    }
     out
+}
+
+/// A block's body that runs `exact` (its version with FP results exact, see
+/// Block::fpcr) when FPCR asks for that, else `plain`.
+fn fpcr_picks(start: u64, plain: &str, exact: &str) -> String {
+    let n = format!("fpcr_{start:x}");
+    format!(
+        "  %{n} = load i32, ptr %FPCR{FPCR_TAG}\n  %{n}_m = and i32 %{n}, {FPCR_MODES}\n  %{n}_x = icmp ne i32 %{n}_m, 0\n  br i1 %{n}_x, label %{n}_exact, label %{n}_plain, !prof !909\n{n}_plain:\n{plain}{n}_exact:\n{exact}"
+    )
 }
 
 /// Lifts the program. The code modules ("chunks") go to `sink` one at a
@@ -1044,7 +1366,7 @@ fn lift_region(prog: &Program, region: u64, leaders: &[u64], alone: bool, unsupp
 /// never has all its IR in memory: a first pass lifts every block for its
 /// flag liveness facts and region entries, keeping no IR; a second lifts
 /// each chunk's regions again and assembles them.
-pub fn lift(image: &Image, prog: &Program, library: bool, page: Option<u64>, sink: &mut dyn FnMut(String)) -> Lifted {
+pub fn lift(image: &Image, prog: &Program, library: bool, page: Option<u64>, fp: FpMode, sink: &mut dyn FnMut(String)) -> Lifted {
     let mut unsupported = BTreeMap::new();
     let mut regions: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for &leader in &prog.leaders {
@@ -1068,7 +1390,7 @@ pub fn lift(image: &Image, prog: &Program, library: bool, page: Option<u64>, sin
     // entries and as leaving their flags live, which is always correct,
     // rather than lifting the whole program to find out.)
     for (&region, leaders) in regions.iter().filter(|(r, _)| page.is_none_or(|p| region_of(p) == **r)) {
-        let r = lift_region(prog, region, leaders, false, &mut unsupported);
+        let r = lift_region(prog, region, leaders, false, fp, &mut unsupported);
         entries.extend(r.cross);
         if page.is_some() {
             entries.extend(leaders);
@@ -1114,9 +1436,16 @@ pub fn lift(image: &Image, prog: &Program, library: bool, page: Option<u64>, sin
         let (mut text, mut strings, mut calls) = (String::new(), Vec::new(), std::collections::BTreeSet::new());
         let mut defined = std::collections::BTreeSet::new();
         for (region, leaders) in group {
-            let mut r = lift_region(prog, region, leaders, page.is_some(), &mut BTreeMap::new());
+            let mut r = lift_region(prog, region, leaders, page.is_some(), fp, &mut BTreeMap::new());
             defined.insert(region);
-            let _ = write!(text, "define void @R_{region:x}(i64 %pc) {{\nentry:\n{STATE_POINTERS}  switch i64 %pc, label %bad [\n");
+            let _ = write!(text, "define void @R_{region:x}(i64 %pc) {{\nentry:\n{STATE_POINTERS}");
+            if r.fp_entry {
+                let _ = write!(
+                    text,
+                    "  %fpcr = load i32, ptr %FPCR{FPCR_TAG}\n  %fpcr_m = and i32 %fpcr, {FPCR_MODES}\n  %fpcr_x = icmp ne i32 %fpcr_m, 0\n  br i1 %fpcr_x, label %fpcr_exact, label %fpcr_plain, !prof !909\nfpcr_exact:\n  musttail call void @__wasm_env_exact_fp(i64 %pc)\n  ret void\nfpcr_plain:\n"
+                );
+            }
+            text.push_str("  switch i64 %pc, label %bad [\n");
             for &a in leaders.iter().filter(|a| entries.contains(a)) {
                 let _ = writeln!(text, "    i64 {}, label %b_{a:x}", a as i64);
             }
@@ -1185,7 +1514,10 @@ const TBAA: &str = "!900 = !{!\"wasm-env\"}\n\
                     !902 = !{!901, !901, i64 0}\n\
                     !903 = !{!\"guest memory\", !900, i64 0}\n\
                     !904 = !{!903, !903, i64 0}\n\
-                    !906 = !{}\n";
+                    !907 = !{!\"FPCR\", !900, i64 0}\n\
+                    !908 = !{!907, !907, i64 0}\n\
+                    !906 = !{}\n\
+                    !909 = !{!\"branch_weights\", i32 1, i32 1048576}\n";
 /// Guest state is a block per thread (`struct guest_state` in
 /// support/runtime.c, whose layout this matches) at the address in the
 /// WebAssembly global `__wasm_env_state`, which the support code sets when a
@@ -1199,7 +1531,8 @@ const STATE_POINTERS: &str = "  %st = load i64, ptr addrspace(1) @__wasm_env_sta
                               \x20 %TP = getelementptr inbounds nuw i8, ptr %R, i64 264\n\
                               \x20 %MONITOR = getelementptr inbounds nuw i8, ptr %R, i64 272\n\
                               \x20 %V = getelementptr inbounds nuw i8, ptr %R, i64 288\n\
-                              \x20 %DC = getelementptr inbounds nuw i8, ptr %R, i64 800\n";
+                              \x20 %DC = getelementptr inbounds nuw i8, ptr %R, i64 800\n\
+                              \x20 %FPCR = getelementptr inbounds nuw i8, ptr %R, i64 66416\n";
 
 /// The global holding this thread's guest state address (see
 /// STATE_POINTERS), defined by the program's data module, and how the
@@ -1214,6 +1547,8 @@ pub const STATE_GLOBAL: &str = "@__wasm_env_state = addrspace(1) global i64 0\n\
 /// Access tags (see TBAA).
 pub const REG: &str = ", !tbaa !902";
 pub const MEM: &str = ", !tbaa !904";
+/// FPCR's (see Block::fpcr): only `msr fpcr` writes it.
+pub const FPCR_TAG: &str = ", !tbaa !908";
 
 /// What every code module starts with: the target, guest state, the
 /// support code's entry points, TBAA metadata and intrinsics.
@@ -1225,6 +1560,10 @@ fn chunk_preamble() -> String {
          declare void @__wasm_env_svc()\n\
          declare i64 @__wasm_env_svc_at(i64)\n\
          declare i32 @__wasm_env_fp_flags(double, double, double, double, i32) memory(none)\n\
+         declare i64 @__wasm_env_fpcr_op(i32, i64, i64, i64, i64, i32) memory(inaccessiblemem: readwrite)\n\
+         declare i32 @__wasm_env_fpcr_flags() memory(inaccessiblemem: read)\n\
+         declare i16 @__truncsfhf2(float) memory(none)\n\
+         declare void @__wasm_env_exact_fp(i64)\n\
          declare void @__wasm_env_fatal(ptr, i64)\n\
          declare void @__wasm_env_bad_target(i64)\n\
          declare i32 @__wasm_env_crc32(i32, i64, i32, i32) memory(none)\n\

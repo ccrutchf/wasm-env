@@ -77,6 +77,9 @@ struct Inputs {
     base: Option<u64>,
     /// The input is code generated at run time (`--raw`), at `base`.
     raw: bool,
+    /// FP results exact only (`--exact-fp`, with `--page`): the version of
+    /// a page the runtime translates when FPCR asks for it (see lift::FpMode).
+    exact_fp: bool,
     /// Only this page's region (`--page`): a patch the runtime makes when
     /// a run reaches a block the translation missed there.
     page: Option<u64>,
@@ -214,7 +217,14 @@ fn translate(input: &str, output: &str, inputs: &Inputs) -> Result<()> {
     if !direct {
         build = Some(make_build()?);
     }
-    let lifted = lift::lift(&image, &prog, library, inputs.page, &mut |chunk| {
+    let fp = if inputs.exact_fp {
+        lift::FpMode::Exact
+    } else if inputs.raw {
+        lift::FpMode::Inline
+    } else {
+        lift::FpMode::Lazy
+    };
+    let lifted = lift::lift(&image, &prog, library, inputs.page, fp, &mut |chunk| {
         if direct {
             chunks.push(chunk);
         } else if failed.is_none()
@@ -318,6 +328,7 @@ fn main() -> Result<()> {
                     "--layout" => inputs.layout = Some(value()?),
                     "--object" => inputs.object = true,
                     "--raw" => inputs.raw = true,
+                    "--exact-fp" => inputs.exact_fp = true,
                     "--leaders-out" => inputs.leaders_out = Some(value()?),
                     "--leaders" => inputs.leaders = Some(value()?),
                     "--page" => {
@@ -349,7 +360,7 @@ fn main() -> Result<()> {
             let image = elf::Image::load(&bytes)?;
             let prog = discover::discover(&image);
             let mut chunks = String::new();
-            let lifted = lift::lift(&image, &prog, false, None, &mut |c| {
+            let lifted = lift::lift(&image, &prog, false, None, lift::FpMode::Lazy, &mut |c| {
                 chunks.push_str("\n; ---- chunk ----\n");
                 chunks.push_str(&c);
             });

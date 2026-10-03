@@ -646,11 +646,16 @@ pub fn translate_page(elf: &Path, module: &Path, args: &[String], base: u64, pag
         })
         .flat_map(|l| l.bytes().chain([b'\n']))
         .collect();
-    let key = hash(module.as_os_str().as_encoded_bytes()) ^ page.rotate_left(9) ^ hash(&listed).rotate_left(17) ^ 0x70616765;
+    // (And by the arguments: a page's exact version, `--exact-fp`, differs.)
+    let key = hash(module.as_os_str().as_encoded_bytes()) ^ page.rotate_left(9) ^ hash(&listed).rotate_left(17) ^ hash(args.join(" ").as_bytes()).rotate_left(29) ^ 0x70616765;
     let out = module_path(&dir, key);
     if !out.exists() {
         let mut args = args.to_vec();
-        args.extend(["--page".into(), format!("{page:x}"), "--roots".into(), roots.display().to_string()]);
+        args.extend(["--page".into(), format!("{page:x}")]);
+        // (A page's exact version may be made before any target was missed.)
+        if roots.exists() {
+            args.extend(["--roots".into(), roots.display().to_string()]);
+        }
         // The blocks the translation found (see run_translator's callers):
         // only this page is discovered again.
         let leaders = module.with_extension("leaders");

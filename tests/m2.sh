@@ -37,6 +37,7 @@ fixtures=(
 	"simd4:tests/arm64/simd4.c:-static"
 	"simd5:tests/arm64/simd5.c:-static"
 	"fpexc:tests/arm64/fpexc.c:-static -lm"
+	"fpcr:tests/arm64/fpcr.c:-static -pthread -march=armv8.2-a+fp16"
 	"flags:tests/arm64/flags.c:-static"
 	"calls:tests/arm64/calls.c:-static"
 	"control:tests/arm64/control.c:-static"

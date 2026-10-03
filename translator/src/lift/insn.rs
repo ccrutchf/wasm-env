@@ -7,7 +7,7 @@
 use anyhow::{Result, bail};
 use bad64::{Condition, Instruction, Operand, Reg, Shift};
 
-use super::{Block, C, N, R, REG, V, Z, arr_bits, elem_bits, konst, konst128, reg};
+use super::{Block, C, FPCR_TAG, FpOp, N, R, REG, V, Z, arr_bits, elem_bits, konst, konst128, reg};
 use crate::discover::{direct_target, imm_u64};
 
 pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
@@ -142,7 +142,21 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                     let v = b.val("load i32, ptr %FPSR");
                     b.val(format!("zext i32 {v} to i64"))
                 }
-                "midr_el1" | "fpcr" => konst(0, 64),
+                "fpcr" => {
+                    let v = b.val(format!("load i32, ptr %FPCR{FPCR_TAG}"));
+                    b.val(format!("zext i32 {v} to i64"))
+                }
+                "nzcv" => {
+                    let mut v = konst(0, 64);
+                    for f in 0..4 {
+                        let x = b.get_flag(f);
+                        let x = b.val(format!("zext i1 {x} to i64"));
+                        let x = b.val(format!("shl i64 {x}, {}", 31 - f));
+                        v = b.val(format!("or i64 {v}, {x}"));
+                    }
+                    v
+                }
+                "midr_el1" => konst(0, 64),
                 "cntfrq_el0" => konst(1_000_000_000, 64),
                 "cntvct_el0" => b.val("call i64 @__wasm_env_counter()"),
                 other => bail!("system register {other}"),
@@ -160,7 +174,18 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                     let v = b.val(format!("trunc i64 {v} to i32"));
                     b.line(format!("store i32 {v}, ptr %FPSR"));
                 }
-                "fpcr" => {}
+                "nzcv" => {
+                        let [n, z, c, f] = [31, 30, 29, 28].map(|s| {
+                        let x = b.val(format!("lshr i64 {v}, {s}"));
+                        b.val(format!("trunc i64 {x} to i1"))
+                    });
+                    b.set_flags(n, z, c, f);
+                }
+                "fpcr" => {
+                    let v = b.val(format!("trunc i64 {v} to i32"));
+                    b.line(format!("store i32 {v}, ptr %FPCR{FPCR_TAG}"));
+                    b.fpcr_written();
+                }
                 other => bail!("system register {other}"),
             }
         }
@@ -927,9 +952,10 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 }
                 _ => fp_minmax(b, m, ty, &x, &y),
             };
-            if !m.contains("min") && !m.contains("max") {
-                fp_exceptions(b, ty, &[&x, &y], &r, m == "fdiv");
-            }
+            let r = match fp_op(m) {
+                Some(op) => fp_arith(b, op, ty, &[&x, &y], &r),
+                None => r,
+            };
             write_fp(b, d, r, bits)?;
         }
         "fabs" | "fneg" | "fsqrt" if is_scalar_fp(ops) && ops.len() == 2 && is_v(ops.get(1)) => {
@@ -941,9 +967,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 "fneg" => b.val(format!("fneg {ty} {x}")),
                 _ => b.val(format!("call {ty} @llvm.sqrt.{s}({ty} {x})")),
             };
-            if m == "fsqrt" {
-                fp_exceptions(b, ty, &[&x], &r, false);
-            }
+            let r = if m == "fsqrt" { fp_arith(b, FpOp::Sqrt, ty, &[&x], &r) } else { r };
             write_fp(b, d, r, bits)?;
         }
         "fmadd" | "fmsub" | "fnmadd" | "fnmsub" => {
@@ -957,7 +981,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let x = if matches!(m, "fmsub" | "fnmadd") { b.val(format!("fneg {ty} {x}")) } else { x };
             let a = if matches!(m, "fnmadd" | "fnmsub") { b.val(format!("fneg {ty} {a}")) } else { a };
             let r = fused(b, ty, &x, &y, &a);
-            fp_exceptions(b, ty, &[&x, &y, &a], &r, false);
+            let r = fp_arith(b, FpOp::Fma, ty, &[&x, &y, &a], &r);
             write_fp(b, d, r, bits)?;
         }
         "fcmp" | "fcmpe" => {
@@ -969,7 +993,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 _ => format!("{ty} 0.0"),
             };
             let y = y.strip_prefix(&format!("{ty} ")).map(String::from).unwrap_or(y);
-            fp_compare(b, ty, &x, &y);
+            fp_compare(b, ty, &x, &y, m.ends_with('e'));
         }
         "fccmp" | "fccmpe" => {
             let (_, bits) = fp_reg(&ops[0])?;
@@ -978,7 +1002,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let y = read_fp(b, &ops[1], bits)?;
             let nzcv = b.imm_op(i, 2)?;
             let cond = b.cond_op(i, 3)?;
-            fp_compare(b, ty, &x, &y);
+            fp_compare(b, ty, &x, &y, m.ends_with('e'));
             let computed: Vec<String> = (0..4).map(|f| b.get_flag(f)).collect();
             let mut merged = Vec::new();
             for (f, c) in computed.iter().enumerate() {
@@ -1013,6 +1037,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let x = if m == "fmls" { b.val(format!("fneg {vt} {x}")) } else { x };
             let s = if elem == 64 { "v2f64" } else { "v4f32" };
             let r = b.val(format!("call {vt} @llvm.wasm.relaxed.madd.{s}({vt} {x}, {vt} {y}, {vt} {acc})"));
+            let r = b.fpcr(FpOp::Fma, ty, ty, Some((128 / elem, total / elem)), &[&x, &y, &acc], &r, 0);
             b.check_fp_vec(ty, 128 / elem, &[&x, &y, &acc], &r, false);
             let r = b.val(format!("bitcast {vt} {r} to i128"));
             b.write_v(d, r, 128);
@@ -1033,6 +1058,8 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 "fmax" | "fmin" | "fmaxnm" | "fminnm" => fp_minmax(b, m, &vt, &x, &y),
                 _ => {
                     let r = b.val(format!("{m} {vt} {x}, {y}"));
+                    let op = fp_op(m).unwrap();
+                    let r = b.fpcr(op, ty, ty, Some((128 / elem, total / elem)), &[&x, &y], &r, 0);
                     b.check_fp_vec(ty, 128 / elem, &[&x, &y], &r, m == "fdiv");
                     r
                 }
@@ -1056,7 +1083,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 });
                 let xf = if m == "fmls" { b.val(format!("fneg {ty} {xf}")) } else { xf };
                 let r = fused(b, ty, &xf, &yf, &af);
-                fp_exceptions(b, ty, &[&xf, &yf, &af], &r, false);
+                let r = fp_arith(b, FpOp::Fma, ty, &[&xf, &yf, &af], &r);
                 parts.push(b.val(format!("bitcast {ty} {r} to i{elem}")));
             }
             let r = vbuild(b, elem, &parts);
@@ -1089,6 +1116,8 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                     }
                     None => "0.0".to_string(),
                 };
+                xf = fp_flushed(b, ty, &xf, m != "fcmeq");
+                yf = fp_flushed(b, ty, &yf, m != "fcmeq");
                 if m.starts_with("fac") {
                     xf = b.val(format!("call {ty} @llvm.fabs.{s}({ty} {xf})"));
                     yf = b.val(format!("call {ty} @llvm.fabs.{s}({ty} {yf})"));
@@ -1101,7 +1130,10 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
         }
         "faddp" | "fmaxp" | "fminp" | "fmaxnmp" | "fminnmp" if is_v(ops.first()) => {
             let combine = |b: &mut Block, ty: &str, p: &str, q: &str| match m {
-                "faddp" => b.val(format!("fadd {ty} {p}, {q}")),
+                "faddp" => {
+                    let r = b.val(format!("fadd {ty} {p}, {q}"));
+                    fp_arith(b, FpOp::Add, ty, &[p, q], &r)
+                }
                 _ => fp_minmax(b, m, ty, p, q),
             };
             if ops.len() == 3 {
@@ -1359,6 +1391,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 let lane = vlane(b, &x, e / 2, first + k);
                 let f = b.val(format!("bitcast i{} {lane} to {narrow}", e / 2));
                 let w = b.val(format!("fpext {narrow} {f} to {wide}"));
+                let w = b.fpcr(FpOp::Cvt, narrow, wide, None, &[&f], &w, 0);
                 parts.push(b.val(format!("bitcast {wide} {w} to i{e}")));
             }
             let r = vbuild(b, e, &parts);
@@ -1382,6 +1415,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 let lane = vlane(b, &x, e * 2, k);
                 let f = b.val(format!("bitcast i{} {lane} to {wide}", e * 2));
                 let t = b.val(format!("fptrunc {wide} {f} to {narrow}"));
+                let t = b.fpcr(FpOp::Cvt, wide, narrow, None, &[&f], &t, 0);
                 let back = b.val(format!("fpext {narrow} {t} to {wide}"));
                 fp_exceptions(b, wide, &[&f], &back, false);
                 parts.push(b.val(format!("bitcast {narrow} {t} to i{e}")));
@@ -1489,6 +1523,8 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             vector_map(b, i, |b, bits, lane| {
                 let ty = fp_ty(bits)?.0;
                 let f = b.val(format!("{op} i{bits} {lane} to {ty}"));
+                let fop = if op == "sitofp" { FpOp::SInt } else { FpOp::UInt };
+                let f = b.fpcr(fop, &format!("i{bits}"), ty, None, &[lane], &f, 0);
                 Ok(b.val(format!("bitcast {ty} {f} to i{bits}")))
             })?
         }
@@ -1507,11 +1543,17 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let op = if m == "scvtf" { "sitofp" } else { "uitofp" };
             let mut r = b.val(format!("{op} i{sbits} {x} to {ty}"));
             // Fixed-point form (scvtf d0, x0, #fbits): scale by 2^-fbits,
-            // which is exact.
+            // which is exact unless the result is denormal (FPCR's path
+            // rounds once).
+            let mut fbits = 0;
             if ops.len() == 3 {
-                let fbits = b.imm_op(i, 2)?;
+                fbits = b.imm_op(i, 2)?;
                 r = b.val(format!("fmul {ty} {r}, {}", pow2(-(fbits as i64))));
             }
+            let fop = if op == "sitofp" { FpOp::SInt } else { FpOp::UInt };
+            let r = b.fpcr(fop, &format!("i{sbits}"), ty, None, &[&x], &r, fbits as u32);
+            // Overflow (only half precision can).
+            fp_exceptions(b, ty, &[], &r, false);
             write_fp(b, d, r, dbits)?;
         }
 
@@ -1537,6 +1579,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 let (ty, s) = fp_ty(bits)?;
                 let x = b.val(format!("bitcast i{bits} {lane} to {ty}"));
                 let r = fround(b, mode, bits, &x)?;
+                fp_convert_exceptions(b, ty, &r, bits, op == "fptosi.sat");
                 Ok(b.val(format!("call i{bits} @llvm.{op}.i{bits}.{s}({ty} {r})")))
             })?
         }
@@ -1567,6 +1610,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let x = read_fp(b, &ops[1], sbits)?;
             let rounded = fround(b, m.as_bytes()[4] as char, sbits, &x)?;
             let op = if m.ends_with('s') { "fptosi.sat" } else { "fptoui.sat" };
+            fp_convert_exceptions(b, sty, &rounded, dbits, m.ends_with('s'));
             let r = b.val(format!("call i{dbits} @llvm.{op}.i{dbits}.{s}({sty} {rounded})"));
             b.write(d, r, dbits)?;
         }
@@ -1579,8 +1623,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 "fabs" => b.val(format!("call {ty} @llvm.fabs.{s}({ty} {x})")),
                 _ => {
                     let r = b.val(format!("call {ty} @llvm.sqrt.{s}({ty} {x})"));
-                    fp_exceptions(b, ty, &[x], &r, false);
-                    r
+                    fp_arith(b, FpOp::Sqrt, ty, &[x], &r)
                 }
             })
         })?,
@@ -1598,8 +1641,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 let r = match m {
                     "fadd" | "fsub" | "fmul" | "fdiv" => {
                         let r = b.val(format!("{m} {ty} {xf}, {yf}"));
-                        fp_exceptions(b, ty, &[&xf, &yf], &r, m == "fdiv");
-                        r
+                        fp_arith(b, fp_op(m).unwrap(), ty, &[&xf, &yf], &r)
                     }
                     _ => fp_minmax(b, m, ty, &xf, &yf),
                 };
@@ -1743,6 +1785,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                 let x = read_fp(b, &ops[1], bits)?;
                 let y = read_fp(b, &ops[2], bits)?;
                 let diff = b.val(format!("fsub {ty} {x}, {y}"));
+                let diff = fp_arith(b, FpOp::Sub, ty, &[&x, &y], &diff);
                 let r = b.val(format!("call {ty} @llvm.fabs.{s}({ty} {diff})"));
                 write_fp(b, d, r, bits)?;
             } else {
@@ -1757,6 +1800,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
                     let xf = b.val(format!("bitcast i{elem} {xl} to {ty}"));
                     let yf = b.val(format!("bitcast i{elem} {yl} to {ty}"));
                     let diff = b.val(format!("fsub {ty} {xf}, {yf}"));
+                    let diff = fp_arith(b, FpOp::Sub, ty, &[&xf, &yf], &diff);
                     let r = b.val(format!("call {ty} @llvm.fabs.{s}({ty} {diff})"));
                     parts.push(b.val(format!("bitcast {ty} {r} to i{elem}")));
                 }
@@ -1819,6 +1863,7 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             } else {
                 b.val(format!("fptrunc {sty} {x} to {dty}"))
             };
+            let r = b.fpcr(FpOp::Cvt, sty, dty, None, &[&x], &r, 0);
             if dbits < sbits {
                 // Overflow when a finite value is too large for the narrower type.
                 let wide = b.val(format!("fpext {dty} {r} to {sty}"));
@@ -1978,7 +2023,7 @@ fn lse_atomic(m: &str) -> Option<(&'static str, Option<u32>)> {
 /// zero, p toward +infinity, m toward -infinity, a ties away from zero.
 fn fround(b: &mut Block, mode: char, bits: u32, x: &str) -> Result<String> {
     let (ty, s) = fp_ty(bits)?;
-    Ok(match mode {
+    let r = match mode {
         'x' | 'i' => b.val(format!("call {ty} @llvm.rint.{s}({ty} {x})")),
         'n' => b.val(format!("call {ty} @llvm.roundeven.{s}({ty} {x})")),
         'z' => b.val(format!("call {ty} @llvm.trunc.{s}({ty} {x})")),
@@ -1997,7 +2042,17 @@ fn fround(b: &mut Block, mode: char, bits: u32, x: &str) -> Result<String> {
             b.val(format!("select i1 {up}, {ty} {stepped}, {ty} {t}"))
         }
         _ => bail!("rounding mode {mode}"),
-    })
+    };
+    // FPCR: its rounding mode for frintx and frinti; FZ and DN for all.
+    let imm = match mode {
+        'n' => 0,
+        'p' => 1,
+        'm' => 2,
+        'z' => 3,
+        'a' => 4,
+        _ => 7,
+    };
+    Ok(b.fpcr(FpOp::Rint, ty, ty, None, &[x], &r, imm))
 }
 
 /// 2^e as an LLVM floating-point constant (exact in float and double for
@@ -2045,6 +2100,27 @@ const FPSR_IOC: u32 = 1; // invalid operation
 /// Block::check_fp).
 fn fp_exceptions(b: &mut Block, ty: &str, inputs: &[&str], r: &str, div: bool) {
     b.check_fp(ty, inputs, r, div);
+}
+
+/// The FpOp of an arithmetic mnemonic (None: min and max, which FPCR's
+/// rounding doesn't change).
+fn fp_op(m: &str) -> Option<FpOp> {
+    Some(match m {
+        "fadd" => FpOp::Add,
+        "fsub" => FpOp::Sub,
+        "fmul" => FpOp::Mul,
+        "fdiv" => FpOp::Div,
+        "fnmul" => FpOp::NMul,
+        _ => return None,
+    })
+}
+
+/// A scalar arithmetic result `r` of `op` on `inputs` as FPCR says it
+/// should be (see Block::fpcr), with its FPSR exceptions raised.
+fn fp_arith(b: &mut Block, op: FpOp, ty: &str, inputs: &[&str], r: &str) -> String {
+    let r = b.fpcr(op, ty, ty, None, inputs, r, 0);
+    fp_exceptions(b, ty, inputs, &r, op == FpOp::Div);
+    r
 }
 
 /// Raises FPSR's invalid flag if converting `x` (type `ty`) to a `bits`-wide
@@ -2104,7 +2180,7 @@ fn fp_minmax(b: &mut Block, m: &str, ty: &str, x: &str, y: &str) -> String {
     let r = b.val(format!("call {ty} @llvm.{f}.{s}({ty} {x}, {ty} {y})"));
     let x_nan = b.fcmp("uno", ty, x, x);
     let y_nan = b.fcmp("uno", ty, y, y);
-    if m.contains("nm") {
+    let r = if m.contains("nm") {
         // One NaN: the other operand. Both: x's NaN, as FMIN would.
         let r = b.val(format!("select {cond} {y_nan}, {ty} {x}, {ty} {r}"));
         let t = if cond == "i1" { "true" } else { "splat (i1 true)" };
@@ -2116,11 +2192,35 @@ fn fp_minmax(b: &mut Block, m: &str, ty: &str, x: &str, y: &str) -> String {
         // x's first.
         let r = b.val(format!("select {cond} {y_nan}, {ty} {y}, {ty} {r}"));
         b.val(format!("select {cond} {x_nan}, {ty} {x}, {ty} {r}"))
+    };
+    // FZ and DN (see Block::fpcr).
+    let op = match m.trim_end_matches(['p', 'v']) {
+        "fmin" => FpOp::Min,
+        "fmax" => FpOp::Max,
+        "fminnm" => FpOp::MinNm,
+        _ => FpOp::MaxNm,
+    };
+    let (elem, lanes) = match ty {
+        "<2 x double>" => ("double", Some((2, 2))),
+        "<4 x float>" => ("float", Some((4, 4))),
+        t => (t, None),
+    };
+    b.fpcr(op, elem, elem, lanes, &[x, y], &r, 0)
+}
+
+/// An FP input to a comparison as FPCR's flush to zero (FZ, FZ16) leaves it.
+/// A signaling NaN raises invalid, and so does any NaN if `signaling`
+/// (FCMPE, and the ordered vector comparisons).
+fn fp_flushed(b: &mut Block, ty: &str, x: &str, signaling: bool) -> String {
+    if x == "0.0" {
+        return x.to_string();
     }
+    b.fpcr(FpOp::Flush, ty, ty, None, &[x], x, signaling as u32)
 }
 
 /// Sets N Z C V from comparing FP values x and y (arm64 FPCompare).
-fn fp_compare(b: &mut Block, ty: &str, x: &str, y: &str) {
+fn fp_compare(b: &mut Block, ty: &str, x: &str, y: &str, signaling: bool) {
+    let (x, y) = (&fp_flushed(b, ty, x, signaling), &fp_flushed(b, ty, y, signaling));
     let lt = b.fcmp("olt", ty, x, y);
     let eq = b.fcmp("oeq", ty, x, y);
     // C is set unless strictly less-than and ordered; V is set when unordered.

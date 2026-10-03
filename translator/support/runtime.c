@@ -44,6 +44,7 @@ struct guest_state {
 	// The code epoch this thread's dispatch cache is from (see
 	// __wasm_env_code_epoch).
 	uint64_t code_epoch;
+	uint32_t fpcr; // see __wasm_env_fpcr_op
 };
 _Static_assert(__builtin_offsetof(struct guest_state, f) == 256, "STATE_POINTERS");
 _Static_assert(__builtin_offsetof(struct guest_state, fpsr) == 260, "STATE_POINTERS");
@@ -52,6 +53,7 @@ _Static_assert(__builtin_offsetof(struct guest_state, monitor) == 272, "STATE_PO
 _Static_assert(__builtin_offsetof(struct guest_state, v) == 288, "STATE_POINTERS");
 _Static_assert(__builtin_offsetof(struct guest_state, cache) == 800, "STATE_POINTERS");
 _Static_assert(__builtin_offsetof(struct guest_state, signal) == 66344, "SIGNAL_DELIVERY in syscall.rs");
+_Static_assert(__builtin_offsetof(struct guest_state, fpcr) == 66416, "STATE_POINTERS");
 static _Thread_local struct guest_state guest;
 void __wasm_env_set_state(struct guest_state *);
 #define R guest.r
@@ -217,6 +219,459 @@ uint32_t __wasm_env_fp_flags(double x, double y, double z, double r, uint32_t ki
 	return in_nan || in_inf ? 0 : FPSR_OFC;
 }
 
+// FPCR: the rounding mode (RMode, bits 23:22), flush to zero (FZ, bit 24,
+// and FZ16, bit 19, for half precision arithmetic) and default NaN (DN,
+// bit 25). The lifted code computes with WebAssembly's arithmetic, which
+// rounds to nearest, keeps denormals and propagates NaNs its own way, and,
+// while any of these is set, passes each result through __wasm_env_fpcr_op
+// (Block::fpcr in the translator), which computes it again in software as
+// arm64 would. Values are exact there, as an integer significand of up to
+// 128 bits times a power of two, and rounded once.
+enum { FPCR_FZ16 = 1 << 19, FPCR_FZ = 1 << 24, FPCR_DN = 1 << 25 };
+// RMode's order, then ties away from zero (FRINTA).
+enum { RN, RP, RM, RZ, RA };
+// FPSR flags __wasm_env_fpcr_op raised.
+static _Thread_local uint32_t fp_raised;
+// Must match the translator's FpOp.
+enum {
+	FP_ADD, FP_SUB, FP_MUL, FP_DIV, FP_SQRT, FP_FMA, FP_NMUL, FP_CVT, FP_SINT, FP_UINT, FP_RINT,
+	// Rounding plays no part in these.
+	FP_FLUSH, FP_MIN, FP_MAX, FP_MINNM, FP_MAXNM,
+};
+
+typedef unsigned __int128 u128;
+struct fp_format {
+	int n, p, bias; // width, precision (significand bits), exponent bias
+};
+enum { FP_ZERO, FP_FINITE, FP_INF, FP_QNAN, FP_SNAN };
+// A value: zero, infinite or NaN (kind), or (-1)^sign * man * 2^exp.
+struct fp_value {
+	int kind, sign;
+	int32_t exp;
+	u128 man;
+	uint64_t bits;
+};
+
+static struct fp_format fp_format(int n)
+{
+	return n == 16 ? (struct fp_format){16, 11, 15} : n == 32 ? (struct fp_format){32, 24, 127} : (struct fp_format){64, 53, 1023};
+}
+
+static uint64_t fp_inf(struct fp_format f, int sign)
+{
+	return (uint64_t)sign << (f.n - 1) | ((1ull << (f.n - f.p)) - 1) << (f.p - 1);
+}
+
+static uint64_t fp_default_nan(struct fp_format f)
+{
+	return ((1ull << (f.n - f.p + 1)) - 1) << (f.p - 2);
+}
+
+static uint64_t fp_invalid(struct fp_format f)
+{
+	fp_raised |= FPSR_IOC;
+	return fp_default_nan(f);
+}
+
+// Unpacks a value of format f; `fz`: denormals are zeros.
+static struct fp_value fp_unpack(uint64_t bits, struct fp_format f, int fz)
+{
+	struct fp_value v = {.sign = bits >> (f.n - 1) & 1, .bits = bits};
+	uint64_t emask = (1ull << (f.n - f.p)) - 1;
+	uint64_t e = bits >> (f.p - 1) & emask, frac = bits & ((1ull << (f.p - 1)) - 1);
+	if (e == emask) {
+		v.kind = !frac ? FP_INF : frac >> (f.p - 2) & 1 ? FP_QNAN : FP_SNAN;
+	} else if (e == 0) {
+		v.kind = frac && !fz ? FP_FINITE : FP_ZERO;
+		v.man = frac;
+		v.exp = 1 - f.bias - (f.p - 1);
+	} else {
+		v.kind = FP_FINITE;
+		v.man = frac | 1ull << (f.p - 1);
+		v.exp = (int32_t)e - f.bias - (f.p - 1);
+	}
+	return v;
+}
+
+static int fp_msb(u128 m)
+{
+	uint64_t hi = (uint64_t)(m >> 64);
+	return hi ? 127 - __builtin_clzll(hi) : 63 - __builtin_clzll((uint64_t)m);
+}
+
+// (-1)^sign * man * 2^exp rounded to format f in `mode`. `man`'s lowest
+// bit may stand for more nonzero bits below it (a sticky bit), as long as
+// it is far below the bit rounding keeps. `fz`: a result that is tiny
+// before rounding is zero.
+static uint64_t fp_round(int sign, u128 man, int32_t exp, struct fp_format f, int mode, int fz)
+{
+	uint64_t s = (uint64_t)sign << (f.n - 1);
+	if (!man)
+		return s;
+	int32_t lead = fp_msb(man) + exp, emin = 1 - f.bias;
+	if (fz && lead < emin)
+		return s; // (UFC isn't modelled)
+	// The weight of the result's last bit, and how far below it man's is.
+	int32_t lsb = (lead > emin ? lead : emin) - (f.p - 1), shift = lsb - exp;
+	u128 q;
+	int half = 0, sticky = 0;
+	if (shift <= 0) {
+		q = man << -shift;
+	} else if (shift > 128) {
+		q = 0;
+		sticky = 1;
+	} else {
+		q = shift == 128 ? 0 : man >> shift;
+		half = (int)(man >> (shift - 1) & 1);
+		sticky = (man & (((u128)1 << (shift - 1)) - 1)) != 0;
+	}
+	int up = mode == RN ? half && (sticky || (q & 1))
+	       : mode == RA ? half
+	       : mode == RP ? !sign && (half || sticky)
+	       : mode == RM ? sign && (half || sticky)
+	                    : 0;
+	q += up;
+	if (q >> f.p) {
+		q >>= 1;
+		lsb++;
+	}
+	// Normal if the leading bit is there, else denormal (exponent field 0).
+	uint64_t biased = q >> (f.p - 1) ? (uint64_t)(lsb + (f.p - 1) + f.bias) : 0;
+	uint64_t emax = (1ull << (f.n - f.p)) - 1;
+	if (biased >= emax) {
+		fp_raised |= FPSR_OFC;
+		int inf = mode == RN || mode == RA || (mode == RP && !sign) || (mode == RM && sign);
+		return inf ? fp_inf(f, sign) : fp_inf(f, sign) - 1;
+	}
+	return s | biased << (f.p - 1) | ((uint64_t)q & ((1ull << (f.p - 1)) - 1));
+}
+
+// man scaled by 2^shift: shifted left, or right keeping a sticky bit.
+static u128 fp_scale(u128 man, int32_t shift)
+{
+	if (shift >= 0)
+		return man << shift;
+	if (shift <= -128)
+		return man != 0;
+	return man >> -shift | ((man & (((u128)1 << -shift) - 1)) != 0);
+}
+
+// The rounded sum of two nonzero finite values with significands of up to
+// 106 bits (a product of two doubles).
+static uint64_t fp_sum(int sa, u128 ma, int32_t ea, int sb, u128 mb, int32_t eb, struct fp_format f, int mode, int fz)
+{
+	if (fp_msb(ma) + ea < fp_msb(mb) + eb) {
+		int s = sa;
+		u128 m = ma;
+		int32_t e = ea;
+		sa = sb, ma = mb, ea = eb;
+		sb = s, mb = m, eb = e;
+	}
+	// The larger's leading bit at bit 125: the smaller is exact unless it is
+	// far below, and then the sum keeps at least 70 bits above the sticky bit.
+	int32_t t = fp_msb(ma) + ea - 125;
+	u128 a = ma << (ea - t), b = fp_scale(mb, eb - t);
+	if (sa == sb)
+		return fp_round(sa, a + b, t, f, mode, fz);
+	if (a == b)
+		return (uint64_t)(mode == RM) << (f.n - 1); // exact cancellation
+	return a > b ? fp_round(sa, a - b, t, f, mode, fz) : fp_round(sb, b - a, t, f, mode, fz);
+}
+
+// The first signaling NaN of `in`, quieted, else the first quiet NaN (or
+// the default NaN with DN), as arm64 picks NaN operands. 0 if none.
+static int fp_nans(const struct fp_value *in, int n, struct fp_format f, int dn, uint64_t *r)
+{
+	for (int pass = 0; pass < 2; pass++)
+		for (int i = 0; i < n; i++)
+			if (in[i].kind == (pass ? FP_QNAN : FP_SNAN)) {
+				if (!pass)
+					fp_raised |= FPSR_IOC;
+				*r = dn ? fp_default_nan(f) : in[i].bits | 1ull << (f.p - 2);
+				return 1;
+			}
+	return 0;
+}
+
+// x*y + z (z: 0 for a plain product).
+static uint64_t fp_mul_add(struct fp_value x, struct fp_value y, const struct fp_value *z, struct fp_format f, int mode,
+                           int fz)
+{
+	int ps = x.sign ^ y.sign;
+	if (x.kind == FP_INF || y.kind == FP_INF) {
+		if (x.kind == FP_ZERO || y.kind == FP_ZERO)
+			return fp_invalid(f);
+		if (z && z->kind == FP_INF && z->sign != ps)
+			return fp_invalid(f);
+		return fp_inf(f, ps);
+	}
+	if (z && z->kind == FP_INF)
+		return fp_inf(f, z->sign);
+	if (x.kind == FP_ZERO || y.kind == FP_ZERO) {
+		if (!z)
+			return (uint64_t)ps << (f.n - 1);
+		if (z->kind == FP_ZERO)
+			return (uint64_t)(ps == z->sign ? ps : mode == RM) << (f.n - 1);
+		return fp_round(z->sign, z->man, z->exp, f, mode, fz);
+	}
+	if (!z || z->kind == FP_ZERO)
+		return fp_round(ps, x.man * y.man, x.exp + y.exp, f, mode, fz);
+	return fp_sum(ps, x.man * y.man, x.exp + y.exp, z->sign, z->man, z->exp, f, mode, fz);
+}
+
+static uint64_t fp_div(struct fp_value x, struct fp_value y, struct fp_format f, int mode, int fz)
+{
+	int s = x.sign ^ y.sign;
+	if (x.kind == y.kind && (x.kind == FP_INF || x.kind == FP_ZERO))
+		return fp_invalid(f);
+	if (x.kind == FP_INF)
+		return fp_inf(f, s);
+	if (y.kind == FP_ZERO) {
+		fp_raised |= FPSR_DZC;
+		return fp_inf(f, s);
+	}
+	if (x.kind == FP_ZERO || y.kind == FP_INF)
+		return (uint64_t)s << (f.n - 1);
+	// x's significand at bit 125 over y's (at most 53 bits): a quotient of
+	// at least 72 bits, and a sticky bit for the remainder.
+	int k = 125 - fp_msb(x.man);
+	u128 n = x.man << k, q = 0;
+	uint64_t d = (uint64_t)y.man, r = 0;
+	for (int i = 127; i >= 0; i--) {
+		r = r << 1 | (uint64_t)(n >> i & 1);
+		q <<= 1;
+		if (r >= d) {
+			r -= d;
+			q |= 1;
+		}
+	}
+	return fp_round(s, q | (r != 0), x.exp - y.exp - k, f, mode, fz);
+}
+
+static uint64_t fp_sqrt(struct fp_value x, struct fp_format f, int mode, int fz)
+{
+	if (x.kind == FP_ZERO)
+		return x.bits & 1ull << (f.n - 1);
+	if (x.sign)
+		return fp_invalid(f);
+	if (x.kind == FP_INF)
+		return x.bits;
+	// The significand at bit 124 or 125, for an even exponent: a root of
+	// at least 62 bits, and a sticky bit for the remainder.
+	int k = 124 - fp_msb(x.man);
+	if ((x.exp - k) & 1)
+		k++;
+	u128 n = x.man << k, root = 0, bit = (u128)1 << 126;
+	while (bit > n)
+		bit >>= 2;
+	while (bit) {
+		if (n >= root + bit) {
+			n -= root + bit;
+			root = (root >> 1) + bit;
+		} else {
+			root >>= 1;
+		}
+		bit >>= 2;
+	}
+	return fp_round(0, root | (n != 0), (x.exp - k) / 2, f, mode, fz);
+}
+
+// x rounded to an integral value in `mode`.
+static uint64_t fp_rint(struct fp_value x, struct fp_format f, int mode, int fz)
+{
+	if (x.kind != FP_FINITE)
+		return x.kind == FP_ZERO ? x.bits & 1ull << (f.n - 1) : x.bits;
+	if (x.exp >= 0)
+		return fp_round(x.sign, x.man, x.exp, f, RN, fz); // integral already
+	int32_t k = -x.exp;
+	u128 q = k >= 128 ? 0 : x.man >> k;
+	int half = k <= 128 && (x.man >> (k - 1) & 1);
+	int sticky = k > 128 || (x.man & (((u128)1 << (k - 1)) - 1)) != 0;
+	q += mode == RN ? half && (sticky || (q & 1))
+	   : mode == RA ? half
+	   : mode == RP ? !x.sign && (half || sticky)
+	   : mode == RM ? x.sign && (half || sticky)
+	                : 0;
+	if (!q)
+		return (uint64_t)x.sign << (f.n - 1);
+	return fp_round(x.sign, q, 0, f, RN, fz);
+}
+
+// Whether a value plays no part in what FZ and DN change: not a NaN, and
+// not denormal (nor, as a result, the smallest normal, which a tiny value
+// may have rounded to).
+static int fp_plain(uint64_t bits, struct fp_format f, int result)
+{
+	uint64_t emask = (1ull << (f.n - f.p)) - 1;
+	uint64_t e = bits >> (f.p - 1) & emask, frac = bits & ((1ull << (f.p - 1)) - 1);
+	if (e == emask)
+		return !frac;
+	return e ? !(result && e == 1 && !frac) : !frac;
+}
+
+// Orders values (not NaNs) as their bits do: -0 below +0.
+static int64_t fp_order(uint64_t bits, struct fp_format f)
+{
+	uint64_t s = 1ull << (f.n - 1);
+	return bits & s ? -(int64_t)(bits & ~s) - 1 : (int64_t)bits;
+}
+
+// FMIN, FMAX, FMINNM and FMAXNM of x and y (flushed, if FZ: their bits
+// are as __wasm_env_fpcr_op left them).
+static uint64_t fp_min_max(int op, struct fp_value x, struct fp_value y, struct fp_format f, int dn)
+{
+	struct fp_value v[2] = {x, y};
+	if (op == FP_MINNM || op == FP_MAXNM) {
+		// One quiet NaN: the other operand, as if the NaN were the
+		// infinity that loses.
+		int xq = x.kind == FP_QNAN, yq = y.kind == FP_QNAN;
+		int xn = xq || x.kind == FP_SNAN, yn = yq || y.kind == FP_SNAN;
+		if (xq && !yn)
+			return y.bits;
+		if (yq && !xn)
+			return x.bits;
+	}
+	uint64_t nan;
+	if (fp_nans(v, 2, f, dn, &nan))
+		return nan;
+	int max = op == FP_MAX || op == FP_MAXNM;
+	int x_wins = fp_order(x.bits, f) < fp_order(y.bits, f) ? !max : max;
+	return x_wins ? x.bits : y.bits;
+}
+
+// A result `r` of operation `code` (FP_*, then the input's and the result's
+// widths in bits, and an immediate: SINT and UINT's fixed-point fraction
+// bits, RINT's rounding mode, 7 for FPCR's) on x, y and z, as FPCR says.
+static uint64_t fpcr_op(uint32_t code, uint64_t x, uint64_t y, uint64_t z, uint64_t r, uint32_t fpcr)
+{
+	int op = code & 0xFF, nin = code >> 8 & 0xFF, nout = code >> 16 & 0xFF, imm = code >> 24;
+	struct fp_format fi = fp_format(nin), fo = fp_format(nout);
+	int mode = fpcr >> 22 & 3, dn = (fpcr & FPCR_DN) != 0;
+	if (op == FP_RINT && imm != 7)
+		mode = imm;
+	// FZ for arithmetic; conversions flush singles and doubles only.
+	int fz_in = (fpcr & (nin == 16 ? FPCR_FZ16 : FPCR_FZ)) != 0;
+	int fz_out = (fpcr & (nout == 16 ? FPCR_FZ16 : FPCR_FZ)) != 0;
+	if (op == FP_CVT) {
+		fz_in = nin != 16 && (fpcr & FPCR_FZ);
+		fz_out = nout != 16 && (fpcr & FPCR_FZ);
+	}
+	int inputs = op == FP_FMA ? 3
+	           : op == FP_SQRT || op == FP_CVT || op == FP_RINT || op == FP_FLUSH ? 1
+	           : op == FP_SINT || op == FP_UINT ? 0
+	                                            : 2;
+	uint64_t in[3] = {x, y, z};
+	// Rounding to nearest, the result as computed stands unless FZ or DN
+	// would change it.
+	// (Half precision fused multiply-adds round twice there.)
+	if ((mode == RN || (op == FP_RINT && imm != 7) || op >= FP_FLUSH) && !(op == FP_FMA && nout == 16)) {
+		int plain = fp_plain(r, fo, 1), inf_in = 0;
+		for (int i = 0; i < inputs; i++) {
+			plain &= fp_plain(in[i], fi, 0);
+			inf_in |= fp_unpack(in[i], fi, 0).kind == FP_INF;
+		}
+		if (plain) {
+			// Its flags (the lifted code's check leaves them to this):
+			// an infinity from finite operands overflowed, or divided by 0.
+			if (fp_unpack(r, fo, 0).kind == FP_INF && !inf_in)
+				fp_raised |= op == FP_DIV && fp_unpack(y, fi, 0).kind == FP_ZERO ? FPSR_DZC : FPSR_OFC;
+			return r;
+		}
+	}
+	if (op == FP_SINT || op == FP_UINT) {
+		int sign = op == FP_SINT && (int64_t)x < 0;
+		uint64_t mag = sign ? -x : x;
+		return fp_round(sign, mag, -imm, fo, mode, fz_out);
+	}
+	struct fp_value v[3];
+	for (int i = 0; i < inputs; i++) {
+		v[i] = fp_unpack(in[i], fi, fz_in);
+		if (v[i].kind == FP_ZERO)
+			v[i].bits &= 1ull << (fi.n - 1); // flushed
+	}
+	if (op == FP_FLUSH) {
+		// A comparison's operand: signaling NaNs raise invalid, and with
+		// imm 1 (FCMPE), quiet ones too.
+		if (v[0].kind == FP_SNAN || (imm && v[0].kind == FP_QNAN))
+			fp_raised |= FPSR_IOC;
+		return v[0].bits;
+	}
+	if (op >= FP_MIN)
+		return fp_min_max(op, v[0], v[1], fo, dn);
+	uint64_t nan;
+	if (op == FP_FMA) {
+		// The addend's NaN first; a quiet NaN addend to inf * 0 is invalid.
+		struct fp_value order[3] = {v[2], v[0], v[1]};
+		int inf_zero = (v[0].kind == FP_INF && v[1].kind == FP_ZERO) || (v[0].kind == FP_ZERO && v[1].kind == FP_INF);
+		if (v[2].kind == FP_QNAN && inf_zero)
+			return fp_invalid(fo);
+		if (fp_nans(order, 3, fo, dn, &nan))
+			return nan;
+		return fp_mul_add(v[0], v[1], &v[2], fo, mode, fz_out);
+	}
+	if (op == FP_CVT) {
+		if (v[0].kind == FP_SNAN)
+			fp_raised |= FPSR_IOC;
+		if (v[0].kind == FP_QNAN || v[0].kind == FP_SNAN) {
+			if (dn)
+				return fp_default_nan(fo);
+			// Sign and the top of the payload, quiet.
+			uint64_t frac = x & ((1ull << (fi.p - 1)) - 1);
+			frac = fo.p > fi.p ? frac << (fo.p - fi.p) : frac >> (fi.p - fo.p);
+			return (uint64_t)v[0].sign << (fo.n - 1) | fp_inf(fo, 0) | 1ull << (fo.p - 2) | frac;
+		}
+		if (v[0].kind == FP_INF)
+			return fp_inf(fo, v[0].sign);
+		if (v[0].kind == FP_ZERO)
+			return (uint64_t)v[0].sign << (fo.n - 1);
+		return fp_round(v[0].sign, v[0].man, v[0].exp, fo, mode, fz_out);
+	}
+	if (fp_nans(v, inputs, fo, dn, &nan))
+		return op == FP_NMUL ? nan ^ 1ull << (fo.n - 1) : nan;
+	switch (op) {
+	case FP_SUB:
+		v[1].sign ^= 1;
+		// fall through
+	case FP_ADD:
+		if (v[0].kind == FP_INF && v[1].kind == FP_INF && v[0].sign != v[1].sign)
+			return fp_invalid(fo);
+		if (v[0].kind == FP_INF || v[1].kind == FP_INF)
+			return fp_inf(fo, v[0].kind == FP_INF ? v[0].sign : v[1].sign);
+		if (v[0].kind == FP_ZERO && v[1].kind == FP_ZERO)
+			return (uint64_t)(v[0].sign == v[1].sign ? v[0].sign : mode == RM) << (fo.n - 1);
+		if (v[0].kind == FP_ZERO || v[1].kind == FP_ZERO) {
+			struct fp_value w = v[0].kind == FP_ZERO ? v[1] : v[0];
+			return fp_round(w.sign, w.man, w.exp, fo, mode, fz_out);
+		}
+		return fp_sum(v[0].sign, v[0].man, v[0].exp, v[1].sign, v[1].man, v[1].exp, fo, mode, fz_out);
+	case FP_MUL:
+		return fp_mul_add(v[0], v[1], 0, fo, mode, fz_out);
+	case FP_NMUL:
+		return fp_mul_add(v[0], v[1], 0, fo, mode, fz_out) ^ 1ull << (fo.n - 1);
+	case FP_DIV:
+		return fp_div(v[0], v[1], fo, mode, fz_out);
+	case FP_SQRT:
+		return fp_sqrt(v[0], fo, mode, fz_out);
+	case FP_RINT:
+		return fp_rint(v[0], fo, mode, fz_out);
+	}
+	return r;
+}
+
+// The result, as fpcr_op; __wasm_env_fpcr_flags then gives the FPSR flags
+// it raised, which the lifted code raises (Block::fpcr). Neither touches
+// memory the lifted code can see.
+uint64_t __wasm_env_fpcr_op(uint32_t code, uint64_t x, uint64_t y, uint64_t z, uint64_t r, uint32_t fpcr)
+{
+	fp_raised = 0;
+	return fpcr_op(code, x, y, z, r, fpcr);
+}
+
+uint32_t __wasm_env_fpcr_flags(void)
+{
+	return fp_raised;
+}
+
 // CNTVCT_EL0, the virtual counter: CLOCK_MONOTONIC in nanoseconds, so
 // CNTFRQ_EL0 reads 1 GHz (as ARMv8.6 requires). Spin loops time out on it
 // (OpenBLAS's idle threads go to sleep after 2^28 ticks), so it must move.
@@ -266,6 +721,8 @@ struct module {
 struct module __wasm_env_modules[MODULES];
 uint64_t __wasm_env_module_count, __wasm_env_modules_added;
 #define WASM_ENV_SYNC_MODULES ((1L << 32) + 3)
+// Set in the generation of an exact page's module (see __wasm_env_exact_fp).
+#define EXACT_FP_MODULE (1ull << 63)
 
 // Code a program generates at run time (a JIT's): when control reaches an
 // address no module covers, the runtime translates the executable mapping
@@ -414,10 +871,13 @@ void dispatch(long pc)
 			uint64_t lo = __atomic_load_n(&m->lo, __ATOMIC_ACQUIRE);
 			if (target < lo || target >= __atomic_load_n(&m->hi, __ATOMIC_ACQUIRE))
 				continue;
+			uint64_t generation = __atomic_load_n(&m->generation, __ATOMIC_ACQUIRE);
+			if (generation & EXACT_FP_MODULE)
+				continue; // see __wasm_env_exact_fp
 			block_fn g = lookup(m->addrs, m->fns, m->count, start);
-			if (g && (!f || m->generation > newest)) {
+			if (g && (!f || generation > newest)) {
 				f = g;
-				newest = m->generation;
+				newest = generation;
 			}
 		}
 	}
@@ -430,6 +890,69 @@ void dispatch(long pc)
 		e->tag = region + 1;
 		e->fn = f;
 	}
+	__attribute__((musttail)) return f(pc);
+}
+
+// A block with FP results that FPCR changes, entered at `pc` while FPCR asks
+// for more than WebAssembly's arithmetic does (a rounding mode, flush to
+// zero, default NaNs): it runs the exact version of its page instead (see
+// Block::fpcr in the translator), which the runtime translates when it's
+// first needed (the wasm-env call exact_fp) and adds to the module
+// directory, marked so dispatch passes over it. Its blocks branch to each
+// other directly, and leave the page through dispatch.
+#define WASM_ENV_EXACT_FP ((1L << 32) + 6)
+static _Thread_local struct dispatch_entry exact_cache[64];
+static _Thread_local uint64_t exact_cache_epoch;
+
+void __wasm_env_exact_fp(long pc)
+{
+	uint64_t target = (uint64_t)pc, region = target >> REGION_SHIFT;
+	check_code_epoch();
+	struct dispatch_entry *e = &exact_cache[region % 64];
+	if (e->tag == region + 1 && exact_cache_epoch == guest.code_epoch) {
+		block_fn f = e->fn;
+		__attribute__((musttail)) return f(pc);
+	}
+	if (exact_cache_epoch != guest.code_epoch) {
+		for (int i = 0; i < 64; i++)
+			exact_cache[i].tag = 0;
+		exact_cache_epoch = guest.code_epoch;
+	}
+	uint64_t start = region << REGION_SHIFT;
+	block_fn f = 0;
+	for (int attempt = 0; !f && attempt < 2; attempt++) {
+		if (attempt) {
+			const struct lib *o = 0;
+			for (uint64_t k = 0; k < guest_object_count; k++)
+				if (target >= guest_objects[k].base && target < guest_objects[k].end)
+					o = &guest_objects[k];
+			if (__wasm_env_host_syscall(WASM_ENV_EXACT_FP, pc, o ? (long)o->path : 0, o ? (long)o->base : 0, 0, 0, 0) < 0)
+				break;
+		}
+		// (Catching up first: the module may be one this thread's instance
+		// hasn't loaded.)
+		uint64_t added = __atomic_load_n(&__wasm_env_modules_added, __ATOMIC_ACQUIRE);
+		if (guest.modules_seen != added) {
+			__wasm_env_host_syscall(WASM_ENV_SYNC_MODULES, 0, 0, 0, 0, 0, 0);
+			guest.modules_seen = added;
+		}
+		uint64_t n = __atomic_load_n(&__wasm_env_module_count, __ATOMIC_ACQUIRE);
+		for (uint64_t k = 0; k < n && !f; k++) {
+			const struct module *m = &__wasm_env_modules[k];
+			uint64_t lo = __atomic_load_n(&m->lo, __ATOMIC_ACQUIRE);
+			if (target < lo || target >= __atomic_load_n(&m->hi, __ATOMIC_ACQUIRE))
+				continue;
+			if (__atomic_load_n(&m->generation, __ATOMIC_ACQUIRE) & EXACT_FP_MODULE)
+				f = lookup(m->addrs, m->fns, m->count, start);
+		}
+	}
+	if (!f) {
+		static const char msg[] = "FPCR sets a rounding mode, flush to zero or default NaNs, and the "
+		                          "exact version of this code couldn't be translated";
+		__wasm_env_fatal(msg, target);
+	}
+	e->tag = region + 1;
+	e->fn = f;
 	__attribute__((musttail)) return f(pc);
 }
 
@@ -616,6 +1139,7 @@ static int library_syscall(long nr)
 // was waiting at its clone, as with a real CLONE_VFORK.
 struct vfork_frame {
 	uint64_t r[32], tp, resume;
+	uint32_t fpcr;
 	uint8_t f[4];
 	__uint128_t v[32];
 };
@@ -644,6 +1168,7 @@ static void vfork_clone(void)
 	__builtin_memcpy(f->f, F, sizeof f->f);
 	__builtin_memcpy(f->v, V, sizeof f->v);
 	f->tp = TP;
+	f->fpcr = guest.fpcr;
 	f->resume = svc_next;
 	R[0] = 0; // the child
 	if (stack)
@@ -659,6 +1184,7 @@ static void vfork_resume(long pid)
 	__builtin_memcpy(F, f->f, sizeof f->f);
 	__builtin_memcpy(V, f->v, sizeof f->v);
 	TP = f->tp;
+	guest.fpcr = f->fpcr;
 	R[0] = (uint64_t)pid;
 	svc_redirect = f->resume;
 }
@@ -686,6 +1212,7 @@ static void thread_clone(void)
 	if (stack)
 		f->r[31] = stack;
 	f->tp = (flags & CLONE_SETTLS) ? tls : TP;
+	f->fpcr = guest.fpcr;
 	f->resume = svc_next;
 	R[0] = (uint64_t)__wasm_env_host_syscall(SYS_clone, (long)flags, (long)stack, (long)R[2], (long)tls, (long)R[4],
 	                                         (long)f);
@@ -699,6 +1226,7 @@ void __wasm_env_thread_start(const struct vfork_frame *f)
 	__builtin_memcpy(F, f->f, sizeof f->f);
 	__builtin_memcpy(V, f->v, sizeof f->v);
 	TP = f->tp;
+	guest.fpcr = f->fpcr;
 	uint64_t pc = f->resume;
 	// The parent may go on (and reuse the frame) from here.
 	__wasm_env_host_syscall(WASM_ENV_THREAD_STARTED, 0, 0, 0, 0, 0, 0);
@@ -841,6 +1369,7 @@ static void enter_handler(uint64_t resume)
 	f->uc.mcontext.fpsimd.magic = FPSIMD_MAGIC;
 	f->uc.mcontext.fpsimd.size = sizeof f->uc.mcontext.fpsimd;
 	f->uc.mcontext.fpsimd.fpsr = guest.fpsr;
+	f->uc.mcontext.fpsimd.fpcr = guest.fpcr;
 	__builtin_memcpy(f->uc.mcontext.fpsimd.vregs, V, sizeof f->uc.mcontext.fpsimd.vregs);
 	R[0] = d.sig;
 	R[1] = (uint64_t)(uintptr_t)&f->info;
@@ -868,6 +1397,7 @@ static void sigreturn(void)
 	F[3] = pstate >> 28 & 1;
 	if (f->uc.mcontext.fpsimd.magic == FPSIMD_MAGIC) {
 		guest.fpsr = f->uc.mcontext.fpsimd.fpsr;
+		guest.fpcr = f->uc.mcontext.fpsimd.fpcr;
 		__builtin_memcpy(V, f->uc.mcontext.fpsimd.vregs, sizeof V);
 	}
 	svc_redirect = f->uc.mcontext.pc;

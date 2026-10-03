@@ -35,6 +35,7 @@ pub fn syscall(
         // fork: a copy of the process (fork.rs).
         nr::CLONE if a & (0x100 | CLONE_THREAD) == 0 => crate::fork::fork(&mut caller, &args),
         nr::WASM_ENV_TRANSLATE_CODE => crate::modules::translate_code(&mut caller, a as u64, args[1] as u64, args[2] as u64),
+        nr::WASM_ENV_EXACT_FP => crate::modules::exact_fp(&mut caller, a as u64, args[1] as u64, args[2] as u64),
         nr::WASM_ENV_SYNC_MODULES => crate::modules::sync(&mut caller).map(|()| 0).map_err(|e| {
             eprintln!("wasm-env: loading libraries: {e:#}");
             EIO

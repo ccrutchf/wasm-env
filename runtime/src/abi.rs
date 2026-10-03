@@ -58,6 +58,8 @@ pub mod nr {
     pub const WASM_ENV_TRANSLATE_CODE: i64 = (1 << 32) + 4;
     /// Code in [start, start + len) may have changed (see modules::check_code).
     pub const WASM_ENV_CODE_CHANGED: i64 = (1 << 32) + 5;
+    /// Translate the exact-FP version of a page (see modules::exact_fp).
+    pub const WASM_ENV_EXACT_FP: i64 = (1 << 32) + 6;
     pub const SET_TID_ADDRESS: i64 = 96;
     pub const SET_ROBUST_LIST: i64 = 99;
     pub const FUTEX: i64 = 98;
