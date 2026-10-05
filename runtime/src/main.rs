@@ -277,5 +277,6 @@ fn main() -> Result<()> {
         }
     };
     drop(terminal);
+    fs::remove_shm();
     std::process::exit(status);
 }

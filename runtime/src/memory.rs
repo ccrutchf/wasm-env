@@ -225,6 +225,22 @@ impl AddressSpace {
         }
     }
 
+    /// The mapped ranges, in order: [start, top) less the free ones.
+    pub fn used(&self) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let mut at = self.start;
+        for (&a, &l) in &self.free {
+            if a > at {
+                out.push((at, a));
+            }
+            at = at.max(a + l);
+        }
+        if self.top > at {
+            out.push((at, self.top));
+        }
+        out
+    }
+
     /// Whether [addr, addr+len) is unmapped: free, or past `top`.
     pub fn is_free(&self, addr: u64, len: u64) -> bool {
         let Some(end) = addr.checked_add(len) else { return false };
@@ -317,6 +333,18 @@ mod tests {
         assert!(!s.contains(a, 8193), "past top");
         assert!(!s.contains(0x1000, 16), "below the mmap region");
         assert!(!s.contains(a, u64::MAX), "overflow");
+    }
+
+    #[test]
+    fn used_ranges_skip_the_free_ones() {
+        // (/proc/self/maps's mappings.)
+        let mut s = AddressSpace::new(0x10000);
+        let a = s.alloc(0x2000);
+        let b = s.alloc(0x1000);
+        let c = s.alloc(0x3000);
+        assert_eq!(s.used(), [(a, c + 0x3000)]);
+        s.release(b, 0x1000);
+        assert_eq!(s.used(), [(a, a + 0x2000), (c, c + 0x3000)]);
     }
 
     #[test]

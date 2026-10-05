@@ -924,13 +924,21 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             let x = read_v128(b, &ops[1])?;
             let y = read_v128(b, &ops[2])?;
             let index = b.imm_op(i, 3)? * 8; // byte index -> bit shift
-            // result = (concat(y, x) >> index) truncated to `total` bits.
-            let lo = b.val(format!("lshr i128 {x}, {index}"));
-            let hi = if index == 0 { "0".to_string() } else { b.val(format!("shl i128 {y}, {}", 128 - index)) };
-            let mut r = b.val(format!("or i128 {lo}, {hi}"));
-            if total < 128 {
-                r = b.val(format!("and i128 {r}, {}", konst128((1u128 << total) - 1)));
-            }
+            // result = (concat(y, x) >> index) truncated to `total` bits,
+            // of the operands' `total` bits (the low halves, for .8b).
+            let r = if total < 128 {
+                let mask = konst128((1u128 << total) - 1);
+                let xl = b.val(format!("and i128 {x}, {mask}"));
+                let yl = b.val(format!("and i128 {y}, {mask}"));
+                let yh = b.val(format!("shl i128 {yl}, {total}"));
+                let both = b.val(format!("or i128 {yh}, {xl}"));
+                let shifted = b.val(format!("lshr i128 {both}, {index}"));
+                b.val(format!("and i128 {shifted}, {mask}"))
+            } else {
+                let lo = b.val(format!("lshr i128 {x}, {index}"));
+                let hi = if index == 0 { "0".to_string() } else { b.val(format!("shl i128 {y}, {}", 128 - index)) };
+                b.val(format!("or i128 {lo}, {hi}"))
+            };
             b.write_v(d, r, 128);
         }
         "shrn" | "shrn2" | "rshrn" | "rshrn2" | "xtn" | "xtn2" => vector_narrow(b, i, m)?,
@@ -1489,6 +1497,39 @@ pub fn lift(b: &mut Block, i: &Instruction) -> Result<bool> {
             }
             let r = vbuild(b, e, &parts);
             b.write_v(d, r, 128);
+        }
+        "pmull" | "pmull2" if is_v(ops.first()) => {
+            // Polynomial (carry-less) multiply, widening: bytes to 16-bit
+            // products (.8h), or doublewords to a 128-bit one (.1q); the
+            // operands' low (or high, "2") half.
+            let (d, e, _) = vec_dst(&ops[0])?;
+            let x = read_v128(b, &ops[1])?;
+            let y = read_v128(b, &ops[2])?;
+            let n = 128 / e;
+            let first = if m == "pmull2" { n } else { 0 };
+            let mut parts = Vec::new();
+            for k in 0..n {
+                let xn = vlane(b, &x, e / 2, first + k);
+                let yn = vlane(b, &y, e / 2, first + k);
+                parts.push(clmul(b, &xn, &yn, e / 2, e));
+            }
+            let r = vbuild(b, e, &parts);
+            b.write_v(d, r, 128);
+        }
+        "pmul" if is_v(ops.first()) => {
+            // Polynomial multiply of bytes, keeping each product's low byte.
+            let (d, e, total) = vec_dst(&ops[0])?;
+            let x = read_v128(b, &ops[1])?;
+            let y = read_v128(b, &ops[2])?;
+            let mut parts = Vec::new();
+            for k in 0..nlanes(total, e) {
+                let xn = vlane(b, &x, e, k);
+                let yn = vlane(b, &y, e, k);
+                let p = clmul(b, &xn, &yn, e, 2 * e);
+                parts.push(b.val(format!("trunc i{} {p} to i{e}", 2 * e)));
+            }
+            let r = vbuild(b, e, &parts);
+            b.write_v(d, r, total);
         }
         "eor3" => {
             let (d, _, _) = vec_dst(&ops[0])?;
@@ -2324,6 +2365,23 @@ fn vlane(b: &mut Block, v: &str, elem: u32, k: u32) -> String {
     let n = 128 / elem;
     let vec = b.val(format!("bitcast i128 {v} to <{n} x i{elem}>"));
     b.val(format!("extractelement <{n} x i{elem}> {vec}, i32 {k}"))
+}
+
+/// The carry-less product of `x` and `y` (each `bits` wide) as `out` bits:
+/// x shifted by each set bit of y, exclusive-ored.
+fn clmul(b: &mut Block, x: &str, y: &str, bits: u32, out: u32) -> String {
+    let xw = b.val(format!("zext i{bits} {x} to i{out}"));
+    let yw = b.val(format!("zext i{bits} {y} to i{out}"));
+    let mut acc = "0".to_string();
+    for k in 0..bits {
+        let bit = b.val(format!("lshr i{out} {yw}, {k}"));
+        let bit = b.val(format!("and i{out} {bit}, 1"));
+        let mask = b.val(format!("sub i{out} 0, {bit}"));
+        let shifted = b.val(format!("shl i{out} {xw}, {k}"));
+        let term = b.val(format!("and i{out} {shifted}, {mask}"));
+        acc = b.val(format!("xor i{out} {acc}, {term}"));
+    }
+    acc
 }
 
 /// Combines lanes (each `elem` bits) into a 128-bit vector value; lanes

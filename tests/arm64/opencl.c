@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static void check(cl_int e, const char *what) {
     if (e != CL_SUCCESS) {
@@ -144,6 +145,55 @@ int main(void) {
     char log[4096] = "";
     clGetProgramBuildInfo(broken, dev, CL_PROGRAM_BUILD_LOG, sizeof log, log, NULL);
     printf("bad program: %s, log mentions it: %s\n", e == CL_BUILD_PROGRAM_FAILURE ? "fails" : "builds?", strstr(log, "undefined_thing") ? "yes" : "no");
+
+    // printf in a kernel: on stdout, after what the program printed before.
+    const char *hello = "__kernel void hello(int n) {\n"
+                        "    if (get_global_id(0) == 1) printf(\"hello %d %.2f %s %v2d %c %lx%%\\n\", n, 1.5f, \"there\", (int2)(-1, 2), 'x', 0xabcdefl);\n"
+                        "}\n";
+    cl_program hp = clCreateProgramWithSource(ctx, 1, &hello, NULL, &e);
+    check(e, "clCreateProgramWithSource(hello)");
+    check(clBuildProgram(hp, 1, &dev, "", NULL, NULL), "clBuildProgram(hello)");
+    cl_kernel hk = clCreateKernel(hp, "hello", &e);
+    check(e, "clCreateKernel(hello)");
+    cl_int arg = 42;
+    check(clSetKernelArg(hk, 0, sizeof arg, &arg), "clSetKernelArg(hello)");
+    size_t four = 4;
+    check(clEnqueueNDRangeKernel(q, hk, 1, NULL, &four, NULL, 0, NULL, NULL), "clEnqueueNDRangeKernel(hello)");
+    check(clFinish(q), "clFinish");
+    clReleaseKernel(hk), clReleaseProgram(hp);
+
+    // Profiling: a kernel's start and end times cover its run, not just its
+    // submission (the course's profilers time kernels so). Launched once
+    // first, so the second, timed, launch doesn't compile.
+    const char *busy = "__kernel void busy(__global uint *p) {\n"
+                       "    uint x = get_global_id(0);\n"
+                       "    for (int k = 0; k < 200000; k++) x = x * 1664525u + 1013904223u;\n"
+                       "    p[get_global_id(0)] = x;\n"
+                       "}\n";
+    cl_program bprog = clCreateProgramWithSource(ctx, 1, &busy, NULL, &e);
+    check(clBuildProgram(bprog, 1, &dev, "", NULL, NULL), "clBuildProgram(busy)");
+    cl_kernel bk = clCreateKernel(bprog, "busy", &e);
+    check(e, "clCreateKernel(busy)");
+    cl_mem bb2 = clCreateBuffer(ctx, CL_MEM_READ_WRITE, 16384 * 4, NULL, &e);
+    check(clSetKernelArg(bk, 0, sizeof bb2, &bb2), "clSetKernelArg(busy)");
+    cl_command_queue pq = clCreateCommandQueue(ctx, dev, CL_QUEUE_PROFILING_ENABLE, &e);
+    check(e, "clCreateCommandQueue(profiling)");
+    size_t many = 16384;
+    check(clEnqueueNDRangeKernel(pq, bk, 1, NULL, &many, NULL, 0, NULL, NULL), "clEnqueueNDRangeKernel(busy, first)");
+    check(clFinish(pq), "clFinish(profiling, first)");
+    cl_event pe;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    check(clEnqueueNDRangeKernel(pq, bk, 1, NULL, &many, NULL, 0, NULL, &pe), "clEnqueueNDRangeKernel(busy)");
+    check(clFinish(pq), "clFinish(profiling)");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    cl_ulong start = 0, end = 0;
+    clGetEventProfilingInfo(pe, CL_PROFILING_COMMAND_START, sizeof start, &start, NULL);
+    clGetEventProfilingInfo(pe, CL_PROFILING_COMMAND_END, sizeof end, &end, NULL);
+    double host = (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec);
+    if (getenv("SHOW_TIMES")) printf("profiled %.3f ms, host %.3f ms\n", (end - start) / 1e6, host / 1e6);
+    printf("profiled kernel time covers its run: %s\n", (double)(end - start) >= 0.5 * host ? "yes" : "no");
+    clReleaseEvent(pe), clReleaseCommandQueue(pq), clReleaseMemObject(bb2), clReleaseKernel(bk), clReleaseProgram(bprog);
 
     clReleaseKernel(add), clReleaseKernel(reduce), clReleaseKernel(bytes);
     clReleaseProgram(prog), clReleaseProgram(broken);

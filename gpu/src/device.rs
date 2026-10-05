@@ -85,11 +85,21 @@ impl Gpu {
     }
 
     /// What the device does that kernels must make up for (`Quirks`), by
-    /// trying it: -2^-126 * -(1 - 2^-24), 2^-126 rounded to the denormals'
-    /// precision, from a buffer (so no compiler folds it).
+    /// trying it, from a buffer (so no compiler folds it): -2^-126 *
+    /// -(1 - 2^-24), 2^-126 rounded to the denormals' precision; and
+    /// a * a - (1 + 2^-11) for a = 1 + 2^-12, 0 unless the multiply and
+    /// the add are fused (2^-24: the exact product's last bit); and
+    /// fma(2274, 1.5707963, -(their product, rounded)), with the constant
+    /// operand a constant (as libclc's argument reductions have it) and
+    /// from the buffer, the product made opaque as for `contracts`: the
+    /// product's rounding error, or 0 if the fma is computed as a multiply
+    /// and an add; and (2^-126 + 2^-149) *
+    /// (1 - 3 2^-24), just under the tie: a denormal or 0, not 2^-126.
     fn probe_quirks(&self) -> Res<Quirks> {
         let code = "@group(0) @binding(0) var<storage, read_write> b: array<f32>;
-@compute @workgroup_size(1) fn main() { b[2] = b[0] * b[1]; }";
+@compute @workgroup_size(1) fn main() { b[2] = b[0] * b[1]; b[5] = b[3] * b[3] + b[4];
+    let n = b[6]; let p = bitcast<f32>(bitcast<u32>(n * 1.5707963f) | bitcast<u32>(b[7])); b[8] = fma(n, 1.5707963f, -p); b[12] = fma(n, b[13], -p);
+    b[11] = b[9] * b[10]; }";
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("probe"), source: wgpu::ShaderSource::Wgsl(code.into()) });
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("probe"),
@@ -99,8 +109,10 @@ impl Gpu {
             compilation_options: Default::default(),
             cache: None,
         });
-        let b = self.buffer(12)?;
-        let words = [(-f32::MIN_POSITIVE).to_bits(), (-(1.0f32 - f32::EPSILON / 2.0)).to_bits(), 1];
+        let b = self.buffer(56)?;
+        let a = 1.0f32 + 2f32.powi(-12);
+        let n = 2274.0f32;
+        let words = [(-f32::MIN_POSITIVE).to_bits(), (-(1.0f32 - f32::EPSILON / 2.0)).to_bits(), 1, a.to_bits(), (-(1.0f32 + 2f32.powi(-11))).to_bits(), 1, n.to_bits(), 0, 1, 0x0080_0001, (1.0f32 - 3.0 * f32::EPSILON / 2.0).to_bits(), 1, 1, 1.5707963f32.to_bits()];
         self.write(&b, 0, &words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>())?;
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -115,8 +127,14 @@ impl Gpu {
             pass.dispatch_workgroups(1, 1, 1);
         }
         self.queue.submit([enc.finish()]);
-        let product = f32::from_le_bytes(self.read(&b, 8, 4)?.try_into().unwrap());
-        Ok(Quirks { flushes_rounded_up_products: product == 0.0, ..Quirks::default() })
+        let out = self.read(&b, 0, 56)?;
+        let word = |k: usize| f32::from_le_bytes(out[k * 4..k * 4 + 4].try_into().unwrap());
+        let (product, fused, split, under) = (word(2), word(5), word(8) == 0.0 || word(12) == 0.0, word(11));
+        // (The same flush to zero flushes denormal results. A product just
+        // under the tie that comes out as the smallest normal (Intel's) is
+        // made up for the same way.)
+        let tiny_products = product == 0.0 || under == f32::MIN_POSITIVE;
+        Ok(Quirks { flushes_rounded_up_products: tiny_products, flushes_denormals: product == 0.0, contracts: fused != 0.0, unfused_fma: split, ..Quirks::default() })
     }
 
     /// Whether the device's own doubles are OpenCL's: denormals kept
@@ -287,7 +305,8 @@ impl Gpu {
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
-        let entries: Vec<_> = std::iter::once(entry(0, true)).chain(buffers.iter().map(|&k| entry(k as u32 + 1, false))).collect();
+        let printf = (!info.printf.is_empty()).then(|| entry(info.args.len() as u32 + 1, false));
+        let entries: Vec<_> = std::iter::once(entry(0, true)).chain(buffers.iter().map(|&k| entry(k as u32 + 1, false))).chain(printf).chain(wgsl::part_bindings(info.args.len(), launch).into_iter().map(|(_, _, binding)| entry(binding, false))).collect();
         let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
@@ -324,14 +343,31 @@ impl Gpu {
     /// `launch.local`. `block` is the argument block from the first
     /// argument on (its header is filled in here); `buffers` gives each
     /// buffer argument's buffer. `program` identifies the module (for the
-    /// pipeline cache).
+    /// pipeline cache). The result: the kernel's printf records (see
+    /// wgsl.rs, "printf"), waited for; none if it has no printf.
     #[allow(clippy::too_many_arguments)]
-    pub fn run(&self, program: usize, m: &Module, info: &KernelInfo, launch: &Launch, dims: u32, global: [u32; 3], offset: [u32; 3], block: &[u8], buffers: &[Bound]) -> Res<()> {
+    pub fn run(&self, program: usize, m: &Module, info: &KernelInfo, launch: &Launch, dims: u32, global: [u32; 3], offset: [u32; 3], block: &[u8], buffers: &[Bound]) -> Res<Vec<u32>> {
+        // Buffers larger than a binding: bound in parts (Launch::parts), of
+        // the largest power of two words a binding takes.
+        let limit = self.limits.max_storage_buffer_binding_size;
+        let shift = (limit / 4).max(1).ilog2();
+        let part = 4u64 << shift;
+        let mut launch = launch.clone();
+        launch.parts = info.args.iter().enumerate().filter_map(|(k, _)| buffers.iter().find(|(a, _)| *a == k).filter(|(_, b)| b.size() > limit).map(|(_, b)| (k, b.size().div_ceil(part) as u32))).collect();
+        launch.part_shift = if launch.parts.is_empty() { 0 } else { shift };
+        let launch = &launch;
         let p = self.pipeline(program, m, info, launch)?;
+        let parts = wgsl::part_bindings(info.args.len(), launch);
+        fn slice(b: &wgpu::Buffer, n: u64, part: u64) -> wgpu::BindingResource<'_> {
+            let offset = n * part;
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: b, offset, size: wgpu::BufferSize::new(part.min(b.size() - offset)) })
+        }
         let groups: [u32; 3] = std::array::from_fn(|d| global[d] / launch.local[d].max(1));
         if groups.contains(&0) {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        // The printf buffer (its count, word 0, starts at 0: buffers are zeroed).
+        let printf = if info.printf.is_empty() { None } else { Some(self.buffer(PRINTF_BYTES)?) };
         let max = self.limits.max_compute_workgroups_per_dimension.max(1);
         let mut enc = self.device.create_command_encoder(&Default::default());
         let chunks = |n: u32| (0..n.div_ceil(max)).map(move |c| (c * max, (n - c * max).min(max)));
@@ -349,7 +385,14 @@ impl Gpu {
                     let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: args.as_entire_binding() }];
                     for &k in &p.buffers {
                         let b = buffers.iter().find(|(a, _)| *a == k).map(|(_, b)| *b).ok_or_else(|| format!("kernel {}: argument {k} not set", info.name))?;
-                        entries.push(wgpu::BindGroupEntry { binding: k as u32 + 1, resource: b.as_entire_binding() });
+                        let resource = if launch.parts.iter().any(|(a, _)| *a == k) { slice(b, 0, part) } else { b.as_entire_binding() };
+                        entries.push(wgpu::BindGroupEntry { binding: k as u32 + 1, resource });
+                        for &(_, n, binding) in parts.iter().filter(|(a, _, _)| *a == k) {
+                            entries.push(wgpu::BindGroupEntry { binding, resource: slice(b, n as u64, part) });
+                        }
+                    }
+                    if let Some(b) = &printf {
+                        entries.push(wgpu::BindGroupEntry { binding: info.args.len() as u32 + 1, resource: b.as_entire_binding() });
                     }
                     let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.layout, entries: &entries });
                     let mut pass = enc.begin_compute_pass(&Default::default());
@@ -359,10 +402,29 @@ impl Gpu {
                 }
             }
         }
-        self.queue.submit([enc.finish()]);
-        Ok(())
+        if std::env::var_os("WASM_ENV_DEBUG_GPU_TIME").is_some() {
+            // (Waited for, and the writes queued before it apart.)
+            let start = std::time::Instant::now();
+            self.queue.submit([]);
+            self.wait()?;
+            let writes = start.elapsed();
+            self.queue.submit([enc.finish()]);
+            self.wait()?;
+            eprintln!("wasm-env: GPU: kernel {}: {global:?} in groups of {:?}: writes before it {writes:?}, run in {:?}", info.name, launch.local, start.elapsed() - writes);
+        } else {
+            self.queue.submit([enc.finish()]);
+        }
+        let Some(b) = printf else { return Ok(Vec::new()) };
+        // The records that fit (the count goes on past the end when some didn't).
+        let n = (u32::from_le_bytes(self.read(&b, 0, 4)?.try_into().unwrap()) as u64).min(PRINTF_BYTES / 4 - 1);
+        let bytes = self.read(&b, 4, n * 4)?;
+        Ok(bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
     }
 }
+
+/// A launch's printf buffer: its count, then the 1 MiB of records a
+/// kernel's printf calls may write (CL_DEVICE_PRINTF_BUFFER_SIZE).
+const PRINTF_BYTES: u64 = 4 + (1 << 20);
 
 /// A work-group size for a launch that doesn't give one: as many
 /// work-items as divide the global size evenly, up to `max` in all.
@@ -438,7 +500,7 @@ __kernel void bytes(__global uchar *p) {
         let info = wgsl::kernel_info(&m, "add").unwrap();
         let mut block = vec![0u8; 16];
         block[12..16].copy_from_slice(&(n as i32).to_le_bytes());
-        let launch = Launch { local: choose_local([n, 1, 1], 1, 64), local_bytes: vec![] };
+        let launch = Launch { local: choose_local([n, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &block, &[(0, &ba), (1, &bb), (2, &bc)]).unwrap();
         let c = words(&g.read(&bc, 0, n as u64 * 4).unwrap());
         for i in 0..n as usize {
@@ -451,7 +513,7 @@ __kernel void bytes(__global uchar *p) {
         g.write(&bi, 0, &bytes(&input)).unwrap();
         g.write(&bo, 0, &[0; 4]).unwrap();
         let info = wgsl::kernel_info(&m, "reduce").unwrap();
-        let launch = Launch { local: [128, 1, 1], local_bytes: vec![(2, 128 * 4)] };
+        let launch = Launch { local: [128, 1, 1], local_bytes: vec![(2, 128 * 4)], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [4096, 1, 1], [0; 3], &[0u8; 8], &[(0, &bi), (1, &bo)]).unwrap();
         let sum = i32::from_le_bytes(g.read(&bo, 0, 4).unwrap().try_into().unwrap());
         assert_eq!(sum, input.iter().sum::<i32>());
@@ -461,7 +523,7 @@ __kernel void bytes(__global uchar *p) {
         let bp = g.buffer(1000).unwrap();
         g.write(&bp, 0, &data).unwrap();
         let info = wgsl::kernel_info(&m, "bytes").unwrap();
-        let launch = Launch { local: choose_local([1000, 1, 1], 1, 64), local_bytes: vec![] };
+        let launch = Launch { local: choose_local([1000, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [1000, 1, 1], [0; 3], &[0u8; 4], &[(0, &bp)]).unwrap();
         let out = g.read(&bp, 0, 1000).unwrap();
         for i in 0..1000 {
@@ -487,12 +549,12 @@ __kernel void vst(__global short *src, __global short *dst) {
         let data: Vec<u8> = (0..n * 4).map(|i| (i * 37 + 11) as u8).collect();
         let (a, b) = (g.buffer(n as u64 * 4).unwrap(), g.buffer(n as u64 * 4 + 8).unwrap());
         g.write(&a, 0, &data).unwrap();
-        let launch = Launch { local: choose_local([n, 1, 1], 1, 64), local_bytes: vec![] };
+        let launch = Launch { local: choose_local([n, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
         let info = wgsl::kernel_info(&m, "as4").unwrap();
         g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &[0u8; 8], &[(0, &a), (1, &b)]).unwrap();
         assert_eq!(g.read(&b, 0, n as u64 * 4).unwrap(), data, "as_uchar4");
         let n2 = n * 2 - 1;
-        let launch = Launch { local: choose_local([n2 / 2, 1, 1], 1, 64), local_bytes: vec![] };
+        let launch = Launch { local: choose_local([n2 / 2, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
         let info = wgsl::kernel_info(&m, "vst").unwrap();
         g.write(&b, 0, &vec![0u8; n as usize * 4 + 8]).unwrap();
         g.run(1, &m, &info, &launch, 1, [n2 / 2, 1, 1], [0; 3], &[0u8; 8], &[(0, &a), (1, &b)]).unwrap();
@@ -522,7 +584,7 @@ __kernel void wide(__global const float8 *a, __global const int16 *b, __global f
         g.write(&ba, 0, &bytes(&a)).unwrap();
         g.write(&bb, 0, &bytes(&b)).unwrap();
         let info = wgsl::kernel_info(&m, "wide").unwrap();
-        let launch = Launch { local: choose_local([n, 1, 1], 1, 64), local_bytes: vec![] };
+        let launch = Launch { local: choose_local([n, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &[0u8; 20], &[(0, &ba), (1, &bb), (2, &bc), (3, &bd), (4, &be)]).unwrap();
         let c: Vec<f32> = words(&g.read(&bc, 0, n as u64 * 32).unwrap()).into_iter().map(f32::from_bits).collect();
         let d: Vec<i32> = words(&g.read(&bd, 0, n as u64 * 64).unwrap()).into_iter().map(|w| w as i32).collect();
@@ -585,7 +647,7 @@ __kernel void longs(__global const long *a, __global const long *b, __global lon
         g.write(&ba, 0, &bytes(&a)).unwrap();
         g.write(&bb, 0, &bytes(&b)).unwrap();
         let info = wgsl::kernel_info(&m, "longs").unwrap();
-        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![] };
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 16], &[(0, &ba), (1, &bb), (2, &bo), (3, &bv)]).unwrap();
         let longs = |data: Vec<u8>| data.chunks(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>();
         let (o, v) = (longs(g.read(&bo, 0, n as u64 * 128).unwrap()), longs(g.read(&bv, 0, n as u64 * 32).unwrap()));
@@ -649,7 +711,7 @@ __kernel void copy(__global const float4 *src, __global float4 *dst, __local flo
         g.write(&bcs, 0, &cs).unwrap();
         g.write(&bd, 0, &vec![0u8; total * 32]).unwrap();
         let info = wgsl::kernel_info(&m, "copy").unwrap();
-        let launch = Launch { local: [local, 1, 1], local_bytes: vec![(2, n as u32 * 16), (5, n as u32)] };
+        let launch = Launch { local: [local, 1, 1], local_bytes: vec![(2, n as u32 * 16), (5, n as u32)], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [local * groups, 1, 1], [0; 3], &[0u8; 24], &[(0, &bs), (1, &bd), (3, &bcs), (4, &bcd)]).unwrap();
         let d: Vec<f32> = words(&g.read(&bd, 0, total as u64 * 32).unwrap()).into_iter().map(f32::from_bits).collect();
         let cd = g.read(&bcd, 0, total as u64).unwrap();
@@ -695,7 +757,7 @@ __kernel void cas(__global int *dest, __global int *old, __local int *l) {
         let (bd, bo) = (g.buffer(8).unwrap(), g.buffer(n as u64 * 4).unwrap());
         g.write(&bd, 0, &[0; 8]).unwrap();
         let info = wgsl::kernel_info(&m, "cas").unwrap();
-        let launch = Launch { local: [n, 1, 1], local_bytes: vec![(2, 4)] };
+        let launch = Launch { local: [n, 1, 1], local_bytes: vec![(2, 4)], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &[0u8; 12], &[(0, &bd), (1, &bo)]).unwrap();
         let d = words(&g.read(&bd, 0, 8).unwrap());
         let sum: u32 = (0..n).map(|t| t + 2).sum();
@@ -744,7 +806,7 @@ __kernel void k(__global const int *a, __global const int *b, __global int *o) {
         g.write(&a, 0, &pairs.iter().flat_map(|p| p.0.to_le_bytes()).collect::<Vec<_>>()).unwrap();
         g.write(&b, 0, &pairs.iter().flat_map(|p| p.1.to_le_bytes()).collect::<Vec<_>>()).unwrap();
         let info = wgsl::kernel_info(&m, "k").unwrap();
-        let launch = Launch { local: [n, 1, 1], local_bytes: vec![] };
+        let launch = Launch { local: [n, 1, 1], local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &[0u8; 12], &[(0, &a), (1, &b), (2, &o)]).unwrap();
         let out = words(&g.read(&o, 0, n as u64 * 48).unwrap());
         let fmin = |x: f32, y: f32| if x.is_nan() { y } else if y.is_nan() { x } else { x.min(y) };
@@ -804,7 +866,7 @@ __kernel void k(__global const float *a, __global const float *b, __global float
         g.write(&ba, 0, &bytes(&a)).unwrap();
         g.write(&bb, 0, &bytes(&b)).unwrap();
         let info = wgsl::kernel_info(&m, "k").unwrap();
-        let launch = Launch { local: [6, 1, 1], local_bytes: vec![] };
+        let launch = Launch { local: [6, 1, 1], local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [6, 1, 1], [0; 3], &[0u8; 12], &[(0, &ba), (1, &bb), (2, &bo)]).unwrap();
         let out: Vec<f32> = words(&g.read(&bo, 0, 48).unwrap()).into_iter().map(f32::from_bits).collect();
         for k in [0, 6] {
@@ -875,7 +937,7 @@ __kernel void k(__global const long *a, __global const long *b, __global const l
         g.write(&bb, 0, &col(1)).unwrap();
         g.write(&bc, 0, &col(2)).unwrap();
         let info = wgsl::kernel_info(&m, "k").unwrap();
-        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![] };
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 16], &[(0, &ba), (1, &bb), (2, &bc), (3, &bo)]).unwrap();
         let out: Vec<i64> = g.read(&bo, 0, n as u64 * 192).unwrap().chunks(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
         let sat = |r: i128| r.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
@@ -950,6 +1012,123 @@ __kernel void k(__global const long *a, __global const long *b, __global const l
         if g.quirks.native_f64 {
             check_doubles(&g, true);
         }
+    }
+
+    #[test]
+    fn buffers_larger_than_a_binding_are_bound_in_parts() {
+        let Some(mut g) = gpu() else { return };
+        // (Bindings of 4 KiB: the buffers below are several parts each.)
+        g.limits.max_storage_buffer_binding_size = 4096;
+        let src = r#"
+__kernel void k(__global uint *a, __global uchar *b, __global int *c, __global uint *o, __global const uchar *d) {
+    int i = get_global_id(0);
+    a[i] = a[i] * 3u + i;
+    b[i] = (uchar)(i * 7);
+    atomic_add(&c[(i * 13) % 5000], i);
+    atomic_max(&c[5000 + i % 7], i);
+    o[i] = ((__global const ushort *)d)[i % 2500];
+}
+"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 5000usize;
+        let a: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2654435761)).collect();
+        let b: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let bytes = |v: &[u32]| v.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+        let (ba, bb, bc, bo) = (g.buffer(n as u64 * 4).unwrap(), g.buffer(n as u64).unwrap(), g.buffer((n as u64 + 7) * 4).unwrap(), g.buffer(n as u64 * 4).unwrap());
+        g.write(&ba, 0, &bytes(&a)).unwrap();
+        g.write(&bb, 0, &b).unwrap();
+        let bd = g.buffer(n as u64).unwrap();
+        g.write(&bd, 0, &b).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: [8, 1, 1], ..Default::default() };
+        g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 20], &[(0, &ba), (1, &bb), (2, &bc), (3, &bo), (4, &bd)]).unwrap();
+        let split: Vec<_> = g.pipelines.lock().unwrap().keys().map(|k| (k.2.parts.clone(), k.2.part_shift)).collect();
+        assert_eq!(split, [(vec![(0, 5), (1, 2), (2, 5), (3, 5), (4, 2)], 10)]);
+        // (Their words reached through the parts' functions.)
+        let parts = Launch { parts: vec![(0, 5), (1, 2), (2, 5), (3, 5), (4, 2)], part_shift: 10, ..launch };
+        let code = wgsl::compile(&m, "k", &parts, g.quirks).unwrap();
+        assert!(code.contains("buf0_4") && code.contains("fn wr_buf0") && code.contains("fn atomicAdd_buf2"), "{code}");
+        let got_a = words(&g.read(&ba, 0, n as u64 * 4).unwrap());
+        let got_b = g.read(&bb, 0, n as u64).unwrap();
+        let got_c = words(&g.read(&bc, 0, (n as u64 + 7) * 4).unwrap());
+        let got_o = words(&g.read(&bo, 0, n as u64 * 4).unwrap());
+        let mut c = vec![0u32; n + 7];
+        for i in 0..n {
+            assert_eq!(got_a[i], a[i].wrapping_mul(3).wrapping_add(i as u32), "a[{i}]");
+            assert_eq!(got_b[i], (i * 7) as u8, "b[{i}]");
+            c[(i * 13) % 5000] += i as u32;
+            c[5000 + i % 7] = c[5000 + i % 7].max(i as u32);
+        }
+        assert_eq!(got_c, c, "atomics");
+        for i in 0..n {
+            let at = (i % 2500) * 2;
+            assert_eq!(got_o[i], b[at] as u32 | (b[at + 1] as u32) << 8, "o[{i}]");
+        }
+    }
+
+    #[test]
+    fn software_fmas_round_once() {
+        let Some(g) = gpu() else { return };
+        check_fmas(&g, false);
+        if g.quirks.native_f64 {
+            check_fmas(&g, true);
+        }
+    }
+
+    /// fma_exact (Quirks::unfused_fma) against the CPU's fma: random
+    /// floats, sums that nearly cancel, tiny results, and sums just under
+    /// and just over a float's tie past a double's precision (rounded to a
+    /// double first, they would be the tie, and go to the even float).
+    fn check_fmas(g: &Gpu, native: bool) {
+        let mut code = wgsl::library_code(&["fma_exact"].into_iter().collect(), native);
+        code.push_str("@group(0) @binding(0) var<storage, read> inp: array<u32>;\n@group(0) @binding(1) var<storage, read_write> out: array<u32>;\n");
+        code.push_str("@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n    let i = id.x * 3u;\n    if (i >= arrayLength(&inp)) { return; }\n    out[id.x] = bitcast<u32>(fma_exact(bitcast<f32>(inp[i]), bitcast<f32>(inp[i + 1u]), bitcast<f32>(inp[i + 2u])));\n}\n");
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut cases: Vec<[f32; 3]> = vec![
+            [1.0 + f32::EPSILON, (1.0 - f32::EPSILON) * 2f32.powi(-24), 1.0 + f32::EPSILON],
+            [-(1.0 + f32::EPSILON), (1.0 - f32::EPSILON) * 2f32.powi(-24), -(1.0 + f32::EPSILON)],
+            [1.0 + f32::EPSILON, (1.0 - f32::EPSILON) * 2f32.powi(-24), -(1.0 + f32::EPSILON)],
+            [-(1.0 + f32::EPSILON), (1.0 - f32::EPSILON) * 2f32.powi(-24), 1.0 + f32::EPSILON],
+            [f32::INFINITY, 0.0, 1.0],
+            [f32::MAX, 2.0, -f32::MAX],
+            [0.0, -1.0, 0.0],
+            [f32::NAN, 1.0, 1.0],
+        ];
+        for k in 0..30000 {
+            // A float of about 2^e.
+            let mut float = |e: i32| f32::from_bits((next() as u32 & 0x807f_ffff) | (((e + 127).clamp(0, 254) as u32) << 23));
+            let (a, b) = (float(k % 40 - 20), float(k % 17 - 8));
+            let p = a * b;
+            let c = match k % 5 {
+                0 => float(k % 60 - 30),
+                1 => -p,
+                2 => -p * (1.0 + (next() % 64) as f32 * f32::EPSILON),
+                3 => f32::from_bits(next() as u32),
+                _ => {
+                    let (s, t) = (float(-70), float(-60));
+                    cases.push([s, t, float(-140)]);
+                    float(-149 + (k % 20))
+                }
+            };
+            cases.push([a, b, c]);
+        }
+        let input: Vec<u32> = cases.iter().flatten().map(|f| f.to_bits()).collect();
+        let out = run_wgsl(g, &code, &input, cases.len(), cases.len() as u32);
+        let mut failures = Vec::new();
+        for (&[a, b, c], &r) in cases.iter().zip(&out) {
+            let want = a.mul_add(b, c);
+            let got = f32::from_bits(r);
+            if !(r == want.to_bits() || (got.is_nan() && want.is_nan())) && failures.len() < 20 {
+                failures.push(format!("fma({a:e}, {b:e}, {c:e}): got {got:e} ({r:#x}), want {want:e} ({:#x})", want.to_bits()));
+            }
+        }
+        assert!(failures.is_empty(), "native {native}:\n{}", failures.join("\n"));
     }
 
     /// f64.rs's library, in software or native, against the CPU.
@@ -1186,7 +1365,7 @@ __kernel void k(__global const float *a, __global const half *hs, __global float
         g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
         g.write(&bh, 0, &hs.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
         let info = wgsl::kernel_info(&m, "k").unwrap();
-        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![] };
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 16], &[(0, &ba), (1, &bh), (2, &bo), (3, &bho)]).unwrap();
         let o: Vec<f32> = words(&g.read(&bo, 0, n as u64 * 32).unwrap()).into_iter().map(f32::from_bits).collect();
         let ho: Vec<u16> = g.read(&bho, 0, n as u64 * 2).unwrap().chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
@@ -1235,7 +1414,7 @@ __kernel void k(__global int *r, __global const int *c, __global int *a, __globa
         g.write(&bufs[2], 0, &bytes(&a)).unwrap();
         g.write(&bufs[3], 0, &bytes(&b)).unwrap();
         let info = wgsl::kernel_info(&m, "k").unwrap();
-        let launch = Launch { local: [n, 1, 1], local_bytes: vec![] };
+        let launch = Launch { local: [n, 1, 1], local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &[0u8; 16], &[(0, &bufs[0]), (1, &bufs[1]), (2, &bufs[2]), (3, &bufs[3])]).unwrap();
         let get = |k: usize| words(&g.read(&bufs[k], 0, n as u64 * 4).unwrap()).into_iter().map(|w| w as i32).collect::<Vec<i32>>();
         let (r, a2, b2) = (get(0), get(2), get(3));
@@ -1320,7 +1499,7 @@ declare i32 @_Z13get_global_idj(i32)
         let (bo, ba) = (g.buffer(n as u64 * 16).unwrap(), g.buffer(n as u64 * 24).unwrap());
         g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
         let info = wgsl::kernel_info(&m, "k").unwrap();
-        let launch = Launch { local: [n as u32, 1, 1], local_bytes: vec![] };
+        let launch = Launch { local: [n as u32, 1, 1], local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 8], &[(0, &bo), (1, &ba)]).unwrap();
         let o: Vec<f64> = g.read(&bo, 0, n as u64 * 16).unwrap().chunks(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
         for i in 0..n {
@@ -1357,18 +1536,18 @@ declare i32 @_Z13get_global_idj(i32)
 "#;
         let m = crate::ir::parse(ir).unwrap();
         let n = 64u32;
-        let a: Vec<u32> = (0..n).map(|i| i * 2654435761).collect();
+        let a: Vec<u32> = (0..n).map(|i| i.wrapping_mul(2654435761)).collect();
         let (bo, ba) = (g.buffer(n as u64 * 4).unwrap(), g.buffer(n as u64 * 4).unwrap());
         g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
         let info = wgsl::kernel_info(&m, "k").unwrap();
-        let launch = Launch { local: [n, 1, 1], local_bytes: vec![] };
+        let launch = Launch { local: [n, 1, 1], local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &[0u8; 8], &[(0, &bo), (1, &ba)]).unwrap();
         let out = words(&g.read(&bo, 0, n as u64 * 4).unwrap());
         for (k, &v) in a.iter().enumerate() {
             // i2: (v + 1) mod 4, sign-extended; i11: v * 3 mod 2^11.
-            let two = ((v + 1) & 3) as i32;
+            let two = (v.wrapping_add(1) & 3) as i32;
             let two = if two >= 2 { two - 4 } else { two };
-            let want = (two + ((v.wrapping_mul(3)) & 0x7ff) as i32) as u32;
+            let want = two.wrapping_add((v.wrapping_mul(3) & 0x7ff) as i32) as u32;
             assert_eq!(out[k], want, "for {v:#x}");
         }
     }
@@ -1383,7 +1562,7 @@ declare i32 @_Z13get_global_idj(i32)
         let (ba, bo, bz) = (g.buffer(n as u64 * 4).unwrap(), g.buffer(n as u64 * 2).unwrap(), g.buffer(n as u64 * 2).unwrap());
         g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
         let info = wgsl::kernel_info(&m, "k").unwrap();
-        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![] };
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 12], &[(0, &ba), (1, &bo), (2, &bz)]).unwrap();
         let read = |b| g.read(b, 0, n as u64 * 2).unwrap().chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<u16>>();
         let (ho, hz) = (read(&bo), read(&bz));
@@ -1452,7 +1631,7 @@ __kernel void k(__global const double *a, __global const double *b, __global dou
         g.write(&ba, 0, &bytes(&a)).unwrap();
         g.write(&bb, 0, &bytes(&b)).unwrap();
         let info = wgsl::kernel_info(&m, "k").unwrap();
-        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![] };
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
         g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 16], &[(0, &ba), (1, &bb), (2, &bo), (3, &bl)]).unwrap();
         let o: Vec<f64> = g.read(&bo, 0, n as u64 * 128).unwrap().chunks(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
         let l: Vec<i64> = g.read(&bl, 0, n as u64 * 32).unwrap().chunks(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
@@ -1518,16 +1697,193 @@ __kernel void k(__global const double *a, __global const double *b, __global dou
         assert_eq!(choose_local([7, 1, 1], 1, 64), [7, 1, 1]);
     }
 
-    /// An image's buffer as the OpenCL driver makes one (see images.cl):
-    /// the header, then the pixels.
-    fn image_buffer(w: u32, h: u32, d: u32, layers: u32, order: u32, ty: u32, elem: u32, channels: u32, pixels: &[u8]) -> Vec<u8> {
+    /// An image's header as the OpenCL driver passes it (see images.cl).
+    fn image_header(w: u32, h: u32, d: u32, layers: u32, order: u32, ty: u32, elem: u32, channels: u32) -> Vec<u8> {
         let row = w * elem;
         let slice = row * h;
         let mut header = [0u32; 16];
         header[..10].copy_from_slice(&[w, h, d, layers, row, slice, order, ty, elem, channels]);
-        let mut b = bytes(&header);
-        b.extend_from_slice(pixels);
-        b
+        bytes(&header)
+    }
+
+
+    #[test]
+    fn half_vectors_as_shorts() {
+        // atan2 on half3 bitcasts <3 x half> to <3 x i16> (libclc's): the same
+        // results as on halves one at a time.
+        let Some(g) = gpu() else { return };
+        let src = "#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void v(__global half *out, __global const half *a, __global const half *b) { size_t i = get_global_id(0); vstore3(atan2(vload3(i, a), vload3(i, b)), i, out); }
+__kernel void s(__global half *out, __global const half *a, __global const half *b) { size_t i = get_global_id(0); out[i] = atan2(a[i], b[i]); }";
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 48usize;
+        let half = |x: f32| nearest_half(x).0;
+        let a: Vec<u16> = (0..n).map(|k| half(k as f32 * 0.37 - 8.0)).collect();
+        let b: Vec<u16> = (0..n).map(|k| half(5.0 - k as f32 * 0.21)).collect();
+        let (ba, bb) = (g.buffer(n as u64 * 2).unwrap(), g.buffer(n as u64 * 2).unwrap());
+        g.write(&ba, 0, &bytes(&a)).unwrap();
+        g.write(&bb, 0, &bytes(&b)).unwrap();
+        let mut results = Vec::new();
+        for (k, global) in [("s", n as u32), ("v", n as u32 / 3)] {
+            let bo = g.buffer(n as u64 * 2).unwrap();
+            let info = wgsl::kernel_info(&m, k).unwrap();
+            let launch = Launch { local: choose_local([global, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
+            g.run(1, &m, &info, &launch, 1, [global, 1, 1], [0; 3], &[0u8; 12], &[(0, &bo), (1, &ba), (2, &bb)]).unwrap();
+            results.push(g.read(&bo, 0, n as u64 * 2).unwrap());
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
+    #[test]
+    fn long_sums_reduced() {
+        // A sum of 64-bit products, which LLVM makes
+        // llvm.vector.reduce.add.v4i64 (dlprim's strided copies, on their
+        // indices).
+        let Some(g) = gpu() else { return };
+        let src = "__kernel void k(__global const long *a, __global long *o, long t0, long t1, long t2, long t3) {
+    size_t i = get_global_id(0);
+    o[i] = a[4 * i] * t0 + a[4 * i + 1] * t1 + a[4 * i + 2] * t2 + a[4 * i + 3] * t3;
+}";
+        let ir = crate::opencl::clang_ir(&test_clang(), src, "", None).unwrap();
+        assert!(ir.contains("llvm.vector.reduce.add"), "no reduction to test");
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 16usize;
+        let t: [i64; 4] = [3, -5, 7, 1 << 40];
+        let a: Vec<i64> = (0..n as i64 * 4).map(|k| (k - 30).wrapping_mul(0x1_2345_6789)).collect();
+        let (ba, bo) = (g.buffer(n as u64 * 32).unwrap(), g.buffer(n as u64 * 8).unwrap());
+        g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
+        let mut block = vec![0u8; 8];
+        block.extend(t.iter().flat_map(|x| x.to_le_bytes()));
+        g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &block, &[(0, &ba), (1, &bo)]).unwrap();
+        let o: Vec<i64> = g.read(&bo, 0, n as u64 * 8).unwrap().chunks(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+        for i in 0..n {
+            let want = (0..4).fold(0i64, |s, l| s.wrapping_add(a[i * 4 + l].wrapping_mul(t[l])));
+            assert_eq!(o[i], want, "work-item {i}");
+        }
+    }
+
+    #[test]
+    fn products_are_rounded_before_adds() {
+        // a * a + c with the product rounded first (FP_CONTRACT OFF: clang
+        // keeps the multiply and the add), which a compiler that fuses them
+        // (Intel's) doesn't: 0, not 2^-24.
+        let Some(g) = gpu() else { return };
+        let src = "#pragma OPENCL FP_CONTRACT OFF\n__kernel void k(__global float *p) { p[0] = p[1] * p[1] + p[2]; }";
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let a = 1.0f32 + 2f32.powi(-12);
+        let v = [1.0f32, a, -(1.0 + 2f32.powi(-11))];
+        let b = g.buffer(12).unwrap();
+        g.write(&b, 0, &v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        g.run(1, &m, &info, &Launch { local: [1, 1, 1], local_bytes: vec![], ..Default::default() }, 1, [1, 1, 1], [0; 3], &[0u8; 4], &[(0, &b)]).unwrap();
+        assert_eq!(f32::from_bits(words(&g.read(&b, 0, 4).unwrap())[0]), 0.0);
+    }
+
+    #[test]
+    fn printf_of_an_empty_string() {
+        // "" is a zeroinitializer constant, not bytes.
+        let m = build(&test_clang(), r#"__kernel void k(void) { printf("%s|\n", ""); }"#, "", None).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        assert_eq!(info.printf.len(), 1);
+        assert_eq!(info.printf[0].args, [wgsl::PrintfArg::Str(String::new())]);
+        wgsl::compile(&m, "k", &Launch { local: [1, 1, 1], local_bytes: vec![], ..Default::default() }, Default::default()).unwrap();
+    }
+
+    #[test]
+    fn printf_records() {
+        // Each work-item's printf a record: the format's number, then its
+        // arguments' words (a string none: it's in the format's description).
+        let Some(g) = gpu() else { return };
+        let src = r#"__kernel void k(__global int *o) {
+    int i = get_global_id(0);
+    o[i] = printf("i=%d h=%f s=%s l=%ld v=%v2d\n", i, i / 2.0f, "str", (long)i << 40, (int2)(i, -i));
+    if (i == 0) printf("once\n");
+}"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        assert_eq!(info.printf.len(), 2);
+        let p = &info.printf[0];
+        assert_eq!(p.format, "i=%d h=%f s=%s l=%ld v=%v2d\n");
+        use wgsl::PrintfArg::*;
+        assert_eq!(p.args, [Int { bytes: 4, lanes: 1 }, Float { bytes: 8, lanes: 1 }, Str("str".into()), Int { bytes: 8, lanes: 1 }, Int { bytes: 4, lanes: 2 }]);
+        assert_eq!(info.printf[1].args, []);
+        let n = 4u32;
+        let bo = g.buffer(n as u64 * 4).unwrap();
+        let launch = Launch { local: [n, 1, 1], local_bytes: vec![], ..Default::default() };
+        let records = g.run(1, &m, &info, &launch, 1, [n, 1, 1], [0; 3], &[0u8; 4], &[(0, &bo)]).unwrap();
+        // 4 records of 1 + 1 + 2 + 2 + 2 words, and one of 1, in any order.
+        assert_eq!(records.len(), 4 * 8 + 1);
+        let mut seen = Vec::new();
+        let mut at = 0;
+        while at < records.len() {
+            if records[at] == 1 {
+                at += 1;
+                continue;
+            }
+            let w = &records[at..at + 8];
+            let i = w[1];
+            assert_eq!(w[0], 0);
+            assert_eq!(f64::from_bits(w[2] as u64 | (w[3] as u64) << 32), i as f64 / 2.0);
+            assert_eq!(w[4] as u64 | (w[5] as u64) << 32, (i as u64) << 40);
+            assert_eq!([w[6], w[7]], [i, i.wrapping_neg()]);
+            seen.push(i);
+            at += 8;
+        }
+        seen.sort();
+        assert_eq!(seen, [0, 1, 2, 3]);
+        assert_eq!(words(&g.read(&bo, 0, 16).unwrap()), [0; 4]);
+    }
+
+    #[test]
+    fn wide_half_vectors_copied() {
+        // half8 and half16 loaded and stored whole, NaNs' bits kept.
+        let Some(g) = gpu() else { return };
+        let src = "#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void h8(__global const half *a, __global half *b) { size_t i = get_global_id(0); vstore8(vload8(i, a), i, b); }
+__kernel void h16(__global const half *a, __global half *b) { size_t i = get_global_id(0); vstore16(vload16(i, a), i, b); }";
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 64usize;
+        let a: Vec<u16> = (0..n as u16).map(|k| if k % 5 == 0 { 0x7d00 | k } else { k.wrapping_mul(0x9e37) }).collect();
+        let ba = g.buffer(n as u64 * 2).unwrap();
+        g.write(&ba, 0, &bytes(&a)).unwrap();
+        for (k, lanes) in [("h8", 8u32), ("h16", 16)] {
+            let bb = g.buffer(n as u64 * 2).unwrap();
+            let info = wgsl::kernel_info(&m, k).unwrap();
+            let global = n as u32 / lanes;
+            let launch = Launch { local: choose_local([global, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
+            g.run(1, &m, &info, &launch, 1, [global, 1, 1], [0; 3], &[0u8; 8], &[(0, &ba), (1, &bb)]).unwrap_or_else(|e| panic!("{k}: {e}"));
+            assert_eq!(g.read(&bb, 0, n as u64 * 2).unwrap(), bytes(&a), "{k}");
+        }
+    }
+
+    #[test]
+    fn vectors_bitcast_to_other_lane_counts() {
+        // uint4 as 16 bytes and back, short8 as int4 (bitcasts of different
+        // lane counts, which LLVM makes of narrowing stores and the like).
+        let Some(g) = gpu() else { return };
+        let src = "__kernel void k(__global const uint4 *a, __global uchar16 *b, __global const short8 *c, __global int4 *d) {
+    size_t i = get_global_id(0);
+    b[i] = as_uchar16(a[i]);
+    d[i] = as_int4(c[i]) + as_int4(as_uchar16(a[i]));
+}";
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 8usize;
+        let a: Vec<u32> = (0..n as u32 * 4).map(|k| k.wrapping_mul(0x9e37_79b9)).collect();
+        let c: Vec<u16> = (0..n as u16 * 8).map(|k| k.wrapping_mul(0x9e37)).collect();
+        let (ba, bb, bc, bd) = (g.buffer(n as u64 * 16).unwrap(), g.buffer(n as u64 * 16).unwrap(), g.buffer(n as u64 * 16).unwrap(), g.buffer(n as u64 * 16).unwrap());
+        g.write(&ba, 0, &bytes(&a)).unwrap();
+        g.write(&bc, 0, &bytes(&c)).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: choose_local([n as u32, 1, 1], 1, 64), local_bytes: vec![], ..Default::default() };
+        g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 16], &[(0, &ba), (1, &bb), (2, &bc), (3, &bd)]).unwrap();
+        assert_eq!(g.read(&bb, 0, n as u64 * 16).unwrap(), bytes(&a));
+        let d = words(&g.read(&bd, 0, n as u64 * 16).unwrap());
+        let cw = words(&bytes(&c));
+        for k in 0..n * 4 {
+            assert_eq!(d[k], cw[k].wrapping_add(a[k]), "lane {k}");
+        }
     }
 
     #[test]
@@ -1556,18 +1912,26 @@ __kernel void k(read_only image2d_t in, write_only image2d_t out, __global float
         let m = build(&test_clang(), src, "", None).unwrap();
         let (w, h) = (4u32, 3u32);
         let pixels: Vec<u8> = (0..w * h * 4).map(|k| (k * 37 % 256) as u8).collect();
-        let bin = g.buffer(64 + (w * h * 4) as u64).unwrap();
-        g.write(&bin, 0, &image_buffer(w, h, 1, 0, RGBA, UNORM_INT8, 4, 4, &pixels)).unwrap();
-        let bout = g.buffer(64 + (w * h * 16) as u64).unwrap();
-        g.write(&bout, 0, &image_buffer(w, h, 1, 0, RGBA, FLOAT, 16, 4, &vec![0; (w * h * 16) as usize])).unwrap();
+        let bin = g.buffer((w * h * 4) as u64).unwrap();
+        g.write(&bin, 0, &pixels).unwrap();
+        let bout = g.buffer((w * h * 16) as u64).unwrap();
         let (bo, binfo) = (g.buffer((w * h * 48) as u64).unwrap(), g.buffer(64).unwrap());
         let info = wgsl::kernel_info(&m, "k").unwrap();
-        let launch = Launch { local: choose_local([w, h, 1], 2, 64), local_bytes: vec![] };
-        g.run(1, &m, &info, &launch, 2, [w, h, 1], [0; 3], &[0u8; 16], &[(0, &bin), (1, &bout), (2, &bo), (3, &binfo)]).unwrap();
+        // The images' headers follow their offsets (0) in the block.
+        let mut block = vec![0u8; (info.block_size - HEADER_WORDS * 4) as usize];
+        for (k, header) in [(0, image_header(w, h, 1, 0, RGBA, UNORM_INT8, 4, 4)), (1, image_header(w, h, 1, 0, RGBA, FLOAT, 16, 4))] {
+            let at = (info.args[k].offset - HEADER_WORDS * 4 + 4) as usize;
+            block[at..at + 64].copy_from_slice(&header);
+        }
+        let launch = Launch { local: choose_local([w, h, 1], 2, 64), local_bytes: vec![], ..Default::default() };
+        g.run(1, &m, &info, &launch, 2, [w, h, 1], [0; 3], &block, &[(0, &bin), (1, &bout), (2, &bo), (3, &binfo)]).unwrap();
         let floats = |b: &[u8]| b.chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<f32>>();
         let o = floats(&g.read(&bo, 0, (w * h * 48) as u64).unwrap());
-        let written = floats(&g.read(&bout, 64, (w * h * 16) as u64).unwrap());
+        let written = floats(&g.read(&bout, 0, (w * h * 16) as u64).unwrap());
         assert_eq!(&words(&g.read(&binfo, 0, 24).unwrap())[..], &[w, h, RGBA, FLOAT, w, h]);
+        // (Normalized integers to floats: within 1.5 ulp, OpenCL says; a GPU's
+        // division is no closer. Doubled, a little more.)
+        let ulps = |a: f32, b: f32| (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs();
         // A texel as floats; out of range, CLAMP's border (transparent black).
         let texel = |x: i32, y: i32| -> [f32; 4] {
             if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
@@ -1581,8 +1945,8 @@ __kernel void k(read_only image2d_t in, write_only image2d_t out, __global float
                 let k = (y as u32 * w + x as u32) as usize;
                 let t = texel(x, y);
                 for c in 0..4 {
-                    assert_eq!(written[k * 4 + c], t[c] * 2.0, "write at {x},{y}");
-                    assert_eq!(o[k * 12 + c], t[c], "nearest at {x},{y}");
+                    assert!(ulps(written[k * 4 + c], t[c] * 2.0) <= 2, "write at {x},{y}: {} vs {}", written[k * 4 + c], t[c] * 2.0);
+                    assert!(ulps(o[k * 12 + c], t[c]) <= 1, "nearest at {x},{y}: {} vs {}", o[k * 12 + c], t[c]);
                 }
                 // Linear at (x + 1, y + 0.75): texels x and x + 1 weighted
                 // 0.5 each, rows y and y + 1 at 0.75 and 0.25.
@@ -1595,7 +1959,7 @@ __kernel void k(read_only image2d_t in, write_only image2d_t out, __global float
                 // Clamped to the edge: texel (0, h - 1).
                 let corner = ((h - 1) * w * 4) as usize;
                 for c in 0..4 {
-                    assert_eq!(o[k * 12 + 8 + c], pixels[corner + c] as f32 / 255.0, "clamped read at {x},{y}");
+                    assert!(ulps(o[k * 12 + 8 + c], pixels[corner + c] as f32 / 255.0) <= 1, "clamped read at {x},{y}");
                 }
             }
         }

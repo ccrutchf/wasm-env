@@ -13,7 +13,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 toolchain=1.98.1
 export RUSTUP_HOME=$root/build/rustup CARGO_HOME=$root/build/cargo-home CARGO_TARGET_DIR=$root/build/target-cross
-store() { nix build --no-link --print-out-paths "nixpkgs#$1" | tail -1; }
+store() { nix build --no-link --print-out-paths --inputs-from "$root" "nixpkgs#$1" | tail -1; }
 rustup=$(store rustup)/bin/rustup
 "$rustup" toolchain install "$toolchain" --profile minimal --target aarch64-apple-darwin --target x86_64-pc-windows-gnu >/dev/null 2>&1
 zig=$(store zig)

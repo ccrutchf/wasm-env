@@ -136,6 +136,29 @@ static void *set_go(void *arg)
 	return NULL;
 }
 
+// Flags other threads clear, each polled in turn with nops between the
+// loads (OpenBLAS's level-3 threads wait for each other so: its YIELDING).
+// LLVM puts a copy of the loop's load before it; wasmtime mustn't take
+// the load in the loop for that one (it did, and the wait never ended).
+static volatile long busy[THREADS][8];
+
+// (Its own function: the load before the loop and the one in it read
+// the same address, as OpenBLAS's do.)
+__attribute__((noinline)) static void wait_clear(volatile long *flag)
+{
+	while (*flag)
+		asm volatile("nop; nop; nop; nop; nop; nop; nop; nop");
+}
+
+static void *clear_busy(void *arg)
+{
+	long i = (long)arg;
+	usleep(5000 * (i + 1));
+	busy[i][0] = 0;
+	busy[i][4] = 0;
+	return NULL;
+}
+
 int main(void)
 {
 	pthread_t t[THREADS];
@@ -187,6 +210,17 @@ int main(void)
 		;
 	pthread_join(g, NULL);
 	puts("volatile flag: seen");
+
+	for (long i = 0; i < THREADS; i++) {
+		busy[i][0] = busy[i][4] = 1;
+		pthread_create(&t[i], NULL, clear_busy, (void *)i);
+	}
+	for (int i = 0; i < THREADS; i++)
+		for (int j = 0; j < 8; j += 4)
+			wait_clear(&busy[i][j]);
+	for (int i = 0; i < THREADS; i++)
+		pthread_join(t[i], NULL);
+	puts("polled flags: all cleared");
 
 	// A spin loop with a timeout on the virtual counter (OpenBLAS's idle
 	// threads wait like this): the counter must advance at its frequency.

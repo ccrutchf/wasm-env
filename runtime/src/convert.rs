@@ -147,14 +147,24 @@ impl Registry {
     /// GETs `path` (under /v2/<repository>/), authenticating as the
     /// registry asks (anonymous bearer tokens, as for public images).
     fn get(&mut self, path: &str, accept: &str) -> Result<ureq::http::Response<ureq::Body>> {
+        self.get_from(path, accept, 0)
+    }
+
+    /// `get` from byte `from` on (a Range request, to resume a download; the
+    /// response is 206 if the server honoured it).
+    fn get_from(&mut self, path: &str, accept: &str, from: u64) -> Result<ureq::http::Response<ureq::Body>> {
         let url = format!("https://{}/v2/{}/{path}", self.reference.registry, self.reference.repository);
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let mut req = self.agent.get(&url).header("Accept", accept);
             if let Some(t) = &self.token {
                 req = req.header("Authorization", format!("Bearer {t}"));
             }
+            if from > 0 {
+                req = req.header("Range", format!("bytes={from}-"));
+            }
             let resp = req.call().with_context(|| format!("fetching {url}"))?;
-            if resp.status() == 401 && self.token.is_none() {
+            // (Unauthorized: no token yet, or it expired during a long pull.)
+            if resp.status() == 401 && attempt == 0 {
                 let challenge = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 self.token = Some(self.authenticate(&challenge)?);
                 continue;
@@ -210,6 +220,39 @@ fn blob_cache() -> PathBuf {
     base.join("wasm-env/blobs")
 }
 
+/// A layer being downloaded: what has arrived so far.
+struct Download {
+    file: std::fs::File,
+    hasher: sha2::Sha256,
+    written: u64,
+}
+
+impl Download {
+    /// Fetches the rest of blob `digest` (all of it, if the server won't
+    /// resume: then it starts again).
+    fn fetch(&mut self, registry: &mut Registry, digest: &str) -> Result<()> {
+        use std::io::Seek;
+        let resp = registry.get_from(&format!("blobs/{digest}"), "*/*", self.written)?;
+        if self.written > 0 && resp.status() != 206 {
+            self.file.set_len(0)?;
+            self.file.rewind()?;
+            self.hasher = sha2::Sha256::new();
+            self.written = 0;
+        }
+        let mut reader = resp.into_body().into_reader();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            self.hasher.update(&buf[..n]);
+            self.file.write_all(&buf[..n])?;
+            self.written += n as u64;
+        }
+    }
+}
+
 fn pull(image: &str, out: &Path) -> Result<()> {
     let reference = parse_reference(image);
     let tag = reference.reference.clone();
@@ -239,21 +282,22 @@ fn pull(image: &str, out: &Path) -> Result<()> {
         let blob = cache.join(hex);
         if !blob.exists() {
             eprintln!("  layer {}/{}: {digest} ({:.1} MB)", k + 1, layers.len(), size as f64 / 1e6);
-            let resp = registry.get(&format!("blobs/{digest}"), "*/*")?;
-            let mut reader = resp.into_body().into_reader();
             let tmp = blob.with_extension("part");
-            let mut file = std::fs::File::create(&tmp)?;
-            let mut hasher = sha2::Sha256::new();
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                let n = reader.read(&mut buf)?;
-                if n == 0 {
-                    break;
+            let mut download = Download { file: std::fs::File::create(&tmp)?, hasher: sha2::Sha256::new(), written: 0 };
+            // A dropped connection (large layers, slow links) resumes where it
+            // stopped, a few times, waiting longer each time.
+            const TRIES: u32 = 5;
+            for attempt in 1..=TRIES {
+                match download.fetch(&mut registry, digest) {
+                    Ok(()) => break,
+                    Err(e) if attempt < TRIES => {
+                        eprintln!("  layer {}/{}: {e:#}; resuming at {:.1} MB ({attempt}/{})", k + 1, layers.len(), download.written as f64 / 1e6, TRIES - 1);
+                        std::thread::sleep(std::time::Duration::from_secs(1 << attempt));
+                    }
+                    Err(e) => return Err(e),
                 }
-                hasher.update(&buf[..n]);
-                file.write_all(&buf[..n])?;
             }
-            let got = format!("{:x}", hasher.finalize());
+            let got = format!("{:x}", download.hasher.finalize());
             if got != hex {
                 let _ = std::fs::remove_file(&tmp);
                 bail!("layer {digest}: downloaded data has digest sha256:{got}");

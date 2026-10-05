@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 wgpu = "30"
 pollster = "0.4"
+
+# (Its own workspace: it builds where it is, inside wasm-env's tree, or copied out.)
+[workspace]

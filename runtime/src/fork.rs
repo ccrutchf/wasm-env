@@ -86,6 +86,7 @@ pub fn fork(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64>
         mem::write(to, ctid as u64, &pid.to_le_bytes())?;
     }
     let child = Process {
+        cpu: kernel.cpu_slot(pid, pid),
         kernel: kernel.clone(),
         pid,
         tid: pid,
@@ -113,6 +114,7 @@ pub fn fork(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64>
 
 /// Runs a forked child until it exits or execs.
 fn run_child(process: Process, tls_base: i64, sp: i64, frame: u64) -> Outcome {
+    process.cpu.update(); // (its CPU time counts from here)
     let kernel = process.kernel.clone();
     let group = process.group.clone();
     let threading = group.threading.get().unwrap();

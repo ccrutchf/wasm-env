@@ -34,7 +34,7 @@ t() { compare "$*" "$(q "$@")" "$(w "$@")"; }
 for f in c/hello.c arm64/control.c arm64/memory.c arm64/arith.c arm64/fp.c arm64/computedgoto.c arm64/simd3.c arm64/calls.c; do
 	name=$(basename "$f" .c)
 	flags=(-O2)
-	[ "$name" = simd3 ] && flags+=(-march=armv8.2-a+crc+sha3)
+	[ "$name" = simd3 ] && flags+=(-march=armv8.2-a+crc+sha3+aes)
 	"${cc[@]}" "${flags[@]}" -o "$R/opt/tests/$name" "tests/$f" || { compare "$name: build" ok failed; continue; }
 	t "/opt/tests/$name" a "b c"
 done
@@ -49,6 +49,8 @@ done
 "${cc[@]}" -O2 -pthread -o "$R/opt/tests/threads-lse" tests/arm64/threads.c && t /opt/tests/threads-lse
 # Signal handlers (frames, masks, sigsuspend, siglongjmp, EINTR, SIGCHLD).
 "${cc[@]}" -O2 -o "$R/opt/tests/signals" tests/arm64/signals.c && t /opt/tests/signals
+# Between processes: a POSIX semaphore (/dev/shm), CPU times, /proc/self/maps.
+"${cc[@]}" -O2 -pthread -o "$R/opt/tests/shm" tests/arm64/shm.c && t /opt/tests/shm
 # Atomics (LSE) and dlopen through glibc's dynamic linker.
 "${cc[@]}" -O2 -march=armv8.1-a -o "$R/opt/tests/atomics" tests/arm64/atomics.c && t /opt/tests/atomics
 "${cc[@]}" -O2 -shared -fPIC -o "$R/usr/lib/libgreet.so" tests/arm64/libgreet.c
@@ -237,6 +239,8 @@ add: 0 of 100000 wrong
 reduce: right
 bytes: 0 of 3200 wrong
 bad program: fails, log mentions it: yes
+hello 42 1.50 there -1,2 x abcdef%
+profiled kernel time covers its run: yes
 done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" /opt/tests/opencl 2>&1)"
 			else
 				echo "skipped OpenCL ($gpu): no such GPU adapter"

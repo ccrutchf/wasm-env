@@ -26,6 +26,9 @@ pub const NSIG: usize = 65;
 pub const SIG_IGN: u64 = 1;
 
 /// A program ready to run: the result of resolving an execve.
+/// The main thread's stack (translator/src/link.rs: `-z stack-size`).
+const STACK_BYTES: u64 = 1 << 20;
+
 pub struct ExecImage {
     /// The WebAssembly file on the host.
     pub host: PathBuf,
@@ -165,6 +168,8 @@ pub struct Process {
     pub pending: Option<Pending>,
     pub trace: bool,
     pub start: Instant,
+    /// This thread's CPU time, which each syscall records (kernel::CpuSlot).
+    pub cpu: crate::kernel::CpuSlot,
     /// The program's path in the environment, absolute (/proc/self/exe).
     pub exe: String,
     /// The WebAssembly module this process runs (for translation feedback).
@@ -516,6 +521,7 @@ pub fn run_image(kernel: &Arc<Kernel>, pid: i32, image: ExecImage, inherit: Inhe
         pending: None,
         trace: kernel.trace,
         start: Instant::now(),
+        cpu: kernel.cpu_slot(pid, pid),
         exe,
         module: image.host.clone(),
         clear_tid: 0,
@@ -638,7 +644,7 @@ fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Resu
     // mem::BRK_MAX; mmap allocations start above that (docs/abi.md, "Memory").
     let brk = mem::page_align(heap_base);
     *store.data().group.mm.lock().unwrap() =
-        crate::thread::Mm { space: AddressSpace::new(brk + mem::BRK_MAX), brk, brk_start: brk, low: Default::default(), code: Default::default(), shared: Default::default() };
+        crate::thread::Mm { space: AddressSpace::new(brk + mem::BRK_MAX), brk, brk_start: brk, low: Default::default(), code: Default::default(), shared: Default::default(), stack: (sp.saturating_sub(STACK_BYTES) & !(crate::abi::PAGE_SIZE - 1), mem::page_align(sp)) };
     // A dynamically-linked program whose libraries are modules of their own
     // starts in its dynamic linker, which the runtime loads first.
     let extra = match &image.interp {
@@ -649,6 +655,7 @@ fn start(store: &mut Store<Process>, module: &Module, image: &ExecImage) -> Resu
     let sp = write_initial_stack(crate::syscall::memory_bytes(store), sp, image, &extra)?;
     stack_pointer.set(&mut *store, Val::I64(sp as i64))?;
 
+    store.data().cpu.update(); // (its CPU time counts from here)
     let start = instance.get_typed_func::<i64, ()>(&mut *store, "_start")?;
     let result = start.call(&mut *store, sp as i64);
     if result.is_err() {
@@ -690,6 +697,7 @@ fn global_i64(v: Val) -> Result<u64> {
 
 /// Writes argc, argv, envp and the auxiliary vector below `top` in the
 /// Linux layout, and returns the new stack pointer (16-byte aligned).
+/// (The stack below: the translator links modules with a 1 MiB stack.)
 fn write_initial_stack(data: &mut [u8], top: u64, image: &ExecImage, extra: &[(u64, u64)]) -> Result<u64> {
     let fault = |_| anyhow::anyhow!("initial stack doesn't fit in memory");
 

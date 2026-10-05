@@ -3,6 +3,8 @@
 //!
 //!   cargo run --release -- bug1 ../bug1.wgsl
 //!   cargo run --release -- bug2 ../bug2-lets.wgsl
+//!   cargo run --release -- bug3 ../bug3.wgsl
+//!   cargo run --release -- bug4 ../bug4.wgsl
 //!
 //! Binding 0 is a read-only block of u32s (sixteen header words: global
 //! offset x/y/z, global size x/y/z, dimensions, workgroup offset x/y/z,
@@ -43,13 +45,30 @@ fn main() {
         "bug2" => {
             let z: Vec<f64> = (0..32).map(|k| ((k * 7919 % 101) as f64 - 50.0) / 17.0).collect();
             // Kernel arguments: z (16 complex numbers), o (16 complex), b (-1.0).
-            // (Groups of 4 or 16, as the shader was made for.)
-            let groups = if std::fs::read_to_string(path).unwrap().contains("workgroup_size(16") { 1 } else { 4 };
+            // (Groups of the size the shader was made for: 16 invocations in all.)
+            let text = std::fs::read_to_string(path).unwrap();
+            let size: u32 = text.split("workgroup_size(").nth(1).and_then(|s| s.split(',').next()).and_then(|s| s.trim().parse().ok()).unwrap();
+            let groups = 16 / size;
             (vec![bytes(&z)], vec![32 * 8], 16, groups)
         }
-        _ => panic!("bug1 or bug2"),
+        "bug3" => {
+            // Kernel arguments: in (12 doubles), out (12; the last work-item
+            // writes none). Huge arguments, then 1.0.
+            (vec![bytes(&bug3_inputs())], vec![12 * 8], 4, 1)
+        }
+        "bug4" => {
+            // Kernel arguments: out (64 doubles), in (64): 4 invocations of 16.
+            let text = std::fs::read_to_string(path).unwrap();
+            let size: u32 = text.split("workgroup_size(").nth(1).and_then(|s| s.split(',').next()).and_then(|s| s.trim().parse().ok()).unwrap();
+            (vec![bytes(&bug4_inputs())], vec![64 * 8], 4, 4 / size)
+        }
+        _ => panic!("bug1, bug2, bug3 or bug4"),
     };
-    let nargs = if case == "bug1" { 4 } else { 3 };
+    let nargs = match case {
+        "bug1" => 4,
+        "bug2" => 3,
+        _ => 2,
+    };
     // (The header is sixteen words, six of them unused.)
     let mut header: Vec<u32> = vec![0, 0, 0, global, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     header.extend(std::iter::repeat_n(0, nargs));
@@ -74,9 +93,15 @@ fn main() {
     for i in &inputs {
         buffers.push(device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: i, usage }));
     }
-    let first_output = buffers.len();
+    let mut first_output = buffers.len();
     for &size in &outputs {
         buffers.push(device.create_buffer(&wgpu::BufferDescriptor { label: None, size: size as u64, usage, mapped_at_creation: false }));
+    }
+    // (bug4's kernel takes its output first.)
+    if case == "bug4" {
+        let out = buffers.pop().unwrap();
+        buffers.insert(1, out);
+        first_output = 1;
     }
     if case == "bug2" {
         buffers.push(device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &(-1.0f64).to_le_bytes(), usage }));
@@ -134,12 +159,61 @@ fn main() {
     if case == "bug2" {
         // Expected: 1 / z, element by element (the kernel computes z^-1).
         let z: Vec<f64> = (0..32).map(|k| ((k * 7919 % 101) as f64 - 50.0) / 17.0).collect();
+        let mut wrong = 0;
         for i in 0..16 {
             let (re, im) = (z[2 * i], z[2 * i + 1]);
             let d = re * re + im * im;
             println!("expected[{}] = {:e}  expected[{}] = {:e}", 2 * i, re / d, 2 * i + 1, -im / d);
+            // (Within 1e-12 of the larger part: complex pow's error.)
+            let tol = 1e-12 * (re / d).abs().max((im / d).abs());
+            let (gr, gi) = (f64::from_bits(got[0][2 * i]), f64::from_bits(got[0][2 * i + 1]));
+            if !((gr - re / d).abs() <= tol && (gi + im / d).abs() <= tol) {
+                wrong += 1;
+                eprintln!("wrong: element {i}: got {gr:e} {gi:e}, want {:e} {:e}", re / d, -im / d);
+            }
         }
+        eprintln!("{wrong} of 16 elements wrong");
     }
+    if case == "bug4" {
+        // Expected: acos(x) / pi, within 4 ulps (libclc's accuracy).
+        let xs = bug4_inputs();
+        let mut wrong = 0;
+        for (j, x) in xs.iter().enumerate() {
+            let w = x.acos() / std::f64::consts::PI;
+            let g = f64::from_bits(got[0][j]);
+            if !((g - w).abs() <= 4.0 * f64::EPSILON * w.abs()) {
+                wrong += 1;
+                if wrong <= 4 {
+                    eprintln!("wrong: out[{j}] = acospi({x:e}): got {g:e}, want {w:e}");
+                }
+            }
+        }
+        eprintln!("{wrong} of 64 outputs wrong");
+    }
+    if case == "bug3" {
+        // Expected: sin of each input but the last work-item's three (0),
+        // within 4 ulps (libclc's accuracy).
+        let xs = bug3_inputs();
+        let mut wrong = 0;
+        for (j, x) in xs.iter().enumerate() {
+            let w = if j < 9 { x.sin() } else { 0.0 };
+            let g = f64::from_bits(got[0][j]);
+            if !(g == w || (g - w).abs() <= 4.0 * f64::EPSILON * w.abs()) {
+                wrong += 1;
+                eprintln!("wrong: out[{j}] = sin({x:e}): got {g:e}, want {w:e}");
+            }
+        }
+        eprintln!("{wrong} of 12 outputs wrong");
+    }
+}
+
+/// bug3's inputs: huge arguments (sin's large-argument reduction) and 1.0.
+fn bug3_inputs() -> Vec<f64> {
+    [0xff00000000000000u64, 0xfc80000000000200, 0xff80000000000200, 0xfe00000000000000, 0xfa80000000000200, 0x3ff0000000000000]
+        .iter()
+        .chain([0xff00000000000000u64, 0xfc80000000000200, 0xff80000000000200, 0xfe00000000000000, 0xfa80000000000200, 0x3ff0000000000000].iter())
+        .map(|&b| f64::from_bits(b))
+        .collect()
 }
 
 /// bug1's expected outputs for item i (o: 16 doubles; l: 4 longs), and
@@ -167,4 +241,9 @@ fn bug1_expected(i: usize, x: f64, y: f64) -> ([(f64, u64); 16], [i64; 4]) {
         ],
         [x as i64, (y * 1e10) as i64, x.to_bits() as i64, x.is_nan() as i64 + 2 * (x < y) as i64],
     )
+}
+
+/// bug4's inputs: tiny negative numbers, and others in (-1, 1).
+fn bug4_inputs() -> Vec<f64> {
+    (0..64).map(|k| if k % 2 == 0 { -(2f64.powi(-7 - (k % 50))) } else { (k as f64 - 32.0) / 40.0 }).collect()
 }

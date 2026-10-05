@@ -974,7 +974,9 @@ enum { MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20 };
 #define WASM_ENV_LOAD_LIBRARY ((1L << 32) + 2)
 
 // Libraries placed so far: guest_libs first, then those the runtime loads.
-#define LIBS 1024
+// (Python with torch, transformers and scipy loads several hundred; one
+// past the end would be mapped as data, and its code not found.)
+#define LIBS 4096
 static struct { uint64_t base, end; } libs[LIBS];
 static uint64_t lib_count;
 
@@ -990,7 +992,7 @@ static uint16_t fd_lib[LIB_FDS];
 static long pending_fd;
 
 // Reservations made that way: unmapping parts of them is a no-op.
-#define RESERVATIONS 256
+#define RESERVATIONS 4096
 static struct { uint64_t start, end; } reserved[RESERVATIONS];
 static uint64_t reservation_count;
 

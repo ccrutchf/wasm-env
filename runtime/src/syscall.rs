@@ -26,6 +26,7 @@ pub fn syscall(
     f: i64,
 ) -> wasmtime::Result<i64> {
     let args = [a, b, c, d, e, f];
+    caller.data().cpu.update();
     deliver_signal(caller.data_mut(), false)?;
     let result = match n {
         nr::MMAP => mmap(&mut caller, &args),
@@ -813,18 +814,45 @@ impl Process {
             }
             nr::WAIT4 => {
                 const WNOHANG: i64 = 1;
-                match self.kernel.wait(self.pid, a as i32, c & WNOHANG != 0, self.interrupting())? {
+                match self.kernel.wait_usage(self.pid, a as i32, c & WNOHANG != 0, self.interrupting())? {
                     None => Ok(0),
-                    Some((child, how)) => {
+                    Some((child, how, time)) => {
                         if b != 0 {
                             mem::write(data, ub, &how.wait_status().to_le_bytes())?;
                         }
                         if d != 0 {
-                            mem::slice_mut(data, d as u64, 144)?.fill(0); // struct rusage
+                            mem::write(data, d as u64, &rusage(time))?;
                         }
                         Ok(child as i64)
                     }
                 }
+            }
+            // CPU times: the threads' (kernel::CpuSlot), as user time.
+            nr::GETRUSAGE => {
+                const SELF: i64 = 0;
+                const CHILDREN: i64 = -1;
+                const THREAD: i64 = 1;
+                let (own, children) = self.kernel.usage(self.pid);
+                let time = match a {
+                    SELF => own,
+                    THREAD => self.cpu.update(),
+                    CHILDREN => children,
+                    _ => return Err(EINVAL),
+                };
+                mem::write(data, ub, &rusage(time)).map(|_| 0)
+            }
+            nr::TIMES => {
+                // In clock ticks (sysconf(_SC_CLK_TCK): 100); the result counts
+                // from the process's start.
+                let (own, children) = self.kernel.usage(self.pid);
+                let ticks = |t: Duration| (t.as_millis() / 10) as i64;
+                if a != 0 {
+                    let mut tms = [0u8; 32];
+                    tms[..8].copy_from_slice(&ticks(own).to_le_bytes());
+                    tms[16..24].copy_from_slice(&ticks(children).to_le_bytes());
+                    mem::write(data, ua, &tms)?;
+                }
+                Ok(ticks(self.start.elapsed()))
             }
             nr::PIPE2 => {
                 let (r, w) = crate::pipe::new();
@@ -1254,9 +1282,18 @@ impl Process {
         const WAIT_BITSET: i64 = 9;
         const WAKE_BITSET: i64 = 10;
         const CLOCK_REALTIME_FLAG: i64 = 256;
+        const PRIVATE: i64 = 128;
         let [addr, op, val, timeout, addr2, val3] = *args;
         let (addr, val) = (addr as u64, val as u32);
-        let futexes = &self.group.futex;
+        // A futex other processes may share (no FUTEX_PRIVATE_FLAG, in a
+        // shared mapping: a POSIX semaphore between processes) is the
+        // kernel's, keyed by its place in the file; others are the process's.
+        let shared = |at: u64| if op & PRIVATE == 0 { self.shared_futex_key(at) } else { None };
+        let (futexes, key) = match shared(addr) {
+            Some(k) => (&self.kernel.shared_futex, k),
+            None => (&self.group.futex, addr),
+        };
+        let to = shared(addr2 as u64).unwrap_or(addr2 as u64);
         match op & 0x7f {
             WAIT | WAIT_BITSET => {
                 let bitset = if op & 0x7f == WAIT { u32::MAX } else { val3 as u32 };
@@ -1274,15 +1311,32 @@ impl Process {
                     };
                     Some(std::time::Instant::now() + wait)
                 };
-                futexes.wait(data, addr, val, bitset, deadline, &self.interrupted())
+                futexes.wait_keyed(data, addr, key, val, bitset, deadline, &self.interrupted())
             }
-            WAKE => Ok(futexes.wake(addr, val, u32::MAX)),
-            WAKE_BITSET => Ok(futexes.wake(addr, val, val3 as u32)),
+            WAKE => Ok(futexes.wake(key, val, u32::MAX)),
+            WAKE_BITSET => Ok(futexes.wake(key, val, val3 as u32)),
             // For requeues the timeout argument is the number to requeue.
-            REQUEUE => futexes.requeue(data, addr, val, timeout as u32, addr2 as u64, None),
-            CMP_REQUEUE => futexes.requeue(data, addr, val, timeout as u32, addr2 as u64, Some(val3 as u32)),
+            REQUEUE => futexes.requeue_keyed(data, addr, key, val, timeout as u32, to, None),
+            CMP_REQUEUE => futexes.requeue_keyed(data, addr, key, val, timeout as u32, to, Some(val3 as u32)),
             _ => Err(ENOSYS),
         }
+    }
+
+    /// The key of a futex word at `addr` in a shared mapping: the mapped
+    /// file's identity and the word's offset in it, the same in every process
+    /// that maps it. None outside shared mappings.
+    fn shared_futex_key(&self, addr: u64) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mm = self.group.mm.lock().unwrap();
+        let (&start, m) = mm.shared.range(..=addr).next_back()?;
+        if addr >= m.end {
+            return None;
+        }
+        let file = std::fs::File::from(m.file.try_clone().ok()?);
+        let id = crate::locks::file_id(&file).ok()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (id, m.offset + (addr - start)).hash(&mut h);
+        Some(h.finish())
     }
 
     /// clone(CLONE_THREAD): a new thread in this process (docs/abi.md,
@@ -1305,6 +1359,7 @@ impl Process {
             }
         }
         let thread = Process {
+            cpu: self.kernel.cpu_slot(self.pid, tid),
             kernel: self.kernel.clone(),
             pid: self.pid,
             tid,
@@ -1550,7 +1605,7 @@ impl Process {
                 if flags & o::ACCMODE != 0 {
                     return Err(EACCES);
                 }
-                let file = s.open().map_err(|e| fs::errno(&e))?;
+                let file = if s == fs::Synthetic::Maps { fs::file_of(self.maps().as_bytes()) } else { s.open() }.map_err(|e| fs::errno(&e))?;
                 let open = Arc::new(Mutex::new(Open::File { file, path: path.to_string(), append: false }));
                 return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
             }
@@ -2011,16 +2066,83 @@ impl Process {
         }
     }
 
+    /// /proc/self/maps: the program's image, its libraries, the heap, the
+    /// other mappings and the stack, in address order. Protections aren't
+    /// enforced (or kept), so each is rwx; offsets and inodes are 0.
+    fn maps(&self) -> String {
+        let mut maps: Vec<(u64, u64, String)> = Vec::new();
+        if let Ok(runs) = crate::image::runs(&self.module) {
+            maps.extend(runs.iter().map(|r| (r.addr, r.addr + r.len, self.exe.clone())));
+        }
+        let libs: Vec<(u64, u64, String)> = self
+            .group
+            .libraries
+            .list
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.code.is_none() && l.patch.is_none() && !l.exact)
+            .map(|l| (l.base, l.end.next_multiple_of(crate::abi::PAGE_SIZE), self.fs.guest(&l.path).unwrap_or_else(|| l.path.display().to_string())))
+            .collect();
+        let mm = self.group.mm.lock().unwrap();
+        if mm.brk > mm.brk_start {
+            maps.push((mm.brk_start, mm.brk, "[heap]".into()));
+        }
+        // Anonymous: the rest of what's mapped, less the libraries in it.
+        let mut anonymous: Vec<(u64, u64)> = mm.space.used();
+        anonymous.extend(mm.low.iter().map(|(&a, &b)| (a, b)));
+        for (a, b) in anonymous {
+            let mut at = a;
+            for &(la, lb, _) in libs.iter().filter(|(la, lb, _)| *la < b && *lb > a) {
+                if la > at {
+                    maps.push((at, la, String::new()));
+                }
+                at = at.max(lb);
+            }
+            if b > at {
+                maps.push((at, b, String::new()));
+            }
+        }
+        if mm.stack.1 > mm.stack.0 {
+            maps.push((mm.stack.0, mm.stack.1, "[stack]".into()));
+        }
+        drop(mm);
+        maps.extend(libs);
+        maps.sort();
+        let mut out = String::new();
+        for (a, b, name) in maps {
+            let line = format!("{a:08x}-{b:08x} rwxp 00000000 00:00 0");
+            if name.is_empty() {
+                out.push_str(&line);
+            } else {
+                out.push_str(&format!("{line:<72} {name}"));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     fn clock(&self, id: i64) -> SysResult<Duration> {
         const REALTIME: i64 = 0;
         const REALTIME_COARSE: i64 = 5;
         match id {
             REALTIME | REALTIME_COARSE => Ok(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()),
-            // Monotonic, CPU time and boot time all count from process start.
-            1..=7 => Ok(self.start.elapsed()),
+            // The process's and the thread's CPU time (kernel::CpuSlot).
+            2 => Ok(self.kernel.usage(self.pid).0),
+            3 => Ok(self.cpu.update()),
+            // Monotonic and boot time count from process start.
+            1 | 4..=7 => Ok(self.start.elapsed()),
             _ => Err(EINVAL),
         }
     }
+}
+
+/// A struct rusage with `user` as its user time (the rest 0).
+fn rusage(user: Duration) -> [u8; 144] {
+    let mut r = [0u8; 144];
+    r[..8].copy_from_slice(&(user.as_secs() as i64).to_le_bytes());
+    r[8..16].copy_from_slice(&(user.subsec_micros() as i64).to_le_bytes());
+    r
 }
 
 /// A terminal ioctl on host descriptor `fd` (0–2), passing `arg` through.

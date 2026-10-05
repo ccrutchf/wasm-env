@@ -58,8 +58,14 @@ impl Guest {
 /// A program's source compiled: its module, or clang's messages (the build
 /// log) on failure.
 pub fn build(cc: &Compiler, source: &str, options: &str, guest: Option<&Guest>) -> Result<Module, String> {
+    build_with_ir(cc, source, options, guest).map(|(m, _)| m)
+}
+
+/// `build`, and the module's IR: the program's binary, which `from_bitcode`
+/// builds again (clang reads IR as text as well as bitcode).
+pub fn build_with_ir(cc: &Compiler, source: &str, options: &str, guest: Option<&Guest>) -> Result<(Module, String), String> {
     let ir = clang_ir(cc, source, options, guest)?;
-    parse(&ir)
+    Ok((parse(&ir)?, ir))
 }
 
 /// OpenCL options clang takes as they are; others (-cl-opt-disable and the
@@ -82,12 +88,20 @@ fn passed(options: &str) -> Vec<String> {
     out
 }
 
+/// The extensions the device has (packages/opencl/icd.c reports the same):
+/// clang defines their macros and no others (for spir it would define
+/// every extension's, and programs test them: dlprim takes its Intel-only
+/// path where `cl_intel_subgroups` is defined).
+const EXTENSIONS: &str = "-cl-ext=-all,+cl_khr_global_int32_base_atomics,+cl_khr_global_int32_extended_atomics,\
++cl_khr_local_int32_base_atomics,+cl_khr_local_int32_extended_atomics,+cl_khr_byte_addressable_store,+cl_khr_fp64,+cl_khr_fp16,\
++cl_khr_3d_image_writes";
+
 pub fn clang_ir(cc: &Compiler, source: &str, options: &str, guest: Option<&Guest>) -> Res<String> {
     let clang = &cc.clang;
     let dir = Scratch::new()?;
     // (__OPENCL_VERSION__ is
     // the device's, which clang leaves to the driver.)
-    let mut args: Vec<String> = ["-x", "cl", "-cl-std=CL1.2", "-target", "spir", "-O2", "-emit-llvm", "-S", "-Xclang", "-finclude-default-header", "-cl-kernel-arg-info", "-D__OPENCL_VERSION__=120"]
+    let mut args: Vec<String> = ["-x", "cl", "-cl-std=CL1.2", "-target", "spir", "-O2", "-emit-llvm", "-S", "-Xclang", "-finclude-default-header", "-Xclang", EXTENSIONS, "-cl-kernel-arg-info", "-D__OPENCL_VERSION__=120"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -138,7 +152,7 @@ pub fn compile(cc: &Compiler, source: &str, options: &str, headers: &[(String, V
         }
         std::fs::write(&path, text).map_err(|e| e.to_string())?;
     }
-    let mut args: Vec<String> = ["-x", "cl", "-cl-std=CL1.2", "-target", "spir", "-O2", "-Xclang", "-disable-llvm-passes", "-c", "-emit-llvm"]
+    let mut args: Vec<String> = ["-x", "cl", "-cl-std=CL1.2", "-target", "spir", "-O2", "-Xclang", "-disable-llvm-passes", "-Xclang", EXTENSIONS, "-c", "-emit-llvm"]
         .iter()
         .chain(&["-Xclang", "-finclude-default-header", "-cl-kernel-arg-info", "-D__OPENCL_VERSION__=120"])
         .map(|s| s.to_string())
@@ -284,17 +298,19 @@ __WENV_V(char) __WENV_V(uchar) __WENV_V(short) __WENV_V(ushort) __WENV_V(int) __
 #endif
 ";
 
-/// clang's arguments including `EXTRA_BUILTINS` (written into `dir`).
+/// clang's arguments including `EXTRA_BUILTINS` and `double_vector_loops` (written
+/// into `dir`).
 fn extra_builtins(dir: &Scratch) -> Result<Vec<String>, String> {
     let path = dir.0.join("wasm-env-builtins.h");
-    std::fs::write(&path, EXTRA_BUILTINS).map_err(|e| e.to_string())?;
+    std::fs::write(&path, format!("{EXTRA_BUILTINS}{}", double_vector_loops())).map_err(|e| e.to_string())?;
     Ok(vec!["-include".into(), path.display().to_string()])
 }
 
 // --- Images -------------------------------------------------------------------
 //
-// An image is a buffer: a header (its size, pitches and format), then its
-// pixels (see images.cl and packages/opencl/icd.c). A kernel compiled for
+// An image is a buffer of its pixels; its header (its size, pitches and
+// format) comes with the image argument, in the argument block (see
+// images.cl, wgsl.rs and packages/opencl/icd.c). A kernel compiled for
 // spir has image and sampler handles (`target("spirv.Image", ...)`,
 // `target("spirv.Sampler")`) and calls the image builtins, which nothing
 // defines. A program that uses them is compiled again: its handles become a
@@ -418,6 +434,33 @@ fn with_images(cc: &Compiler, ir: String) -> Res<String> {
 }
 
 #[cfg(test)]
+mod extension_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_devices_extensions_are_defined() {
+        // A program sees the macros of the extensions the device has, and
+        // not those of others (cl_intel_subgroups: dlprim's test).
+        let src = "#if !defined(cl_khr_fp64) || !defined(cl_khr_fp16) || !defined(cl_khr_global_int32_base_atomics)\n#error missing\n#endif\n\
+                   #if defined(cl_intel_subgroups) || defined(cl_khr_subgroups) || defined(cl_khr_int64_base_atomics)\n#error extra\n#endif\n\
+                   __kernel void k(__global int *p) { p[0] = 1; }";
+        clang_ir(&test_clang(), src, "", None).unwrap();
+    }
+
+    #[test]
+    fn a_built_programs_ir_builds_again() {
+        // Its binary (clGetProgramInfo) is its IR: built again without the
+        // options it was built with (a -D the source needs), as dlprim does.
+        let src = "__kernel void k(__global int *p) { p[get_global_id(0)] = SCALE * 2; }";
+        let (m, ir) = build_with_ir(&test_clang(), src, "-DSCALE=3", None).unwrap();
+        let again = from_bitcode(&test_clang(), ir.as_bytes()).unwrap();
+        let kernels = |m: &Module| m.functions.iter().filter(|f| f.kernel).map(|f| f.name.clone()).collect::<Vec<_>>();
+        assert_eq!(kernels(&again), kernels(&m));
+        assert_eq!(kernels(&again), ["k"]);
+    }
+}
+
+#[cfg(test)]
 mod image_tests {
     use super::*;
 
@@ -451,7 +494,146 @@ mod image_tests {
         let ir = clang_ir(&test_clang(), &src, "", None).unwrap();
         assert!(!ir.contains("spirv."), "image handles left");
         for line in ir.lines().filter(|l| l.starts_with("declare")) {
-            assert!(!line.contains("image") && !line.contains("sampler"), "unresolved: {line}");
+            assert!(line.contains("__wenv_image_header") || (!line.contains("image") && !line.contains("sampler")), "unresolved: {line}");
         }
+        // And each translates (the headers' words read from the block).
+        let m = build(&test_clang(), &src, "", None).unwrap();
+        let launch = crate::wgsl::Launch { local: [1, 1, 1], local_bytes: vec![], ..Default::default() };
+        for n in ["image1d", "image1d_array", "image2d", "image2d_array", "image3d"] {
+            crate::wgsl::compile(&m, &format!("k_{n}"), &launch, Default::default()).unwrap_or_else(|e| panic!("k_{n}: {e}"));
+        }
+    }
+}
+
+/// Double-precision math builtins (software doubles, see f64.rs: libclc's
+/// functions, each hundreds of operations) on vectors, as a loop over the
+/// lanes: one copy of the function in the kernel rather than one per lane.
+/// GPU drivers inline every function call (Mesa does), so it takes a loop
+/// to keep a double16 `sin` from being sixteen `sin`s, which lavapipe takes
+/// minutes to compile. A macro per builtin calls an overload that loops
+/// for double vectors and calls the builtin itself for everything else.
+fn double_vector_loops() -> String {
+    const UNARY: &[&str] = &[
+        "acos", "acosh", "acospi", "asin", "asinh", "asinpi", "atan", "atanh", "atanpi", "cbrt", "cos", "cosh", "cospi", "erf", "erfc", "exp", "exp2",
+        "exp10", "expm1", "lgamma", "log", "log10", "log1p", "log2", "logb", "rsqrt", "sin", "sinh", "sinpi", "sqrt", "tan", "tanh", "tanpi", "tgamma",
+    ];
+    const BINARY: &[&str] = &["atan2", "atan2pi", "fmod", "hypot", "pow", "powr", "remainder"];
+    // (With an int second argument.)
+    const INT: &[&str] = &["pown", "rootn"];
+    const TERNARY: &[&str] = &["fma"];
+    let widths = ["2", "3", "4", "8", "16"];
+    let others: Vec<String> = ["float", "half"].iter().flat_map(|t| std::iter::once(t.to_string()).chain(widths.iter().map(move |n| format!("{t}{n}")))).chain(["double".to_string()]).collect();
+    let mut s = String::from(
+        "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n\
+         #if __OPENCL_C_VERSION__ >= 120\n#define __WENV_F static __attribute__((overloadable, always_inline))\n\
+         #else\n#define __WENV_F __attribute__((overloadable, always_inline))\n#endif\n",
+    );
+    // An argument's lane k: vectors as arrays in private memory.
+    let lane = |v: &str, t: &str| format!("((const {t} *)&{v})[k]");
+    for (names, arity) in [(UNARY, 1), (BINARY, 2), (INT, 0), (TERNARY, 3)] {
+        for f in names {
+            let params = |t: &str, i: &str| match arity {
+                1 => format!("{t} x"),
+                2 => format!("{t} x, {t} y"),
+                3 => format!("{t} x, {t} y, {t} z"),
+                _ => format!("{t} x, {i} y"),
+            };
+            let args = match arity {
+                1 => "x",
+                2 => "x, y",
+                3 => "x, y, z",
+                _ => "x, y",
+            };
+            for t in &others {
+                let i = t.replace("float", "int").replace("half", "int").replace("double", "int");
+                s.push_str(&format!("__WENV_F {t} __wenv_{f}({}) {{ return ({f})({args}); }}\n", params(t, &i)));
+            }
+            for n in widths {
+                let t = format!("double{n}");
+                let i = format!("int{n}");
+                let call = match arity {
+                    1 => format!("({f})({})", lane("x", "double")),
+                    2 => format!("({f})({}, {})", lane("x", "double"), lane("y", "double")),
+                    3 => format!("({f})({}, {}, {})", lane("x", "double"), lane("y", "double"), lane("z", "double")),
+                    _ => format!("({f})({}, {})", lane("x", "double"), lane("y", "int")),
+                };
+                s.push_str(&format!(
+                    "__WENV_F {t} __wenv_{f}({}) {{ {t} r; __attribute__((opencl_unroll_hint(1))) for (int k = 0; k < {n}; k++) ((double *)&r)[k] = {call}; return r; }}\n",
+                    params(&t, &i)
+                ));
+            }
+            let ps = match arity {
+                1 => "x",
+                2 | 0 => "x, y",
+                _ => "x, y, z",
+            };
+            s.push_str(&format!("#define {f}({ps}) __wenv_{f}({ps})\n"));
+        }
+    }
+    // With a pointer for a second result, in any address space: lgamma_r's
+    // sign, sincos's cosine, remquo's quotient bits.
+    for (f, int_result, binary) in [("lgamma_r", true, false), ("sincos", false, false), ("remquo", true, true)] {
+        for space in ["__global", "__local", "__private"] {
+            let params = |t: &str, p: &str| if binary { format!("{t} x, {t} y, {space} {p} *q") } else { format!("{t} x, {space} {p} *q") };
+            let args = if binary { "x, y, q" } else { "x, q" };
+            for t in &others {
+                let i = t.replace("float", "int").replace("half", "int").replace("double", "int");
+                let p = if int_result { i } else { t.clone() };
+                s.push_str(&format!("__WENV_F {t} __wenv_{f}({}) {{ return ({f})({args}); }}\n", params(t, &p)));
+            }
+            for n in widths {
+                let t = format!("double{n}");
+                let (p, pe) = if int_result { (format!("int{n}"), "int") } else { (t.clone(), "double") };
+                let y = if binary { format!(", {}", lane("y", "double")) } else { String::new() };
+                s.push_str(&format!(
+                    "__WENV_F {t} __wenv_{f}({}) {{ {t} r; __attribute__((opencl_unroll_hint(1))) for (int k = 0; k < {n}; k++) {{ {pe} e; ((double *)&r)[k] = ({f})({}{y}, &e); (({space} {pe} *)q)[k] = e; }} return r; }}\n",
+                    params(&t, &p),
+                    lane("x", "double")
+                ));
+            }
+        }
+        let ps = if binary { "x, y, q" } else { "x, q" };
+        s.push_str(&format!("#define {f}({ps}) __wenv_{f}({ps})\n"));
+    }
+    s
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    #[test]
+    fn the_loops_build_for_opencl_c_1_1() {
+        // (Which has no `static`: the header's functions are plain there.)
+        let src = "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n__kernel void k(__global double4 *p) { p[0] = sin(p[1]); }";
+        build(&test_clang(), src, "-cl-std=CL1.1", None).unwrap();
+    }
+
+    #[test]
+    fn double_vector_math_is_a_loop() {
+        // One copy of each function, in a loop over the lanes: including those
+        // with a second result through a pointer, in each address space.
+        let src = "#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+__kernel void k(__global double16 *o, __global int16 *s, __global double8 *c, __local int4 *q) {
+    o[0] = sin(o[1]);
+    o[2] = lgamma_r(o[3], s);
+    double8 cv; c[0] = sincos(c[1], &cv); c[2] = cv;
+    ((__global double4 *)o)[20] = remquo(((__global double4 *)o)[21], ((__global double4 *)o)[22], q);
+    s[1].s0123 = q[0];
+}";
+        let ir = clang_ir(&test_clang(), src, "", None).unwrap();
+        let loops = ir.lines().filter(|l| l.contains("!llvm.loop")).count();
+        assert!(loops >= 4, "{loops} loops");
+        // About as large as the same on scalars (with the lanes, it would be
+        // many times larger).
+        let scalars = clang_ir(
+            &test_clang(),
+            "#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+__kernel void k(__global double *o, __global int *s, __local int *q) { double c; o[0] = sin(o[1]); o[2] = lgamma_r(o[3], s); o[4] = sincos(o[5], &c); o[6] = c; o[7] = remquo(o[8], o[9], q); s[1] = q[0]; }",
+            "",
+            None,
+        )
+        .unwrap();
+        assert!(ir.len() < 2 * scalars.len(), "{} bytes of IR, {} for scalars", ir.len(), scalars.len());
     }
 }

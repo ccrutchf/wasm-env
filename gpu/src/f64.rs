@@ -420,6 +420,23 @@ pub(crate) const LIBRARY: &[(&str, &[&str], &str)] = &[
     if ((mode == 3u || (mode == 1u && !neg)) && f64_lt(a, d)) { return f32_next(r, false); }
     return r;
 }"),
+    // A float fma rounded once, for a device whose fma isn't fused
+    // (Quirks::unfused_fma): the product is a double exactly, and so is the
+    // sum's error (Knuth's two-sum); the sum, rounded to odd (toward zero,
+    // with its last bit set where it isn't exact), keeps 29 more bits than
+    // a float, and rounds to the float the exact sum does.
+    ("fma_exact", &["f64_mul", "f64_add", "f64_sub", "f64_from_f32", "f64_to_f32", "f64_is_zero", "f64_is_nan", "f64_is_inf", "f64_next"], "fn fma_exact(a: f32, b: f32, c: f32) -> f32 {
+    let p = f64_mul(f64_from_f32(a), f64_from_f32(b));
+    let z = f64_from_f32(c);
+    let r = f64_add(p, z);
+    let zr = f64_sub(r, p);
+    let e = f64_add(f64_sub(p, f64_sub(r, zr)), f64_sub(z, zr));
+    if (f64_is_zero(e) || f64_is_nan(e) || f64_is_inf(r)) { return f64_to_f32(r); }
+    let neg = (r.y >> 31u) != 0u;
+    var t = select(r, f64_next(r, neg), ((e.y >> 31u) != 0u) != neg);
+    t.x |= 1u;
+    return f64_to_f32(t);
+}"),
     // An integer's double (x a long, or an unsigned long), likewise. (A
     // double from a long is an integer: compared as one, unless it's out
     // of the long's range.)
@@ -453,7 +470,8 @@ pub(crate) const LIBRARY: &[(&str, &[&str], &str)] = &[
     let s = (u >> 16u) & 0x8000u;
     let e = i32((u >> 23u) & 0xffu);
     let m = u & 0x7fffffu;
-    if (e == 0xff) { return s | 0x7c00u | select(0u, 0x200u | (m >> 13u), m != 0u); }
+    // (A NaN keeps its payload and whether it signals: f16_to_f32 made it.)
+    if (e == 0xff) { return s | 0x7c00u | select(0u, max(m >> 13u, 1u), m != 0u); }
     // The value is full * 2^(e - 150); a half's last bit is 2^(e - 137) for a
     // normal one, at least 2^-24: d bits to drop.
     let full = m | select(0u, 0x800000u, e != 0);
@@ -468,16 +486,51 @@ pub(crate) const LIBRARY: &[(&str, &[&str], &str)] = &[
     let r = select(q, (field << 10u) + q, d == 13i);
     return s | min(r, 0x7c00u);
 }"),
-    ("f16_round", &["f32_to_f16"], "fn f16_round(f: f32) -> f32 { return unpack2x16float(f32_to_f16(f)).x; }"),
+    ("f16_round", &["f32_to_f16", "f16_to_f32"], "fn f16_round(f: f32) -> f32 { return f16_to_f32(f32_to_f16(f)); }"),
+    // A half's float (its value; a NaN's payload, signaling or not, which
+    // unpack2x16float would quiet: copying halves keeps their bits).
+    ("f16_to_f32", &[], "fn f16_to_f32(h: u32) -> f32 {
+    if ((h & 0x7c00u) == 0x7c00u && (h & 0x3ffu) != 0u) {
+        return bitcast<f32>(((h & 0x8000u) << 16u) | 0x7f800000u | ((h & 0x3ffu) << 13u));
+    }
+    return unpack2x16float(h & 0xffffu).x;
+}"),
+    // A double rounded to half precision once (a half value, held as a float):
+    // to a float toward zero with the last bit set if anything was dropped
+    // (round to odd), which then rounds to half as the double would.
+    ("f64_to_f16", &["f64_to_f32_dir", "f64_from_f32", "f64_eq", "f64_is_nan", "f32_to_f16", "f16_to_f32"], "fn f64_to_f16(a: vec2<u32>) -> f32 {
+    let t = f64_to_f32_dir(a, 1u);
+    if (f64_is_nan(a)) { return t; }
+    let odd = select(t, bitcast<f32>(bitcast<u32>(t) | 1u), !f64_eq(f64_from_f32(t), a));
+    return f16_to_f32(f32_to_f16(odd));
+}"),
+    // Likewise in a rounding mode (1 toward zero, 2 up, 3 down): to nearest,
+    // then a step where that went the wrong way (as f16_round_dir).
+    ("f64_to_f16_dir", &["f64_to_f16", "f64_from_f32", "f64_lt", "f64_is_nan", "f32_to_f16", "f16_to_f32"], "fn f64_to_f16_dir(a: vec2<u32>, mode: u32) -> f32 {
+    let r = f64_to_f16(a);
+    if (f64_is_nan(a)) { return r; }
+    var h = f32_to_f16(r);
+    let d = f64_from_f32(r);
+    let neg = (a.y >> 31u) != 0u;
+    let up = (mode == 2u || (mode == 1u && neg)) && f64_lt(d, a);
+    let down = (mode == 3u || (mode == 1u && !neg)) && f64_lt(a, d);
+    if (up || down) {
+        if ((h & 0x7fffu) == 0u) { h = select(0x8001u, 1u, up); }
+        else if (up != neg) { h += 1u; } else { h -= 1u; }
+    }
+    return f16_to_f32(h);
+}"),
     ("f16_round2", &["f16_round"], "fn f16_round2(v: vec2<f32>) -> vec2<f32> { return vec2<f32>(f16_round(v.x), f16_round(v.y)); }"),
     ("f16_round3", &["f16_round"], "fn f16_round3(v: vec3<f32>) -> vec3<f32> { return vec3<f32>(f16_round(v.x), f16_round(v.y), f16_round(v.z)); }"),
     ("f16_round4", &["f16_round"], "fn f16_round4(v: vec4<f32>) -> vec4<f32> { return vec4<f32>(f16_round(v.x), f16_round(v.y), f16_round(v.z), f16_round(v.w)); }"),
+    ("f16_round8", &["f16_round"], "fn f16_round8(v: array<f32, 8>) -> array<f32, 8> { var r = v; for (var k = 0u; k < 8u; k++) { r[k] = f16_round(r[k]); } return r; }"),
+    ("f16_round16", &["f16_round"], "fn f16_round16(v: array<f32, 16>) -> array<f32, 16> { var r = v; for (var k = 0u; k < 16u; k++) { r[k] = f16_round(r[k]); } return r; }"),
     // Rounded otherwise than to nearest (mode 1 toward zero, 2 up, 3 down),
     // as an exact half: to nearest, then a step where that went the wrong
     // way.
-    ("f16_round_dir", &["f32_to_f16"], "fn f16_round_dir(f: f32, mode: u32) -> f32 {
+    ("f16_round_dir", &["f32_to_f16", "f16_to_f32"], "fn f16_round_dir(f: f32, mode: u32) -> f32 {
     var h = f32_to_f16(f);
-    let r = unpack2x16float(h).x;
+    let r = f16_to_f32(h);
     if ((h & 0x7c00u) == 0x7c00u && (h & 0x3ffu) != 0u) { return r; }
     let neg = (h & 0x8000u) != 0u;
     let up = (mode == 2u || (mode == 1u && neg)) && r < f;
@@ -487,7 +540,7 @@ pub(crate) const LIBRARY: &[(&str, &[&str], &str)] = &[
         if ((h & 0x7fffu) == 0u) { h = select(0x8001u, 1u, up); }
         else if (up != neg) { h += 1u; } else { h -= 1u; }
     }
-    return unpack2x16float(h).x;
+    return f16_to_f32(h);
 }"),
 ];
 

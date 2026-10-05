@@ -1442,7 +1442,7 @@ impl<'a> FuncGen<'a> {
             self.emit(I::GlobalGet(self.ctx.state));
             return self.define(dest, ty);
         }
-        let p = p.split(" seq_cst").next().unwrap().trim();
+        let p = without_ordering(p).trim();
         let offset = self.address(p)?;
         let a = if atomic { ty.bits().max(8).trailing_zeros() - 3 } else { 0 };
         let m = MemArg { offset, align: a, memory_index: 0 };
@@ -1469,7 +1469,7 @@ impl<'a> FuncGen<'a> {
         let args = args.trim_start_matches("atomic ").trim_start_matches("volatile ");
         let parts = split_top(args);
         let (Some(v), Some(p)) = (parts.first(), parts.get(1)) else { unsupported!("store") };
-        let p = p.split(" seq_cst").next().unwrap().trim();
+        let p = without_ordering(p).trim();
         if p.contains("addrspace") {
             unsupported!("store to {p}");
         }
@@ -2224,7 +2224,7 @@ impl<'a> FuncGen<'a> {
         // cmpxchg ptr %p, T %expected, T %new seq_cst seq_cst
         let parts = split_top(args);
         let [p, e, n] = parts.as_slice() else { unsupported!("cmpxchg") };
-        let n = n.trim().split(" seq_cst").next().unwrap();
+        let n = without_ordering(n.trim());
         self.typed(p)?;
         let ty = self.typed(e)?;
         let expected = self.new_local(ty.val());
@@ -2257,7 +2257,7 @@ impl<'a> FuncGen<'a> {
         let (op, rest) = args.split_once(' ').ok_or("atomicrmw")?;
         let parts = split_top(rest);
         let [p, v] = parts.as_slice() else { unsupported!("atomicrmw") };
-        let v = v.trim().split(" seq_cst").next().unwrap();
+        let v = without_ordering(v.trim());
         self.typed(p)?;
         let ty = self.typed(v)?;
         let m = Self::memarg(ty.bits().max(8).trailing_zeros() - 3);
@@ -2461,6 +2461,14 @@ fn uleb(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
+/// An atomic access's last operand without its memory ordering (`ptr %p
+/// monotonic`, `i64 %v seq_cst`): WebAssembly's atomics are all
+/// sequentially consistent. (Left on, it read as part of the value's name,
+/// a new local holding 0.)
+fn without_ordering(s: &str) -> &str {
+    [" syncscope(", " seq_cst", " acq_rel", " acquire", " release", " monotonic", " unordered"].iter().filter_map(|o| s.find(o)).min().map_or(s, |at| &s[..at])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2588,6 +2596,14 @@ bad:
     }
 
     #[test]
+    fn atomic_operands_lose_their_ordering() {
+        assert_eq!(without_ordering("ptr %t7.ap monotonic"), "ptr %t7.ap");
+        assert_eq!(without_ordering("i64 %v seq_cst"), "i64 %v");
+        assert_eq!(without_ordering("i64 %new syncscope(\"singlethread\") acquire"), "i64 %new");
+        assert_eq!(without_ordering("ptr %p"), "ptr %p");
+    }
+
+    #[test]
     fn lays_out_aggregates_like_llvm() {
         let entry = Agg::parse("[4096 x { i64, ptr }]").unwrap();
         assert_eq!(entry.size(), 4096 * 16);
@@ -2595,3 +2611,4 @@ bad:
         assert_eq!(Agg::parse("[32 x i128]").unwrap().size(), 512);
     }
 }
+

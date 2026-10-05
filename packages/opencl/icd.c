@@ -34,6 +34,10 @@ int open(const char *, int, ...);
 int ioctl(int, unsigned long, ...);
 int close(int);
 int sched_yield(void);
+int snprintf(char *, size_t, const char *, ...);
+void *realloc(void *, size_t);
+size_t fwrite(const void *, size_t, size_t, void *);
+extern void *stdout;
 struct timespec {
     long tv_sec, tv_nsec;
 };
@@ -45,7 +49,7 @@ int clock_gettime(int, struct timespec *);
 #define API __attribute__((visibility("default")))
 #define GPU_CALL 0xc0805740u
 
-enum { INFO = 1, CREATE, FREE, WRITE, READ, COPY, FILL, BUILD, LOG, KERNELS, ARGS, RUN, FINISH, ATTRIBUTES, COMPILE, LINK, BINARY, LOAD };
+enum { INFO = 1, CREATE, FREE, WRITE, READ, COPY, FILL, BUILD, LOG, KERNELS, ARGS, RUN, FINISH, ATTRIBUTES, COMPILE, LINK, BINARY, LOAD, PRINTF };
 
 struct request {
     uint64_t op, a[9], r[6];
@@ -86,8 +90,8 @@ struct _cl_mem {
     cl_mem parent;
     void *host;
     cl_uint maps;
-    // An image's description (type 0: a buffer). Its buffer holds a header
-    // (see gpu/src/images.cl), then its pixels, packed: `size` covers both.
+    // An image's description (type 0: a buffer). Its buffer holds its
+    // pixels, packed; kernels get its header with it (see SetKernelArg).
     struct image {
         cl_mem_object_type type;
         cl_image_format format;
@@ -274,6 +278,16 @@ static cl_int done(cl_command_queue q, cl_command_type type, cl_event *ev) {
 
 // ---- Commands ----
 
+// A command on a queue that records profiling times is waited for, so its
+// end time is when the device finished it (a launch only queues the work:
+// timing that would be timing the submission).
+static void profiled(cl_command_queue q) {
+    if (q && (q->props & CL_QUEUE_PROFILING_ENABLE)) {
+        struct request f = {FINISH};
+        call(&f);
+    }
+}
+
 // A command runs as it's enqueued, unless an event in its wait list isn't
 // done yet (a user event's, or a command's still waiting) or its queue has
 // commands waiting (queues run in order): then it waits, its event queued,
@@ -444,6 +458,8 @@ static void drain(void) {
             beginning = 1;
             cl_ulong start = now();
             cl_int e = c->run(c);
+            if (e == CL_SUCCESS)
+                profiled(c->q);
             c->ev->began = beginning ? start : began;
             c->ev->ended = now();
             beginning = 1;
@@ -508,6 +524,8 @@ static cl_int submit(cl_command_queue q, cl_command_type type, struct command *c
     }
     e = c->run(c);
     drop(c);
+    if (e == CL_SUCCESS)
+        profiled(q);
     if (e != CL_SUCCESS) {
         beginning = 1;
         return e;
@@ -574,7 +592,7 @@ static cl_int GetDeviceIDs(cl_platform_id p, cl_device_type type, cl_uint n, cl_
 }
 
 static const char extensions[] = "cl_khr_global_int32_base_atomics cl_khr_global_int32_extended_atomics cl_khr_local_int32_base_atomics "
-                                 "cl_khr_local_int32_extended_atomics cl_khr_byte_addressable_store cl_khr_fp64 cl_khr_fp16";
+                                 "cl_khr_local_int32_extended_atomics cl_khr_byte_addressable_store cl_khr_fp64 cl_khr_fp16 cl_khr_3d_image_writes";
 
 static cl_int GetDeviceInfo(cl_device_id dev, cl_device_info what, size_t cap, void *out, size_t *size_ret) {
     if (dev != &device)
@@ -622,10 +640,12 @@ static cl_int GetDeviceInfo(cl_device_id dev, cl_device_info what, size_t cap, v
         INFO_OF(cl_ulong, desc.global_mem);
     case CL_DEVICE_IMAGE_SUPPORT:
         INFO_OF(cl_bool, CL_TRUE);
+    // (Each image a buffer binding: as many as the device has, which may be
+    // fewer than OpenCL's 128, lavapipe's 47 for one.)
     case CL_DEVICE_MAX_READ_IMAGE_ARGS:
-        INFO_OF(cl_uint, 128);
+        INFO_OF(cl_uint, desc.max_buffers < 128 ? desc.max_buffers : 128);
     case CL_DEVICE_MAX_WRITE_IMAGE_ARGS:
-        INFO_OF(cl_uint, 64);
+        INFO_OF(cl_uint, desc.max_buffers < 64 ? desc.max_buffers : 64);
     case CL_DEVICE_MAX_SAMPLERS:
         INFO_OF(cl_uint, 16);
     case CL_DEVICE_IMAGE2D_MAX_WIDTH:
@@ -653,7 +673,7 @@ static cl_int GetDeviceInfo(cl_device_id dev, cl_device_info what, size_t cap, v
     case CL_DEVICE_REFERENCE_COUNT - 0:
         INFO_OF(cl_uint, what == CL_DEVICE_REFERENCE_COUNT ? 1 : 0);
     case CL_DEVICE_PRINTF_BUFFER_SIZE:
-        INFO_OF(size_t, 0);
+        INFO_OF(size_t, 1 << 20); // (gpu/src/device.rs, PRINTF_BYTES)
     case CL_DEVICE_MAX_PARAMETER_SIZE:
         INFO_OF(size_t, 1024);
     case CL_DEVICE_MEM_BASE_ADDR_ALIGN:
@@ -961,7 +981,7 @@ static cl_mem CreateSubBuffer(cl_mem parent, cl_mem_flags flags, cl_buffer_creat
             f |= parent->flags & access;
         if (!(flags & hostaccess))
             f |= parent->flags & hostaccess;
-        *m = (struct _cl_mem){&dispatch, 1, parent->ctx, f, region->size, region->origin, 0, parent};
+        *m = (struct _cl_mem){&dispatch, 1, parent->ctx, f, region->size, parent->offset + region->origin, 0, parent};
         if (parent->host)
             m->host = (char *)parent->host + region->origin;
         retain(&parent->refs);
@@ -1036,17 +1056,17 @@ static cl_int GetMemObjectInfo(cl_mem m, cl_mem_info what, size_t cap, void *out
     case CL_MEM_ASSOCIATED_MEMOBJECT:
         INFO_OF(cl_mem, m->parent);
     case CL_MEM_OFFSET:
-        INFO_OF(size_t, m->offset);
+        INFO_OF(size_t, m->parent && !m->image.type ? m->offset - m->parent->offset : 0);
     }
     return CL_INVALID_VALUE;
 }
 
 // ---- Images ----
 //
-// An image is a buffer: a header of 16 words (its extent, pitches and
-// format, which the kernel's image builtins read: gpu/src/images.cl), then
-// its pixels, packed. Its handle is a kernel's image argument, as a
-// buffer's is.
+// An image is a buffer of its pixels, packed. A kernel's image argument is
+// its handle, as a buffer's is, then its header: 16 words (its extent,
+// pitches and format, which the kernel's image builtins read:
+// gpu/src/images.cl) in the argument block (see SetKernelArg).
 
 #define IMAGE_HEADER 64
 
@@ -1134,23 +1154,82 @@ static cl_int GetSupportedImageFormats(cl_context c, cl_mem_flags flags, cl_mem_
     if (!image_type(type) && type != CL_MEM_OBJECT_IMAGE1D_BUFFER)
         return CL_INVALID_VALUE;
     cl_uint k = 0;
-    // (Not yet: images made from buffers.)
-    if (type != CL_MEM_OBJECT_IMAGE1D_BUFFER)
-        for (size_t o = 0; o < sizeof orders / sizeof *orders; o++)
-            for (size_t t = 0; t < sizeof types / sizeof *types; t++) {
-                cl_image_format f = {orders[o], types[t]};
-                if (!image_format(&f))
-                    continue;
-                if (k < n)
-                    formats[k] = f;
-                k++;
-            }
+    for (size_t o = 0; o < sizeof orders / sizeof *orders; o++)
+        for (size_t t = 0; t < sizeof types / sizeof *types; t++) {
+            cl_image_format f = {orders[o], types[t]};
+            if (!image_format(&f))
+                continue;
+            if (k < n)
+                formats[k] = f;
+            k++;
+        }
     if (count)
         *count = k;
     return CL_SUCCESS;
 }
 
+// An image's header, as its kernel arguments carry it (see images.cl).
+static void image_header(cl_mem m, uint32_t h[IMAGE_HEADER / 4]) {
+    const struct image *im = &m->image;
+    cl_mem_object_type t = im->type;
+    memset(h, 0, IMAGE_HEADER);
+    h[0] = (uint32_t)im->width;
+    h[1] = (uint32_t)im->height;
+    h[2] = (uint32_t)im->depth;
+    h[3] = t == CL_MEM_OBJECT_IMAGE1D_ARRAY || t == CL_MEM_OBJECT_IMAGE2D_ARRAY ? (uint32_t)im->layers : 0;
+    h[4] = (uint32_t)im->row;
+    h[5] = (uint32_t)im->slice;
+    h[6] = im->format.image_channel_order;
+    h[7] = im->format.image_channel_data_type;
+    h[8] = (uint32_t)im->elem;
+    h[9] = (uint32_t)order_channels(im->format.image_channel_order);
+}
+
+// An image made from a buffer (CL_MEM_OBJECT_IMAGE1D_BUFFER): its pixels are
+// the buffer's data.
+static cl_mem image_from_buffer(cl_context c, cl_mem_flags flags, const cl_image_format *format, const cl_image_desc *d, cl_int *err) {
+    cl_mem b = d->buffer;
+    size_t elem = image_format(format), w = d->image_width;
+    cl_int e = CL_SUCCESS;
+    if (!b || b->image.type || b->ctx != c)
+        e = CL_INVALID_IMAGE_DESCRIPTOR;
+    else if (!order_channels(format->image_channel_order) || !(type_size(format->image_channel_data_type) || format->image_channel_order == CL_RGB))
+        e = CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
+    else if (!elem)
+        e = CL_IMAGE_FORMAT_NOT_SUPPORTED;
+    else if (flags & (CL_MEM_USE_HOST_PTR | CL_MEM_ALLOC_HOST_PTR | CL_MEM_COPY_HOST_PTR))
+        e = CL_INVALID_VALUE;
+    else if (!w || w > 65536 || w * elem > b->size)
+        e = CL_INVALID_IMAGE_SIZE;
+    // (A row pitch may be given: one row, as long as the buffer has it.)
+    else if ((d->image_row_pitch && (d->image_row_pitch < w * elem || d->image_row_pitch > b->size)) || d->image_slice_pitch)
+        e = CL_INVALID_IMAGE_DESCRIPTOR;
+    cl_mem m = e == CL_SUCCESS ? calloc(1, sizeof *m) : NULL;
+    if (m) {
+        // Access and host flags unspecified are the buffer's.
+        const cl_mem_flags access = CL_MEM_READ_WRITE | CL_MEM_WRITE_ONLY | CL_MEM_READ_ONLY;
+        const cl_mem_flags hostaccess = CL_MEM_HOST_WRITE_ONLY | CL_MEM_HOST_READ_ONLY | CL_MEM_HOST_NO_ACCESS;
+        cl_mem_flags f = flags;
+        if (!(flags & access))
+            f |= b->flags & access;
+        if (!(flags & hostaccess))
+            f |= b->flags & hostaccess;
+        *m = (struct _cl_mem){&dispatch, 1, c, f, w * elem, b->offset, 0, b};
+        m->host = b->host;
+        m->image = (struct image){CL_MEM_OBJECT_IMAGE1D_BUFFER, *format, w, 1, 1, 1, elem, w * elem, w * elem, w * elem, w * elem};
+        retain(&b->refs);
+        retain(&c->refs);
+    } else if (e == CL_SUCCESS) {
+        e = CL_OUT_OF_HOST_MEMORY;
+    }
+    if (err)
+        *err = e;
+    return m;
+}
+
 static cl_mem CreateImage(cl_context c, cl_mem_flags flags, const cl_image_format *format, const cl_image_desc *desc_, void *host, cl_int *err) {
+    if (c && format && desc_ && desc_->image_type == CL_MEM_OBJECT_IMAGE1D_BUFFER && !desc_->num_mip_levels && !desc_->num_samples)
+        return image_from_buffer(c, flags, format, desc_, err);
     cl_int e = CL_SUCCESS;
     size_t elem = format ? image_format(format) : 0;
     int wants_host = (flags & (CL_MEM_USE_HOST_PTR | CL_MEM_COPY_HOST_PTR)) != 0;
@@ -1164,7 +1243,7 @@ static cl_mem CreateImage(cl_context c, cl_mem_flags flags, const cl_image_forma
         e = CL_INVALID_IMAGE_DESCRIPTOR;
     else if (!order_channels(format->image_channel_order) || !(type_size(format->image_channel_data_type) || format->image_channel_order == CL_RGB))
         e = CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
-    else if (!elem || t == CL_MEM_OBJECT_IMAGE1D_BUFFER)
+    else if (!elem)
         e = CL_IMAGE_FORMAT_NOT_SUPPORTED;
     else if (wants_host != (host != NULL))
         e = CL_INVALID_HOST_PTR;
@@ -1192,11 +1271,11 @@ static cl_mem CreateImage(cl_context c, cl_mem_flags flags, const cl_image_forma
             e = CL_INVALID_IMAGE_DESCRIPTOR;
     }
     size_t planes = depth * layers, data = slice * planes;
-    if (e == CL_SUCCESS && data + IMAGE_HEADER > desc.max_alloc)
+    if (e == CL_SUCCESS && data > desc.max_alloc)
         e = CL_INVALID_IMAGE_SIZE;
     cl_mem m = NULL;
     if (e == CL_SUCCESS) {
-        struct request r = {CREATE, {data + IMAGE_HEADER}};
+        struct request r = {CREATE, {data}};
         e = call(&r);
         if (e == CL_SUCCESS && !(m = calloc(1, sizeof *m))) {
             struct request f = {FREE, {r.r[0]}};
@@ -1204,18 +1283,14 @@ static cl_mem CreateImage(cl_context c, cl_mem_flags flags, const cl_image_forma
             e = CL_OUT_OF_HOST_MEMORY;
         }
         if (m) {
-            *m = (struct _cl_mem){&dispatch, 1, c, flags ? flags : CL_MEM_READ_WRITE, data + IMAGE_HEADER, 0, r.r[0]};
+            *m = (struct _cl_mem){&dispatch, 1, c, flags ? flags : CL_MEM_READ_WRITE, data, 0, r.r[0]};
             m->host = flags & CL_MEM_USE_HOST_PTR ? host : NULL;
             m->image = (struct image){t, *format, w, h, depth, layers, elem, row, slice, host_row, host_slice};
             retain(&c->refs);
-            uint32_t header[16] = {(uint32_t)w,     (uint32_t)h,   (uint32_t)depth, t == CL_MEM_OBJECT_IMAGE1D_ARRAY || t == CL_MEM_OBJECT_IMAGE2D_ARRAY ? (uint32_t)layers : 0,
-                                   (uint32_t)row,   (uint32_t)slice, format->image_channel_order, format->image_channel_data_type,
-                                   (uint32_t)elem,  (uint32_t)order_channels(format->image_channel_order)};
-            e = write_mem(m, 0, sizeof header, header);
             // The host's pixels, row by row.
             for (size_t z = 0; e == CL_SUCCESS && host && z < planes; z++)
                 for (size_t y = 0; e == CL_SUCCESS && y < h; y++)
-                    e = write_mem(m, IMAGE_HEADER + z * slice + y * row, row, (const char *)host + z * host_slice + y * host_row);
+                    e = write_mem(m, z * slice + y * row, row, (const char *)host + z * host_slice + y * host_row);
             if (e != CL_SUCCESS) {
                 struct request f = {FREE, {m->handle}};
                 call(&f);
@@ -1254,17 +1329,17 @@ static cl_int GetImageInfo(cl_mem m, cl_image_info what, size_t cap, void *out, 
     case CL_IMAGE_ROW_PITCH:
         INFO_OF(size_t, im->row);
     case CL_IMAGE_SLICE_PITCH:
-        INFO_OF(size_t, t == CL_MEM_OBJECT_IMAGE1D || t == CL_MEM_OBJECT_IMAGE2D ? 0 : im->slice);
+        INFO_OF(size_t, t == CL_MEM_OBJECT_IMAGE1D || t == CL_MEM_OBJECT_IMAGE1D_BUFFER || t == CL_MEM_OBJECT_IMAGE2D ? 0 : im->slice);
     case CL_IMAGE_WIDTH:
         INFO_OF(size_t, im->width);
     case CL_IMAGE_HEIGHT:
-        INFO_OF(size_t, t == CL_MEM_OBJECT_IMAGE1D || t == CL_MEM_OBJECT_IMAGE1D_ARRAY ? 0 : im->height);
+        INFO_OF(size_t, t == CL_MEM_OBJECT_IMAGE1D || t == CL_MEM_OBJECT_IMAGE1D_BUFFER || t == CL_MEM_OBJECT_IMAGE1D_ARRAY ? 0 : im->height);
     case CL_IMAGE_DEPTH:
         INFO_OF(size_t, t == CL_MEM_OBJECT_IMAGE3D ? im->depth : 0);
     case CL_IMAGE_ARRAY_SIZE:
         INFO_OF(size_t, t == CL_MEM_OBJECT_IMAGE1D_ARRAY || t == CL_MEM_OBJECT_IMAGE2D_ARRAY ? im->layers : 0);
     case CL_IMAGE_BUFFER:
-        INFO_OF(cl_mem, NULL);
+        INFO_OF(cl_mem, t == CL_MEM_OBJECT_IMAGE1D_BUFFER ? m->parent : NULL);
     case CL_IMAGE_NUM_MIP_LEVELS:
     case CL_IMAGE_NUM_SAMPLES:
         INFO_OF(cl_uint, 0);
@@ -1283,6 +1358,7 @@ static cl_int image_region(cl_mem m, const size_t *origin, const size_t *region,
         o[k] = origin[k], r[k] = region[k];
     switch (im->type) {
     case CL_MEM_OBJECT_IMAGE1D:
+    case CL_MEM_OBJECT_IMAGE1D_BUFFER:
         if (o[1] || o[2] || r[1] != 1 || r[2] != 1)
             return CL_INVALID_VALUE;
         break;
@@ -1309,7 +1385,7 @@ static cl_int image_rect(cl_mem m, int writing, const size_t o[3], const size_t 
     size_t bytes = r[0] * im->elem;
     for (size_t z = 0; z < r[2]; z++)
         for (size_t y = 0; y < r[1]; y++) {
-            size_t b = IMAGE_HEADER + (o[2] + z) * im->slice + (o[1] + y) * im->row + o[0] * im->elem;
+            size_t b = (o[2] + z) * im->slice + (o[1] + y) * im->row + o[0] * im->elem;
             char *h = (char *)p + z * hslice + y * hrow;
             cl_int e = writing ? write_mem(m, b, bytes, h) : read_mem(m, b, bytes, h);
             if (e != CL_SUCCESS)
@@ -2313,7 +2389,8 @@ static cl_int GetProgramInfo(cl_program p, cl_program_info what, size_t cap, voi
     case CL_PROGRAM_BINARIES: {
         size_t len = p->len;
         char *bits = p->source;
-        int object = p->binary == CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT || p->binary == CL_PROGRAM_BINARY_TYPE_LIBRARY || p->prebuilt;
+        // (A program built from source: its executable, as for one linked.)
+        int object = p->binary == CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT || p->binary == CL_PROGRAM_BINARY_TYPE_LIBRARY || p->binary == CL_PROGRAM_BINARY_TYPE_EXECUTABLE || p->prebuilt;
         if (object && !(bits = object_binary(p, &len)))
             return CL_OUT_OF_RESOURCES;
         if (what == CL_PROGRAM_BINARY_SIZES) {
@@ -2486,6 +2563,19 @@ static cl_int ReleaseKernel(cl_kernel k) {
     return CL_SUCCESS;
 }
 
+// The image type of a kernel argument's type name (0: not an image).
+static cl_mem_object_type image_arg_type(const char *t) {
+    static const struct {
+        const char *name;
+        cl_mem_object_type type;
+    } kinds[] = {{"image1d_t", CL_MEM_OBJECT_IMAGE1D},   {"image1d_buffer_t", CL_MEM_OBJECT_IMAGE1D_BUFFER}, {"image1d_array_t", CL_MEM_OBJECT_IMAGE1D_ARRAY},
+                 {"image2d_t", CL_MEM_OBJECT_IMAGE2D},   {"image2d_array_t", CL_MEM_OBJECT_IMAGE2D_ARRAY},   {"image3d_t", CL_MEM_OBJECT_IMAGE3D}};
+    for (size_t k = 0; k < sizeof kinds / sizeof *kinds; k++)
+        if (!strcmp(t, kinds[k].name))
+            return kinds[k].type;
+    return 0;
+}
+
 static cl_int SetKernelArg(cl_kernel k, cl_uint i, size_t size, const void *value) {
     if (!k)
         return CL_INVALID_KERNEL;
@@ -2498,11 +2588,30 @@ static cl_int SetKernelArg(cl_kernel k, cl_uint i, size_t size, const void *valu
         if (size != sizeof(cl_mem))
             return CL_INVALID_ARG_SIZE;
         cl_mem m = value ? *(const cl_mem *)value : NULL;
+        // An image argument takes an image of its type, its access allowing
+        // the kernel's; a buffer argument, a buffer.
+        cl_mem_object_type want = image_arg_type(a->type);
+        if (want && (!m || m->image.type != want))
+            return CL_INVALID_MEM_OBJECT;
+        if (!want && m && m->image.type)
+            return CL_INVALID_MEM_OBJECT;
+        if (want) {
+            cl_uint access = a->qualifiers >> 16;
+            if ((access == CL_KERNEL_ARG_ACCESS_WRITE_ONLY && (m->flags & CL_MEM_READ_ONLY)) ||
+                (access == CL_KERNEL_ARG_ACCESS_READ_ONLY && (m->flags & CL_MEM_WRITE_ONLY)))
+                return CL_INVALID_ARG_VALUE;
+        }
         // A null buffer argument (allowed: the kernel may test for it, not
         // use it): 0xffffffff, which the kernel sees as a null pointer.
         k->handles[i] = m ? base_handle(m) : 0;
         uint32_t offset = m ? (uint32_t)base_offset(m) : 0xffffffffu;
         memcpy(k->block + a->offset, &offset, 4);
+        // (An image's header follows its handle.)
+        if (want) {
+            uint32_t h[IMAGE_HEADER / 4];
+            image_header(m, h);
+            memcpy(k->block + a->offset + 4, h, sizeof h);
+        }
         break;
     }
     case 2:
@@ -2604,6 +2713,205 @@ static cl_int GetKernelArgInfo(cl_kernel k, cl_uint i, cl_kernel_arg_info what, 
     return CL_INVALID_VALUE;
 }
 
+// ---- printf ----
+//
+// A kernel's printf output: the records the runtime gives (PRINTF, see
+// runtime/src/gpu.rs), formatted here by the program's C library, a
+// conversion at a time, and written to its stdout (after what the program
+// itself printed before the kernel ran, which stdio may still hold).
+
+struct text {
+    char *b;
+    size_t n, cap;
+};
+
+static void text_add(struct text *t, const char *s, size_t n) {
+    if (t->n + n + 1 > t->cap) {
+        size_t cap = (t->n + n + 1) * 2;
+        char *b = realloc(t->b, cap);
+        if (!b)
+            return;
+        t->b = b;
+        t->cap = cap;
+    }
+    memcpy(t->b + t->n, s, n);
+    t->n += n;
+}
+
+static uint32_t take_word(const uint8_t **p) {
+    uint32_t w;
+    memcpy(&w, *p, 4);
+    *p += 4;
+    return w;
+}
+
+struct printf_arg {
+    uint32_t kind, bytes, lanes;
+    const uint8_t *data; // a u64 per lane, or a string's bytes
+};
+
+// One conversion (spec: "%", flags, width and precision; conv: its letter;
+// bits: the length modifier's width, 0 if none) of one lane.
+static void printf_lane(struct text *t, const char *spec, char conv, unsigned bits, const struct printf_arg *a, uint32_t lane) {
+    char f[64], out[512];
+    uint64_t v = 0;
+    if (a->kind != 2)
+        memcpy(&v, a->data + lane * 8, 8);
+    int n = 0;
+    switch (conv) {
+    case 'd':
+    case 'i': {
+        unsigned w = bits ? bits : a->bytes * 8;
+        int64_t x = w >= 64 ? (int64_t)v : (int64_t)(v << (64 - w)) >> (64 - w);
+        snprintf(f, sizeof f, "%sll%c", spec, conv);
+        n = snprintf(out, sizeof out, f, (long long)x);
+        break;
+    }
+    case 'o':
+    case 'u':
+    case 'x':
+    case 'X': {
+        unsigned w = bits ? bits : a->bytes * 8;
+        uint64_t x = w >= 64 ? v : v & ((1ull << w) - 1);
+        snprintf(f, sizeof f, "%sll%c", spec, conv);
+        n = snprintf(out, sizeof out, f, (unsigned long long)x);
+        break;
+    }
+    case 'c':
+        snprintf(f, sizeof f, "%sc", spec);
+        n = snprintf(out, sizeof out, f, (int)v);
+        break;
+    case 's': {
+        // (The string: its length, then its bytes.)
+        uint32_t len;
+        memcpy(&len, a->data, 4);
+        char *str = malloc(len + 1);
+        if (!str)
+            return;
+        memcpy(str, a->data + 4, len);
+        str[len] = 0;
+        snprintf(f, sizeof f, "%ss", spec);
+        n = snprintf(out, sizeof out, f, str);
+        free(str);
+        break;
+    }
+    case 'p':
+        snprintf(f, sizeof f, "%sp", spec);
+        n = snprintf(out, sizeof out, f, (void *)(uintptr_t)v);
+        break;
+    default: {
+        double x;
+        if (a->kind == 1 && a->bytes == 4) {
+            float y;
+            uint32_t w = (uint32_t)v;
+            memcpy(&y, &w, 4);
+            x = y;
+        } else if (a->kind == 1) {
+            memcpy(&x, &v, 8);
+        } else {
+            x = (double)(int64_t)v;
+        }
+        snprintf(f, sizeof f, "%s%c", spec, conv);
+        n = snprintf(out, sizeof out, f, x);
+    }
+    }
+    if (n > 0)
+        text_add(t, out, (size_t)n < sizeof out ? (size_t)n : sizeof out - 1);
+}
+
+// One printf's output, from its format and arguments.
+static void printf_format(struct text *t, const char *fmt, uint32_t flen, const struct printf_arg *args, uint32_t nargs) {
+    uint32_t next = 0;
+    for (uint32_t i = 0; i < flen; i++) {
+        if (fmt[i] != '%') {
+            text_add(t, fmt + i, 1);
+            continue;
+        }
+        if (i + 1 < flen && fmt[i + 1] == '%') {
+            text_add(t, "%", 1);
+            i++;
+            continue;
+        }
+        char spec[48] = "%";
+        size_t sn = 1;
+        i++;
+        // Flags, width and precision go to the C library as they are.
+        while (i < flen && strchr("-+ #0123456789.", fmt[i]) && sn < sizeof spec - 1)
+            spec[sn++] = fmt[i++];
+        spec[sn] = 0;
+        // A vector's lanes (vN), then the length (hh, h, hl, l).
+        uint32_t lanes = 1;
+        if (i < flen && fmt[i] == 'v') {
+            lanes = 0;
+            for (i++; i < flen && fmt[i] >= '0' && fmt[i] <= '9'; i++)
+                lanes = lanes * 10 + (uint32_t)(fmt[i] - '0');
+        }
+        unsigned bits = 0;
+        if (i + 1 < flen && fmt[i] == 'h' && fmt[i + 1] == 'h')
+            bits = 8, i += 2;
+        else if (i + 1 < flen && fmt[i] == 'h' && fmt[i + 1] == 'l')
+            bits = 32, i += 2;
+        else if (i < flen && fmt[i] == 'h')
+            bits = 16, i++;
+        else if (i < flen && fmt[i] == 'l')
+            bits = 64, i++;
+        if (i >= flen)
+            break;
+        char conv = fmt[i];
+        if (next >= nargs)
+            break;
+        const struct printf_arg *a = &args[next++];
+        // (Floats' lengths say the vector's lanes are halves, floats or doubles: the values say it.)
+        if (strchr("fFeEgGaA", conv))
+            bits = 0;
+        for (uint32_t l = 0; l < lanes && l < a->lanes; l++) {
+            if (l)
+                text_add(t, ",", 1);
+            printf_lane(t, spec, conv, bits, a, l);
+        }
+    }
+}
+
+// The output the launches left (PRINTF), formatted and written.
+static void printf_output(size_t n) {
+    uint8_t *b = malloc(n);
+    if (!b)
+        return;
+    struct request r = {PRINTF, {(uintptr_t)b, n}};
+    if (call(&r) == CL_SUCCESS && r.r[0] <= n) {
+        struct text t = {0};
+        const uint8_t *p = b, *end = b + r.r[0];
+        while (p + 8 <= end) {
+            uint32_t flen = take_word(&p);
+            const char *fmt = (const char *)p;
+            p += (flen + 3) & ~3u;
+            uint32_t nargs = take_word(&p);
+            struct printf_arg *args = calloc(nargs ? nargs : 1, sizeof *args);
+            if (!args)
+                break;
+            for (uint32_t k = 0; k < nargs; k++) {
+                args[k].kind = take_word(&p);
+                args[k].bytes = take_word(&p);
+                args[k].lanes = take_word(&p);
+                args[k].data = p;
+                if (args[k].kind == 2) {
+                    uint32_t len;
+                    memcpy(&len, p, 4);
+                    p += 4 + ((len + 3) & ~3u);
+                } else {
+                    p += 8 * args[k].lanes;
+                }
+            }
+            printf_format(&t, fmt, flen, args, nargs);
+            free(args);
+        }
+        if (t.n)
+            fwrite(t.b, 1, t.n, stdout);
+        free(t.b);
+    }
+    free(b);
+}
+
 // a[0] the dimensions; data the arguments (see EnqueueNDRangeKernel).
 static cl_int run_kernel(struct command *c) {
     cl_kernel k = c->kernel;
@@ -2612,7 +2920,10 @@ static cl_int run_kernel(struct command *c) {
     struct request r = {RUN,
                         {k->program->handle, (uintptr_t)k->name, strlen(k->name), c->a[0], (uintptr_t)sizes, (uintptr_t)block, k->block_size,
                          (uintptr_t)handles, (uintptr_t)locals}};
-    return call(&r);
+    cl_int e = call(&r);
+    if (e == CL_SUCCESS && r.r[0])
+        printf_output(r.r[0]);
+    return e;
 }
 
 static cl_int EnqueueNDRangeKernel(cl_command_queue q, cl_kernel k, cl_uint dims, const size_t *offset, const size_t *global, const size_t *local,

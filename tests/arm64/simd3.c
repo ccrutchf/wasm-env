@@ -1,7 +1,8 @@
 // More NEON and scalar instructions that libraries (zlib, OpenSSL, SQLite,
 // Python extensions) use: vector orr/bic immediates, compares with zero,
 // float widening/narrowing, shift-and-insert, widening multiplies (also by
-// element), post-index-by-register loads/stores, eor3 and crc32.
+// element), post-index-by-register loads/stores, eor3, crc32 and polynomial
+// multiplies.
 #include <arm_acle.h>
 #include <arm_neon.h>
 #include <stdint.h>
@@ -105,6 +106,23 @@ int main(void)
 	uint64x2_t e;
 	__asm__("eor3 %0.16b, %1.16b, %2.16b, %3.16b" : "=w"(e) : "w"(e1), "w"(e2), "w"(e3));
 	P("eor3", e);
+
+	// Polynomial multiplies: bytes (pmul), bytes widened (pmull, pmull2;
+	// TLS's GHASH without the crypto extension), doublewords to 128 bits.
+	poly8x16_t pa = vreinterpretq_p8_u64(e1), pb = vreinterpretq_p8_u64(e3 ^ e1);
+	OPAQUE(pa);
+	P("pmul", vmulq_p8(pa, pb));
+	P("pmull", vmull_p8(vget_low_p8(pa), vget_low_p8(pb)));
+	P("pmull2", vmull_high_p8(pa, pb));
+	uint64x2_t pq;
+	__asm__("pmull %0.1q, %1.1d, %2.1d" : "=w"(pq) : "w"(e1), "w"(e2));
+	P("pmull.1q", pq);
+	__asm__("pmull2 %0.1q, %1.2d, %2.2d" : "=w"(pq) : "w"(e1), "w"(e3));
+	P("pmull2.1q", pq);
+	// ext of 8 bytes: from the operands' low halves (GHASH's NEON code).
+	uint8x8_t xa = vget_low_u8(vreinterpretq_u8_u64(e1)), xb = vget_high_u8(vreinterpretq_u8_u64(e1));
+	OPAQUE(xa);
+	P("ext.8b", vcombine_u8(vext_u8(xa, xb, 3), vext_u8(xb, xa, 7)));
 
 	uint32_t c = 0xffffffff;
 	c = __crc32b(c, 'a');

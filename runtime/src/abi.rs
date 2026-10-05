@@ -101,6 +101,8 @@ pub mod nr {
     pub const MSYNC: i64 = 227;
     pub const MADVISE: i64 = 233;
     pub const WAIT4: i64 = 260;
+    pub const TIMES: i64 = 153;
+    pub const GETRUSAGE: i64 = 165;
     pub const PRLIMIT64: i64 = 261;
     pub const RENAMEAT2: i64 = 276;
     pub const MEMFD_CREATE: i64 = 279;

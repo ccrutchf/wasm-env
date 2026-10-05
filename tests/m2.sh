@@ -33,7 +33,7 @@ fixtures=(
 	"bti:tests/arm64/bti.S:-static -nostdlib"
 	"strrchr:tests/arm64/strrchr.c:-static tests/arm64/glibc_strrchr.S"
 	"atomics:tests/arm64/atomics.c:-static -march=armv8.1-a"
-	"simd3:tests/arm64/simd3.c:-static -march=armv8.2-a+crc+sha3"
+	"simd3:tests/arm64/simd3.c:-static -march=armv8.2-a+crc+sha3+aes"
 	"simd4:tests/arm64/simd4.c:-static"
 	"simd5:tests/arm64/simd5.c:-static"
 	"fpexc:tests/arm64/fpexc.c:-static -lm"

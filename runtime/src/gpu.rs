@@ -34,6 +34,7 @@
 //!              the device choose), a5: argument block, a6: its length,
 //!              a7: per argument, a buffer handle (u64; 0 if none),
 //!              a8: per argument, local memory bytes (u32)
+//!              r0: bytes of printf output the launch left (see PRINTF)
 //!  13 FINISH
 //!  14 ATTRIBUTES a0: program, a1: name, a2: length, a3: address, a4: capacity
 //!              r0: the length of the kernel's attributes ("reqd_work_group_size(…)…"),
@@ -49,6 +50,13 @@
 //!              (0, 1, 2)
 //!  18 LOAD     a0: bitcode, a1: length, a2: its kind (as BINARY's r2)
 //!              r0: program handle
+//!  19 PRINTF   a0: address, a1: capacity   r0: the length of the launches'
+//!              printf output not yet taken (taken if it fits): each
+//!              printf's format (u32 length, bytes, padded to 4), its
+//!              arguments' number (u32), then each argument: its kind (u32:
+//!              0 integer, 1 float, 2 string, 3 pointer), bytes and lanes
+//!              (u32s), then a u64 for each lane (a string: u32 length,
+//!              bytes, padded to 4)
 //!
 //! INFO's description (256 bytes): name, vendor and driver (64 bytes
 //! each), device type (u32: OpenCL's), maximum work-group size, maximum
@@ -105,6 +113,8 @@ struct State {
     next: u64,
     buffers: HashMap<u64, wgpu::Buffer>,
     programs: HashMap<u64, Program>,
+    /// Launches' printf output, for PRINTF.
+    printf: Vec<u8>,
 }
 
 struct Program {
@@ -210,12 +220,14 @@ impl Session {
             8 => {
                 let source = String::from_utf8_lossy(mem::slice(data, a[0], a[1])?).into_owned();
                 let options = String::from_utf8_lossy(mem::slice(data, a[2], a[3])?).into_owned();
-                let (module, log) = build(&source, &options, guest);
-                let failed = module.is_none();
+                let (built, log) = build(&source, &options, guest);
+                let failed = built.is_none();
+                // (Its IR is its binary: an executable's, built again by LOAD.)
+                let (module, object) = built.map_or((None, None), |(m, ir)| (Some(Arc::new(m)), Some(ir.into_bytes())));
                 let mut st = self.state.lock().unwrap();
                 let h = st.next;
                 st.next += 1;
-                st.programs.insert(h, Program { id: PROGRAMS.fetch_add(1, Ordering::Relaxed), module: module.map(Arc::new), log, object: None, library: false });
+                st.programs.insert(h, Program { id: PROGRAMS.fetch_add(1, Ordering::Relaxed), module, log, object, library: false });
                 r[0] = h;
                 if failed {
                     return Err(Failure::Cl(CL_BUILD_PROGRAM_FAILURE));
@@ -345,14 +357,23 @@ impl Session {
                 };
                 r[0] = self.add_program(Program { id: PROGRAMS.fetch_add(1, Ordering::Relaxed), module, log: String::new(), object: Some(o), library: a[2] == 1 });
             }
-            12 => self.run(data, a)?,
+            12 => r[0] = self.run(data, a)? as u64,
+            19 => {
+                let mut st = self.state.lock().unwrap();
+                r[0] = st.printf.len() as u64;
+                if st.printf.len() as u64 <= a[1] {
+                    mem::slice_mut(data, a[0], st.printf.len() as u64)?.copy_from_slice(&st.printf);
+                    st.printf.clear();
+                }
+            }
             13 => g.finish().map_err(|_| Failure::Cl(CL_OUT_OF_RESOURCES))?,
             _ => return Err(Failure::Errno(EINVAL)),
         }
         Ok(())
     }
 
-    fn run(&self, data: &mut [u8], a: &[u64; 9]) -> Result<(), Failure> {
+    /// A launch; the result: the printf output waiting (PRINTF).
+    fn run(&self, data: &mut [u8], a: &[u64; 9]) -> Result<usize, Failure> {
         let (id, m) = self.program(a[0])?;
         let name = String::from_utf8_lossy(mem::slice(data, a[1], a[2])?).into_owned();
         let info = wgsl::kernel_info(&m, &name).map_err(|_| Failure::Cl(CL_INVALID_KERNEL_NAME))?;
@@ -373,7 +394,15 @@ impl Session {
         let limits = &self.gpu.limits;
         let max = limits.max_compute_invocations_per_workgroup;
         if local[..dims as usize].contains(&0) {
-            local = info.required_local.unwrap_or_else(|| choose_local(global, dims, max.min(256)));
+            // WASM_ENV_GPU_GROUPS_OF_ONE: work-groups of one work-item where the
+            // program leaves them to the driver. A diagnostic: a kernel's results
+            // don't depend on the work-group size it didn't choose, so results
+            // that change with it are the driver's doing (lavapipe's, with some
+            // large shaders: docs/upstream/lavapipe). Not a workaround: lavapipe
+            // gets other shaders wrong with work-groups of one.
+            static ONE: OnceLock<bool> = OnceLock::new();
+            let one = *ONE.get_or_init(|| std::env::var_os("WASM_ENV_GPU_GROUPS_OF_ONE").is_some_and(|v| v != "0"));
+            local = info.required_local.unwrap_or_else(|| if one { [1, 1, 1] } else { choose_local(global, dims, max.min(256)) });
         }
         let per_dim = [limits.max_compute_workgroup_size_x, limits.max_compute_workgroup_size_y, limits.max_compute_workgroup_size_z];
         if (0..3).any(|d| local[d] == 0 || global[d] % local[d] != 0 || local[d] > per_dim[d])
@@ -410,13 +439,17 @@ impl Session {
         if total_local > limits.max_compute_workgroup_storage_size {
             return Err(Failure::Cl(CL_OUT_OF_RESOURCES));
         }
-        let launch = Launch { local, local_bytes };
-        self.gpu.run(id, &m, &info, &launch, dims, global, offset, &block, &bound).map_err(|e| {
+        let launch = Launch { local, local_bytes, ..Default::default() };
+        let words = self.gpu.run(id, &m, &info, &launch, dims, global, offset, &block, &bound).map_err(|e| {
             if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
                 eprintln!("wasm-env: GPU: {e}");
             }
             Failure::Cl(CL_OUT_OF_RESOURCES)
-        })
+        })?;
+        drop(st);
+        let mut st = self.state.lock().unwrap();
+        printf_output(&info.printf, &words, &mut st.printf);
+        Ok(st.printf.len())
     }
 
     fn add_program(&self, p: Program) -> u64 {
@@ -471,7 +504,9 @@ impl Session {
         for (k, v) in words32.iter().enumerate() {
             d[192 + k * 4..196 + k * 4].copy_from_slice(&v.to_le_bytes());
         }
-        let max_alloc = l.max_storage_buffer_binding_size.min(l.max_buffer_size);
+        // (Buffers larger than a binding are bound in parts: Launch::parts.
+        // A kernel's pointers are 32-bit byte offsets from 4096.)
+        let max_alloc = l.max_buffer_size.min((1 << 32) - 4096);
         for (k, v) in [l.max_compute_workgroup_storage_size as u64, max_alloc, max_alloc.saturating_mul(4)].iter().enumerate() {
             d[216 + k * 8..224 + k * 8].copy_from_slice(&v.to_le_bytes());
         }
@@ -507,15 +542,15 @@ fn vendor_name(id: u32) -> String {
 
 /// A program's source built: its module (with every kernel checked to
 /// translate), or none; and the build log.
-fn build(source: &str, options: &str, guest: &wasm_env_gpu::opencl::Guest) -> (Option<Module>, String) {
+fn build(source: &str, options: &str, guest: &wasm_env_gpu::opencl::Guest) -> (Option<(Module, String)>, String) {
     let cc = match toolchain() {
         Ok(cc) => cc,
         Err(log) => return (None, log),
     };
     let timing = std::env::var_os("WASM_ENV_DEBUG_GPU_TIME").is_some();
     let start = std::time::Instant::now();
-    let m = match wasm_env_gpu::opencl::build(&cc, source, options, Some(guest)) {
-        Ok(m) => m,
+    let (m, ir) = match wasm_env_gpu::opencl::build_with_ir(&cc, source, options, Some(guest)) {
+        Ok(built) => built,
         Err(log) => return (None, log),
     };
     let built = start.elapsed();
@@ -523,7 +558,7 @@ fn build(source: &str, options: &str, guest: &wasm_env_gpu::opencl::Guest) -> (O
     if timing {
         eprintln!("wasm-env: GPU: built a program of {} bytes: clang and parsing {built:?}, checking its kernels {:?}", source.len(), start.elapsed() - built);
     }
-    if log.is_empty() { (Some(m), log) } else { (None, log) }
+    if log.is_empty() { (Some((m, ir)), log) } else { (None, log) }
 }
 
 /// What compiles OpenCL C: the translation toolchain's clang, and OpenCL's
@@ -545,9 +580,57 @@ fn check_kernels(m: &Module) -> String {
         // Checked with a trivial launch: what the kernel's code needs is the
         // same for every launch.
         let locals = f.params.iter().enumerate().filter(|(_, t)| **t == wasm_env_gpu::ir::Type::Ptr(3)).map(|(k, _)| (k, 4)).collect();
-        if let Err(e) = wgsl::compile(m, &f.name, &Launch { local: [1, 1, 1], local_bytes: locals }, Default::default()) {
+        if let Err(e) = wgsl::compile(m, &f.name, &Launch { local: [1, 1, 1], local_bytes: locals, ..Default::default() }, Default::default()) {
             log.push_str(&format!("kernel {}: not supported here: {e}\n", f.name));
         }
     }
     log
+}
+
+/// A launch's printf records (wgsl.rs, "printf") as PRINTF gives them.
+fn printf_output(formats: &[wgsl::PrintfFormat], words: &[u32], out: &mut Vec<u8>) {
+    let mut put = |out: &mut Vec<u8>, w: u32| out.extend_from_slice(&w.to_le_bytes());
+    let bytes = |out: &mut Vec<u8>, b: &[u8], put: &mut dyn FnMut(&mut Vec<u8>, u32)| {
+        put(out, b.len() as u32);
+        out.extend_from_slice(b);
+        out.resize(out.len().next_multiple_of(4), 0);
+    };
+    let mut at = 0;
+    while let Some(f) = words.get(at).and_then(|&id| formats.get(id as usize)) {
+        let len = 1 + f.args.iter().map(|a| a.words() as usize).sum::<usize>();
+        let Some(w) = words.get(at + 1..at + len) else { break };
+        at += len;
+        bytes(out, f.format.as_bytes(), &mut put);
+        put(out, f.args.len() as u32);
+        let mut k = 0;
+        for a in &f.args {
+            match a {
+                wgsl::PrintfArg::Int { bytes: b, lanes } | wgsl::PrintfArg::Float { bytes: b, lanes } => {
+                    put(out, if matches!(a, wgsl::PrintfArg::Int { .. }) { 0 } else { 1 });
+                    put(out, *b);
+                    put(out, *lanes);
+                    for _ in 0..*lanes {
+                        let (lo, hi) = if *b == 8 { (w[k], w[k + 1]) } else { (w[k], 0) };
+                        k += if *b == 8 { 2 } else { 1 };
+                        put(out, lo);
+                        put(out, hi);
+                    }
+                }
+                wgsl::PrintfArg::Str(text) => {
+                    put(out, 2);
+                    put(out, 0);
+                    put(out, 1);
+                    bytes(out, text.as_bytes(), &mut put);
+                }
+                wgsl::PrintfArg::Ptr => {
+                    put(out, 3);
+                    put(out, 4);
+                    put(out, 1);
+                    put(out, w[k]);
+                    put(out, 0);
+                    k += 1;
+                }
+            }
+        }
+    }
 }

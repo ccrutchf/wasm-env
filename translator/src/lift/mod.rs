@@ -1380,10 +1380,11 @@ pub fn lift(image: &Image, prog: &Program, library: bool, page: Option<u64>, fp:
     let mut entries = prog.entries.clone();
     // Small loops that load guest memory but never store to it are how
     // compiled code polls a word another thread writes (a `volatile` flag,
-    // a relaxed atomic): their loads are made volatile, or LLVM, which knows
-    // guest memory and registers don't alias (TBAA), would read the word
-    // once, before the loop. Larger store-free loops (a reduction, a search)
-    // keep ordinary loads.
+    // a relaxed atomic): their loads are made atomic where they can be (see
+    // `poll_load`), or LLVM, which knows guest memory and registers don't
+    // alias (TBAA), and then wasmtime would read the word once, before the
+    // loop. Larger store-free loops (a reduction, a search) keep ordinary
+    // loads.
     const POLL_LOOP_BYTES: u64 = 64;
     let mut polling = std::collections::HashSet::new();
     // (For one page, only its own region: its blocks are all taken as
@@ -1461,7 +1462,7 @@ pub fn lift(image: &Image, prog: &Program, library: bool, page: Option<u64>, fp:
                         ";ENDFLAGS" => in_flags = false,
                         _ if in_flags && !keep => {}
                         l if polls && l.ends_with(MEM) && l.contains(" = load ") && !l.contains(" = load atomic ") => {
-                            text.push_str(&line.replacen(" = load ", " = load volatile ", 1));
+                            text.push_str(&poll_load(line));
                             text.push('\n');
                         }
                         _ => {
@@ -1547,6 +1548,48 @@ pub const STATE_GLOBAL: &str = "@__wasm_env_state = addrspace(1) global i64 0\n\
 /// Access tags (see TBAA).
 pub const REG: &str = ", !tbaa !902";
 pub const MEM: &str = ", !tbaa !904";
+
+/// A load of guest memory in a polling loop (`%t = load T, ptr %p, align
+/// 1, !tbaa !904`), made to read memory on every pass. A volatile load
+/// isn't enough: it becomes an ordinary WebAssembly load, and wasmtime
+/// (Cranelift) takes a load in a loop that stores nothing for the same
+/// load before the loop (WebAssembly allows that for loads that aren't
+/// atomic), so a thread waiting on a flag never sees it change (OpenBLAS's
+/// threaded GEMM hung so). An atomic load it keeps; but one that isn't
+/// aligned traps, so an integer's is made from the address rounded down
+/// to its size, and taken where that's the address (a polled word always
+/// is), else the volatile load, as before. Others (vectors) stay volatile.
+fn poll_load(line: &str) -> String {
+    let volatile = line.replacen(" = load ", " = load volatile ", 1);
+    let parse = || {
+        let (dest, rest) = line.trim().split_once(" = load ")?;
+        let (ty, rest) = rest.split_once(", ptr ")?;
+        let (ptr, _) = rest.split_once(", ")?;
+        let bytes: u64 = match ty {
+            "i8" => 1,
+            "i16" => 2,
+            "i32" => 4,
+            "i64" => 8,
+            _ => return None,
+        };
+        Some((dest, ty, ptr, bytes))
+    };
+    let Some((dest, ty, ptr, bytes)) = parse() else { return volatile };
+    if bytes == 1 {
+        return format!("  {dest} = load atomic i8, ptr {ptr} monotonic, align 1{MEM}");
+    }
+    let mask = -(bytes as i64);
+    [
+        format!("  {dest}.pa = ptrtoint ptr {ptr} to i64"),
+        format!("  {dest}.al = and i64 {dest}.pa, {mask}"),
+        format!("  {dest}.ap = inttoptr i64 {dest}.al to ptr"),
+        format!("  {dest}.at = load atomic {ty}, ptr {dest}.ap monotonic, align {bytes}{MEM}"),
+        format!("  {dest}.v = load volatile {ty}, ptr {ptr}, align 1{MEM}"),
+        format!("  {dest}.ok = icmp eq i64 {dest}.pa, {dest}.al"),
+        format!("  {dest} = select i1 {dest}.ok, {ty} {dest}.at, {ty} {dest}.v"),
+    ]
+    .join("\n")
+}
 /// FPCR's (see Block::fpcr): only `msr fpcr` writes it.
 pub const FPCR_TAG: &str = ", !tbaa !908";
 
@@ -1757,4 +1800,28 @@ fn cstring_raw(bytes: &[u8]) -> String {
 /// An LLVM `[N x i8] c"..."` constant with a trailing NUL (for C strings).
 fn cstring(bytes: &[u8]) -> String {
     format!("[{} x i8] {}", bytes.len() + 1, cstring_raw(&[bytes, &[0]].concat()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polled_words_are_read_atomically_where_aligned() {
+        let got = poll_load(&format!("  %t7 = load i32, ptr %t6, align 1{MEM}"));
+        let want = [
+            "  %t7.pa = ptrtoint ptr %t6 to i64",
+            "  %t7.al = and i64 %t7.pa, -4",
+            "  %t7.ap = inttoptr i64 %t7.al to ptr",
+            &format!("  %t7.at = load atomic i32, ptr %t7.ap monotonic, align 4{MEM}"),
+            &format!("  %t7.v = load volatile i32, ptr %t6, align 1{MEM}"),
+            "  %t7.ok = icmp eq i64 %t7.pa, %t7.al",
+            "  %t7 = select i1 %t7.ok, i32 %t7.at, i32 %t7.v",
+        ]
+        .join("\n");
+        assert_eq!(got, want);
+        // (A byte is always aligned; a vector stays volatile.)
+        assert_eq!(poll_load(&format!("  %t1 = load i8, ptr %t0, align 1{MEM}")), format!("  %t1 = load atomic i8, ptr %t0 monotonic, align 1{MEM}"));
+        assert_eq!(poll_load(&format!("  %t1 = load <4 x i32>, ptr %t0, align 1{MEM}")), format!("  %t1 = load volatile <4 x i32>, ptr %t0, align 1{MEM}"));
+    }
 }

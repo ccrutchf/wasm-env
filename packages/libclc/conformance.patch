@@ -10,6 +10,16 @@
    ir = ix < 0x4b000000 ? jr : ir;
  
    return __CLC_AS_GENTYPE(ir);
+@@ -102,6 +105,9 @@
+   __clc_sincos_piby4(a * M_PI, 0.0, &sinval, &cosval);
+   __CLC_LONGN jr = s ^ __CLC_AS_LONGN(e != 0 ? cosval : sinval);
+ 
++  // Odd multiples of 0.5: +0 (OpenCL).
++  jr = r == 0.5 ? 0 : jr;
++
+   ir = absx < 0x1.0p+52 ? jr : ir;
+ 
+   return __CLC_AS_GENTYPE(ir);
 --- a/clc/lib/generic/math/clc_sinpi.inc
 +++ b/clc/lib/generic/math/clc_sinpi.inc
 @@ -48,6 +48,9 @@
@@ -22,6 +32,16 @@
    ir = ix < 0x4b000000 ? jr : ir;
  
    return __CLC_AS_GENTYPE(ir);
+@@ -100,6 +103,9 @@
+   __clc_sincos_piby4(api, 0.0, &sinval, &cosval);
+   __CLC_LONGN jr = xodd ^ __CLC_AS_LONGN(e != 0 ? cosval : sinval);
+ 
++  // Integers: a zero of x's sign (OpenCL; sin(0) is +0).
++  jr = r == 0.0 ? xsgn : jr;
++
+   ir = absx < 0x1.0p+52 ? jr : ir;
+ 
+   return __CLC_AS_GENTYPE(ir);
 --- a/clc/lib/generic/math/clc_tanpi.inc
 +++ b/clc/lib/generic/math/clc_tanpi.inc
 @@ -57,6 +57,9 @@
@@ -32,6 +52,16 @@
 +  jr = r == 0.0f ? xodd : jr;
 +
    ir = ix < 0x4b000000 ? jr : ir;
+ 
+   return __CLC_AS_GENTYPE(ir);
+@@ -118,6 +121,9 @@
+   __CLC_LONGN si = xodd | 0x7ff0000000000000L;
+   jr = r == 0.5 ? si : jr;
+ 
++  // Integers: a zero of x's sign, the other sign for odd ones (OpenCL).
++  jr = r == 0.0 ? xodd : jr;
++
+   ir = ix < 0x4330000000000000L ? jr : ir;
  
    return __CLC_AS_GENTYPE(ir);
 --- a/clc/lib/generic/math/clc_tgamma.cl
@@ -132,3 +162,184 @@
  }
  
  #define __FLOAT_ONLY
+@@ -42,21 +99,67 @@
+ 
+ #pragma OPENCL EXTENSION cl_khr_fp64 : enable
+ 
++// The same, in double-double.
++static void __clc_tgamma_mul_dd(double *h, double *l, double f) {
++  double p = *h * f;
++  if (__clc_isinf(p)) {
++    *h = p;
++    *l = 0.0;
++    return;
++  }
++  double e = __clc_fma(*h, f, -p) + *l * f;
++  *h = p + e;
++  *l = e - (*h - p);
++}
++
+ _CLC_OVERLOAD _CLC_DEF double __clc_tgamma(double x) {
+-  const double pi = 3.1415926535897932384626433832795;
+-  double absx = __clc_fabs(x);
+-  double lg = __clc_lgamma(absx);
+-  double g = __clc_exp(lg);
+-
+-  if (x < 0.0) {
+-    double z = __clc_sinpi(x);
+-    g = g * absx * z;
+-    g = pi / g;
+-    g = g == 0 ? INFINITY : g;
+-    g = z == 0 ? DBL_NAN : g;
++  const double pi_hi = 0x1.921fb54442d18p+1, pi_lo = 0x1.1a62633145c07p-53;
++  if (__clc_isnan(x))
++    return x;
++  if (x == 0.0)
++    return __clc_copysign((double)INFINITY, x);
++  if (__clc_isinf(x))
++    return x > 0.0 ? x : DBL_NAN;
++  if (x > 171.7)
++    return INFINITY;
++  if (x < 0.0 && __clc_floor(x) == x)
++    return DBL_NAN;
++  // (sinpi once: it's large too.)
++  double s = x < 0.0 ? __clc_sinpi(x) : 0.0;
++  // (Beyond -185 it underflows: a zero of sinpi(x)'s sign.)
++  if (x < -185.0)
++    return __clc_copysign(0.0, s);
++
++  double t = __clc_fabs(x);
++  double h, l = 0.0;
++  // (Below -170, -x Gamma(-x) would overflow: it's scaled down by 2^-128,
++  // and the result up.)
++  double scale = x < -170.0 ? 0x1p-128 : 1.0;
++  // Gamma(y) for y in [1, 2): 1 + t below 1, rounded (Gamma' is under 0.6
++  // on [1, 2]). (One exp and lgamma, which are large, for both.)
++  double y = t < 1.0 ? 1.0 + t : t - (__clc_floor(t) - 1.0);
++  double g = __clc_exp(__clc_lgamma(y));
++  if (t < 1.0) {
++    h = g;
++    if (x > 0.0)
++      return h / t;
++  } else {
++    h = g * scale;
++    // (Not unrolled: up to 185 steps, each a double-double product.)
++    __attribute__((opencl_unroll_hint(1))) for (; y < t; y += 1.0)
++      __clc_tgamma_mul_dd(&h, &l, y);
++    if (x > 0.0)
++      return h + l;
++    // -x Gamma(-x)
++    __clc_tgamma_mul_dd(&h, &l, t);
+   }
+ 
+-  return g;
++  // pi / (sinpi(x) (h + l))
++  double dh = s * h;
++  double dl = __clc_fma(s, h, -dh) + s * l;
++  double q = pi_hi / dh;
++  double r = __clc_fma(-q, dh, pi_hi) + pi_lo - q * dl;
++  return (q + r / dh) * scale;
+ }
+ 
+ #define __DOUBLE_ONLY
+--- a/clc/lib/generic/math/clc_asinpi.inc
++++ b/clc/lib/generic/math/clc_asinpi.inc
+@@ -144,7 +144,8 @@
+   v = MATH_DIVIDE(v, pi);
+   v = __CLC_CONVERT_LONGN(xexp >= 0) ? __CLC_GENTYPE_NAN : v;
+   v = y == 1.0 ? 0.5 : v;
+-  return xneg ? -v : v;
++  // (-0: -0, OpenCL. xneg misses it.)
++  return __CLC_AS_GENTYPE((__CLC_AS_ULONGN(v) & 0x7fffffffffffffffUL) | (__CLC_AS_ULONGN(x) & 0x8000000000000000UL));
+ }
+ 
+ #elif __CLC_FPSIZE == 16
+--- a/clc/lib/generic/math/clc_atanpi.inc
++++ b/clc/lib/generic/math/clc_atanpi.inc
+@@ -160,7 +160,8 @@
+   __CLC_GENTYPE z = __clc_isnan(x) ? x : 0.5;
+   z = v <= 0x1.0p+56 ? r : z;
+   z = v < 0x1.0p-26 ? vp : z;
+-  return x == v ? z : -z;
++  // (-0: -0, OpenCL. x == v misses it.)
++  return __CLC_AS_GENTYPE((__CLC_AS_ULONGN(z) & 0x7fffffffffffffffUL) | (__CLC_AS_ULONGN(x) & 0x8000000000000000UL));
+ }
+ 
+ #elif __CLC_FPSIZE == 16
+--- a/clc/lib/generic/math/clc_ldexp.cl
++++ b/clc/lib/generic/math/clc_ldexp.cl
+@@ -102,7 +102,8 @@
+ 
+   ux = c ? ux : l;
+ 
+-  int v = e + n;
++  // (n clamped first: e + n may overflow.)
++  int v = e + __clc_clamp(n, -0x1000, 0x1000);
+   v = __clc_clamp(v, -0x7ff, 0x7ff);
+ 
+   ux &= ~EXPBITS_DP64;
+@@ -115,7 +116,8 @@
+   mr = v == 0x7ff ? __clc_as_double(s | PINFBITPATT_DP64) : mr;
+   mr = v < -53 ? __clc_as_double(s) : mr;
+ 
+-  mr = ((n == 0) | __clc_isinf(x) | (x == 0)) ? x : mr;
++  // (NaN too: OpenCL.)
++  mr = ((n == 0) | __clc_isinf(x) | (x == 0) | (x != x)) ? x : mr;
+   return mr;
+ }
+ 
+--- a/clc/lib/generic/math/clc_pow.inc
++++ b/clc/lib/generic/math/clc_pow.inc
+@@ -336,6 +336,8 @@
+     // afterwards because v may be so large that temp is out of range of int, in
+     // which case that conversion, and a value based on that conversion being
+     // passed to __clc_ldexp, results in undefined behavior.
++    // (And the tail, which is huge too when v is: OpenCL.)
++    vt = v > max_exp_arg || v < min_exp_arg ? 0.0 : vt;
+     v = v > max_exp_arg ? 1000.0 : v;
+     v = v < min_exp_arg ? -1000.0 : v;
+ 
+--- a/clc/lib/generic/math/clc_powr.inc
++++ b/clc/lib/generic/math/clc_powr.inc
+@@ -322,6 +322,8 @@
+     // afterwards because v may be so large that temp is out of range of int, in
+     // which case that conversion, and a value based on that conversion being
+     // passed to __clc_ldexp, results in undefined behavior.
++    // (And the tail, which is huge too when v is: OpenCL.)
++    vt = v > max_exp_arg || v < min_exp_arg ? 0.0 : vt;
+     v = v > max_exp_arg ? 1000.0 : v;
+     v = v < min_exp_arg ? -1000.0 : v;
+ 
+--- a/clc/lib/generic/math/clc_pown.inc
++++ b/clc/lib/generic/math/clc_pown.inc
+@@ -323,6 +323,8 @@
+     // afterwards because v may be so large that temp is out of range of int, in
+     // which case that conversion, and a value based on that conversion being
+     // passed to __clc_ldexp, results in undefined behavior.
++    // (And the tail, which is huge too when v is: OpenCL.)
++    vt = v > max_exp_arg || v < min_exp_arg ? 0.0 : vt;
+     v = v > max_exp_arg ? 1000.0 : v;
+     v = v < min_exp_arg ? -1000.0 : v;
+ 
+--- a/clc/lib/generic/math/clc_rootn.inc
++++ b/clc/lib/generic/math/clc_rootn.inc
+@@ -329,6 +329,8 @@
+     // afterwards because v may be so large that temp is out of range of int, in
+     // which case that conversion, and a value based on that conversion being
+     // passed to __clc_ldexp, results in undefined behavior.
++    // (And the tail, which is huge too when v is: OpenCL.)
++    vt = v > max_exp_arg || v < min_exp_arg ? 0.0 : vt;
+     v = v > max_exp_arg ? 1000.0 : v;
+     v = v < min_exp_arg ? -1000.0 : v;
+ 
+--- a/clc/lib/generic/math/clc_nan.inc
++++ b/clc/lib/generic/math/clc_nan.inc
+@@ -7,7 +7,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #if __CLC_FPSIZE == 64
+-#define NAN_MASK 0x7ff0000000000000ul
++#define NAN_MASK 0x7ff8000000000000ul // (quiet: nan(0) mustn't be infinity)
+ #elif __CLC_FPSIZE == 32
+ #define NAN_MASK 0x7fc00000
+ #elif __CLC_FPSIZE == 16

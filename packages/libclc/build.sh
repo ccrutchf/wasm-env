@@ -21,16 +21,21 @@ for p in libclc cmake; do
 	[ -d $p-$version.src ] || tar -xf $p-$version.src.tar.xz
 done
 ln -sfn cmake-$version.src cmake
-# Fixes for OpenCL's conformance tests: signed zeros in sinpi, cospi and
-# tanpi, and a tgamma accurate to a few ulps (libclc's is exp(lgamma)).
+# Fixes for OpenCL's conformance tests: signed zeros in sinpi, cospi,
+# tanpi and (double) asinpi and atanpi; NaN and huge exponents in (double)
+# ldexp; results that underflow or overflow in (double) pow, powr, pown and
+# rootn; and a tgamma accurate to a few ulps in single and double precision
+# (libclc's is exp(lgamma), tens of ulps out, and more for large doubles).
 rm -rf libclc && cp -r libclc-$version.src libclc && patch -s -d libclc -p1 < "$root/packages/libclc/conformance.patch"
-store() { nix build --no-link --print-out-paths "nixpkgs#$1" | tail -1; }
+# (The project's nixpkgs, as flake.lock pins it: not the system registry's,
+# whose LLVM may need a newer glibc than the shell links with.)
+store() { nix build --no-link --print-out-paths --inputs-from "$root" "nixpkgs#$1" | tail -1; }
 llvm=$(store llvmPackages_21.llvm)
 clang=$(store llvmPackages_21.clang-unwrapped)
 export PATH=$(store ninja)/bin:$(store python3)/bin:$(store cmake)/bin:$llvm/bin:$clang/bin:$PATH
 cmake -S libclc -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLIBCLC_TARGETS_TO_BUILD=clspv-- \
 	-DLLVM_DIR="$(store llvmPackages_21.llvm.dev)/lib/cmake/llvm" -DLLVM_TOOLS_BINARY_DIR="$llvm/bin" -DLLVM_TOOL_clang="$clang/bin/clang" >/dev/null
-ninja -C build >/dev/null
+ninja -C build >build/ninja.log || { tail -30 build/ninja.log; exit 1; }
 # Inlined into kernels: no noinline or no-builtins (which stop the inliner),
 # and alwaysinline on its functions (log and the like are big).
 llvm-dis build/clspv--.bc -o - |

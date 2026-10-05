@@ -38,6 +38,8 @@ pub struct Mm {
     pub code: Ranges,
     /// Shared mappings: host mappings of files (see shared.rs).
     pub shared: crate::shared::SharedMaps,
+    /// The main thread's stack, [low, high) (/proc/self/maps).
+    pub stack: (u64, u64),
 }
 
 /// Disjoint address ranges, start → end.
@@ -158,7 +160,7 @@ pub struct Group {
 impl Group {
     pub fn new() -> Arc<Group> {
         Arc::new(Group {
-            mm: Mutex::new(Mm { space: AddressSpace::new(0), brk: 0, brk_start: 0, low: Default::default(), code: Default::default(), shared: Default::default() }),
+            mm: Mutex::new(Mm { space: AddressSpace::new(0), brk: 0, brk_start: 0, low: Default::default(), code: Default::default(), shared: Default::default(), stack: (0, 0) }),
             futex: Futexes::default(),
             threading: OnceLock::new(),
             libraries: Default::default(),
@@ -172,7 +174,7 @@ impl Group {
     pub fn fork(&self, memory: SharedMemory) -> Arc<Group> {
         let mm = self.mm.lock().unwrap();
         let child = Arc::new(Group {
-            mm: Mutex::new(Mm { space: mm.space.clone(), brk: mm.brk, brk_start: mm.brk_start, low: mm.low.clone(), code: mm.code.clone(), shared: mm.shared.clone() }),
+            mm: Mutex::new(Mm { space: mm.space.clone(), brk: mm.brk, brk_start: mm.brk_start, low: mm.low.clone(), code: mm.code.clone(), shared: mm.shared.clone(), stack: mm.stack }),
             futex: Futexes::default(),
             threading: OnceLock::new(),
             libraries: self.libraries.fork(),
@@ -267,10 +269,27 @@ impl Futexes {
     /// FUTEX_WAIT: sleeps until woken, if the word at `addr` still holds
     /// `val` (else EAGAIN), until `deadline` (ETIMEDOUT) or until
     /// `interrupted` (EINTR).
+    #[cfg(test)]
     pub fn wait(
         &self,
         data: &[u8],
         addr: u64,
+        val: u32,
+        bitset: u32,
+        deadline: Option<Instant>,
+        interrupted: &dyn Fn() -> bool,
+    ) -> SysResult<i64> {
+        self.wait_keyed(data, addr, addr, val, bitset, deadline, interrupted)
+    }
+
+    /// `wait` on the word at `addr`, queued as `key` (the address, or for a
+    /// futex in a shared mapping, its place in the file: Kernel::shared_futex).
+    #[allow(clippy::too_many_arguments)]
+    pub fn wait_keyed(
+        &self,
+        data: &[u8],
+        addr: u64,
+        key: u64,
         val: u32,
         bitset: u32,
         deadline: Option<Instant>,
@@ -287,7 +306,7 @@ impl Futexes {
                 return Err(EAGAIN);
             }
             let w = Arc::new(Waiter { bitset, woken: Mutex::new(false), cv: Condvar::new() });
-            queues.entry(addr).or_default().push(w.clone());
+            queues.entry(key).or_default().push(w.clone());
             w
         };
         let mut woken = waiter.woken.lock().unwrap();
@@ -308,7 +327,7 @@ impl Futexes {
                 if *waiter.woken.lock().unwrap() {
                     return Ok(0);
                 }
-                remove(&mut queues, addr, &waiter);
+                remove(&mut queues, key, &waiter);
                 return Err(e);
             }
             let slice = deadline.map_or(POLL, |d| (d - now).min(POLL));
@@ -340,13 +359,22 @@ impl Futexes {
     /// FUTEX_REQUEUE and FUTEX_CMP_REQUEUE: wakes up to `n` waiters on
     /// `addr` and moves up to `requeue` more to `to`; with `expect`, only if
     /// the word at `addr` holds it (else EAGAIN).
+    #[cfg(test)]
     pub fn requeue(&self, data: &[u8], addr: u64, n: u32, requeue: u32, to: u64, expect: Option<u32>) -> SysResult<i64> {
+        self.requeue_keyed(data, addr, addr, n, requeue, to, expect)
+    }
+
+    /// `requeue` from the waiters queued as `key` (see wait_keyed) to those
+    /// queued as `to`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn requeue_keyed(&self, data: &[u8], addr: u64, key: u64, n: u32, requeue: u32, to: u64, expect: Option<u32>) -> SysResult<i64> {
         let mut queues = self.queues.lock().unwrap();
         if let Some(v) = expect
             && word(data, addr)?.load(Ordering::SeqCst) != v
         {
             return Err(EAGAIN);
         }
+        let addr = key;
         let waiters = queues.remove(&addr).unwrap_or_default();
         let (mut woken, mut moved) = (0, 0);
         let mut kept = Vec::new();
@@ -418,6 +446,7 @@ pub fn spawn(mut process: Process, frame: u64) -> SysResult<()> {
 
 /// Runs a started thread until it exits, then cleans up after it.
 fn run(process: Process, frame: u64) {
+    process.cpu.update(); // (its CPU time counts from here)
     let kernel = process.kernel.clone();
     let group = process.group.clone();
     let threading = group.threading.get().unwrap();
@@ -470,6 +499,8 @@ fn run(process: Process, frame: u64) {
         }
     };
     exit_thread(p);
+    p.cpu.update();
+    p.kernel.cpu_thread_done(p.pid, p.tid);
     if let Some((base, len)) = block {
         group.mm.lock().unwrap().space.release(base, len);
     }

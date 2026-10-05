@@ -51,6 +51,70 @@ struct Entry {
     /// Signals sent to the process and not yet delivered (bit N-1: signal N),
     /// delivered at one of its threads' next syscalls, lowest first.
     signal: u64,
+    /// Its CPU time (see CpuSlot): its threads' that have exited (or
+    /// exec'd), each live thread's so far, and (once it has exited) the total.
+    cpu_exited: std::time::Duration,
+    cpu_live: HashMap<i32, Arc<std::sync::atomic::AtomicU64>>,
+    ran: std::time::Duration,
+    /// The time of its children that it has waited for, theirs included
+    /// (RUSAGE_CHILDREN).
+    children: std::time::Duration,
+}
+
+impl Entry {
+    fn cpu(&self) -> std::time::Duration {
+        self.cpu_exited + self.cpu_live.values().map(|c| std::time::Duration::from_nanos(c.load(std::sync::atomic::Ordering::Relaxed))).sum::<std::time::Duration>()
+    }
+}
+
+/// A guest thread's CPU time: the host thread's that runs it, since it
+/// started (counted from its first `update`, on that thread), kept where
+/// the kernel sums its process's (getrusage, the CPU-time clocks).
+pub struct CpuSlot {
+    cell: Arc<std::sync::atomic::AtomicU64>,
+    base: std::cell::Cell<Option<std::time::Duration>>,
+}
+
+impl CpuSlot {
+    /// Records the time so far (each syscall does), and returns it.
+    pub fn update(&self) -> std::time::Duration {
+        let now = thread_cpu();
+        let base = *self.base.get().get_or_insert(now);
+        self.base.set(Some(base));
+        let t = now.saturating_sub(base);
+        self.cell.store(t.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        t
+    }
+}
+
+/// The CPU time of the calling host thread.
+pub fn thread_cpu() -> std::time::Duration {
+    #[cfg(unix)]
+    {
+        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a valid timespec to fill.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) } == 0 {
+            return std::time::Duration::new(t.tv_sec as u64, t.tv_nsec as u32);
+        }
+        std::time::Duration::ZERO
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+        let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: the current thread's pseudo-handle and four FILETIMEs to fill.
+        if unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+            return std::time::Duration::ZERO;
+        }
+        let ticks = |f: FILETIME| (f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64;
+        std::time::Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::time::Duration::ZERO
+    }
 }
 
 struct Procs {
@@ -72,6 +136,9 @@ pub struct Kernel {
     forwarded: Mutex<HashMap<String, PathBuf>>,
     /// Unix socket names (unix.rs).
     pub unix: crate::unix::Names,
+    /// Futexes in shared mappings, which processes share: keyed by the file
+    /// and the offset in it (see Process::futex).
+    pub shared_futex: crate::thread::Futexes,
     /// File locks (locks.rs).
     pub locks: crate::locks::Locks,
     /// Signalled whenever a process exits or receives a signal.
@@ -108,11 +175,42 @@ impl Kernel {
             foreground: std::sync::atomic::AtomicI32::new(1),
             forwarded: Mutex::new(HashMap::new()),
             unix: Default::default(),
+            shared_futex: Default::default(),
             locks: Default::default(),
             changed: Condvar::new(),
             modules: Mutex::new(HashMap::new()),
             timers: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// A process's CPU time and its waited-for children's, as getrusage
+    /// reports them (each live thread's as of its last syscall).
+    pub fn usage(&self, pid: i32) -> (std::time::Duration, std::time::Duration) {
+        let p = self.procs.lock().unwrap();
+        p.table.get(&pid).map_or_else(Default::default, |e| (e.cpu(), e.children))
+    }
+
+    /// Thread `tid` of process `pid`'s CPU time slot (see CpuSlot). A thread
+    /// that already had one (it exec'd) keeps its time so far.
+    pub fn cpu_slot(&self, pid: i32, tid: i32) -> CpuSlot {
+        let cell = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut p = self.procs.lock().unwrap();
+        if let Some(e) = p.table.get_mut(&pid)
+            && let Some(old) = e.cpu_live.insert(tid, cell.clone())
+        {
+            e.cpu_exited += std::time::Duration::from_nanos(old.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        CpuSlot { cell, base: std::cell::Cell::new(None) }
+    }
+
+    /// Thread `tid` of process `pid` exited: its time counts for the process.
+    pub fn cpu_thread_done(&self, pid: i32, tid: i32) {
+        let mut p = self.procs.lock().unwrap();
+        if let Some(e) = p.table.get_mut(&pid)
+            && let Some(old) = e.cpu_live.remove(&tid)
+        {
+            e.cpu_exited += std::time::Duration::from_nanos(old.load(std::sync::atomic::Ordering::Relaxed));
+        }
     }
 
     /// Allocates a pid for a new process (ppid 0 for the first one).
@@ -121,7 +219,7 @@ impl Kernel {
         let pid = p.next_pid;
         p.next_pid += 1;
         let (pgid, sid) = p.table.get(&ppid).map_or((pid, pid), |e| (e.pgid, e.sid));
-        p.table.insert(pid, Entry { ppid, pgid, sid, status: None, signal: 0 });
+        p.table.insert(pid, Entry { ppid, pgid, sid, status: None, signal: 0, cpu_exited: Default::default(), cpu_live: HashMap::new(), ran: Default::default(), children: Default::default() });
         pid
     }
 
@@ -148,6 +246,7 @@ impl Kernel {
         match p.table.get_mut(&pid) {
             Some(e) if e.ppid != 0 => {
                 e.status = Some(how);
+                e.ran = e.cpu();
                 // The parent gets SIGCHLD (ignored unless it has a handler).
                 let ppid = e.ppid;
                 if let Some(parent) = p.table.get_mut(&ppid) {
@@ -192,7 +291,14 @@ impl Kernel {
     /// Returns None with WNOHANG if no matching child has exited yet, and
     /// EINTR if a signal in `interrupting` (a sigset) arrives for `pid` while
     /// waiting.
+    #[cfg(test)]
     pub fn wait(&self, pid: i32, target: i32, nohang: bool, interrupting: u64) -> SysResult<Option<(i32, Termination)>> {
+        Ok(self.wait_usage(pid, target, nohang, interrupting)?.map(|(child, how, _)| (child, how)))
+    }
+
+    /// `wait`, and the reaped child's time (its own and its children's), which
+    /// the waiter's RUSAGE_CHILDREN takes on.
+    pub fn wait_usage(&self, pid: i32, target: i32, nohang: bool, interrupting: u64) -> SysResult<Option<(i32, Termination, std::time::Duration)>> {
         let mut p = self.procs.lock().unwrap();
         let own_pgid = p.table.get(&pid).map_or(pid, |e| e.pgid);
         loop {
@@ -217,8 +323,12 @@ impl Kernel {
                 }
             }
             if let Some((child, status)) = done {
-                p.table.remove(&child);
-                return Ok(Some((child, status)));
+                let e = p.table.remove(&child).expect("found above");
+                let time = e.ran + e.children;
+                if let Some(parent) = p.table.get_mut(&pid) {
+                    parent.children += time;
+                }
+                return Ok(Some((child, status, time)));
             }
             if !any {
                 return Err(ECHILD);
@@ -421,6 +531,32 @@ mod tests {
         assert_eq!(k.ppid(child), parent);
         assert_eq!(k.pgid(child), Ok(parent), "a child joins its parent's process group");
         assert_eq!(k.sid(child), Ok(parent));
+    }
+
+    #[test]
+    fn a_reaped_childs_time_counts_for_its_parent() {
+        // A process's CPU time is its threads' (one exited, one live, one
+        // replaced by an exec); RUSAGE_CHILDREN, its waited-for children's,
+        // theirs included.
+        let ms = std::time::Duration::from_millis;
+        let set = |slot: &CpuSlot, t: std::time::Duration| slot.cell.store(t.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let k = kernel();
+        let parent = k.create(0);
+        let child = k.create(parent);
+        let grandchild = k.create(child);
+        set(&k.cpu_slot(grandchild, grandchild), ms(5));
+        k.exit(grandchild, Termination::Exit(0));
+        let (_, _, g) = k.wait_usage(child, -1, false, u64::MAX).unwrap().unwrap();
+        assert_eq!(g, ms(5));
+        set(&k.cpu_slot(child, child), ms(10));
+        set(&k.cpu_slot(child, child), ms(1)); // exec'd: the 10 stay
+        set(&k.cpu_slot(child, 99), ms(20));
+        k.cpu_thread_done(child, 99);
+        assert_eq!(k.usage(child), (ms(31), ms(5)));
+        k.exit(child, Termination::Exit(0));
+        let (_, _, c) = k.wait_usage(parent, -1, false, u64::MAX).unwrap().unwrap();
+        assert_eq!(c, ms(36), "the child's own time and its child's");
+        assert_eq!(k.usage(parent).1, ms(36));
     }
 
     #[test]

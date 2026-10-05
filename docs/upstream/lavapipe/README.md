@@ -1,16 +1,16 @@
 # lavapipe: wrong results from large compute shaders
 
-Two problems found while running OpenCL kernels on lavapipe through
+Four problems found while running OpenCL kernels on lavapipe through
 wasm-env's GPU service (OpenCL C → LLVM IR → WGSL → naga → SPIR-V → lavapipe).
-Both involve large compute shaders: OpenCL `double` arithmetic emulated on
-32-bit integers, with libclc's math functions inlined, which gives shaders
-of 80–100 KB of WGSL (130–180 KB of SPIR-V).
+All four involve large compute shaders: OpenCL `double` arithmetic
+emulated on 32-bit integers, with libclc's math functions inlined, which
+gives shaders of 25–100 KB of WGSL (40–180 KB of SPIR-V).
 
-| | Bug 1: 256-bit miscompile | Bug 2: equivalent shaders differ |
-|---|---|---|
-| Status | Reproduced standalone | Seen only inside wasm-env so far |
-| Trigger | `LP_NATIVE_VECTOR_WIDTH=256` (the default on AVX2 machines) | One of two semantically identical shaders |
-| Workaround | `LP_NATIVE_VECTOR_WIDTH=128` | None in place |
+| | Bug 1: 256-bit miscompile | Bug 2: wrong with larger workgroups | Bug 3: wrong at both widths | Bug 4: small, all wrong |
+|---|---|---|---|---|
+| Status | Reproduced standalone | Reproduced standalone | Reproduced standalone | Reproduced standalone |
+| Trigger | `LP_NATIVE_VECTOR_WIDTH=256` (the default on AVX2 machines) | Workgroups of more than one invocation; any width | A branch around three inlined `sin`s; any width | Workgroups of 4 (of 1: right) |
+| Workaround | `LP_NATIVE_VECTOR_WIDTH=128` | None in place | None in place | None in place |
 
 ## Environment
 
@@ -22,16 +22,17 @@ of 80–100 KB of WGSL (130–180 KB of SPIR-V).
 
 ## Files here
 
-- `bug1.cl`, `bug2.cl`: the OpenCL C kernels the shaders came from (for
+- `bug1.cl` to `bug4.cl`: the OpenCL C kernels the shaders came from (for
   context; the shaders are the reproducers).
-- `bug1.wgsl`, `bug2-lets.wgsl`, `bug2-vars.wgsl`: the shaders as wasm-env
+- `bug1.wgsl`, `bug2-lets.wgsl`, `bug2-lets-group1.wgsl`, `bug2-vars.wgsl`,
+  `bug3.wgsl`, `bug4.wgsl`, `bug4-group1.wgsl`: the shaders as wasm-env
   generates them.
 - `*.spv`: the same shaders as SPIR-V, from naga 30 with default options.
   These are not byte for byte what wgpu submits, which uses its own naga
   options.
 - `repro/`: a standalone wgpu program that runs a shader with the exact
-  inputs, prints every output (value and bits), and for bug 1 checks each
-  output against Rust's `f64` arithmetic.
+  inputs, prints every output (value and bits), and checks each against
+  Rust's `f64` arithmetic (bugs 1, 3 and 4) or the exact answer (bug 2).
 
 The shaders use no `f64` (doubles are `vec2<u32>` bit patterns), so they need
 no optional Vulkan features.
@@ -96,44 +97,170 @@ Also observed:
   `var`s.
 - **Undefined shifts:** shift amounts are masked or bounded throughout.
 
-## Bug 2: two equivalent shaders, different results
-
-**Status:** observed deterministically in wasm-env's own harness, but
-**not yet reproduced standalone**. Read the evidence with that in mind.
+## Bug 2: the same shader, wrong with larger workgroups
 
 `bug2.cl` is pyopencl's complex power, `z^b` through log, hypot, atan2, exp
-and sincos, with `b = -1`. wasm-env generates `bug2-lets.wgsl`. That version
-binds values used only within one block with `let`, rather than as
-function-scope `var`s, which keeps large shaders smaller.
+and sincos, with `b = -1`, for 16 complex numbers. wasm-env generates
+`bug2-lets.wgsl` (workgroups of 4). `bug2-lets-group1.wgsl` is the same
+shader generated for workgroups of 1: the two differ only in
+`@workgroup_size` and the matching constant in the global id computation.
 
-`bug2-vars.wgsl` is the same shader with every value a `var`. The two differ
-only in how values are bound:
-- no value is both a `var` and a `let`;
-- every value assigned after its declaration is a `var`;
-- the soft-float functions are called the same number of times in each.
+```sh
+cd repro
+VK_ICD_FILENAMES=/path/to/lvp_icd.x86_64.json \
+    LP_NATIVE_VECTOR_WIDTH=128 cargo run --release -- bug2 ../bug2-lets.wgsl > /dev/null
+VK_ICD_FILENAMES=/path/to/lvp_icd.x86_64.json \
+    LP_NATIVE_VECTOR_WIDTH=128 cargo run --release -- bug2 ../bug2-lets-group1.wgsl > /dev/null
+```
 
-What we saw, at 128 bits, through wasm-env's own runner:
+The program dispatches 16 invocations in all (4 workgroups of 4, or 16 of
+1) and checks each result against `1/z`.
 
-- **`let` version:** deterministically slightly wrong for some elements. For
-  `1/z` at element 1 it gave 0.2965130815484636 instead of 0.3008849557522124.
-- **`var` version:** correct (one element differs only in the last digits of
-  a value near zero, about 1e-17).
-- **Same IR on the CPU:** the LLVM IR the shader comes from, compiled natively
-  with clang, gives the right answer.
-- **Instrumented IR:** recording all 680 intermediate values of that same IR
-  through the GPU path also made the result right. All 9,360 recorded values
-  matched the CPU exactly.
+**Expected:** every element right, as with workgroups of 1:
+"0 of 16 elements wrong".
 
-With the standalone program here (`cargo run --release -- bug2 ../bug2-lets.wgsl`
-and `../bug2-vars.wgsl`), **both** versions give NaN for most elements.
-Element 1 is the exception and shows the same split: the `var` version
-right, the `let` version wrong. We haven't found what differs between that
-program and wasm-env's runner: same bindings, same inputs, same limits, same
-vector width. So this needs more reduction before it's a useful report.
+**Actual with workgroups of 4:** "15 of 16 elements wrong", most of them NaN:
+
+```
+wrong: element 0: got NaN NaN, want -3.293297171638899e-1 5.927934908950019e-2
+wrong: element 1: got 2.965130815484636e-1 2.632742800899157e-1, want 3.008849557522124e-1 2.632743362831858e-1
+```
+
+Also observed:
+
+- **Width:** at `LP_NATIVE_VECTOR_WIDTH=256`, workgroups of 4 give finite
+  but slightly wrong values everywhere (`-3.293297240097818e-1` for
+  element 0's real part).
+- **Workgroups of 16:** wrong too, like 4.
+- **How values are bound matters, a little:** `bug2-vars.wgsl` is the
+  workgroups-of-4 shader with every value a function-scope `var` (no
+  `let`s). It's wrong too ("13 of 16 elements wrong"), but on different
+  elements: element 1, for one, is right. (In an earlier test with
+  pyopencl's own inputs, the `var` version looked entirely right, which is
+  why the two versions are both here.)
+- **The same IR on the CPU** (compiled natively with clang) gives the right
+  answers, and recording every intermediate value through the GPU path
+  matched the CPU exactly, value for value (which changes the shader's
+  shape too).
+
+This looks like the same problem as bug 3: results that depend on how many
+invocations run together.
+
+## Bug 3: three `sin`s in a branch, wrong at any vector width
+
+`bug3.wgsl` computes libclc's double `sin` of three inputs per invocation,
+inside a branch (the last invocation does nothing):
+
+```c
+if (i + 1 < get_global_size(0)) {
+    out[3 * i] = sin(in[3 * i]);
+    out[3 * i + 1] = sin(in[3 * i + 1]);
+    out[3 * i + 2] = sin(in[3 * i + 2]);
+}
+```
+
+The inputs are huge (`-0x1p+1009` and the like), which takes `sin` through
+its large-argument reduction (Payne–Hanek, a table lookup and a long chain
+of integer arithmetic), plus `1.0`. One workgroup of 4.
+
+```sh
+cd repro
+VK_ICD_FILENAMES=/path/to/lvp_icd.x86_64.json \
+    LP_NATIVE_VECTOR_WIDTH=128 cargo run --release -- bug3 ../bug3.wgsl > /dev/null
+VK_ICD_FILENAMES=/path/to/lvp_icd.x86_64.json \
+    LP_NATIVE_VECTOR_WIDTH=256 cargo run --release -- bug3 ../bug3.wgsl > /dev/null
+```
+
+**Expected:** each output within 4 ulps of Rust's `f64::sin` (libclc's
+accuracy), the last invocation's three untouched (zero).
+
+**Actual:** 5 of 12 outputs wrong at either width, differently:
+
+```
+width 128:
+wrong: out[0] = sin(-5.486124068793689e303): got NaN, want 1.7722886839407961e-1
+wrong: out[2] = sin(-1.404447761611344e306): got -9.864817135300161e-1, want -9.864816126884146e-1
+wrong: out[3] = sin(-8.371160993642713e298): got NaN, want 2.4419163478511433e-1
+width 256:
+wrong: out[0] = sin(-5.486124068793689e303): got 1.7798366486886463e-1, want 1.7722886839407961e-1
+wrong: out[2] = sin(-1.404447761611344e306): got 5.033976941658121e253, want -9.864816126884146e-1
+wrong: out[3] = sin(-8.371160993642713e298): got 2.4456350246454409e-1, want 2.4419163478511433e-1
+```
+
+Also observed, through wasm-env's own runner:
+
+- **Size:** the same kernel with one or two `sin`s in the branch is right;
+  three is wrong. Without the branch, three are right too.
+- **Workgroup size:** the results change with it. With workgroups of one
+  invocation, a kernel computing `out[i] = sin(in[i])` (no branch), right
+  with larger workgroups, gives NaN for these inputs, and at width 256 some
+  outputs aren't written at all.
+- **Not the optimizer:** `GALLIVM_PERF=no_opt` gives the same wrong results.
+  `LP_NUM_THREADS=0` too.
+- **`var`s don't help:** making every value a function-scope `var` (no
+  `let`s) doesn't change the results.
+- **Where it came from:** Khronos's conformance test `test_bruteforce sin`
+  (double), whose 3-wide kernel (two `sin(double3)`s, one in a branch)
+  fails on lavapipe; its scalar, 2-, 4-, 8- and 16-wide kernels pass.
+
+## Bug 4: a small shader, every result wrong with workgroups of 4
+
+This is the smallest of the four, and the quickest to run (25 KB of WGSL,
+built in under a second). `bug4.wgsl` is libclc's double `acospi` on a
+`double16`. wasm-env compiles double math on vectors as a loop over the
+lanes through private arrays (one copy of `acospi` rather than sixteen), so
+each invocation loops over 16 inputs. `bug4-group1.wgsl` is the same shader
+for workgroups of 1: again only `@workgroup_size` and the matching constant
+differ.
+
+```sh
+cd repro
+VK_ICD_FILENAMES=/path/to/lvp_icd.x86_64.json \
+    LP_NATIVE_VECTOR_WIDTH=128 cargo run --release -- bug4 ../bug4.wgsl > /dev/null
+VK_ICD_FILENAMES=/path/to/lvp_icd.x86_64.json \
+    LP_NATIVE_VECTOR_WIDTH=128 cargo run --release -- bug4 ../bug4-group1.wgsl > /dev/null
+```
+
+Four invocations in all, 64 inputs, each checked against `acos(x) / pi`.
+
+**Expected:** "0 of 64 outputs wrong", as with workgroups of 1.
+
+**Actual with workgroups of 4:** "64 of 64 outputs wrong", all NaN:
+
+```
+wrong: out[0] = acospi(-7.8125e-3): got NaN, want 5.024868212835026e-1
+wrong: out[1] = acospi(-7.75e-1): got NaN, want 7.822501809667615e-1
+```
+
+Also observed:
+
+- **Where it goes wrong:** storing intermediate values instead of the
+  result, every value up to the last two selects is right, and so is
+  `v58 = select(v56, v52, v57)`. The final `v60 = select(vec2<u32>(0u,
+  1071644672u), v58, v59)` gives NaN: `v56`, the value `v58` chose
+  against. (`v57` and `v59` are `v13 < 1023u` and `v13 > 966u`.)
+- **Size:** making almost anything else in the shader simpler (replacing
+  `v52` by an earlier value, for one) makes it right, and the two selects
+  alone, in a small shader, are right.
+- **Not the optimizer:** the same with `GALLIVM_PERF=no_opt`.
+- **Not private memory:** declaring the two arrays in the function instead
+  (`var` rather than `var<private>`) doesn't change it, nor does dropping
+  the `loop` wrapping the lane loop.
+- **Only width 16:** the same kernel on double2, double4 and double8 is
+  right, as are `acos`, `asinpi` and `atanpi` on double16.
 
 ## Workaround in wasm-env
 
 wasm-env sets `LP_NATIVE_VECTOR_WIDTH=128` before creating its Vulkan
 instance, unless it's already set. That fixes bug 1 and also speeds up
-lavapipe's compiles of these shaders. Bug 2 has no workaround; it affects
-pyopencl's complex `pow` (2 of its 318 tests).
+lavapipe's compiles of these shaders. Bugs 2 to 4 have none in place.
+Workgroups of one invocation make these four shaders right, but they aren't
+a workaround: with them, other shaders go wrong (libclc's double `sinh`,
+for one, right with workgroups of 4 and wrong with workgroups of 1, even
+as a scalar). They look like one problem:
+results that depend on how many invocations run together. They affect
+pyopencl's complex `pow` (2 of its 318 tests) and some of the conformance
+tests' double precision kernels (`acospi` on double16, for one). wasm-env
+computes double-precision vector math as a loop over the lanes, which
+happens to avoid bug 3 in the conformance test it came from (and is how
+bug 4's shader looks).

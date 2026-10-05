@@ -1,8 +1,9 @@
 // OpenCL's image builtins, for images kept in buffers (see opencl.rs,
-// "Images"). An image is a buffer: a header of 16 words, then its pixels,
-// packed: row after row, slice (or array layer) after slice.
+// "Images"). An image is a buffer of its pixels, packed: row after row,
+// slice (or array layer) after slice. Its header, 16 words, is in the
+// argument block, after the image argument's buffer offset (H, below).
 //
-// Kernels' image and sampler handles become a pointer to the header and the
+// Kernels' image and sampler handles become a pointer to the pixels and the
 // sampler's bits (opencl.rs rewrites them), and their image builtins calls
 // to these functions: __img_<builtin>_<image type>[_<variant>], the variant
 // saying whether a sampler is given (s) or not (n) and the coordinates'
@@ -12,12 +13,15 @@
 
 typedef global uint *img;
 
-// The header (written by the OpenCL driver, packages/opencl/icd.c).
+// The header (written by the OpenCL driver, packages/opencl/icd.c), and a
+// word of an image's: the translator's (gpu/src/wgsl.rs), which reads it
+// from the argument block for the image argument the pointer came from.
 enum {
 	H_WIDTH, H_HEIGHT, H_DEPTH, H_ARRAY_SIZE, H_ROW_PITCH, H_SLICE_PITCH,
 	H_ORDER, H_TYPE, H_ELEMENT_SIZE, H_CHANNELS,
 };
-#define HEADER_BYTES 64
+uint __attribute__((overloadable, const)) __wenv_image_header(img i, uint field);
+#define H(i, field) __wenv_image_header(i, field)
 
 // Sampler bits, as __translate_sampler_initializer takes them.
 #define S_NORMALIZED 1u
@@ -37,13 +41,13 @@ uint __translate_sampler_initializer(uint s)
 // The extent in each dimension: width, height, and depth or layers.
 static int4 extent(img i)
 {
-	return (int4)((int)i[H_WIDTH], (int)i[H_HEIGHT], (int)max(i[H_DEPTH], i[H_ARRAY_SIZE]), 1);
+	return (int4)((int)H(i, H_WIDTH), (int)H(i, H_HEIGHT), (int)max(H(i, H_DEPTH), H(i, H_ARRAY_SIZE)), 1);
 }
 
 // A texel (x, y, and z or layer), in range.
 static global uchar *texel(img i, int4 c)
 {
-	return (global uchar *)i + HEADER_BYTES + (uint)c.z * i[H_SLICE_PITCH] + (uint)c.y * i[H_ROW_PITCH] + (uint)c.x * i[H_ELEMENT_SIZE];
+	return (global uchar *)i + (uint)c.z * H(i, H_SLICE_PITCH) + (uint)c.y * H(i, H_ROW_PITCH) + (uint)c.x * H(i, H_ELEMENT_SIZE);
 }
 
 static int in_range(img i, int4 c)
@@ -111,9 +115,9 @@ static int has_alpha(uint order)
 // A texel's channels, of a normalized, half or float format.
 static float4 load_f(img i, global uchar *p)
 {
-	uint n = i[H_CHANNELS];
+	uint n = H(i, H_CHANNELS);
 	float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	switch (i[H_TYPE]) {
+	switch (H(i, H_TYPE)) {
 	case CLK_UNORM_INT8:
 		for (uint k = 0; k < n; k++)
 			c[k] = p[k] / 255.0f;
@@ -159,16 +163,16 @@ static float4 load_f(img i, global uchar *p)
 		for (uint k = 0; k < n; k++)
 			c[k] = ((global float *)p)[k];
 	}
-	return to_rgba_float(i[H_ORDER], (float4)(c[0], c[1], c[2], c[3]));
+	return to_rgba_float(H(i, H_ORDER), (float4)(c[0], c[1], c[2], c[3]));
 }
 
 // A texel's channels, of an integer format (signed ones' bits as uint).
 static uint4 load_u(img i, global uchar *p)
 {
-	uint n = i[H_CHANNELS];
+	uint n = H(i, H_CHANNELS);
 	uint c[4] = {0, 0, 0, 0};
 	for (uint k = 0; k < n; k++) {
-		switch (i[H_TYPE]) {
+		switch (H(i, H_TYPE)) {
 		case CLK_SIGNED_INT8:
 			c[k] = (uint)(int)((global char *)p)[k];
 			break;
@@ -185,15 +189,15 @@ static uint4 load_u(img i, global uchar *p)
 			c[k] = ((global uint *)p)[k];
 		}
 	}
-	return to_rgba_uint(i[H_ORDER], (uint4)(c[0], c[1], c[2], c[3]));
+	return to_rgba_uint(H(i, H_ORDER), (uint4)(c[0], c[1], c[2], c[3]));
 }
 
 static void store_f(img i, global uchar *p, float4 v)
 {
-	uint n = i[H_CHANNELS];
-	float4 s = from_rgba_float(i[H_ORDER], v);
+	uint n = H(i, H_CHANNELS);
+	float4 s = from_rgba_float(H(i, H_ORDER), v);
 	float c[4] = {s.x, s.y, s.z, s.w};
-	switch (i[H_TYPE]) {
+	switch (H(i, H_TYPE)) {
 	case CLK_UNORM_INT8:
 		for (uint k = 0; k < n; k++)
 			p[k] = convert_uchar_sat_rte(c[k] * 255.0f);
@@ -239,12 +243,12 @@ static void store_f(img i, global uchar *p, float4 v)
 // range by its signedness).
 static void store_u(img i, global uchar *p, uint4 v, int sign)
 {
-	uint n = i[H_CHANNELS];
-	uint4 s = from_rgba_uint(i[H_ORDER], v);
+	uint n = H(i, H_CHANNELS);
+	uint4 s = from_rgba_uint(H(i, H_ORDER), v);
 	uint c[4] = {s.x, s.y, s.z, s.w};
 	for (uint k = 0; k < n; k++) {
 		int si = (int)c[k];
-		switch (i[H_TYPE]) {
+		switch (H(i, H_TYPE)) {
 		case CLK_SIGNED_INT8:
 			((global char *)p)[k] = sign ? convert_char_sat(si) : convert_char_sat(c[k]);
 			break;
@@ -325,21 +329,21 @@ static void linear(float s, int size, uint smp, int *i0, int *i1, float *a)
 static float4 fetch_f(img i, int4 c)
 {
 	if (!in_range(i, c))
-		return has_alpha(i[H_ORDER]) ? (float4)(0.0f) : (float4)(0.0f, 0.0f, 0.0f, 1.0f);
+		return has_alpha(H(i, H_ORDER)) ? (float4)(0.0f) : (float4)(0.0f, 0.0f, 0.0f, 1.0f);
 	return load_f(i, texel(i, c));
 }
 
 static uint4 fetch_u(img i, int4 c)
 {
 	if (!in_range(i, c))
-		return has_alpha(i[H_ORDER]) ? (uint4)(0) : (uint4)(0, 0, 0, 1);
+		return has_alpha(H(i, H_ORDER)) ? (uint4)(0) : (uint4)(0, 0, 0, 1);
 	return load_u(i, texel(i, c));
 }
 
 // An array's layer from its coordinate.
 static int layer(img i, float v)
 {
-	return clamp(to_int(rint(v)), 0, (int)i[H_ARRAY_SIZE] - 1);
+	return clamp(to_int(rint(v)), 0, (int)H(i, H_ARRAY_SIZE) - 1);
 }
 
 // Integer coordinates with a sampler: unnormalized, nearest, addressed.
@@ -426,14 +430,14 @@ static void write_u(img i, int4 c, uint4 v, int sign)
 #define F3(c) ((float4)((c).x, (c).y, (c).z, 0.0f))
 
 #define GETS(kind)                                                                                                     \
-	int __img_get_image_width_##kind(img i) { return (int)i[H_WIDTH]; }                                         \
-	int __img_get_image_height_##kind(img i) { return (int)i[H_HEIGHT]; }                                       \
-	int __img_get_image_depth_##kind(img i) { return (int)i[H_DEPTH]; }                                         \
-	uint __img_get_image_array_size_##kind(img i) { return i[H_ARRAY_SIZE]; }                                   \
-	int __img_get_image_channel_data_type_##kind(img i) { return (int)i[H_TYPE]; }                              \
-	int __img_get_image_channel_order_##kind(img i) { return (int)i[H_ORDER]; }                                 \
-	int2 __img_get_image_dim2_##kind(img i) { return (int2)((int)i[H_WIDTH], (int)i[H_HEIGHT]); }               \
-	int4 __img_get_image_dim4_##kind(img i) { return (int4)((int)i[H_WIDTH], (int)i[H_HEIGHT], (int)i[H_DEPTH], 0); }
+	int __img_get_image_width_##kind(img i) { return (int)H(i, H_WIDTH); }                                         \
+	int __img_get_image_height_##kind(img i) { return (int)H(i, H_HEIGHT); }                                       \
+	int __img_get_image_depth_##kind(img i) { return (int)H(i, H_DEPTH); }                                         \
+	uint __img_get_image_array_size_##kind(img i) { return H(i, H_ARRAY_SIZE); }                                   \
+	int __img_get_image_channel_data_type_##kind(img i) { return (int)H(i, H_TYPE); }                              \
+	int __img_get_image_channel_order_##kind(img i) { return (int)H(i, H_ORDER); }                                 \
+	int2 __img_get_image_dim2_##kind(img i) { return (int2)((int)H(i, H_WIDTH), (int)H(i, H_HEIGHT)); }               \
+	int4 __img_get_image_dim4_##kind(img i) { return (int4)((int)H(i, H_WIDTH), (int)H(i, H_HEIGHT), (int)H(i, H_DEPTH), 0); }
 
 #define READS(kind, CI, CF, TI, TF, dims, arrayed)                                                                     \
 	float4 __img_read_imagef_##kind##_s_i(img i, uint s, CI c) { return fetch_f(i, address_int(i, s, TI(c), dims, arrayed)); } \

@@ -69,11 +69,21 @@ impl Fs {
 
     /// The host path for a resolved guest path.
     pub fn host(&self, guest: &str) -> PathBuf {
+        if let Some(rest) = guest.strip_prefix("/dev/shm")
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            return shm_dir().join(rest.trim_start_matches('/'));
+        }
         self.root.join(guest.trim_start_matches('/'))
     }
 
     /// The guest path of a host path under the root (None outside it).
     pub fn guest(&self, host: &Path) -> Option<String> {
+        if let Some(dir) = SHM.get()
+            && let Ok(rest) = host.strip_prefix(dir)
+        {
+            return Some(format!("/dev/shm/{}", rest.to_str()?).trim_end_matches('/').to_string());
+        }
         let rest = host.strip_prefix(&self.root).ok()?;
         Some(format!("/{}", rest.to_str()?))
     }
@@ -176,6 +186,9 @@ pub enum Synthetic {
     MountInfo,
     /// /proc/meminfo: the host's memory.
     MemInfo,
+    /// /proc/self/maps: made by the process opening it (Process::maps); no
+    /// content of its own.
+    Maps,
     /// /sys/devices/system/cpu/cpuN/topology/*: each CPU a core of its own,
     /// all in one package (what hwloc, and so pocl, reads).
     Topology(u32, Topology),
@@ -246,6 +259,7 @@ impl Synthetic {
                     .as_slice()
                     .into()
             }
+            Synthetic::Maps => b"".as_slice().into(),
             Synthetic::MemInfo => {
                 let (total, available) = host_memory();
                 format!(
@@ -280,16 +294,21 @@ impl Synthetic {
     /// The content as an open host file (an unlinked temporary), so reading,
     /// seeking, stat and mmap work as for any file.
     pub fn open(self) -> std::io::Result<File> {
-        use std::io::{Seek, Write};
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("wasm-env-synthetic-{}-{n}", std::process::id()));
-        let mut file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
-        let _ = std::fs::remove_file(&path);
-        file.write_all(&self.content())?;
-        file.rewind()?;
-        Ok(file)
+        file_of(&self.content())
     }
+}
+
+/// A file holding `bytes`, which no path names (a synthetic file's).
+pub fn file_of(bytes: &[u8]) -> std::io::Result<File> {
+    use std::io::{Seek, Write};
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("wasm-env-synthetic-{}-{n}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+    let _ = std::fs::remove_file(&path);
+    file.write_all(bytes)?;
+    file.rewind()?;
+    Ok(file)
 }
 
 impl Fs {
@@ -317,6 +336,7 @@ impl Fs {
                 return Some(DevPath::Synthetic(Synthetic::CpuList));
             }
             ["proc", "meminfo"] => return Some(DevPath::Synthetic(Synthetic::MemInfo)),
+            ["proc", "self", "maps"] => return Some(DevPath::Synthetic(Synthetic::Maps)),
             ["sys", "devices", "system", "cpu", ..] | ["sys", "devices", "system"] | ["sys", "devices"] => return cpu_tree(&parts),
             ["etc", "resolv.conf"]
                 if std::fs::metadata(self.host("/etc/resolv.conf")).is_ok_and(|m| m.len() == 0)
@@ -338,6 +358,27 @@ impl Fs {
             ["fd", n] => n.parse().ok().map(DevPath::Fd),
             _ => None,
         }
+    }
+}
+
+/// /dev/shm: where POSIX shared memory and named semaphores live (shm_open
+/// and sem_open make files there and map them shared). Each run of wasm-env
+/// has its own, as each container has under Docker: a host directory, made
+/// when first used and removed when wasm-env exits (remove_shm).
+static SHM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn shm_dir() -> &'static Path {
+    SHM.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("wasm-env-shm-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
+/// Removes this run's /dev/shm, if it made one.
+pub fn remove_shm() {
+    if let Some(dir) = SHM.get() {
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
