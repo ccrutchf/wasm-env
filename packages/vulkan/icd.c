@@ -2,10 +2,12 @@
 // Khronos loader (libvulkan.so.1), implementing a portable subset of
 // Vulkan 1.0 on the runtime's GPU service through /dev/wasm-env-gpu
 // (runtime/src/gpu.rs has the requests, gpu/src/vulkan.rs the shaders and
-// the commands). Compute first: memory, buffers, SPIR-V shader modules,
-// descriptor sets of buffers, compute pipelines, push constants, command
-// buffers (recorded as a stream of commands the runtime replays) and
-// fences. One physical device, with one queue.
+// the commands): memory, buffers, images, SPIR-V shader modules, descriptor
+// sets, compute and graphics pipelines, render passes, command buffers
+// (recorded as a stream of commands the runtime replays), fences, and
+// presenting to Wayland surfaces. One physical device, with one queue. Its
+// entry points are generated from the Vulkan registry (entries.awk), so a
+// command it doesn't implement is a stub that says so.
 //
 // Device memory is a buffer in the runtime. Memory the program maps is a
 // copy in its own memory: sent to the device before each submission, and
@@ -15,10 +17,16 @@
 // haven't been read back reads them first, so it doesn't overwrite them.
 //
 // Like the OpenCL driver, it uses nothing from the C library but
-// allocation, a few string functions, open, ioctl and close: the same
+// allocation, a few string functions, open, ioctl and close (and, to
+// present, mapping memory and libwayland-client through dlopen): the same
 // library serves glibc and musl programs.
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+// (Wayland's types, without wayland-client.h: pointers to its structs.)
+struct wl_display;
+struct wl_surface;
+#include <vulkan/vulkan_wayland.h>
+#define VK_USE_PLATFORM_WAYLAND_KHR
 #include <vulkan/vk_icd.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -288,11 +296,10 @@ static void *zalloc(size_t n) {
 
 // ---- Instance and physical device ----
 
-// (VK_KHR_wayland_surface's name, without vulkan_wayland.h.)
 static const VkExtensionProperties instance_extensions[] = {
     {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_SPEC_VERSION},
     {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},
-    {"VK_KHR_wayland_surface", 6},
+    {VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, VK_KHR_WAYLAND_SURFACE_SPEC_VERSION},
 };
 static const VkExtensionProperties device_extensions[] = {
     {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SWAPCHAIN_SPEC_VERSION},
@@ -1919,8 +1926,6 @@ static CALL VkResult CC ResetEvent(VkDevice d, VkEvent e) {
     return VK_SUCCESS;
 }
 
-// ---- Entry points ----
-
 // ---- Presenting: Wayland surfaces and swapchains ----
 //
 // As Mesa presents for its software drivers: a swapchain's images are
@@ -1941,12 +1946,6 @@ int munmap(void *, size_t);
 #define MAP_SHARED 1
 #define MAP_FAILED ((void *)-1)
 
-// (The loader makes the surface: VkIcdSurfaceWayland, without
-// wayland-client.h.)
-struct wayland_surface {
-    VkIcdSurfaceBase base;
-    void *display, *surface;
-};
 
 struct wl_interface {
     const char *name;
@@ -1995,7 +1994,7 @@ static CALL VkResult CC GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice pd, 
     return VK_SUCCESS;
 }
 
-static CALL VkBool32 CC GetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice pd, uint32_t family, void *display) {
+static CALL VkBool32 CC GetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice pd, uint32_t family, struct wl_display *display) {
     return VK_TRUE;
 }
 
@@ -2109,7 +2108,8 @@ static CALL void CC DestroySwapchainKHR(VkDevice d, VkSwapchainKHR s, const VkAl
 }
 
 static CALL VkResult CC CreateSwapchainKHR(VkDevice d, const VkSwapchainCreateInfoKHR *info, const VkAllocationCallbacks *a, VkSwapchainKHR *out) {
-    struct wayland_surface *surface = (struct wayland_surface *)info->surface;
+    // (The loader makes the surface: VkIcdSurfaceWayland.)
+    VkIcdSurfaceWayland *surface = (VkIcdSurfaceWayland *)info->surface;
     if (surface->base.platform != VK_ICD_WSI_PLATFORM_WAYLAND || load_wayland())
         return VK_ERROR_SURFACE_LOST_KHR;
     struct VkSwapchainKHR_T *s = zalloc(sizeof *s);
@@ -2269,157 +2269,46 @@ static CALL VkResult CC QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *i
     return result;
 }
 
+// ---- Entry points ----
+
+long write(int, const void *, size_t);
+
+// A command the driver doesn't implement, said once on stderr (from the
+// generated stubs).
+static void unimplemented(const char *command) {
+    static const char *said[64];
+    for (size_t k = 0; k < sizeof said / sizeof *said; k++) {
+        if (said[k] == command)
+            return;
+        if (!said[k]) {
+            said[k] = command;
+            break;
+        }
+    }
+    char line[128];
+    int n = snprintf(line, sizeof line, "wasm-env's Vulkan driver: %s isn't implemented\n", command);
+    if (n > 0)
+        write(2, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
+}
+
+API CALL PFN_vkVoidFunction CC vk_icdGetInstanceProcAddr(VkInstance i, const char *name);
 static CALL PFN_vkVoidFunction CC GetDeviceProcAddr(VkDevice d, const char *name);
 
-#define F(name) {"vk" #name, (PFN_vkVoidFunction)name}
-#define FKHR(name) {"vk" #name "KHR", (PFN_vkVoidFunction)name}
-static const struct entry {
+static CALL PFN_vkVoidFunction CC GetInstanceProcAddr(VkInstance i, const char *name) {
+    return vk_icdGetInstanceProcAddr(i, name);
+}
+
+static CALL VkResult CC EnumerateInstanceLayerProperties(uint32_t *count, VkLayerProperties *out) {
+    *count = 0;
+    return VK_SUCCESS;
+}
+
+struct entry {
     const char *name;
     PFN_vkVoidFunction f;
-} global[] = {
-    F(CreateInstance),
-    F(EnumerateInstanceExtensionProperties),
-    F(EnumerateInstanceVersion),
-},
-  instance[] = {
-      F(DestroyInstance),
-      F(EnumeratePhysicalDevices),
-      F(GetPhysicalDeviceProperties),
-      F(GetPhysicalDeviceFeatures),
-      F(GetPhysicalDeviceQueueFamilyProperties),
-      F(GetPhysicalDeviceMemoryProperties),
-      F(GetPhysicalDeviceFormatProperties),
-      F(GetPhysicalDeviceImageFormatProperties),
-      F(GetPhysicalDeviceSparseImageFormatProperties),
-      FKHR(GetPhysicalDeviceProperties2),
-      FKHR(GetPhysicalDeviceFeatures2),
-      FKHR(GetPhysicalDeviceMemoryProperties2),
-      FKHR(GetPhysicalDeviceFormatProperties2),
-      FKHR(GetPhysicalDeviceQueueFamilyProperties2),
-      FKHR(GetPhysicalDeviceImageFormatProperties2),
-      FKHR(GetPhysicalDeviceSparseImageFormatProperties2),
-      F(EnumerateDeviceExtensionProperties),
-      F(EnumerateDeviceLayerProperties),
-      F(CreateDevice),
-      F(GetDeviceProcAddr),
-      F(GetPhysicalDeviceSurfaceSupportKHR),
-      F(GetPhysicalDeviceSurfaceCapabilitiesKHR),
-      F(GetPhysicalDeviceSurfaceFormatsKHR),
-      F(GetPhysicalDeviceSurfacePresentModesKHR),
-      F(GetPhysicalDeviceWaylandPresentationSupportKHR),
-},
-  device[] = {
-      F(DestroyDevice),
-      F(GetDeviceQueue),
-      F(QueueSubmit),
-      F(QueueWaitIdle),
-      F(DeviceWaitIdle),
-      F(AllocateMemory),
-      F(FreeMemory),
-      F(MapMemory),
-      F(UnmapMemory),
-      F(FlushMappedMemoryRanges),
-      F(InvalidateMappedMemoryRanges),
-      F(GetDeviceMemoryCommitment),
-      F(CreateBuffer),
-      F(DestroyBuffer),
-      F(GetBufferMemoryRequirements),
-      F(BindBufferMemory),
-      F(CreateImage),
-      F(DestroyImage),
-      F(GetImageMemoryRequirements),
-      F(BindImageMemory),
-      F(GetImageSubresourceLayout),
-      F(GetImageSparseMemoryRequirements),
-      F(CreateImageView),
-      F(DestroyImageView),
-      F(CreateSampler),
-      F(DestroySampler),
-      F(CreateShaderModule),
-      F(DestroyShaderModule),
-      F(CreateComputePipelines),
-      F(CreateGraphicsPipelines),
-      F(DestroyPipeline),
-      F(CreateRenderPass),
-      F(DestroyRenderPass),
-      F(GetRenderAreaGranularity),
-      F(CreateFramebuffer),
-      F(DestroyFramebuffer),
-      F(CreatePipelineCache),
-      F(DestroyPipelineCache),
-      F(GetPipelineCacheData),
-      F(MergePipelineCaches),
-      F(CreatePipelineLayout),
-      F(DestroyPipelineLayout),
-      F(CreateDescriptorSetLayout),
-      F(DestroyDescriptorSetLayout),
-      F(CreateDescriptorPool),
-      F(DestroyDescriptorPool),
-      F(ResetDescriptorPool),
-      F(AllocateDescriptorSets),
-      F(FreeDescriptorSets),
-      F(UpdateDescriptorSets),
-      F(CreateCommandPool),
-      F(DestroyCommandPool),
-      F(ResetCommandPool),
-      F(AllocateCommandBuffers),
-      F(FreeCommandBuffers),
-      F(BeginCommandBuffer),
-      F(EndCommandBuffer),
-      F(ResetCommandBuffer),
-      F(CmdBindPipeline),
-      F(CmdBindDescriptorSets),
-      F(CmdPushConstants),
-      F(CmdDispatch),
-      F(CmdDispatchIndirect),
-      F(CmdCopyBuffer),
-      F(CmdFillBuffer),
-      F(CmdUpdateBuffer),
-      F(CmdCopyBufferToImage),
-      F(CmdCopyImageToBuffer),
-      F(CmdCopyImage),
-      F(CmdClearColorImage),
-      F(CmdBeginRenderPass),
-      F(CmdNextSubpass),
-      F(CmdEndRenderPass),
-      F(CmdSetViewport),
-      F(CmdSetScissor),
-      F(CmdSetBlendConstants),
-      F(CmdSetStencilReference),
-      F(CmdSetLineWidth),
-      F(CmdSetDepthBias),
-      F(CmdSetDepthBounds),
-      F(CmdSetStencilCompareMask),
-      F(CmdSetStencilWriteMask),
-      F(CmdBindVertexBuffers),
-      F(CmdBindIndexBuffer),
-      F(CmdDraw),
-      F(CmdDrawIndexed),
-      F(CmdDrawIndirect),
-      F(CmdDrawIndexedIndirect),
-      F(CmdPipelineBarrier),
-      F(CmdSetEvent),
-      F(CmdResetEvent),
-      F(CmdWaitEvents),
-      F(CmdExecuteCommands),
-      F(CreateFence),
-      F(DestroyFence),
-      F(ResetFences),
-      F(GetFenceStatus),
-      F(WaitForFences),
-      F(CreateSemaphore),
-      F(DestroySemaphore),
-      F(CreateEvent),
-      F(DestroyEvent),
-      F(GetEventStatus),
-      F(SetEvent),
-      F(ResetEvent),
-      F(CreateSwapchainKHR),
-      F(DestroySwapchainKHR),
-      F(GetSwapchainImagesKHR),
-      F(AcquireNextImageKHR),
-      F(QueuePresentKHR),
 };
+// The tables, global, instance and device, from vk.xml (entries.awk).
+#include "entries.h"
 
 static PFN_vkVoidFunction find(const struct entry *t, size_t n, const char *name) {
     for (size_t k = 0; k < n; k++)
