@@ -43,9 +43,35 @@ int close(int);
 #define CALL VKAPI_ATTR
 #define CC VKAPI_CALL
 
-enum { INFO = 1, CREATE, FREE, WRITE, READ, FINISH = 13, VK_SHADER = 20, VK_PIPELINE, VK_SUBMIT, VK_LIMITS, VK_IMAGE, VK_VIEW, VK_SAMPLER, VK_FORMAT };
+enum { INFO = 1, CREATE, FREE, WRITE, READ, FINISH = 13, VK_SHADER = 20, VK_PIPELINE, VK_SUBMIT, VK_LIMITS, VK_IMAGE, VK_VIEW, VK_SAMPLER, VK_FORMAT, VK_GRAPHICS };
 // The command stream's operations (gpu/src/vulkan.rs, `decode`).
-enum { BIND_PIPELINE = 1, BIND_SET, PUSH, DISPATCH, DISPATCH_INDIRECT, COPY, FILL, UPDATE, BUFFER_TO_IMAGE, IMAGE_TO_BUFFER, COPY_IMAGE, CLEAR_COLOR };
+enum {
+    BIND_PIPELINE = 1,
+    BIND_SET,
+    PUSH,
+    DISPATCH,
+    DISPATCH_INDIRECT,
+    COPY,
+    FILL,
+    UPDATE,
+    BUFFER_TO_IMAGE,
+    IMAGE_TO_BUFFER,
+    COPY_IMAGE,
+    CLEAR_COLOR,
+    BEGIN_PASS,
+    END_PASS,
+    SET_VIEWPORT,
+    SET_SCISSOR,
+    BIND_VERTEX,
+    BIND_INDEX,
+    DRAW,
+    DRAW_INDEXED,
+    DRAW_INDIRECT,
+    DRAW_INDEXED_INDIRECT,
+    SET_BLEND_CONSTANTS,
+    SET_STENCIL_REFERENCE,
+    BIND_GRAPHICS_SET
+};
 
 struct request {
     uint64_t op, a[9], r[6];
@@ -144,8 +170,39 @@ struct VkBuffer_T {
 struct VkShaderModule_T {
     uint64_t handle;
 };
+// Graphics state a pipeline may leave to commands (Vulkan's dynamic
+// state), kept by command buffers: WebGPU's passes each start without it.
+enum { S_VIEWPORT = 1, S_SCISSOR = 2, S_BLEND = 4, S_REFERENCE = 8 };
+struct state {
+    uint32_t set;
+    float viewport[6];
+    uint32_t scissor[4];
+    float blend[4];
+    uint32_t reference;
+};
 struct VkPipeline_T {
     uint64_t handle;
+    int graphics;
+    // A graphics pipeline's own state (its `set` what isn't dynamic).
+    struct state fixed;
+};
+struct subpass {
+    uint32_t ncolors;
+    uint32_t colors[8];
+    uint32_t depth; // VK_ATTACHMENT_UNUSED: none
+};
+struct VkRenderPass_T {
+    uint32_t n;
+    VkAttachmentDescription *attachments;
+    // Per attachment: the subpasses that first and last use it.
+    uint32_t *first, *last;
+    uint32_t nsub;
+    struct subpass *sub;
+};
+struct VkFramebuffer_T {
+    uint32_t n;
+    VkImageView *views;
+    uint32_t width, height;
 };
 struct VkPipelineLayout_T {
     uint32_t sets;
@@ -202,8 +259,15 @@ struct VkCommandBuffer_T {
     size_t n, cap;
     struct write *writes;
     size_t nwrites, wcap;
-    // Bound now: the compute pipeline's layout (for dynamic offsets).
     int failed;
+    // Graphics: the state set, and the render pass begun (or NULL), its
+    // framebuffer, subpass and clear values.
+    struct state state;
+    VkRenderPass pass;
+    VkFramebuffer framebuffer;
+    uint32_t subpass;
+    VkClearValue *clears;
+    uint32_t nclears;
 };
 struct VkFence_T {
     int signaled;
@@ -224,10 +288,31 @@ static void *zalloc(size_t n) {
 
 // ---- Instance and physical device ----
 
+// (VK_KHR_wayland_surface's name, without vulkan_wayland.h.)
+static const VkExtensionProperties instance_extensions[] = {
+    {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_SPEC_VERSION},
+    {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},
+    {"VK_KHR_wayland_surface", 6},
+};
+static const VkExtensionProperties device_extensions[] = {
+    {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SWAPCHAIN_SPEC_VERSION},
+};
+
+// Whether every extension named is one of `have`.
+static int extensions(const VkExtensionProperties *have, size_t n, uint32_t count, const char *const *names) {
+    for (uint32_t i = 0; i < count; i++) {
+        size_t k = 0;
+        while (k < n && strcmp(names[i], have[k].extensionName))
+            k++;
+        if (k == n)
+            return 0;
+    }
+    return 1;
+}
+
 static CALL VkResult CC CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *a, VkInstance *out) {
-    for (uint32_t i = 0; i < info->enabledExtensionCount; i++)
-        if (strcmp(info->ppEnabledExtensionNames[i], VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
-            return VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (!extensions(instance_extensions, sizeof instance_extensions / sizeof *instance_extensions, info->enabledExtensionCount, info->ppEnabledExtensionNames))
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
     struct VkInstance_T *i = zalloc(sizeof *i);
     if (!i)
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -253,14 +338,10 @@ static VkResult enumerate(uint32_t *count, void *out, const void *items, uint32_
     return k < n ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
-static const VkExtensionProperties instance_extensions[] = {
-    {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_SPEC_VERSION},
-};
-
 static CALL VkResult CC EnumerateInstanceExtensionProperties(const char *layer, uint32_t *count, VkExtensionProperties *out) {
     if (layer)
         return VK_ERROR_LAYER_NOT_PRESENT;
-    return enumerate(count, out, instance_extensions, 1, sizeof *out);
+    return enumerate(count, out, instance_extensions, sizeof instance_extensions / sizeof *instance_extensions, sizeof *out);
 }
 
 static CALL VkResult CC EnumerateInstanceVersion(uint32_t *version) {
@@ -336,7 +417,7 @@ static CALL void CC GetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDev
     memset(f, 0, sizeof *f);
 }
 
-static const VkQueueFamilyProperties family = {VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT, 1, 0, {1, 1, 1}};
+static const VkQueueFamilyProperties family = {VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT, 1, 0, {1, 1, 1}};
 
 static CALL void CC GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice pd, uint32_t *count, VkQueueFamilyProperties *out) {
     enumerate(count, out, &family, 1, sizeof family);
@@ -436,8 +517,9 @@ static CALL void CC GetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevi
 }
 
 static CALL VkResult CC EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char *layer, uint32_t *count, VkExtensionProperties *out) {
-    *count = 0;
-    return layer ? VK_ERROR_LAYER_NOT_PRESENT : VK_SUCCESS;
+    if (layer)
+        return VK_ERROR_LAYER_NOT_PRESENT;
+    return enumerate(count, out, device_extensions, sizeof device_extensions / sizeof *device_extensions, sizeof *out);
 }
 
 static CALL VkResult CC EnumerateDeviceLayerProperties(VkPhysicalDevice pd, uint32_t *count, VkLayerProperties *out) {
@@ -448,7 +530,7 @@ static CALL VkResult CC EnumerateDeviceLayerProperties(VkPhysicalDevice pd, uint
 // ---- Device and queue ----
 
 static CALL VkResult CC CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *info, const VkAllocationCallbacks *a, VkDevice *out) {
-    if (info->enabledExtensionCount)
+    if (!extensions(device_extensions, sizeof device_extensions / sizeof *device_extensions, info->enabledExtensionCount, info->ppEnabledExtensionNames))
         return VK_ERROR_EXTENSION_NOT_PRESENT;
     for (uint32_t i = 0; i < info->queueCreateInfoCount; i++)
         if (info->pQueueCreateInfos[i].queueFamilyIndex != 0 || info->pQueueCreateInfos[i].queueCount > 1)
@@ -785,10 +867,266 @@ static CALL VkResult CC CreateComputePipelines(VkDevice d, VkPipelineCache cache
     return result;
 }
 
+// Words for VK_GRAPHICS (gpu/src/vulkan.rs, `GraphicsState::decode`).
+struct words {
+    uint32_t *w;
+    size_t n, cap;
+    int failed;
+};
+
+static void word(struct words *b, uint32_t v) {
+    if (b->n == b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 128;
+        uint32_t *w = realloc(b->w, cap * sizeof *w);
+        if (!w) {
+            b->failed = 1;
+            return;
+        }
+        b->w = w;
+        b->cap = cap;
+    }
+    b->w[b->n++] = v;
+}
+
+static uint32_t bits(float f) {
+    union {
+        float f;
+        uint32_t u;
+    } x = {f};
+    return x.u;
+}
+
+static void stencil_face(struct words *b, const VkStencilOpState *s) {
+    word(b, (uint32_t)s->failOp);
+    word(b, (uint32_t)s->passOp);
+    word(b, (uint32_t)s->depthFailOp);
+    word(b, (uint32_t)s->compareOp);
+    word(b, s->compareMask);
+    word(b, s->writeMask);
+}
+
+static void name(struct words *b, const char *s) {
+    size_t n = strlen(s);
+    for (size_t k = 0; k < n; k += 4) {
+        uint32_t w = 0;
+        memcpy(&w, s + k, n - k < 4 ? n - k : 4);
+        word(b, w);
+    }
+}
+
+static VkResult graphics_pipeline(const VkGraphicsPipelineCreateInfo *info, VkPipeline *out) {
+    const VkPipelineShaderStageCreateInfo *vs = NULL, *fs = NULL;
+    for (uint32_t k = 0; k < info->stageCount; k++) {
+        const VkPipelineShaderStageCreateInfo *st = &info->pStages[k];
+        if (st->stage == VK_SHADER_STAGE_VERTEX_BIT)
+            vs = st;
+        else if (st->stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+            fs = st;
+        else
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    const VkPipelineRasterizationStateCreateInfo *rs = info->pRasterizationState;
+    if (!vs || !rs)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (rs->rasterizerDiscardEnable)
+        fs = NULL;
+    const struct subpass *sp = &info->renderPass->sub[info->subpass];
+    const VkAttachmentDescription *att = info->renderPass->attachments;
+    int has_depth = sp->depth != VK_ATTACHMENT_UNUSED;
+    const VkPipelineDepthStencilStateCreateInfo *ds = has_depth ? info->pDepthStencilState : NULL;
+    const VkPipelineColorBlendStateCreateInfo *cb = fs ? info->pColorBlendState : NULL;
+    const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
+    struct words b = {0};
+    uint64_t shaders[2] = {vs->module->handle, fs ? fs->module->handle : 0};
+    for (int k = 0; k < 2; k++) {
+        word(&b, (uint32_t)shaders[k]);
+        word(&b, (uint32_t)(shaders[k] >> 32));
+    }
+    word(&b, strlen(vs->pName));
+    word(&b, fs ? strlen(fs->pName) : 0);
+    word(&b, (uint32_t)info->pInputAssemblyState->topology);
+    word(&b, rs->cullMode);
+    word(&b, (uint32_t)rs->frontFace);
+    word(&b, rs->depthBiasEnable);
+    word(&b, bits(rs->depthBiasConstantFactor));
+    word(&b, bits(rs->depthBiasSlopeFactor));
+    word(&b, bits(rs->depthBiasClamp));
+    word(&b, ds ? ds->depthTestEnable : 0);
+    word(&b, ds ? ds->depthWriteEnable : 0);
+    word(&b, ds ? (uint32_t)ds->depthCompareOp : 0);
+    word(&b, ds ? ds->stencilTestEnable : 0);
+    VkStencilOpState none = {0};
+    stencil_face(&b, ds ? &ds->front : &none);
+    stencil_face(&b, ds ? &ds->back : &none);
+    word(&b, has_depth ? (uint32_t)att[sp->depth].format : 0);
+    word(&b, info->pMultisampleState ? (uint32_t)info->pMultisampleState->rasterizationSamples : 1);
+    uint32_t nc = fs ? sp->ncolors : 0, nb = vi ? vi->vertexBindingDescriptionCount : 0, na = vi ? vi->vertexAttributeDescriptionCount : 0;
+    word(&b, nc);
+    word(&b, nb);
+    word(&b, na);
+    for (uint32_t k = 0; k < nc; k++) {
+        word(&b, (uint32_t)att[sp->colors[k]].format);
+        VkPipelineColorBlendAttachmentState blend = {.colorWriteMask = 0xf};
+        if (cb && k < cb->attachmentCount)
+            blend = cb->pAttachments[k];
+        word(&b, blend.blendEnable);
+        word(&b, (uint32_t)blend.srcColorBlendFactor);
+        word(&b, (uint32_t)blend.dstColorBlendFactor);
+        word(&b, (uint32_t)blend.colorBlendOp);
+        word(&b, (uint32_t)blend.srcAlphaBlendFactor);
+        word(&b, (uint32_t)blend.dstAlphaBlendFactor);
+        word(&b, (uint32_t)blend.alphaBlendOp);
+        word(&b, blend.colorWriteMask);
+    }
+    for (uint32_t k = 0; k < nb; k++) {
+        const VkVertexInputBindingDescription *v = &vi->pVertexBindingDescriptions[k];
+        word(&b, v->binding);
+        word(&b, v->stride);
+        word(&b, (uint32_t)v->inputRate);
+    }
+    for (uint32_t k = 0; k < na; k++) {
+        const VkVertexInputAttributeDescription *v = &vi->pVertexAttributeDescriptions[k];
+        word(&b, v->location);
+        word(&b, v->binding);
+        word(&b, (uint32_t)v->format);
+        word(&b, v->offset);
+    }
+    name(&b, vs->pName);
+    if (fs)
+        name(&b, fs->pName);
+    struct VkPipeline_T *p = zalloc(sizeof *p);
+    char why[256];
+    struct request q = {VK_GRAPHICS, {(uint64_t)(uintptr_t)b.w, b.n * 4, 0, (uint64_t)(uintptr_t)why, sizeof why}};
+    if (!p || b.failed || call(&q)) {
+        free(b.w);
+        free(p);
+        return b.failed || !p ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_INITIALIZATION_FAILED;
+    }
+    free(b.w);
+    p->handle = q.r[0];
+    p->graphics = 1;
+    // Its own state: what it doesn't leave to commands.
+    struct state *s = &p->fixed;
+    s->set = S_VIEWPORT | S_SCISSOR | S_BLEND | S_REFERENCE;
+    if (info->pDynamicState)
+        for (uint32_t k = 0; k < info->pDynamicState->dynamicStateCount; k++)
+            switch (info->pDynamicState->pDynamicStates[k]) {
+            case VK_DYNAMIC_STATE_VIEWPORT: s->set &= ~S_VIEWPORT; break;
+            case VK_DYNAMIC_STATE_SCISSOR: s->set &= ~S_SCISSOR; break;
+            case VK_DYNAMIC_STATE_BLEND_CONSTANTS: s->set &= ~S_BLEND; break;
+            case VK_DYNAMIC_STATE_STENCIL_REFERENCE: s->set &= ~S_REFERENCE; break;
+            default: break;
+            }
+    const VkPipelineViewportStateCreateInfo *vp = info->pViewportState;
+    if (vp && vp->pViewports && vp->viewportCount)
+        memcpy(s->viewport, vp->pViewports, sizeof s->viewport);
+    else
+        s->set &= ~S_VIEWPORT;
+    if (vp && vp->pScissors && vp->scissorCount)
+        memcpy(s->scissor, vp->pScissors, sizeof s->scissor);
+    else
+        s->set &= ~S_SCISSOR;
+    if (cb)
+        memcpy(s->blend, cb->blendConstants, sizeof s->blend);
+    else
+        s->set &= ~S_BLEND;
+    if (ds && ds->stencilTestEnable)
+        s->reference = ds->front.reference;
+    else
+        s->set &= ~S_REFERENCE;
+    *out = p;
+    return VK_SUCCESS;
+}
+
 static CALL VkResult CC CreateGraphicsPipelines(VkDevice d, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *info, const VkAllocationCallbacks *a, VkPipeline *out) {
-    for (uint32_t i = 0; i < n; i++)
+    VkResult result = VK_SUCCESS;
+    for (uint32_t i = 0; i < n; i++) {
         out[i] = VK_NULL_HANDLE;
-    return VK_ERROR_FEATURE_NOT_PRESENT;
+        VkResult r = graphics_pipeline(&info[i], &out[i]);
+        if (r != VK_SUCCESS)
+            result = r;
+    }
+    return result;
+}
+
+// ---- Render passes and framebuffers ----
+
+static CALL VkResult CC CreateRenderPass(VkDevice d, const VkRenderPassCreateInfo *info, const VkAllocationCallbacks *a, VkRenderPass *out) {
+    struct VkRenderPass_T *p = zalloc(sizeof *p);
+    if (!p)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    p->n = info->attachmentCount;
+    p->nsub = info->subpassCount;
+    p->attachments = malloc((p->n ? p->n : 1) * sizeof *p->attachments);
+    p->first = malloc((p->n ? p->n : 1) * sizeof *p->first);
+    p->last = malloc((p->n ? p->n : 1) * sizeof *p->last);
+    p->sub = zalloc(p->nsub * sizeof *p->sub);
+    if (!p->attachments || !p->first || !p->last || !p->sub) {
+        free(p->attachments), free(p->first), free(p->last), free(p->sub), free(p);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (p->n)
+        memcpy(p->attachments, info->pAttachments, p->n * sizeof *p->attachments);
+    for (uint32_t k = 0; k < p->n; k++)
+        p->first[k] = VK_ATTACHMENT_UNUSED, p->last[k] = 0;
+    for (uint32_t s = 0; s < p->nsub; s++) {
+        const VkSubpassDescription *sd = &info->pSubpasses[s];
+        struct subpass *sub = &p->sub[s];
+        // (Multisampled attachments resolved: not yet.)
+        if (sd->pResolveAttachments)
+            for (uint32_t k = 0; k < sd->colorAttachmentCount; k++)
+                if (sd->pResolveAttachments[k].attachment != VK_ATTACHMENT_UNUSED) {
+                    free(p->attachments), free(p->first), free(p->last), free(p->sub), free(p);
+                    return VK_ERROR_FEATURE_NOT_PRESENT;
+                }
+        for (uint32_t k = 0; k < sd->colorAttachmentCount && sub->ncolors < 8; k++)
+            if (sd->pColorAttachments[k].attachment != VK_ATTACHMENT_UNUSED)
+                sub->colors[sub->ncolors++] = sd->pColorAttachments[k].attachment;
+        sub->depth = sd->pDepthStencilAttachment ? sd->pDepthStencilAttachment->attachment : VK_ATTACHMENT_UNUSED;
+        for (uint32_t k = 0; k <= sub->ncolors; k++) {
+            uint32_t at = k < sub->ncolors ? sub->colors[k] : sub->depth;
+            if (at == VK_ATTACHMENT_UNUSED)
+                continue;
+            if (p->first[at] == VK_ATTACHMENT_UNUSED)
+                p->first[at] = s;
+            p->last[at] = s;
+        }
+    }
+    *out = p;
+    return VK_SUCCESS;
+}
+
+static CALL void CC DestroyRenderPass(VkDevice d, VkRenderPass p, const VkAllocationCallbacks *a) {
+    if (!p)
+        return;
+    free(p->attachments), free(p->first), free(p->last), free(p->sub), free(p);
+}
+
+static CALL void CC GetRenderAreaGranularity(VkDevice d, VkRenderPass p, VkExtent2D *g) {
+    *g = (VkExtent2D){1, 1};
+}
+
+static CALL VkResult CC CreateFramebuffer(VkDevice d, const VkFramebufferCreateInfo *info, const VkAllocationCallbacks *a, VkFramebuffer *out) {
+    struct VkFramebuffer_T *f = zalloc(sizeof *f);
+    VkImageView *views = malloc((info->attachmentCount ? info->attachmentCount : 1) * sizeof *views);
+    if (!f || !views) {
+        free(f), free(views);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (info->attachmentCount)
+        memcpy(views, info->pAttachments, info->attachmentCount * sizeof *views);
+    f->n = info->attachmentCount;
+    f->views = views;
+    f->width = info->width;
+    f->height = info->height;
+    *out = f;
+    return VK_SUCCESS;
+}
+
+static CALL void CC DestroyFramebuffer(VkDevice d, VkFramebuffer f, const VkAllocationCallbacks *a) {
+    if (!f)
+        return;
+    free(f->views), free(f);
 }
 
 static CALL void CC DestroyPipeline(VkDevice d, VkPipeline p, const VkAllocationCallbacks *a) {
@@ -1025,6 +1363,8 @@ static CALL VkResult CC AllocateCommandBuffers(VkDevice d, const VkCommandBuffer
 static void reset(VkCommandBuffer c) {
     c->n = c->nwrites = 0;
     c->failed = 0;
+    c->state.set = 0;
+    c->pass = NULL;
 }
 
 static CALL void CC FreeCommandBuffers(VkDevice d, VkCommandPool p, uint32_t n, const VkCommandBuffer *cs) {
@@ -1032,6 +1372,7 @@ static CALL void CC FreeCommandBuffers(VkDevice d, VkCommandPool p, uint32_t n, 
         if (cs[i]) {
             free(cs[i]->s);
             free(cs[i]->writes);
+            free(cs[i]->clears);
             free(cs[i]);
         }
 }
@@ -1091,9 +1432,56 @@ static void writes(VkCommandBuffer c, VkBuffer b, VkDeviceSize offset, VkDeviceS
     c->writes[c->nwrites++] = (struct write){b->memory, b->offset + offset, b->offset + offset + size};
 }
 
+// Graphics state set (the bits `which`), into the render pass begun.
+static void emit_state(VkCommandBuffer c, uint32_t which) {
+    struct state *s = &c->state;
+    which &= s->set;
+    if (!c->pass)
+        return;
+    if (which & S_VIEWPORT)
+        command(c, SET_VIEWPORT, s->viewport, sizeof s->viewport, NULL, 0);
+    if (which & S_SCISSOR) {
+        // (Within the framebuffer, as WebGPU's must be.)
+        int32_t x = (int32_t)s->scissor[0], y = (int32_t)s->scissor[1];
+        int64_t w = s->scissor[2], h = s->scissor[3];
+        if (x < 0)
+            w += x, x = 0;
+        if (y < 0)
+            h += y, y = 0;
+        uint32_t fw = c->framebuffer->width, fh = c->framebuffer->height;
+        if ((uint32_t)x > fw)
+            x = (int32_t)fw;
+        if ((uint32_t)y > fh)
+            y = (int32_t)fh;
+        if (w > (int64_t)fw - x)
+            w = (int64_t)fw - x;
+        if (h > (int64_t)fh - y)
+            h = (int64_t)fh - y;
+        uint32_t r[4] = {(uint32_t)x, (uint32_t)y, (uint32_t)(w > 0 ? w : 0), (uint32_t)(h > 0 ? h : 0)};
+        command(c, SET_SCISSOR, r, sizeof r, NULL, 0);
+    }
+    if (which & S_BLEND)
+        command(c, SET_BLEND_CONSTANTS, s->blend, sizeof s->blend, NULL, 0);
+    if (which & S_REFERENCE)
+        command(c, SET_STENCIL_REFERENCE, &s->reference, 4, NULL, 0);
+}
+
 static CALL void CC CmdBindPipeline(VkCommandBuffer c, VkPipelineBindPoint point, VkPipeline p) {
-    if (point == VK_PIPELINE_BIND_POINT_COMPUTE)
-        command(c, BIND_PIPELINE, &p->handle, 8, NULL, 0);
+    command(c, BIND_PIPELINE, &p->handle, 8, NULL, 0);
+    if (!p->graphics)
+        return;
+    // Its own state, as if set by commands.
+    struct state *s = &c->state, *f = &p->fixed;
+    if (f->set & S_VIEWPORT)
+        memcpy(s->viewport, f->viewport, sizeof s->viewport);
+    if (f->set & S_SCISSOR)
+        memcpy(s->scissor, f->scissor, sizeof s->scissor);
+    if (f->set & S_BLEND)
+        memcpy(s->blend, f->blend, sizeof s->blend);
+    if (f->set & S_REFERENCE)
+        s->reference = f->reference;
+    s->set |= f->set;
+    emit_state(c, f->set);
 }
 
 static CALL void CC CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t first, uint32_t n, const VkDescriptorSet *sets, uint32_t ndyn, const uint32_t *dyn) {
@@ -1108,7 +1496,7 @@ static CALL void CC CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint
         for (uint32_t k = 0; k < s->layout->n; k++)
             count += s->d[k].buffer || s->d[k].view || s->d[k].sampler;
         uint32_t head[2] = {first + i, count};
-        uint32_t h[2] = {BIND_SET, 8 + 8 + count * 32};
+        uint32_t h[2] = {point == VK_PIPELINE_BIND_POINT_GRAPHICS ? BIND_GRAPHICS_SET : BIND_SET, 8 + 8 + count * 32};
         put(c, h, 8);
         put(c, head, 8);
         for (uint32_t k = 0; k < s->layout->n; k++) {
@@ -1234,6 +1622,152 @@ static CALL void CC CmdClearColorImage(VkCommandBuffer c, VkImage im, VkImageLay
         uint32_t w[8] = {r[i].baseMipLevel, mips, r[i].baseArrayLayer, layers, color->uint32[0], color->uint32[1], color->uint32[2], color->uint32[3]};
         command(c, CLEAR_COLOR, &im->handle, 8, w, sizeof w);
     }
+}
+
+// ---- Drawing ----
+
+// A subpass begun: a WebGPU render pass of its attachments, which load as
+// the render pass says where it first uses them (else what's there), and
+// store unless where it last does the render pass says not to.
+static void begin_subpass(VkCommandBuffer c) {
+    VkRenderPass p = c->pass;
+    VkFramebuffer f = c->framebuffer;
+    uint32_t s = c->subpass;
+    const struct subpass *sp = &p->sub[s];
+    uint32_t head[2] = {sp->ncolors, sp->depth != VK_ATTACHMENT_UNUSED};
+    uint32_t h[2] = {BEGIN_PASS, 8 + 8 + sp->ncolors * 32 + (head[1] ? 32 : 0)};
+    put(c, h, 8);
+    put(c, head, 8);
+    VkClearValue zero = {0};
+    for (uint32_t k = 0; k <= sp->ncolors; k++) {
+        uint32_t at = k < sp->ncolors ? sp->colors[k] : sp->depth;
+        if (at == VK_ATTACHMENT_UNUSED)
+            continue;
+        const VkAttachmentDescription *d = &p->attachments[at];
+        const VkClearValue *clear = at < c->nclears ? &c->clears[at] : &zero;
+        uint32_t load = p->first[at] == s ? (uint32_t)d->loadOp : 0, store = p->last[at] == s ? (uint32_t)d->storeOp : 0;
+        uint32_t w[6];
+        if (k < sp->ncolors) {
+            w[0] = load, w[1] = store;
+            memcpy(w + 2, clear->color.uint32, 16);
+        } else {
+            uint32_t sload = p->first[at] == s ? (uint32_t)d->stencilLoadOp : 0, sstore = p->last[at] == s ? (uint32_t)d->stencilStoreOp : 0;
+            w[0] = load, w[1] = store, w[2] = sload, w[3] = sstore;
+            w[4] = bits(clear->depthStencil.depth), w[5] = clear->depthStencil.stencil;
+        }
+        put(c, &f->views[at]->handle, 8);
+        put(c, w, sizeof w);
+    }
+    // (State set before: each WebGPU pass starts without it.)
+    emit_state(c, ~0u);
+}
+
+static CALL void CC CmdBeginRenderPass(VkCommandBuffer c, const VkRenderPassBeginInfo *info, VkSubpassContents contents) {
+    if (info->clearValueCount > c->nclears) {
+        VkClearValue *v = realloc(c->clears, info->clearValueCount * sizeof *v);
+        if (!v) {
+            c->failed = 1;
+            return;
+        }
+        c->clears = v;
+    }
+    c->nclears = info->clearValueCount;
+    if (c->nclears)
+        memcpy(c->clears, info->pClearValues, c->nclears * sizeof *c->clears);
+    c->pass = info->renderPass;
+    c->framebuffer = info->framebuffer;
+    c->subpass = 0;
+    begin_subpass(c);
+}
+
+static CALL void CC CmdNextSubpass(VkCommandBuffer c, VkSubpassContents contents) {
+    command(c, END_PASS, NULL, 0, NULL, 0);
+    c->subpass++;
+    begin_subpass(c);
+}
+
+static CALL void CC CmdEndRenderPass(VkCommandBuffer c) {
+    command(c, END_PASS, NULL, 0, NULL, 0);
+    c->pass = NULL;
+}
+
+static void set_state(VkCommandBuffer c, uint32_t bit) {
+    c->state.set |= bit;
+    emit_state(c, bit);
+}
+
+// (One viewport and scissor: the device's limit.)
+static CALL void CC CmdSetViewport(VkCommandBuffer c, uint32_t first, uint32_t n, const VkViewport *v) {
+    if (first == 0 && n) {
+        memcpy(c->state.viewport, v, sizeof c->state.viewport);
+        set_state(c, S_VIEWPORT);
+    }
+}
+
+static CALL void CC CmdSetScissor(VkCommandBuffer c, uint32_t first, uint32_t n, const VkRect2D *r) {
+    if (first == 0 && n) {
+        memcpy(c->state.scissor, r, sizeof c->state.scissor);
+        set_state(c, S_SCISSOR);
+    }
+}
+
+static CALL void CC CmdSetBlendConstants(VkCommandBuffer c, const float blend[4]) {
+    memcpy(c->state.blend, blend, sizeof c->state.blend);
+    set_state(c, S_BLEND);
+}
+
+static CALL void CC CmdSetStencilReference(VkCommandBuffer c, VkStencilFaceFlags faces, uint32_t reference) {
+    c->state.reference = reference;
+    set_state(c, S_REFERENCE);
+}
+
+// State WebGPU's pipelines fix (their own, then): lines one pixel wide,
+// no depth bounds test.
+static CALL void CC CmdSetLineWidth(VkCommandBuffer c, float width) {}
+static CALL void CC CmdSetDepthBias(VkCommandBuffer c, float constant, float clamp, float slope) {}
+static CALL void CC CmdSetDepthBounds(VkCommandBuffer c, float lo, float hi) {}
+static CALL void CC CmdSetStencilCompareMask(VkCommandBuffer c, VkStencilFaceFlags faces, uint32_t mask) {}
+static CALL void CC CmdSetStencilWriteMask(VkCommandBuffer c, VkStencilFaceFlags faces, uint32_t mask) {}
+
+static CALL void CC CmdBindVertexBuffers(VkCommandBuffer c, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *offsets) {
+    uint32_t head[2] = {first, n};
+    uint32_t h[2] = {BIND_VERTEX, 8 + 8 + n * 16};
+    put(c, h, 8);
+    put(c, head, 8);
+    for (uint32_t k = 0; k < n; k++) {
+        uint64_t r[2] = {b[k]->memory->handle, b[k]->offset + offsets[k]};
+        put(c, r, 16);
+    }
+}
+
+static CALL void CC CmdBindIndexBuffer(VkCommandBuffer c, VkBuffer b, VkDeviceSize offset, VkIndexType type) {
+    uint64_t r[2] = {b->memory->handle, b->offset + offset};
+    uint32_t t = (uint32_t)type;
+    command(c, BIND_INDEX, r, 16, &t, 4);
+}
+
+static CALL void CC CmdDraw(VkCommandBuffer c, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t first_instance) {
+    uint32_t w[4] = {vertices, instances, first, first_instance};
+    command(c, DRAW, w, sizeof w, NULL, 0);
+}
+
+static CALL void CC CmdDrawIndexed(VkCommandBuffer c, uint32_t indices, uint32_t instances, uint32_t first, int32_t vertex_offset, uint32_t first_instance) {
+    uint32_t w[5] = {indices, instances, first, (uint32_t)vertex_offset, first_instance};
+    command(c, DRAW_INDEXED, w, sizeof w, NULL, 0);
+}
+
+static void draw_indirect(VkCommandBuffer c, uint32_t op, VkBuffer b, VkDeviceSize offset, uint32_t count, uint32_t stride) {
+    uint64_t r[2] = {b->memory->handle, b->offset + offset};
+    uint32_t w[2] = {count, stride};
+    command(c, op, r, 16, w, 8);
+}
+
+static CALL void CC CmdDrawIndirect(VkCommandBuffer c, VkBuffer b, VkDeviceSize offset, uint32_t count, uint32_t stride) {
+    draw_indirect(c, DRAW_INDIRECT, b, offset, count, stride);
+}
+
+static CALL void CC CmdDrawIndexedIndirect(VkCommandBuffer c, VkBuffer b, VkDeviceSize offset, uint32_t count, uint32_t stride) {
+    draw_indirect(c, DRAW_INDEXED_INDIRECT, b, offset, count, stride);
 }
 
 // Barriers and events: the commands run in order (wgpu orders a
@@ -1387,6 +1921,354 @@ static CALL VkResult CC ResetEvent(VkDevice d, VkEvent e) {
 
 // ---- Entry points ----
 
+// ---- Presenting: Wayland surfaces and swapchains ----
+//
+// As Mesa presents for its software drivers: a swapchain's images are
+// ordinary images, and presenting one copies it into a shared-memory
+// buffer (wl_shm) committed to the program's wl_surface, through the
+// program's own libwayland-client on a queue of the driver's.
+
+void *dlopen(const char *, int);
+void *dlsym(void *, const char *);
+int memfd_create(const char *, unsigned);
+int ftruncate(int, long);
+void *mmap(void *, size_t, int, int, int, long);
+int munmap(void *, size_t);
+#define RTLD_NOW 2
+#define MFD_CLOEXEC 1u
+#define PROT_READ 1
+#define PROT_WRITE 2
+#define MAP_SHARED 1
+#define MAP_FAILED ((void *)-1)
+
+// (The loader makes the surface: VkIcdSurfaceWayland, without
+// wayland-client.h.)
+struct wayland_surface {
+    VkIcdSurfaceBase base;
+    void *display, *surface;
+};
+
+struct wl_interface {
+    const char *name;
+    int version;
+};
+enum { WL_MARSHAL_FLAG_DESTROY = 1, WL_SHM_FORMAT_ARGB8888 = 0, WL_SHM_FORMAT_XRGB8888 = 1 };
+// libwayland-client's functions and interfaces, found when first needed.
+static struct {
+    void *(*create_queue)(void *display);
+    void (*queue_destroy)(void *queue);
+    void *(*create_wrapper)(void *proxy);
+    void (*wrapper_destroy)(void *wrapper);
+    void (*set_queue)(void *proxy, void *queue);
+    void *(*marshal_flags)(void *proxy, uint32_t opcode, const struct wl_interface *iface, uint32_t version, uint32_t flags, ...);
+    int (*add_listener)(void *proxy, const void *implementation, void *data);
+    void (*destroy)(void *proxy);
+    uint32_t (*get_version)(void *proxy);
+    int (*roundtrip_queue)(void *display, void *queue);
+    int (*dispatch_queue)(void *display, void *queue);
+    int (*flush)(void *display);
+    const struct wl_interface *registry, *shm, *shm_pool, *buffer, *callback;
+} wl;
+
+static int load_wayland(void) {
+    if (wl.callback)
+        return 0;
+    void *lib = dlopen("libwayland-client.so.0", RTLD_NOW);
+    if (!lib)
+        return -1;
+    static const char *names[] = {"wl_display_create_queue",    "wl_event_queue_destroy", "wl_proxy_create_wrapper",  "wl_proxy_wrapper_destroy",
+                                  "wl_proxy_set_queue",         "wl_proxy_marshal_flags", "wl_proxy_add_listener",    "wl_proxy_destroy",
+                                  "wl_proxy_get_version",       "wl_display_roundtrip_queue", "wl_display_dispatch_queue", "wl_display_flush",
+                                  "wl_registry_interface",      "wl_shm_interface",       "wl_shm_pool_interface",    "wl_buffer_interface",
+                                  "wl_callback_interface"};
+    void *found[sizeof names / sizeof *names];
+    for (size_t k = 0; k < sizeof names / sizeof *names; k++)
+        if (!(found[k] = dlsym(lib, names[k])))
+            return -1;
+    _Static_assert(sizeof wl == sizeof found, "one pointer each");
+    memcpy(&wl, found, sizeof wl);
+    return 0;
+}
+
+static CALL VkResult CC GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice pd, uint32_t family, VkSurfaceKHR surface, VkBool32 *supported) {
+    *supported = ((VkIcdSurfaceBase *)surface)->platform == VK_ICD_WSI_PLATFORM_WAYLAND;
+    return VK_SUCCESS;
+}
+
+static CALL VkBool32 CC GetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice pd, uint32_t family, void *display) {
+    return VK_TRUE;
+}
+
+static const VkImageUsageFlags swapchain_usage =
+    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+
+// (Wayland's surfaces take the swapchain's size: no current extent.)
+static CALL VkResult CC GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice pd, VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR *c) {
+    *c = (VkSurfaceCapabilitiesKHR){.minImageCount = 2,
+                                    .maxImageCount = 8,
+                                    .currentExtent = {0xffffffffu, 0xffffffffu},
+                                    .minImageExtent = {1, 1},
+                                    .maxImageExtent = {4096, 4096},
+                                    .maxImageArrayLayers = 1,
+                                    .supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+                                    .currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+                                    .supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR | VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+                                    .supportedUsageFlags = swapchain_usage};
+    return VK_SUCCESS;
+}
+
+// wl_shm's formats, which are BGRA in memory.
+static const VkSurfaceFormatKHR surface_formats[] = {
+    {VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+    {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+};
+
+static CALL VkResult CC GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice pd, VkSurfaceKHR surface, uint32_t *count, VkSurfaceFormatKHR *out) {
+    return enumerate(count, out, surface_formats, 2, sizeof *out);
+}
+
+static CALL VkResult CC GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice pd, VkSurfaceKHR surface, uint32_t *count, VkPresentModeKHR *out) {
+    static const VkPresentModeKHR fifo = VK_PRESENT_MODE_FIFO_KHR;
+    return enumerate(count, out, &fifo, 1, sizeof fifo);
+}
+
+struct slot {
+    VkImage image;
+    void *buffer;
+    // The compositor has its buffer; the program has acquired it.
+    int busy, acquired;
+};
+struct VkSwapchainKHR_T {
+    VkDevice device;
+    void *display, *queue, *surface, *shm, *pool, *frame;
+    uint32_t width, height, n;
+    struct slot *slots;
+    uint8_t *pixels;
+    size_t size;
+    // The device's copy of an image presented, read into its buffer.
+    struct VkDeviceMemory_T copy;
+    uint32_t next;
+    int lost;
+};
+
+static void registry_global(void *data, void *registry, uint32_t name, const char *interface, uint32_t version) {
+    struct VkSwapchainKHR_T *s = data;
+    if (!strcmp(interface, "wl_shm") && !s->shm)
+        s->shm = wl.marshal_flags(registry, 0, wl.shm, 1, 0, name, wl.shm->name, 1u, NULL);
+}
+static void registry_global_remove(void *data, void *registry, uint32_t name) {}
+static const struct {
+    void (*global)(void *, void *, uint32_t, const char *, uint32_t);
+    void (*global_remove)(void *, void *, uint32_t);
+} registry_listener = {registry_global, registry_global_remove};
+
+static void released(void *data, void *buffer) {
+    ((struct slot *)data)->busy = 0;
+}
+static const struct {
+    void (*release)(void *, void *);
+} buffer_listener = {released};
+
+static void frame_done(void *data, void *callback, uint32_t time) {
+    struct VkSwapchainKHR_T *s = data;
+    wl.destroy(callback);
+    s->frame = NULL;
+}
+static const struct {
+    void (*done)(void *, void *, uint32_t);
+} frame_listener = {frame_done};
+
+static CALL void CC DestroySwapchainKHR(VkDevice d, VkSwapchainKHR s, const VkAllocationCallbacks *a) {
+    if (!s)
+        return;
+    for (uint32_t k = 0; k < s->n; k++) {
+        if (s->slots[k].buffer)
+            wl.marshal_flags(s->slots[k].buffer, 0, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+        DestroyImage(d, s->slots[k].image, NULL);
+    }
+    if (s->pool)
+        wl.marshal_flags(s->pool, 1, NULL, 1, WL_MARSHAL_FLAG_DESTROY);
+    if (s->frame)
+        wl.destroy(s->frame);
+    if (s->shm)
+        wl.destroy(s->shm);
+    if (s->surface)
+        wl.wrapper_destroy(s->surface);
+    if (s->display)
+        wl.flush(s->display);
+    if (s->queue)
+        wl.queue_destroy(s->queue);
+    if (s->pixels)
+        munmap(s->pixels, s->size);
+    if (s->copy.handle) {
+        struct request q = {FREE, {s->copy.handle}};
+        call(&q);
+    }
+    free(s->slots);
+    free(s);
+}
+
+static CALL VkResult CC CreateSwapchainKHR(VkDevice d, const VkSwapchainCreateInfoKHR *info, const VkAllocationCallbacks *a, VkSwapchainKHR *out) {
+    struct wayland_surface *surface = (struct wayland_surface *)info->surface;
+    if (surface->base.platform != VK_ICD_WSI_PLATFORM_WAYLAND || load_wayland())
+        return VK_ERROR_SURFACE_LOST_KHR;
+    struct VkSwapchainKHR_T *s = zalloc(sizeof *s);
+    uint32_t n = info->minImageCount < 2 ? 2 : info->minImageCount;
+    if (!s || !(s->slots = zalloc(n * sizeof *s->slots))) {
+        free(s);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    s->device = d;
+    s->n = n;
+    s->width = info->imageExtent.width;
+    s->height = info->imageExtent.height;
+    VkResult r = VK_ERROR_SURFACE_LOST_KHR;
+    // wl_shm, found on a queue of the driver's, and the program's surface
+    // on it too (for frame callbacks).
+    s->queue = wl.create_queue(surface->display);
+    void *display = wl.create_wrapper(surface->display);
+    if (!s->queue || !display)
+        goto fail;
+    s->display = surface->display;
+    wl.set_queue(display, s->queue);
+    void *registry = wl.marshal_flags(display, 1, wl.registry, wl.get_version(display), 0, NULL);
+    wl.wrapper_destroy(display);
+    if (!registry)
+        goto fail;
+    wl.add_listener(registry, &registry_listener, s);
+    wl.roundtrip_queue(s->display, s->queue);
+    wl.destroy(registry);
+    s->surface = wl.create_wrapper(surface->surface);
+    if (!s->shm || !s->surface)
+        goto fail;
+    wl.set_queue(s->surface, s->queue);
+    // The buffers: one shared memory, an image's pixels each.
+    size_t stride = (size_t)s->width * 4, image = stride * s->height;
+    s->size = image * n;
+    int fd = memfd_create("wasm-env-vulkan", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, (long)s->size) || (s->pixels = mmap(NULL, s->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)) == MAP_FAILED) {
+        s->pixels = NULL;
+        if (fd >= 0)
+            close(fd);
+        r = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto fail;
+    }
+    s->pool = wl.marshal_flags(s->shm, 0, wl.shm_pool, 1, 0, NULL, fd, (int32_t)s->size);
+    close(fd);
+    uint32_t format = info->compositeAlpha == VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+    struct request q = {CREATE, {image}};
+    if (!s->pool || call(&q))
+        goto fail;
+    s->copy.handle = q.r[0];
+    s->copy.size = image;
+    for (uint32_t k = 0; k < n; k++) {
+        struct slot *sl = &s->slots[k];
+        sl->buffer = wl.marshal_flags(s->pool, 0, wl.buffer, 1, 0, NULL, (int32_t)(image * k), (int32_t)s->width, (int32_t)s->height, (int32_t)stride, format);
+        if (!sl->buffer)
+            goto fail;
+        wl.add_listener(sl->buffer, &buffer_listener, sl);
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                .imageType = VK_IMAGE_TYPE_2D,
+                                .format = info->imageFormat,
+                                .extent = {s->width, s->height, 1},
+                                .mipLevels = 1,
+                                .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = info->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+        if ((r = CreateImage(d, &ii, NULL, &sl->image)) != VK_SUCCESS)
+            goto fail;
+    }
+    wl.flush(s->display);
+    *out = s;
+    return VK_SUCCESS;
+fail:
+    DestroySwapchainKHR(d, s, NULL);
+    return r;
+}
+
+static CALL VkResult CC GetSwapchainImagesKHR(VkDevice d, VkSwapchainKHR s, uint32_t *count, VkImage *out) {
+    if (!out) {
+        *count = s->n;
+        return VK_SUCCESS;
+    }
+    uint32_t n = *count < s->n ? *count : s->n;
+    for (uint32_t k = 0; k < n; k++)
+        out[k] = s->slots[k].image;
+    *count = n;
+    return n < s->n ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+// An image the program doesn't have: there's nothing to wait for (its
+// buffer is waited for when it's presented).
+static CALL VkResult CC AcquireNextImageKHR(VkDevice d, VkSwapchainKHR s, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t *index) {
+    if (s->lost)
+        return VK_ERROR_SURFACE_LOST_KHR;
+    for (uint32_t k = 0; k < s->n; k++) {
+        uint32_t i = (s->next + k) % s->n;
+        if (!s->slots[i].acquired) {
+            s->slots[i].acquired = 1;
+            s->next = i + 1;
+            *index = i;
+            if (fence)
+                fence->signaled = 1;
+            return VK_SUCCESS;
+        }
+    }
+    return timeout ? VK_TIMEOUT : VK_NOT_READY;
+}
+
+// Presenting: once the compositor has shown the last frame (FIFO) and is
+// done with this image's buffer, the image copied into it and committed.
+static VkResult present(VkSwapchainKHR s, uint32_t i) {
+    struct slot *sl = &s->slots[i];
+    sl->acquired = 0;
+    while (s->frame || sl->busy)
+        if (wl.dispatch_queue(s->display, s->queue) < 0) {
+            s->lost = 1;
+            return VK_ERROR_SURFACE_LOST_KHR;
+        }
+    struct VkCommandBuffer_T c = {0};
+    struct VkBuffer_T b = {s->copy.size, 0, &s->copy, 0};
+    VkBufferImageCopy whole = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {s->width, s->height, 1}};
+    buffer_image(&c, IMAGE_TO_BUFFER, &b, sl->image, 1, &whole);
+    struct request q = {VK_SUBMIT, {(uint64_t)(uintptr_t)c.s, c.n}};
+    int failed = c.failed || call(&q);
+    free(c.s);
+    free(c.writes);
+    s->copy.map = s->pixels + (size_t)s->copy.size * i;
+    if (failed || transfer(READ, &s->copy, 0, s->copy.size))
+        return VK_ERROR_DEVICE_LOST;
+    s->frame = wl.marshal_flags(s->surface, 3, wl.callback, wl.get_version(s->surface), 0, NULL);
+    if (s->frame)
+        wl.add_listener(s->frame, &frame_listener, s);
+    uint32_t v = wl.get_version(s->surface);
+    wl.marshal_flags(s->surface, 1, NULL, v, 0, sl->buffer, 0, 0);
+    if (v >= 4)
+        wl.marshal_flags(s->surface, 9, NULL, v, 0, 0, 0, (int32_t)s->width, (int32_t)s->height);
+    else
+        wl.marshal_flags(s->surface, 2, NULL, v, 0, 0, 0, 0x7fffffff, 0x7fffffff);
+    wl.marshal_flags(s->surface, 6, NULL, v, 0);
+    sl->busy = 1;
+    if (wl.flush(s->display) < 0) {
+        s->lost = 1;
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    return VK_SUCCESS;
+}
+
+static CALL VkResult CC QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info) {
+    VkResult result = VK_SUCCESS;
+    for (uint32_t k = 0; k < info->swapchainCount; k++) {
+        VkResult r = present(info->pSwapchains[k], info->pImageIndices[k]);
+        if (info->pResults)
+            info->pResults[k] = r;
+        if (r != VK_SUCCESS)
+            result = r;
+    }
+    return result;
+}
+
 static CALL PFN_vkVoidFunction CC GetDeviceProcAddr(VkDevice d, const char *name);
 
 #define F(name) {"vk" #name, (PFN_vkVoidFunction)name}
@@ -1420,6 +2302,11 @@ static const struct entry {
       F(EnumerateDeviceLayerProperties),
       F(CreateDevice),
       F(GetDeviceProcAddr),
+      F(GetPhysicalDeviceSurfaceSupportKHR),
+      F(GetPhysicalDeviceSurfaceCapabilitiesKHR),
+      F(GetPhysicalDeviceSurfaceFormatsKHR),
+      F(GetPhysicalDeviceSurfacePresentModesKHR),
+      F(GetPhysicalDeviceWaylandPresentationSupportKHR),
 },
   device[] = {
       F(DestroyDevice),
@@ -1453,6 +2340,11 @@ static const struct entry {
       F(CreateComputePipelines),
       F(CreateGraphicsPipelines),
       F(DestroyPipeline),
+      F(CreateRenderPass),
+      F(DestroyRenderPass),
+      F(GetRenderAreaGranularity),
+      F(CreateFramebuffer),
+      F(DestroyFramebuffer),
       F(CreatePipelineCache),
       F(DestroyPipelineCache),
       F(GetPipelineCacheData),
@@ -1487,6 +2379,24 @@ static const struct entry {
       F(CmdCopyImageToBuffer),
       F(CmdCopyImage),
       F(CmdClearColorImage),
+      F(CmdBeginRenderPass),
+      F(CmdNextSubpass),
+      F(CmdEndRenderPass),
+      F(CmdSetViewport),
+      F(CmdSetScissor),
+      F(CmdSetBlendConstants),
+      F(CmdSetStencilReference),
+      F(CmdSetLineWidth),
+      F(CmdSetDepthBias),
+      F(CmdSetDepthBounds),
+      F(CmdSetStencilCompareMask),
+      F(CmdSetStencilWriteMask),
+      F(CmdBindVertexBuffers),
+      F(CmdBindIndexBuffer),
+      F(CmdDraw),
+      F(CmdDrawIndexed),
+      F(CmdDrawIndirect),
+      F(CmdDrawIndexedIndirect),
       F(CmdPipelineBarrier),
       F(CmdSetEvent),
       F(CmdResetEvent),
@@ -1504,6 +2414,11 @@ static const struct entry {
       F(GetEventStatus),
       F(SetEvent),
       F(ResetEvent),
+      F(CreateSwapchainKHR),
+      F(DestroySwapchainKHR),
+      F(GetSwapchainImagesKHR),
+      F(AcquireNextImageKHR),
+      F(QueuePresentKHR),
 };
 
 static PFN_vkVoidFunction find(const struct entry *t, size_t n, const char *name) {

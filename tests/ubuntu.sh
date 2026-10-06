@@ -257,13 +257,16 @@ fi
 # Vulkan (M9): Ubuntu's loader (libvulkan1) with wasm-env's driver
 # (packages/vulkan), likewise: vulkaninfo sees its device, a compute shader
 # (tests/arm64/vulkan.comp, made SPIR-V by glslang) runs, and another
-# samples an image through a combined image sampler (vulkan_image.comp).
+# samples an image through a combined image sampler (vulkan_image.comp),
+# and triangles are drawn with depth and culling (vulkan_draw.vert, .frag).
 if tests/ubuntu-fetch.sh libvulkan-dev vulkan-tools >/dev/null 2>&1 && packages/vulkan/build.sh >/dev/null; then
 	mkdir -p "$R/usr/lib/wasm-env" "$R/usr/share/vulkan/icd.d" build/vulkan-test
 	cp build/packages/vulkan/libwasm-env-vulkan.so "$R/usr/lib/wasm-env/"
 	cp build/packages/vulkan/wasm-env_icd.aarch64.json "$R/usr/share/vulkan/icd.d/"
 	if glslangValidator -V --quiet --vn compute_spv -o build/vulkan-test/vulkan_spv.h tests/arm64/vulkan.comp \
 		&& glslangValidator -V --quiet --vn image_spv -o build/vulkan-test/vulkan_image_spv.h tests/arm64/vulkan_image.comp \
+		&& glslangValidator -V --quiet --vn vert_spv -o build/vulkan-test/vulkan_draw_vert.h tests/arm64/vulkan_draw.vert \
+		&& glslangValidator -V --quiet --vn frag_spv -o build/vulkan-test/vulkan_draw_frag.h tests/arm64/vulkan_draw.frag \
 		&& "${cc[@]}" -O2 -Ibuild/vulkan-test -o "$R/opt/tests/vulkan" tests/arm64/vulkan.c -lvulkan; then
 		only=(--env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/wasm-env_icd.aarch64.json)
 		for gpu in host software; do
@@ -274,7 +277,13 @@ compute: 0 of 1000 wrong
 fill and update: right
 the program's own write kept: yes
 images: texels fetched 0 wrong, image 0 wrong
+draw: 5 pixels looked at, 0 wrong
 done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" /opt/tests/vulkan 2>&1)"
+				# vkcube, presenting to the runtime's compositor: its 60th
+				# frame a textured cube (many colors) on a gray background.
+				colors=$(WASM_ENV_GPU=$gpu WASM_ENV_DEBUG_WAYLAND=1 timeout 900 "$wasm_env" run --wayland=headless --root "$R" "${only[@]}" \
+					/usr/bin/vkcube-wayland --c 70 2>&1 | sed -n 's/.*frame 60: [0-9x]*, \([0-9]*\) colors.*/\1/p' | head -1)
+				compare "vkcube ($gpu, the runtime's compositor)" yes "$([ "${colors:-0}" -gt 1000 ] && echo yes || echo "no (${colors:-no frame 60})")"
 			else
 				echo "skipped Vulkan ($gpu): no such GPU adapter"
 			fi

@@ -83,7 +83,8 @@ impl Display for Headless {
         // that frames hold pictures, not only that there are frames).
         if n % 60 == 0 && std::env::var_os("WASM_ENV_DEBUG_WAYLAND").is_some() {
             let drawn = frame.pixels.iter().filter(|&&p| p & 0xff_ffff != 0).count();
-            eprintln!("wasm-env: window {window} frame {n}: {}x{}, {drawn} pixels not black", frame.width * frame.scale, frame.height * frame.scale);
+            let colors = frame.pixels.iter().map(|&p| p & 0xff_ffff).collect::<std::collections::HashSet<_>>().len();
+            eprintln!("wasm-env: window {window} frame {n}: {}x{}, {colors} colors, {drawn} pixels not black", frame.width * frame.scale, frame.height * frame.scale);
         }
     }
     fn set_title(&self, _: u64, _: &str) {}

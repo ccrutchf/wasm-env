@@ -9,6 +9,8 @@
 #include <vulkan/vulkan.h>
 #include "vulkan_spv.h"
 #include "vulkan_image_spv.h"
+#include "vulkan_draw_frag.h"
+#include "vulkan_draw_vert.h"
 
 #define N 1000
 #define CHECK(x)                                                    \
@@ -175,6 +177,231 @@ static int images(VkDevice dev, VkQueue queue) {
     return 0;
 }
 
+// Drawing into a 64 × 64 RGBA8 image with a depth buffer, read back: a
+// green square over everything (indexed), then three triangles in its
+// corners: a red one in front of it, a blue one behind it, and a yellow one
+// facing away (culled). The vertex shader (vulkan_draw.vert) moves
+// positions by a uniform; the fragment shader (vulkan_draw.frag) tints by
+// push constants. The viewport is set before the render pass begins, the
+// scissor is the pipeline's own.
+static int draw(VkDevice dev, VkQueue queue) {
+    enum { W = 64 };
+    VkFormat formats[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT};
+    VkImageUsageFlags usage[2] = {VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};
+    VkImageAspectFlags aspect[2] = {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT};
+    VkImage im[2];
+    VkDeviceMemory imem[2];
+    VkImageView view[2];
+    for (int k = 0; k < 2; k++) {
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = formats[k], .extent = {W, W, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage[k]};
+        CHECK(vkCreateImage(dev, &ii, NULL, &im[k]));
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(dev, im[k], &req);
+        VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = 0};
+        CHECK(vkAllocateMemory(dev, &mi, NULL, &imem[k]));
+        CHECK(vkBindImageMemory(dev, im[k], imem[k], 0));
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im[k], .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = formats[k],
+                                    .subresourceRange = {aspect[k], 0, 1, 0, 1}};
+        CHECK(vkCreateImageView(dev, &vi, NULL, &view[k]));
+    }
+
+    // One memory: vertices (position, color), indices, the uniform, and
+    // the image read back.
+    float offset[4] = {0.25f, -0.125f, 0, 0};
+    struct vertex {
+        float x, y, z, r, g, b;
+    } v[13] = {
+        // The square (Vulkan's y is down: counter-clockwise on screen is
+        // front-facing).
+        {-1, -1, 0.5f, 0, 1, 0},
+        {-1, 1, 0.5f, 0, 1, 0},
+        {1, 1, 0.5f, 0, 1, 0},
+        {1, -1, 0.5f, 0, 1, 0},
+        // Top left, in front; bottom right, behind; bottom left, facing away.
+        {-1, -1, 0.25f, 1, 0, 0},
+        {-1, 0, 0.25f, 1, 0, 0},
+        {0, -1, 0.25f, 1, 0, 0},
+        {1, 1, 0.75f, 0, 0, 1},
+        {1, 0, 0.75f, 0, 0, 1},
+        {0, 1, 0.75f, 0, 0, 1},
+        {-1, 1, 0.1f, 1, 1, 0},
+        {-1, 0, 0.1f, 1, 1, 0},
+        {0, 1, 0.1f, 1, 1, 0},
+    };
+    for (int k = 0; k < 13; k++)
+        v[k].x -= offset[0], v[k].y -= offset[1];
+    uint16_t indices[6] = {0, 1, 2, 0, 2, 3};
+    VkDeviceSize size[4] = {sizeof v, sizeof indices, sizeof offset, W * W * 4}, at[4], total = 0;
+    VkBufferUsageFlags busage[4] = {VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer buf[4];
+    for (int k = 0; k < 4; k++) {
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size[k], .usage = busage[k]};
+        CHECK(vkCreateBuffer(dev, &bi, NULL, &buf[k]));
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(dev, buf[k], &req);
+        at[k] = (total + req.alignment - 1) / req.alignment * req.alignment;
+        total = at[k] + req.size;
+    }
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = total, .memoryTypeIndex = 0};
+    VkDeviceMemory mem;
+    CHECK(vkAllocateMemory(dev, &mi, NULL, &mem));
+    for (int k = 0; k < 4; k++)
+        CHECK(vkBindBufferMemory(dev, buf[k], mem, at[k]));
+    uint8_t *map;
+    CHECK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, (void **)&map));
+    memcpy(map + at[0], v, sizeof v);
+    memcpy(map + at[1], indices, sizeof indices);
+    memcpy(map + at[2], offset, sizeof offset);
+    uint8_t *pixels = map + at[3];
+
+    VkAttachmentDescription att[2] = {
+        {0, formats[0], VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+        {0, formats[1], VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL},
+    };
+    VkAttachmentReference color_ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, depth_ref = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &color_ref, .pDepthStencilAttachment = &depth_ref};
+    VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 2, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub};
+    VkRenderPass pass;
+    CHECK(vkCreateRenderPass(dev, &rpi, NULL, &pass));
+    VkFramebufferCreateInfo fbi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = pass, .attachmentCount = 2, .pAttachments = view, .width = W, .height = W, .layers = 1};
+    VkFramebuffer fb;
+    CHECK(vkCreateFramebuffer(dev, &fbi, NULL, &fb));
+
+    VkShaderModule shaders[2];
+    VkShaderModuleCreateInfo si[2] = {{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof vert_spv, .pCode = vert_spv},
+                                      {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof frag_spv, .pCode = frag_spv}};
+    for (int k = 0; k < 2; k++)
+        CHECK(vkCreateShaderModule(dev, &si[k], NULL, &shaders[k]));
+    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
+    VkDescriptorSetLayout sl;
+    CHECK(vkCreateDescriptorSetLayout(dev, &li, NULL, &sl));
+    VkPushConstantRange pr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+    VkPipelineLayout layout;
+    CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &layout));
+
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = shaders[0], .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = shaders[1], .pName = "main"},
+    };
+    VkVertexInputBindingDescription vb = {0, sizeof(struct vertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription va[2] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12}};
+    VkPipelineVertexInputStateCreateInfo vis = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &vb,
+                                                .vertexAttributeDescriptionCount = 2, .pVertexAttributeDescriptions = va};
+    VkPipelineInputAssemblyStateCreateInfo ias = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkRect2D scissor = {{0, 0}, {W, W}};
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1, .pScissors = &scissor};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_BACK_BIT,
+                                                 .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE,
+                                                 .depthCompareOp = VK_COMPARE_OP_LESS};
+    VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xf};
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba};
+    VkDynamicState dyn = VK_DYNAMIC_STATE_VIEWPORT;
+    VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 1, .pDynamicStates = &dyn};
+    VkGraphicsPipelineCreateInfo gpi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                                        .stageCount = 2,
+                                        .pStages = stages,
+                                        .pVertexInputState = &vis,
+                                        .pInputAssemblyState = &ias,
+                                        .pViewportState = &vps,
+                                        .pRasterizationState = &rs,
+                                        .pMultisampleState = &ms,
+                                        .pDepthStencilState = &dss,
+                                        .pColorBlendState = &cbs,
+                                        .pDynamicState = &ds,
+                                        .layout = layout,
+                                        .renderPass = pass};
+    VkPipeline pipeline;
+    CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &pipeline));
+
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+    VkDescriptorPool pool;
+    CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &pool));
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &sl};
+    VkDescriptorSet set;
+    CHECK(vkAllocateDescriptorSets(dev, &dai, &set));
+    VkDescriptorBufferInfo bu = {buf[2], 0, sizeof offset};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bu};
+    vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
+
+    VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0};
+    VkCommandPool cpool;
+    CHECK(vkCreateCommandPool(dev, &cpi, NULL, &cpool));
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkCommandBuffer cmd;
+    CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    VkViewport viewport = {0, 0, W, W, 0, 1};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    VkClearValue clears[2] = {{.color = {.float32 = {0, 0, 0, 1}}}, {.depthStencil = {1, 0}}};
+    VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = pass, .framebuffer = fb, .renderArea = {{0, 0}, {W, W}}, .clearValueCount = 2, .pClearValues = clears};
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
+    float tint[4] = {1, 0.5f, 1, 1};
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, tint);
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &buf[0], &zero);
+    vkCmdBindIndexBuffer(cmd, buf[1], 0, VK_INDEX_TYPE_UINT16);
+    vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+    vkCmdDraw(cmd, 9, 1, 4, 0);
+    vkCmdEndRenderPass(cmd);
+    VkBufferImageCopy whole = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W, W, 1}};
+    vkCmdCopyImageToBuffer(cmd, im[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf[3], 1, &whole);
+    CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+    CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+    CHECK(vkQueueWaitIdle(queue));
+
+    // Pixels well inside each corner, and the middle.
+    struct {
+        int x, y;
+        uint8_t rgba[4];
+    } want[5] = {
+        {6, 6, {255, 0, 0, 255}}, {58, 58, {0, 128, 0, 255}}, {6, 58, {0, 128, 0, 255}}, {58, 6, {0, 128, 0, 255}}, {40, 24, {0, 128, 0, 255}},
+    };
+    int wrong = 0;
+    for (int k = 0; k < 5; k++) {
+        uint8_t *p = pixels + (want[k].y * W + want[k].x) * 4;
+        int bad = 0;
+        for (int c = 0; c < 4; c++)
+            bad |= p[c] < want[k].rgba[c] - 1 || p[c] > want[k].rgba[c] + 1;
+        if (bad)
+            printf("pixel (%d, %d): %d %d %d %d\n", want[k].x, want[k].y, p[0], p[1], p[2], p[3]);
+        wrong += bad;
+    }
+    printf("draw: 5 pixels looked at, %d wrong\n", wrong);
+
+    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+    vkDestroyCommandPool(dev, cpool, NULL);
+    vkDestroyDescriptorPool(dev, pool, NULL);
+    vkDestroyPipeline(dev, pipeline, NULL);
+    vkDestroyPipelineLayout(dev, layout, NULL);
+    vkDestroyDescriptorSetLayout(dev, sl, NULL);
+    for (int k = 0; k < 2; k++)
+        vkDestroyShaderModule(dev, shaders[k], NULL);
+    vkDestroyFramebuffer(dev, fb, NULL);
+    vkDestroyRenderPass(dev, pass, NULL);
+    for (int k = 0; k < 2; k++) {
+        vkDestroyImageView(dev, view[k], NULL);
+        vkDestroyImage(dev, im[k], NULL);
+        vkFreeMemory(dev, imem[k], NULL);
+    }
+    for (int k = 0; k < 4; k++)
+        vkDestroyBuffer(dev, buf[k], NULL);
+    vkUnmapMemory(dev, mem);
+    vkFreeMemory(dev, mem, NULL);
+    return 0;
+}
+
 int main(void) {
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_0};
     VkInstanceCreateInfo ii = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
@@ -292,7 +519,7 @@ int main(void) {
     printf("compute: %d of %d wrong\n", wrong, N);
     printf("fill and update: %s\n", filled[0] == 0x5a5a5a5a && filled[2] == 0xc0ffee && filled[3] == 0xbeef && filled[15] == 0x5a5a5a5a ? "right" : "wrong");
     printf("the program's own write kept: %s\n", unused[0] == 12345 ? "yes" : "no");
-    if (images(dev, queue))
+    if (images(dev, queue) || draw(dev, queue))
         return 1;
 
     vkDestroyFence(dev, fence, NULL);

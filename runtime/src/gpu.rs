@@ -83,6 +83,9 @@
 //!              (VkCompareOp + 1, or 0), LOD minimum and maximum (f32)   r0: handle
 //!  27 VK_FORMAT   a0: VkFormat   r0: its VkFormatFeatureFlags (optimal
 //!              tiling), r2: a texel's bytes (0: not supported)
+//!  28 VK_GRAPHICS a0: state, a1: its length (gpu/src/vulkan.rs,
+//!              `GraphicsState::decode`), a3, a4: as VK_SHADER's   r0:
+//!              graphics pipeline handle
 //!
 //! Vulkan's device memory is a buffer (CREATE), read and written as one.
 //!
@@ -160,7 +163,7 @@ enum Vk {
     Shader(Arc<vulkan::Shader>),
     Pipeline(Arc<vulkan::Pipeline>),
     Image(wgpu::Texture),
-    View(wgpu::TextureView),
+    View(vulkan::View),
     Sampler(wgpu::Sampler),
 }
 
@@ -424,10 +427,18 @@ impl Session {
             }
             13 => g.finish().map_err(|_| Failure::Cl(CL_OUT_OF_RESOURCES))?,
             // Vulkan (packages/vulkan): shaders, pipelines, submissions.
-            20 | 21 => {
+            20 | 21 | 28 => {
                 let made = if op == 20 {
                     let spirv = mem::slice(data, a[0], a[1])?.to_vec();
                     vulkan::shader(g, &spirv).map(|s| Vk::Shader(Arc::new(s)))
+                } else if op == 28 {
+                    let state = vulkan::GraphicsState::decode(mem::slice(data, a[0], a[1])?).map_err(|_| Failure::Errno(EINVAL))?;
+                    let st = self.state.lock().unwrap();
+                    let shader = |h: u64| match st.vk.get(&h) {
+                        Some(Vk::Shader(s)) => Some(&**s),
+                        _ => None,
+                    };
+                    vulkan::graphics_pipeline(g, &state, shader).map(|p| Vk::Pipeline(Arc::new(p)))
                 } else {
                     let shader = match self.state.lock().unwrap().vk.get(&a[0]) {
                         Some(Vk::Shader(s)) => s.clone(),
@@ -445,6 +456,9 @@ impl Session {
                         r[0] = h;
                     }
                     Err(e) => {
+                        if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
+                            eprintln!("wasm-env: Vulkan: {e}");
+                        }
                         // (Why, as text at a3 (capacity a4), for the driver's
                         // messages.)
                         let n = (a[4] as usize).min(e.len());
