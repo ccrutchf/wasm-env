@@ -6,6 +6,9 @@
 //! sampler is `2b + 1` (`binding`). A load of a combined image sampler
 //! becomes loads of its image and its sampler, put together again by
 //! `OpSampledImage`, which naga does read.
+//!
+//! And writes of `gl_PointSize`, which WGSL hasn't (WebGPU's points are one
+//! pixel), are dropped: naga leaves out the builtins nothing touches.
 
 use std::collections::HashMap;
 
@@ -17,6 +20,13 @@ const OP_TYPE_SAMPLED_IMAGE: u32 = 27;
 const OP_TYPE_POINTER: u32 = 32;
 const OP_VARIABLE: u32 = 59;
 const OP_LOAD: u32 = 61;
+const OP_STORE: u32 = 62;
+const OP_ACCESS_CHAIN: u32 = 65;
+const OP_IN_BOUNDS_ACCESS_CHAIN: u32 = 66;
+const OP_CONSTANT: u32 = 43;
+const OP_MEMBER_DECORATE: u32 = 72;
+const DECORATION_BUILTIN: u32 = 11;
+const BUILTIN_POINT_SIZE: u32 = 1;
 const OP_DECORATE: u32 = 71;
 const OP_SAMPLED_IMAGE: u32 = 86;
 const DECORATION_BINDING: u32 = 33;
@@ -84,10 +94,37 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
     let sampler_pointer = fresh();
     let parts: HashMap<u32, (u32, u32)> = combined.keys().map(|&v| (v, (fresh(), fresh()))).collect();
 
+    // gl_PointSize: a variable decorated so, or a member of a block (the
+    // block's type, the member); pointers to it (those variables, and
+    // access chains into the member), whose stores go.
+    let point_vars: Vec<u32> =
+        insts.iter().filter(|i| i.op == OP_DECORATE && i.words[1..] == [DECORATION_BUILTIN, BUILTIN_POINT_SIZE]).map(|i| i.words[0]).collect();
+    let point_members: HashMap<u32, u32> =
+        insts.iter().filter(|i| i.op == OP_MEMBER_DECORATE && i.words[2..] == [DECORATION_BUILTIN, BUILTIN_POINT_SIZE]).map(|i| (i.words[0], i.words[1])).collect();
+    let pointee: HashMap<u32, u32> = insts.iter().filter(|i| i.op == OP_TYPE_POINTER).map(|i| (i.words[0], i.words[2])).collect();
+    let var_type: HashMap<u32, u32> = insts.iter().filter(|i| i.op == OP_VARIABLE).filter_map(|i| Some((i.words[1], *pointee.get(&i.words[0])?))).collect();
+    let constants: HashMap<u32, u32> = insts.iter().filter(|i| i.op == OP_CONSTANT && i.words.len() == 3).map(|i| (i.words[1], i.words[2])).collect();
+    let mut points: std::collections::HashSet<u32> = point_vars.iter().copied().collect();
+    for i in &insts {
+        if (i.op == OP_ACCESS_CHAIN || i.op == OP_IN_BOUNDS_ACCESS_CHAIN) && i.words.len() >= 4 {
+            let member = var_type.get(&i.words[2]).and_then(|t| point_members.get(t));
+            if member.is_some() && member == constants.get(&i.words[3]) {
+                points.insert(i.words[1]);
+            }
+        }
+    }
+    let point_chains: std::collections::HashSet<u32> = points.iter().filter(|p| !point_vars.contains(p)).copied().collect();
+
     let mut out: Vec<Inst> = Vec::with_capacity(insts.len());
     let mut declared = false;
     for i in insts {
         match i.op {
+            // (Points: stores to gl_PointSize, the access chains they went
+            // through, and a variable of its own with its decorations.)
+            OP_STORE if points.contains(&i.words[0]) => {}
+            OP_ACCESS_CHAIN | OP_IN_BOUNDS_ACCESS_CHAIN if point_chains.contains(&i.words[1]) => {}
+            OP_VARIABLE if point_vars.contains(&i.words[1]) => {}
+            OP_DECORATE if point_vars.contains(&i.words[0]) => {}
             // (What it needs declared before the first combined variable.)
             OP_VARIABLE if combined.contains_key(&i.words[1]) => {
                 let v = i.words[1];
@@ -121,12 +158,12 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
                 }
             }
             // (A SPIR-V 1.4 interface lists every global the entry point
-            // uses: the sampler too.)
+            // uses: the sampler too, and gl_PointSize's variable no more.)
             OP_ENTRY_POINT => {
                 // (Its execution model, its function, its name (a string,
                 // through the word with its NUL), then the interface.)
                 let name_end = 2 + i.words[2..].iter().position(|w| w.to_le_bytes().contains(&0)).map_or(i.words.len() - 2, |k| k + 1);
-                let mut words = i.words.clone();
+                let mut words: Vec<u32> = i.words[..name_end].iter().chain(i.words[name_end..].iter().filter(|w| !point_vars.contains(w))).copied().collect();
                 words.extend(i.words[name_end..].iter().filter_map(|w| parts.get(w).map(|p| p.1)));
                 out.push(Inst { op: OP_ENTRY_POINT, words });
             }

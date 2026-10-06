@@ -258,11 +258,21 @@ fi
 # (packages/vulkan), likewise: vulkaninfo sees its device, a compute shader
 # (tests/arm64/vulkan.comp, made SPIR-V by glslang) runs, and another
 # samples an image through a combined image sampler (vulkan_image.comp),
-# and triangles are drawn with depth and culling (vulkan_draw.vert, .frag).
+# and triangles are drawn with depth and culling (vulkan_draw.vert, .frag);
+# then vkcube and Doom.
 if tests/ubuntu-fetch.sh libvulkan-dev vulkan-tools >/dev/null 2>&1 && packages/vulkan/build.sh >/dev/null; then
 	mkdir -p "$R/usr/lib/wasm-env" "$R/usr/share/vulkan/icd.d" build/vulkan-test
 	cp build/packages/vulkan/libwasm-env-vulkan.so "$R/usr/lib/wasm-env/"
 	cp build/packages/vulkan/wasm-env_icd.aarch64.json "$R/usr/share/vulkan/icd.d/"
+	# (Doom, where its packages and SDL3 build: windowed, its config says.)
+	doom=
+	if tests/ubuntu-fetch.sh chocolate-doom freedoom libsdl2-dev >/dev/null 2>&1 && packages/sdl3/build.sh >/dev/null 2>&1; then
+		mkdir -p "$R/root/.local/share/chocolate-doom"
+		echo "fullscreen 0" >"$R/root/.local/share/chocolate-doom/chocolate-doom.cfg"
+		doom=yes
+	else
+		echo "skipped Doom: can't fetch its packages or build SDL3 (offline?)"
+	fi
 	if glslangValidator -V --quiet --vn compute_spv -o build/vulkan-test/vulkan_spv.h tests/arm64/vulkan.comp \
 		&& glslangValidator -V --quiet --vn image_spv -o build/vulkan-test/vulkan_image_spv.h tests/arm64/vulkan_image.comp \
 		&& glslangValidator -V --quiet --vn vert_spv -o build/vulkan-test/vulkan_draw_vert.h tests/arm64/vulkan_draw.vert \
@@ -285,6 +295,16 @@ done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" 
 				colors=$(WASM_ENV_GPU=$gpu WASM_ENV_DEBUG_WAYLAND=1 timeout 900 "$wasm_env" run --wayland=headless --root "$R" "${only[@]}" \
 					/usr/bin/vkcube-wayland --c 70 2>&1 | sed -n 's/.*frame 60: [0-9x]*, \([0-9]*\) colors.*/\1/p' | head -1)
 				compare "vkcube ($gpu, the runtime's compositor)" yes "$([ "${colors:-0}" -gt 1000 ] && echo yes || echo "no (${colors:-no frame 60})")"
+				# Doom: Ubuntu's chocolate-doom with Freedoom's data, on SDL3
+				# (packages/sdl3, through sdl2-compat) and its Vulkan
+				# renderer: its 60th frame the title screen or a demo.
+				if [ -n "$doom" ]; then
+					colors=$(WASM_ENV_GPU=$gpu WASM_ENV_DEBUG_WAYLAND=1 timeout 900 "$wasm_env" run --wayland=headless --root "$R" "${only[@]}" \
+						--env LD_LIBRARY_PATH=/opt/sdl3/lib --env SDL_RENDER_DRIVER=vulkan --env HOME=/root \
+						/usr/games/chocolate-doom -iwad /usr/share/games/doom/freedoom1.wad -nosound 2>&1 |
+						sed -n 's/.*frame 60: [0-9x]*, \([0-9]*\) colors.*/\1/p;/frame 60:/q')
+					compare "Doom ($gpu, Vulkan through SDL3)" yes "$([ "${colors:-0}" -gt 100 ] && echo yes || echo "no (${colors:-no frame 60})")"
+				fi
 			else
 				echo "skipped Vulkan ($gpu): no such GPU adapter"
 			fi
