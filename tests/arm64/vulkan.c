@@ -11,6 +11,10 @@
 #include "vulkan_image_spv.h"
 #include "vulkan_draw_frag.h"
 #include "vulkan_draw_vert.h"
+#include "vulkan_subpass_frag.h"
+#include "vulkan_subpass_vert.h"
+#include "vulkan_texel_spv.h"
+#include "vulkan_array_spv.h"
 
 #define N 1000
 #define CHECK(x)                                                    \
@@ -172,6 +176,359 @@ static int images(VkDevice dev, VkQueue queue) {
         vkFreeMemory(dev, imem[k], NULL);
         vkDestroyBuffer(dev, buf[k], NULL);
     }
+    vkUnmapMemory(dev, mem);
+    vkFreeMemory(dev, mem, NULL);
+    return 0;
+}
+
+// A descriptor array: three 1 × 1 images cleared to colors of their own,
+// written into one binding's three elements (one write, from element 0),
+// and read by a compute shader (vulkan_array.comp) into words.
+static int arrays(VkDevice dev, VkQueue queue) {
+    VkImage im[3];
+    VkImageView view[3];
+    for (int k = 0; k < 3; k++) {
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {1, 1, 1}, .mipLevels = 1,
+                                .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        CHECK(vkCreateImage(dev, &ii, NULL, &im[k]));
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im[k], .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        CHECK(vkCreateImageView(dev, &vi, NULL, &view[k]));
+    }
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 16, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VkBuffer buf;
+    CHECK(vkCreateBuffer(dev, &bi, NULL, &buf));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev, buf, &req);
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = 0};
+    VkDeviceMemory mem;
+    CHECK(vkAllocateMemory(dev, &mi, NULL, &mem));
+    CHECK(vkBindBufferMemory(dev, buf, mem, 0));
+    uint32_t *out;
+    CHECK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, (void **)&out));
+
+    VkShaderModuleCreateInfo si = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof array_spv, .pCode = array_spv};
+    VkShaderModule shader;
+    CHECK(vkCreateShaderModule(dev, &si, NULL, &shader));
+    VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3, VK_SHADER_STAGE_COMPUTE_BIT}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT}};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b};
+    VkDescriptorSetLayout sl;
+    CHECK(vkCreateDescriptorSetLayout(dev, &li, NULL, &sl));
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl};
+    VkPipelineLayout layout;
+    CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &layout));
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
+                                      .layout = layout};
+    VkPipeline pipeline;
+    CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipeline));
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = ps};
+    VkDescriptorPool pool;
+    CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &pool));
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &sl};
+    VkDescriptorSet set;
+    CHECK(vkAllocateDescriptorSets(dev, &dai, &set));
+    VkDescriptorImageInfo images[3];
+    for (int k = 0; k < 3; k++)
+        images[k] = (VkDescriptorImageInfo){VK_NULL_HANDLE, view[k], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorBufferInfo bo = {buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[2] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 3, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+         .pImageInfo = images},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bo},
+    };
+    vkUpdateDescriptorSets(dev, 2, w, 0, NULL);
+
+    VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0};
+    VkCommandPool cpool;
+    CHECK(vkCreateCommandPool(dev, &cpi, NULL, &cpool));
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkCommandBuffer cmd;
+    CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    const float colors[3][4] = {{1, 0, 0, 1}, {0, 1, 0, 0.5f}, {0, 0, 1, 0}};
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    for (int k = 0; k < 3; k++) {
+        VkClearColorValue c = {.float32 = {colors[k][0], colors[k][1], colors[k][2], colors[k][3]}};
+        vkCmdClearColorImage(cmd, im[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &range);
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+    vkCmdDispatch(cmd, 1, 1, 1);
+    CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+    CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+    CHECK(vkQueueWaitIdle(queue));
+    const uint32_t want[3] = {0xff0000ffu, 0x8000ff00u, 0x00ff0000u};
+    int wrong = 0;
+    for (int k = 0; k < 3; k++)
+        for (int c = 0; c < 32; c += 8) {
+            int got = out[k] >> c & 255, w = want[k] >> c & 255;
+            wrong += got < w - 1 || got > w + 1;
+        }
+    printf("descriptor array: %d of 12 wrong\n", wrong);
+
+    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+    vkDestroyCommandPool(dev, cpool, NULL);
+    vkDestroyDescriptorPool(dev, pool, NULL);
+    vkDestroyPipeline(dev, pipeline, NULL);
+    vkDestroyPipelineLayout(dev, layout, NULL);
+    vkDestroyDescriptorSetLayout(dev, sl, NULL);
+    vkDestroyShaderModule(dev, shader, NULL);
+    for (int k = 0; k < 3; k++) {
+        vkDestroyImageView(dev, view[k], NULL);
+        vkDestroyImage(dev, im[k], NULL);
+    }
+    vkDestroyBuffer(dev, buf, NULL);
+    vkUnmapMemory(dev, mem);
+    vkFreeMemory(dev, mem, NULL);
+    return 0;
+}
+
+// A texel buffer: 256 RGBA8 texels the program writes into mapped memory,
+// viewed as a uniform texel buffer (a VkBufferView) and read by a compute
+// shader (vulkan_texel.comp) into words, which come back as written.
+static int texels(VkDevice dev, VkQueue queue) {
+    VkBuffer buf[2];
+    VkBufferUsageFlags use[2] = {VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VkDeviceSize at[2], total = 0;
+    for (int k = 0; k < 2; k++) {
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 1024, .usage = use[k]};
+        CHECK(vkCreateBuffer(dev, &bi, NULL, &buf[k]));
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(dev, buf[k], &req);
+        at[k] = (total + req.alignment - 1) / req.alignment * req.alignment;
+        total = at[k] + req.size;
+    }
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = total, .memoryTypeIndex = 0};
+    VkDeviceMemory mem;
+    CHECK(vkAllocateMemory(dev, &mi, NULL, &mem));
+    for (int k = 0; k < 2; k++)
+        CHECK(vkBindBufferMemory(dev, buf[k], mem, at[k]));
+    uint8_t *map;
+    CHECK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, (void **)&map));
+    uint32_t *in = (uint32_t *)(map + at[0]), *out = (uint32_t *)(map + at[1]);
+    for (uint32_t i = 0; i < 256; i++)
+        in[i] = i | (255 - i) << 8 | (i * 7 & 255) << 16 | 0xffu << 24;
+
+    VkBufferViewCreateInfo bvi = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = buf[0], .format = VK_FORMAT_R8G8B8A8_UNORM, .offset = 0, .range = VK_WHOLE_SIZE};
+    VkBufferView view;
+    CHECK(vkCreateBufferView(dev, &bvi, NULL, &view));
+    VkShaderModuleCreateInfo si = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof texel_spv, .pCode = texel_spv};
+    VkShaderModule shader;
+    CHECK(vkCreateShaderModule(dev, &si, NULL, &shader));
+    VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
+                                         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT}};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b};
+    VkDescriptorSetLayout sl;
+    CHECK(vkCreateDescriptorSetLayout(dev, &li, NULL, &sl));
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl};
+    VkPipelineLayout layout;
+    CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &layout));
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
+                                      .layout = layout};
+    VkPipeline pipeline;
+    CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipeline));
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = ps};
+    VkDescriptorPool pool;
+    CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &pool));
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &sl};
+    VkDescriptorSet set;
+    CHECK(vkAllocateDescriptorSets(dev, &dai, &set));
+    VkDescriptorBufferInfo bo = {buf[1], 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[2] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .pTexelBufferView = &view},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bo},
+    };
+    vkUpdateDescriptorSets(dev, 2, w, 0, NULL);
+
+    VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0};
+    VkCommandPool cpool;
+    CHECK(vkCreateCommandPool(dev, &cpi, NULL, &cpool));
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkCommandBuffer cmd;
+    CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+    vkCmdDispatch(cmd, 4, 1, 1);
+    CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+    CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+    CHECK(vkQueueWaitIdle(queue));
+    int wrong = 0;
+    for (int i = 0; i < 256; i++)
+        wrong += out[i] != in[i];
+    printf("texel buffer: %d of 256 wrong\n", wrong);
+
+    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+    vkDestroyCommandPool(dev, cpool, NULL);
+    vkDestroyDescriptorPool(dev, pool, NULL);
+    vkDestroyPipeline(dev, pipeline, NULL);
+    vkDestroyPipelineLayout(dev, layout, NULL);
+    vkDestroyDescriptorSetLayout(dev, sl, NULL);
+    vkDestroyShaderModule(dev, shader, NULL);
+    vkDestroyBufferView(dev, view, NULL);
+    for (int k = 0; k < 2; k++)
+        vkDestroyBuffer(dev, buf[k], NULL);
+    vkUnmapMemory(dev, mem);
+    vkFreeMemory(dev, mem, NULL);
+    return 0;
+}
+
+// Two subpasses: the first clears an 8 × 8 attachment (A) to a color; the
+// second reads it as an input attachment (vulkan_subpass.frag) and writes
+// its inverse to another (B), which is read back. A's store op says not to
+// keep it: it's kept until the second subpass has read it.
+static int subpasses(VkDevice dev, VkQueue queue) {
+    enum { W = 8 };
+    VkFormat rgba = VK_FORMAT_R8G8B8A8_UNORM;
+    VkImageUsageFlags usage[2] = {VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+    VkImage im[2];
+    VkImageView view[2];
+    for (int k = 0; k < 2; k++) {
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = rgba, .extent = {W, W, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage[k]};
+        CHECK(vkCreateImage(dev, &ii, NULL, &im[k]));
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im[k], .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = rgba,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        CHECK(vkCreateImageView(dev, &vi, NULL, &view[k]));
+    }
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = W * W * 4, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer buf;
+    CHECK(vkCreateBuffer(dev, &bi, NULL, &buf));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev, buf, &req);
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = 0};
+    VkDeviceMemory mem;
+    CHECK(vkAllocateMemory(dev, &mi, NULL, &mem));
+    CHECK(vkBindBufferMemory(dev, buf, mem, 0));
+    uint8_t *px;
+    CHECK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, (void **)&px));
+
+    VkAttachmentDescription att[2] = {
+        {0, rgba, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {0, rgba, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+    };
+    VkAttachmentReference a_out = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, a_in = {0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                          b_out = {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub[2] = {
+        {0, VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &a_out},
+        {0, VK_PIPELINE_BIND_POINT_GRAPHICS, .inputAttachmentCount = 1, .pInputAttachments = &a_in, .colorAttachmentCount = 1, .pColorAttachments = &b_out},
+    };
+    VkSubpassDependency dep = {0, 1, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                               VK_ACCESS_INPUT_ATTACHMENT_READ_BIT, VK_DEPENDENCY_BY_REGION_BIT};
+    VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 2, .pAttachments = att, .subpassCount = 2, .pSubpasses = sub,
+                                  .dependencyCount = 1, .pDependencies = &dep};
+    VkRenderPass pass;
+    CHECK(vkCreateRenderPass(dev, &rpi, NULL, &pass));
+    VkFramebufferCreateInfo fbi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = pass, .attachmentCount = 2, .pAttachments = view, .width = W, .height = W, .layers = 1};
+    VkFramebuffer fb;
+    CHECK(vkCreateFramebuffer(dev, &fbi, NULL, &fb));
+
+    VkShaderModule shaders[2];
+    VkShaderModuleCreateInfo si[2] = {{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof subpass_vert_spv, .pCode = subpass_vert_spv},
+                                      {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof subpass_frag_spv, .pCode = subpass_frag_spv}};
+    for (int k = 0; k < 2; k++)
+        CHECK(vkCreateShaderModule(dev, &si[k], NULL, &shaders[k]));
+    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
+    VkDescriptorSetLayout sl;
+    CHECK(vkCreateDescriptorSetLayout(dev, &li, NULL, &sl));
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl};
+    VkPipelineLayout layout;
+    CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &layout));
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = shaders[0], .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = shaders[1], .pName = "main"},
+    };
+    VkPipelineVertexInputStateCreateInfo vis = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ias = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkViewport viewport = {0, 0, W, W, 0, 1};
+    VkRect2D scissor = {{0, 0}, {W, W}};
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .pViewports = &viewport, .scissorCount = 1, .pScissors = &scissor};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xf};
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba};
+    VkGraphicsPipelineCreateInfo gpi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                                        .stageCount = 2,
+                                        .pStages = stages,
+                                        .pVertexInputState = &vis,
+                                        .pInputAssemblyState = &ias,
+                                        .pViewportState = &vps,
+                                        .pRasterizationState = &rs,
+                                        .pMultisampleState = &ms,
+                                        .pColorBlendState = &cbs,
+                                        .layout = layout,
+                                        .renderPass = pass,
+                                        .subpass = 1};
+    VkPipeline pipeline;
+    CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &pipeline));
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+    VkDescriptorPool pool;
+    CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &pool));
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &sl};
+    VkDescriptorSet set;
+    CHECK(vkAllocateDescriptorSets(dev, &dai, &set));
+    VkDescriptorImageInfo input = {VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .pImageInfo = &input};
+    vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
+
+    VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0};
+    VkCommandPool cpool;
+    CHECK(vkCreateCommandPool(dev, &cpi, NULL, &cpool));
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkCommandBuffer cmd;
+    CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    VkClearValue clears[2] = {{.color = {.float32 = {0.25f, 0.5f, 0.75f, 1}}}, {.color = {.float32 = {0, 0, 0, 0}}}};
+    VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = pass, .framebuffer = fb, .renderArea = {{0, 0}, {W, W}}, .clearValueCount = 2, .pClearValues = clears};
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdNextSubpass(cmd, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cmd);
+    VkBufferImageCopy whole = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W, W, 1}};
+    vkCmdCopyImageToBuffer(cmd, im[1], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &whole);
+    CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+    CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+    CHECK(vkQueueWaitIdle(queue));
+
+    int wrong = 0;
+    const uint8_t want[4] = {191, 128, 64, 255};
+    for (int k = 0; k < W * W; k++)
+        for (int c = 0; c < 4; c++)
+            wrong += px[4 * k + c] < want[c] - 1 || px[4 * k + c] > want[c] + 1;
+    printf("subpasses: %d of %d wrong\n", wrong, W * W * 4);
+
+    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+    vkDestroyCommandPool(dev, cpool, NULL);
+    vkDestroyDescriptorPool(dev, pool, NULL);
+    vkDestroyPipeline(dev, pipeline, NULL);
+    vkDestroyPipelineLayout(dev, layout, NULL);
+    vkDestroyDescriptorSetLayout(dev, sl, NULL);
+    for (int k = 0; k < 2; k++) {
+        vkDestroyShaderModule(dev, shaders[k], NULL);
+        vkDestroyImageView(dev, view[k], NULL);
+        vkDestroyImage(dev, im[k], NULL);
+    }
+    vkDestroyFramebuffer(dev, fb, NULL);
+    vkDestroyRenderPass(dev, pass, NULL);
+    vkDestroyBuffer(dev, buf, NULL);
     vkUnmapMemory(dev, mem);
     vkFreeMemory(dev, mem, NULL);
     return 0;
@@ -585,7 +942,7 @@ int main(void) {
     printf("compute: %d of %d wrong\n", wrong, N);
     printf("fill and update: %s\n", filled[0] == 0x5a5a5a5a && filled[2] == 0xc0ffee && filled[3] == 0xbeef && filled[15] == 0x5a5a5a5a ? "right" : "wrong");
     printf("the program's own write kept: %s\n", unused[0] == 12345 ? "yes" : "no");
-    if (images(dev, queue) || blits(dev, queue) || draw(dev, queue))
+    if (images(dev, queue) || blits(dev, queue) || draw(dev, queue) || subpasses(dev, queue) || texels(dev, queue) || arrays(dev, queue))
         return 1;
 
     vkDestroyFence(dev, fence, NULL);

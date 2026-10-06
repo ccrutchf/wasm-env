@@ -153,9 +153,9 @@ const RATES: (u32, u32) = (8000, 192000);
 const PERIOD_BYTES_RANGE: (u32, u32) = (64, 1 << 20);
 const PERIODS_RANGE: (u32, u32) = (2, 1024);
 const BUFFER_BYTES_MAX: u32 = 4 << 20;
-// (At least 40 ms buffered: a translated program needs the slack more than
-// a native one.)
-const BUFFER_TIME_MIN: u32 = 40_000;
+// (At least 80 ms buffered: a translated program needs the slack more than
+// a native one, and a host's output may take 20 ms at a time.)
+const BUFFER_TIME_MIN: u32 = 80_000;
 
 const STATE_OPEN: u32 = 0;
 const STATE_SETUP: u32 = 1;

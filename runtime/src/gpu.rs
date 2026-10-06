@@ -88,6 +88,8 @@
 //!  28 VK_GRAPHICS a0: state, a1: its length (gpu/src/vulkan.rs,
 //!              `GraphicsState::decode`), a3, a4: as VK_SHADER's   r0:
 //!              graphics pipeline handle
+//!  29 VK_BUFFER_VIEW a0: buffer (device memory), a1: offset, a2: range,
+//!              a3: VkFormat   r0: texel buffer view handle
 //!
 //! Vulkan's device memory is a buffer (CREATE), read and written as one.
 //!
@@ -166,6 +168,7 @@ enum Vk {
     Pipeline(Arc<vulkan::Pipeline>),
     Image(wgpu::Texture),
     View(vulkan::View),
+    Texel(vulkan::TexelView),
     Sampler(wgpu::Sampler),
 }
 
@@ -482,6 +485,7 @@ impl Session {
                     (_, Some(Vk::Pipeline(p))) => Some(vulkan::Object::Pipeline(p.clone())),
                     (_, Some(Vk::Image(t))) => Some(vulkan::Object::Texture(t)),
                     (_, Some(Vk::View(v))) => Some(vulkan::Object::View(v)),
+                    (_, Some(Vk::Texel(t))) => Some(vulkan::Object::Texel(t)),
                     (_, Some(Vk::Sampler(s))) => Some(vulkan::Object::Sampler(s)),
                     _ => None,
                 };
@@ -496,6 +500,24 @@ impl Session {
                 let d = self.vulkan_limits();
                 let n = (a[1] as usize).min(d.len());
                 mem::slice_mut(data, a[0], n as u64)?.copy_from_slice(&d[..n]);
+            }
+            29 => {
+                let made = vulkan::texel_view(g, a[0], a[1], a[2], a[3] as u32);
+                match made {
+                    Ok(t) => {
+                        let mut st = self.state.lock().unwrap();
+                        let h = st.next;
+                        st.next += 1;
+                        st.vk.insert(h, Vk::Texel(t));
+                        r[0] = h;
+                    }
+                    Err(e) => {
+                        if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
+                            eprintln!("wasm-env: Vulkan: {e}");
+                        }
+                        return Err(Failure::Cl(VK_ERROR_FORMAT_NOT_SUPPORTED));
+                    }
+                }
             }
             24..=26 => {
                 let words = |at: u64, n: u64| -> Result<Vec<u32>, Failure> { Ok(mem::slice(data, at, n * 4)?.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()) };

@@ -21,6 +21,9 @@ pub struct Gpu {
     pipelines: Mutex<HashMap<(usize, String, Launch), Arc<Pipeline>>>,
     /// Vulkan's blits: a render pipeline per destination format.
     pub(crate) blits: Mutex<HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
+    /// Vulkan's copies of buffers at any size and offset (WebGPU's are of
+    /// whole words): a compute pipeline copying bytes.
+    pub(crate) byte_copy: Mutex<Option<wgpu::ComputePipeline>>,
     lost: std::sync::atomic::AtomicBool,
 }
 
@@ -93,16 +96,25 @@ impl Gpu {
         // software ones (f64.rs) everywhere.
         let f64_features = wgpu::Features::SHADER_F64 | wgpu::Features::SHADER_INT64;
         let native_f64 = adapter.features().contains(f64_features) && std::env::var_os("WASM_ENV_GPU_SOFT_F64").is_none();
+        // Vulkan's descriptor arrays (binding arrays), where the device has
+        // them.
+        let arrays = wgpu::Features::TEXTURE_BINDING_ARRAY
+            | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+            | wgpu::Features::BUFFER_BINDING_ARRAY
+            | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
+            // (and blending 32-bit float attachments, as Vulkan devices do)
+            | wgpu::Features::FLOAT32_BLENDABLE;
+        let arrays = if api == Api::Vulkan { adapter.features() & arrays } else { wgpu::Features::empty() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("wasm-env"),
-            required_features: if native_f64 { f64_features } else { wgpu::Features::empty() },
+            required_features: arrays | if native_f64 { f64_features } else { wgpu::Features::empty() },
             required_limits: limits.clone(),
             ..Default::default()
         }))
         .map_err(|e| format!("can't open {}: {e}", info.name))?;
         // Errors are reported to the caller (error scopes), not panics.
         device.on_uncaptured_error(Arc::new(|e| eprintln!("wasm-env: GPU: {}", chain(&e))));
-        let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), lost: Default::default() };
+        let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), byte_copy: Default::default(), lost: Default::default() };
         g.quirks = Quirks { native_f64: native_f64 && g.native_doubles_conform()?, ..g.probe_quirks()? };
         Ok(g)
     }

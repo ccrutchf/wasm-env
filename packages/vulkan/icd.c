@@ -51,7 +51,7 @@ int close(int);
 #define CALL VKAPI_ATTR
 #define CC VKAPI_CALL
 
-enum { INFO = 1, CREATE, FREE, WRITE, READ, FINISH = 13, VK_SHADER = 20, VK_PIPELINE, VK_SUBMIT, VK_LIMITS, VK_IMAGE, VK_VIEW, VK_SAMPLER, VK_FORMAT, VK_GRAPHICS };
+enum { INFO = 1, CREATE, FREE, WRITE, READ, FINISH = 13, VK_SHADER = 20, VK_PIPELINE, VK_SUBMIT, VK_LIMITS, VK_IMAGE, VK_VIEW, VK_SAMPLER, VK_FORMAT, VK_GRAPHICS, VK_BUFFER_VIEW };
 // The command stream's operations (gpu/src/vulkan.rs, `decode`).
 enum {
     BIND_PIPELINE = 1,
@@ -219,7 +219,10 @@ struct VkPipelineLayout_T {
 struct VkDescriptorSetLayout_T {
     uint32_t n;
     VkDescriptorSetLayoutBinding *bindings;
-    // Per binding: its immutable sampler (or NULL).
+    // Per binding, in binding order: its first descriptor in a set's (an
+    // array's elements follow); and how many a set has.
+    uint32_t *first, total;
+    // Per descriptor: its immutable sampler (or NULL).
     VkSampler *immutable;
 };
 struct VkImage_T {
@@ -232,6 +235,9 @@ struct VkImage_T {
 struct VkImageView_T {
     uint64_t handle;
 };
+struct VkBufferView_T {
+    uint64_t handle;
+};
 struct VkSampler_T {
     uint64_t handle;
 };
@@ -239,10 +245,13 @@ struct VkSampler_T {
 // sampler.
 struct descriptor {
     VkDescriptorType type;
+    // Its binding, and element of an array.
+    uint32_t binding, element;
     VkBuffer buffer;
     VkDeviceSize offset, range;
     VkImageView view;
     VkSampler sampler;
+    VkBufferView texel;
 };
 struct VkDescriptorSet_T {
     VkDescriptorSetLayout layout;
@@ -830,6 +839,30 @@ static CALL void CC DestroySampler(VkDevice d, VkSampler s, const VkAllocationCa
     free(s);
 }
 
+// A texel buffer's view: a 1D texture of its texels in the runtime,
+// brought up to date with the buffer before each use (VK_BUFFER_VIEW).
+static CALL VkResult CC CreateBufferView(VkDevice d, const VkBufferViewCreateInfo *info, const VkAllocationCallbacks *a, VkBufferView *out) {
+    VkBuffer b = info->buffer;
+    VkDeviceSize range = info->range == VK_WHOLE_SIZE ? b->size - info->offset : info->range;
+    struct VkBufferView_T *v = zalloc(sizeof *v);
+    struct request q = {VK_BUFFER_VIEW, {b->memory->handle, b->offset + info->offset, range, (uint64_t)info->format}};
+    if (!v || call(&q)) {
+        free(v);
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    v->handle = q.r[0];
+    *out = v;
+    return VK_SUCCESS;
+}
+
+static CALL void CC DestroyBufferView(VkDevice d, VkBufferView v, const VkAllocationCallbacks *a) {
+    if (!v)
+        return;
+    struct request q = {FREE, {v->handle}};
+    call(&q);
+    free(v);
+}
+
 // ---- Shaders and pipelines ----
 
 static CALL VkResult CC CreateShaderModule(VkDevice d, const VkShaderModuleCreateInfo *info, const VkAllocationCallbacks *a, VkShaderModule *out) {
@@ -1132,6 +1165,16 @@ static CALL VkResult CC CreateRenderPass(VkDevice d, const VkRenderPassCreateInf
                 p->first[at] = s;
             p->last[at] = s;
         }
+        // (An input attachment is a use too: read, so stored until then.)
+        for (uint32_t k = 0; k < sd->inputAttachmentCount; k++) {
+            uint32_t at = sd->pInputAttachments[k].attachment;
+            if (at == VK_ATTACHMENT_UNUSED)
+                continue;
+            if (p->first[at] == VK_ATTACHMENT_UNUSED)
+                p->first[at] = s;
+            if (p->last[at] < s)
+                p->last[at] = s;
+        }
     }
     *out = p;
     return VK_SUCCESS;
@@ -1219,6 +1262,9 @@ static CALL void CC DestroyPipelineLayout(VkDevice d, VkPipelineLayout l, const 
 
 // ---- Descriptor sets (of buffers) ----
 
+static int texel_descriptor(VkDescriptorType t) {
+    return t == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+}
 static int buffer_descriptor(VkDescriptorType t) {
     return t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
            t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
@@ -1226,17 +1272,17 @@ static int buffer_descriptor(VkDescriptorType t) {
 
 static int image_descriptor(VkDescriptorType t) {
     return t == VK_DESCRIPTOR_TYPE_SAMPLER || t == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || t == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
-           t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+           t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
 }
 
 static CALL VkResult CC CreateDescriptorSetLayout(VkDevice d, const VkDescriptorSetLayoutCreateInfo *info, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
     for (uint32_t i = 0; i < info->bindingCount; i++) {
         const VkDescriptorSetLayoutBinding *b = &info->pBindings[i];
-        if (b->descriptorCount > 1 || (b->descriptorCount && !buffer_descriptor(b->descriptorType) && !image_descriptor(b->descriptorType)))
+        if (b->descriptorCount && !buffer_descriptor(b->descriptorType) && !image_descriptor(b->descriptorType) && !texel_descriptor(b->descriptorType))
             return VK_ERROR_FEATURE_NOT_PRESENT;
     }
     struct VkDescriptorSetLayout_T *l = zalloc(sizeof *l);
-    if (!l || !(l->bindings = zalloc(info->bindingCount * sizeof *l->bindings)) || !(l->immutable = zalloc(info->bindingCount * sizeof *l->immutable))) {
+    if (!l || !(l->bindings = zalloc(info->bindingCount * sizeof *l->bindings)) || !(l->first = zalloc(info->bindingCount * sizeof *l->first))) {
         if (l)
             free(l->bindings);
         free(l);
@@ -1251,11 +1297,20 @@ static CALL VkResult CC CreateDescriptorSetLayout(VkDevice d, const VkDescriptor
             l->bindings[j] = l->bindings[j - 1];
             l->bindings[j - 1] = t;
         }
+    for (uint32_t k = 0; k < l->n; k++) {
+        l->first[k] = l->total;
+        l->total += l->bindings[k].descriptorCount;
+    }
+    if (!(l->immutable = zalloc(l->total * sizeof *l->immutable))) {
+        free(l->bindings), free(l->first), free(l);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     // (Immutable samplers kept: the program's array needn't outlive this.)
     for (uint32_t k = 0; k < l->n; k++) {
         VkDescriptorSetLayoutBinding *b = &l->bindings[k];
-        int has = (b->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || b->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) && b->pImmutableSamplers && b->descriptorCount;
-        l->immutable[k] = has ? b->pImmutableSamplers[0] : VK_NULL_HANDLE;
+        if ((b->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || b->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) && b->pImmutableSamplers)
+            for (uint32_t e = 0; e < b->descriptorCount; e++)
+                l->immutable[l->first[k] + e] = b->pImmutableSamplers[e];
         b->pImmutableSamplers = NULL;
     }
     *out = l;
@@ -1264,6 +1319,7 @@ static CALL VkResult CC CreateDescriptorSetLayout(VkDevice d, const VkDescriptor
 static CALL void CC DestroyDescriptorSetLayout(VkDevice d, VkDescriptorSetLayout l, const VkAllocationCallbacks *a) {
     if (l) {
         free(l->bindings);
+        free(l->first);
         free(l->immutable);
         free(l);
     }
@@ -1298,7 +1354,7 @@ static CALL VkResult CC AllocateDescriptorSets(VkDevice d, const VkDescriptorSet
     for (uint32_t i = 0; i < info->descriptorSetCount; i++) {
         struct VkDescriptorSet_T *s = zalloc(sizeof *s);
         VkDescriptorSetLayout l = info->pSetLayouts[i];
-        if (!s || !(s->d = zalloc(l->n * sizeof *s->d))) {
+        if (!s || !(s->d = zalloc(l->total * sizeof *s->d))) {
             free(s);
             for (uint32_t j = 0; j < i; j++)
                 out[j] = VK_NULL_HANDLE;
@@ -1308,10 +1364,14 @@ static CALL VkResult CC AllocateDescriptorSets(VkDevice d, const VkDescriptorSet
         s->pool = info->descriptorPool;
         s->next = s->pool->sets;
         s->pool->sets = s;
-        for (uint32_t k = 0; k < l->n; k++) {
-            s->d[k].type = l->bindings[k].descriptorType;
-            s->d[k].sampler = l->immutable[k];
-        }
+        for (uint32_t k = 0; k < l->n; k++)
+            for (uint32_t e = 0; e < l->bindings[k].descriptorCount; e++) {
+                struct descriptor *x = &s->d[l->first[k] + e];
+                x->type = l->bindings[k].descriptorType;
+                x->binding = l->bindings[k].binding;
+                x->element = e;
+                x->sampler = l->immutable[l->first[k] + e];
+            }
         out[i] = s;
     }
     return VK_SUCCESS;
@@ -1333,18 +1393,24 @@ static CALL VkResult CC FreeDescriptorSets(VkDevice d, VkDescriptorPool p, uint3
 
 // A set's descriptor for a binding (and the binding after it, as writes
 // of several descriptors continue to the next binding).
-static struct descriptor *slot(VkDescriptorSet s, uint32_t binding) {
-    for (uint32_t k = 0; k < s->layout->n; k++)
-        if (s->layout->bindings[k].binding == binding)
-            return &s->d[k];
-    return NULL;
+static struct descriptor *slot(VkDescriptorSet s, uint32_t binding, uint32_t element) {
+    VkDescriptorSetLayout l = s->layout;
+    uint32_t k = 0;
+    while (k < l->n && l->bindings[k].binding != binding)
+        k++;
+    // (Past a binding's last element, Vulkan goes on into the next's.)
+    while (k < l->n && element >= l->bindings[k].descriptorCount) {
+        element -= l->bindings[k].descriptorCount;
+        k++;
+    }
+    return k < l->n ? &s->d[l->first[k] + element] : NULL;
 }
 
 static CALL void CC UpdateDescriptorSets(VkDevice d, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c) {
     for (uint32_t i = 0; i < nw; i++) {
         VkDescriptorType t = w[i].descriptorType;
         for (uint32_t k = 0; k < w[i].descriptorCount; k++) {
-            struct descriptor *e = slot(w[i].dstSet, w[i].dstBinding + k);
+            struct descriptor *e = slot(w[i].dstSet, w[i].dstBinding, w[i].dstArrayElement + k);
             if (!e)
                 continue;
             if (buffer_descriptor(t)) {
@@ -1352,6 +1418,8 @@ static CALL void CC UpdateDescriptorSets(VkDevice d, uint32_t nw, const VkWriteD
                 e->buffer = b->buffer;
                 e->offset = b->offset;
                 e->range = b->range == VK_WHOLE_SIZE ? b->buffer->size - b->offset : b->range;
+            } else if (texel_descriptor(t)) {
+                e->texel = w[i].pTexelBufferView[k];
             } else if (image_descriptor(t)) {
                 const VkDescriptorImageInfo *im = &w[i].pImageInfo[k];
                 if (t != VK_DESCRIPTOR_TYPE_SAMPLER)
@@ -1364,9 +1432,12 @@ static CALL void CC UpdateDescriptorSets(VkDevice d, uint32_t nw, const VkWriteD
     }
     for (uint32_t i = 0; i < nc; i++)
         for (uint32_t k = 0; k < c[i].descriptorCount; k++) {
-            struct descriptor *from = slot(c[i].srcSet, c[i].srcBinding + k), *to = slot(c[i].dstSet, c[i].dstBinding + k);
-            if (from && to)
+            struct descriptor *from = slot(c[i].srcSet, c[i].srcBinding, c[i].srcArrayElement + k), *to = slot(c[i].dstSet, c[i].dstBinding, c[i].dstArrayElement + k);
+            if (from && to) {
+                uint32_t binding = to->binding, element = to->element;
                 *to = *from;
+                to->binding = binding, to->element = element;
+            }
         }
 }
 
@@ -1521,20 +1592,21 @@ static CALL void CC CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint
         if (!s)
             continue;
         // Its descriptors that are set (kind 0 a buffer, 1 a view, 2 a
-        // sampler, 3 a view and sampler: gpu/src/vulkan.rs, `decode`).
+        // sampler, 3 a view and sampler, 4 a texel buffer view:
+        // gpu/src/vulkan.rs, `decode`).
         uint32_t count = 0;
-        for (uint32_t k = 0; k < s->layout->n; k++)
-            count += s->d[k].buffer || s->d[k].view || s->d[k].sampler;
+        for (uint32_t k = 0; k < s->layout->total; k++)
+            count += s->d[k].buffer || s->d[k].view || s->d[k].sampler || s->d[k].texel;
         uint32_t head[2] = {first + i, count};
         uint32_t h[2] = {point == VK_PIPELINE_BIND_POINT_GRAPHICS ? BIND_GRAPHICS_SET : BIND_SET, 8 + 8 + count * 32};
         put(c, h, 8);
         put(c, head, 8);
-        for (uint32_t k = 0; k < s->layout->n; k++) {
+        for (uint32_t k = 0; k < s->layout->total; k++) {
             struct descriptor *e = &s->d[k];
             VkDeviceSize offset = e->offset;
             if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC || e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
                 offset += used < ndyn ? dyn[used++] : 0;
-            uint32_t b[2] = {s->layout->bindings[k].binding, 0};
+            uint32_t b[2] = {e->binding, 0};
             uint64_t r[3] = {0, 0, 0};
             if (e->buffer) {
                 r[0] = e->buffer->memory->handle;
@@ -1552,8 +1624,13 @@ static CALL void CC CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint
             } else if (e->sampler) {
                 b[1] = 2;
                 r[0] = e->sampler->handle;
+            } else if (e->texel) {
+                b[1] = 4;
+                r[0] = e->texel->handle;
             } else
                 continue;
+            // (An array's element above the kind's byte.)
+            b[1] |= e->element << 8;
             put(c, b, 8);
             put(c, r, 24);
         }

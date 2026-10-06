@@ -19,3 +19,7 @@ cranelift-codegen = { path = "vendor/cranelift-codegen" }
 # bad64 (the arm64 decoder) passes its C enums as i32, which Windows
 # targets' bindings make u32: `as _` at the four calls (vendor/bad64).
 bad64 = { path = "vendor/bad64" }
+# naga (wgpu's shader translator) took a fetch from an element of a binding
+# array (Vulkan's descriptor arrays) for one from the array:
+# vendor/naga/src/front/spv/image.rs (search "wasm-env").
+naga = { path = "vendor/naga" }

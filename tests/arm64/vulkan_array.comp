@@ -1,0 +1,13 @@
+// tests/arm64/vulkan.c's descriptor array: three images, one descriptor
+// each in an array (as vkQuake's lightmap update has them), each one's
+// texel packed into a word.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) uniform texture2D images[3];
+layout(set = 0, binding = 1) buffer Out { uint o[]; };
+
+void main() {
+    for (int i = 0; i < 3; i++)
+        o[i] = packUnorm4x8(texelFetch(images[i], ivec2(0), 0));
+}
