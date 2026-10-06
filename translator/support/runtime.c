@@ -1031,13 +1031,25 @@ static long lib_of_fd(long fd)
 		return -1;
 	if (!fd_lib[fd]) {
 		uint64_t range[2];
-		if (lib_count == LIBS || __wasm_env_host_syscall(WASM_ENV_LOAD_LIBRARY, fd, (long)range, 0, 0, 0, 0) != 0) {
+		if (__wasm_env_host_syscall(WASM_ENV_LOAD_LIBRARY, fd, (long)range, 0, 0, 0, 0) != 0) {
 			fd_lib[fd] = NOT_LIB;
 			return -1;
 		}
-		libs[lib_count].base = range[0];
-		libs[lib_count].end = range[1];
-		fd_lib[fd] = (uint16_t)++lib_count;
+		// (A library opened again, after a dlclose, is the one it was:
+		// programs that dlopen and dlclose in a loop, as SDL does libudev,
+		// mustn't fill the table.)
+		uint64_t k = 0;
+		while (k < lib_count && libs[k].base != range[0])
+			k++;
+		if (k == lib_count) {
+			if (lib_count == LIBS) {
+				fd_lib[fd] = NOT_LIB;
+				return -1;
+			}
+			libs[lib_count].base = range[0];
+			libs[lib_count++].end = range[1];
+		}
+		fd_lib[fd] = (uint16_t)(k + 1);
 	}
 	return fd_lib[fd] - 1;
 }
@@ -1086,17 +1098,24 @@ static int library_syscall(long nr)
 	case SYS_mmap: {
 		uint64_t addr = R[0], len = R[1], flags = R[3], off = R[5];
 		long fd = (long)R[4];
-		if ((flags & MAP_ANONYMOUS) && !(flags & MAP_FIXED) && R[2] == 0 && pending_fd
-		    && reservation_count < RESERVATIONS) {
+		if ((flags & MAP_ANONYMOUS) && !(flags & MAP_FIXED) && R[2] == 0 && pending_fd) {
 			// glibc's reservation for an aligned library (see pending_fd),
 			// at the library's base plus its first segment's address, which
-			// it passes as a hint (0 for most shared objects).
+			// it passes as a hint (0 for most shared objects). (Made
+			// again for a library opened again: recorded once.)
 			long k = lib_of_fd(pending_fd - 1);
 			if (k < 0)
 				return 0;
-			reserved[reservation_count].start = libs[k].base + addr;
-			reserved[reservation_count++].end = libs[k].base + addr + len;
-			R[0] = libs[k].base + addr;
+			uint64_t start = libs[k].base + addr, j = 0;
+			while (j < reservation_count && !(reserved[j].start == start && reserved[j].end == start + len))
+				j++;
+			if (j == reservation_count) {
+				if (reservation_count == RESERVATIONS)
+					return 0;
+				reserved[reservation_count].start = start;
+				reserved[reservation_count++].end = start + len;
+			}
+			R[0] = start;
 			return 1;
 		}
 		if (!(flags & MAP_ANONYMOUS)) {
