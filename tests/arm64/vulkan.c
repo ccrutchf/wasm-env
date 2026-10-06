@@ -1,9 +1,9 @@
 // Vulkan compute through wasm-env's driver: a shader (vulkan.comp, as
-// SPIR-V in vulkan_spv.h) over buffers in one mapped memory, with two
-// descriptor sets, push constants, a fill, an update and a copy, waited for
-// with a fence; then a write of the program's own to a buffer in that
-// memory the submission doesn't use, made while the device works elsewhere
-// in it, still there after the wait.
+// SPIR-V in vulkan_spv.h, specialized) over buffers in one mapped memory,
+// with two descriptor sets, push constants, a fill, an update and a copy,
+// waited for with a fence; then a write of the program's own to a buffer
+// in that memory the submission doesn't use, made while the device works
+// elsewhere in it, still there after the wait.
 #include <stdio.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
@@ -177,6 +177,64 @@ static int images(VkDevice dev, VkQueue queue) {
     return 0;
 }
 
+// A blit: a 16 × 16 RGBA8 image of four colored quadrants, linearly
+// filtered into its 8 × 8 mip level, mirrored left to right, read back.
+static int blits(VkDevice dev, VkQueue queue) {
+    VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {16, 16, 1}, .mipLevels = 2,
+                            .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    VkImage im;
+    CHECK(vkCreateImage(dev, &ii, NULL, &im));
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 16 * 16 * 4, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer buf;
+    CHECK(vkCreateBuffer(dev, &bi, NULL, &buf));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev, buf, &req);
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = 0};
+    VkDeviceMemory mem;
+    CHECK(vkAllocateMemory(dev, &mi, NULL, &mem));
+    CHECK(vkBindBufferMemory(dev, buf, mem, 0));
+    uint8_t *px;
+    CHECK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, (void **)&px));
+    static const uint8_t quadrant[4][4] = {{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {255, 255, 255, 255}};
+    for (int y = 0; y < 16; y++)
+        for (int x = 0; x < 16; x++)
+            memcpy(px + (y * 16 + x) * 4, quadrant[(x >= 8) + 2 * (y >= 8)], 4);
+
+    VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0};
+    VkCommandPool cpool;
+    CHECK(vkCreateCommandPool(dev, &cpi, NULL, &cpool));
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkCommandBuffer cmd;
+    CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    VkBufferImageCopy level0 = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {16, 16, 1}};
+    vkCmdCopyBufferToImage(cmd, buf, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &level0);
+    VkImageBlit region = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {16, 16, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, {{8, 0, 0}, {0, 8, 1}}};
+    vkCmdBlitImage(cmd, im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+    VkBufferImageCopy level1 = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, {0, 0, 0}, {8, 8, 1}};
+    vkCmdCopyImageToBuffer(cmd, im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &level1);
+    CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+    CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+    CHECK(vkQueueWaitIdle(queue));
+
+    int wrong = 0;
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++)
+            wrong += memcmp(px + (y * 8 + x) * 4, quadrant[(x < 4) + 2 * (y >= 4)], 4) != 0;
+    printf("blit: %d of 64 wrong\n", wrong);
+
+    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+    vkDestroyCommandPool(dev, cpool, NULL);
+    vkDestroyImage(dev, im, NULL);
+    vkDestroyBuffer(dev, buf, NULL);
+    vkUnmapMemory(dev, mem);
+    vkFreeMemory(dev, mem, NULL);
+    return 0;
+}
+
 // Drawing into a 64 × 64 RGBA8 image with a depth buffer, read back: a
 // green square over everything (indexed), then three triangles in its
 // corners: a red one in front of it, a blue one behind it, and a yellow one
@@ -283,10 +341,13 @@ static int draw(VkDevice dev, VkQueue queue) {
     VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
     VkPipelineLayout layout;
     CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &layout));
-
+    // (The fragment shader's scale, specialized: 1.)
+    float one = 1;
+    VkSpecializationMapEntry se = {7, 0, 4};
+    VkSpecializationInfo spec = {1, &se, 4, &one};
     VkPipelineShaderStageCreateInfo stages[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = shaders[0], .pName = "main"},
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = shaders[1], .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = shaders[1], .pName = "main", .pSpecializationInfo = &spec},
     };
     VkVertexInputBindingDescription vb = {0, sizeof(struct vertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription va[2] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12}};
@@ -461,8 +522,13 @@ int main(void) {
     VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = sl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
     VkPipelineLayout layout;
     CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &layout));
+    // (extra, specialized: 5.)
+    uint32_t extra = 5;
+    VkSpecializationMapEntry se = {5, 0, 4};
+    VkSpecializationInfo spec = {1, &se, 4, &extra};
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                                      .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
+                                      .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main",
+                                                .pSpecializationInfo = &spec},
                                       .layout = layout};
     VkPipeline pipeline;
     CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipeline));
@@ -515,11 +581,11 @@ int main(void) {
 
     int wrong = 0;
     for (uint32_t i = 0; i < N; i++)
-        wrong += out[i] != i * 7 * 3 + 11 || copy[i] != out[i];
+        wrong += out[i] != i * 7 * 3 + 11 + 5 || copy[i] != out[i];
     printf("compute: %d of %d wrong\n", wrong, N);
     printf("fill and update: %s\n", filled[0] == 0x5a5a5a5a && filled[2] == 0xc0ffee && filled[3] == 0xbeef && filled[15] == 0x5a5a5a5a ? "right" : "wrong");
     printf("the program's own write kept: %s\n", unused[0] == 12345 ? "yes" : "no");
-    if (images(dev, queue) || draw(dev, queue))
+    if (images(dev, queue) || blits(dev, queue) || draw(dev, queue))
         return 1;
 
     vkDestroyFence(dev, fence, NULL);

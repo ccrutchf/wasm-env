@@ -25,6 +25,8 @@ pub struct Shader {
     module: wgpu::ShaderModule,
     /// Per entry point: its stage and the (set, binding)s it uses.
     entries: BTreeMap<String, (naga::ShaderStage, BTreeSet<(u32, u32)>)>,
+    /// Its specialization constants (WGSL's overrides): id, and type.
+    overrides: BTreeMap<u16, naga::Scalar>,
     /// The bind group push constants are in, if the shader has them.
     push_group: Option<u32>,
 }
@@ -131,6 +133,14 @@ pub fn shader(gpu: &Gpu, spirv: &[u8]) -> Res<Shader> {
             .collect();
         entries.insert(ep.name.clone(), (ep.stage, bindings));
     }
+    let overrides = module
+        .overrides
+        .iter()
+        .filter_map(|(_, o)| match (o.id, &module.types[o.ty].inner) {
+            (Some(id), naga::TypeInner::Scalar(s)) => Some((id, *s)),
+            _ => None,
+        })
+        .collect();
     let wgsl = naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty()).map_err(|e| format!("shader: {e}"))?;
     if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
         eprintln!("wasm-env: Vulkan shader:\n{wgsl}");
@@ -140,22 +150,57 @@ pub fn shader(gpu: &Gpu, spirv: &[u8]) -> Res<Shader> {
     if let Some(e) = pollster::block_on(scope.pop()) {
         return Err(format!("shader: {e}"));
     }
-    Ok(Shader { module, entries, push_group: has_push.then_some(push_group) })
+    Ok(Shader { module, entries, overrides, push_group: has_push.then_some(push_group) })
 }
 
-/// A compute pipeline of a shader's entry point.
-pub fn compute_pipeline(gpu: &Gpu, shader: &Shader, entry: &str) -> Res<Pipeline> {
+/// A specialization constant's value from Vulkan: its id, its size in
+/// bytes, and its bytes (the low and high words).
+pub type Spec = [u32; 4];
+
+impl Shader {
+    /// Specialization constants as wgpu's override values, each read as its
+    /// type in the shader (those it doesn't have are left out).
+    fn constants(&self, spec: &[Spec]) -> Vec<(String, f64)> {
+        use naga::ScalarKind as K;
+        spec.iter()
+            .filter_map(|&[id, size, lo, hi]| {
+                let s = self.overrides.get(&u16::try_from(id).ok()?)?;
+                let wide = size == 8 && s.width == 8;
+                let v = match s.kind {
+                    K::Bool => (lo != 0) as u32 as f64,
+                    K::Sint if wide => ((hi as u64) << 32 | lo as u64) as i64 as f64,
+                    K::Sint => lo as i32 as f64,
+                    K::Uint if wide => ((hi as u64) << 32 | lo as u64) as f64,
+                    K::Uint => lo as f64,
+                    K::Float if wide => f64::from_bits((hi as u64) << 32 | lo as u64),
+                    K::Float => f32::from_bits(lo) as f64,
+                    _ => return None,
+                };
+                Some((id.to_string(), v))
+            })
+            .collect()
+    }
+}
+
+fn options<'a>(constants: &'a [(&'a str, f64)]) -> wgpu::PipelineCompilationOptions<'a> {
+    wgpu::PipelineCompilationOptions { constants, ..Default::default() }
+}
+
+/// A compute pipeline of a shader's entry point, specialized.
+pub fn compute_pipeline(gpu: &Gpu, shader: &Shader, entry: &str, spec: &[Spec]) -> Res<Pipeline> {
     let Some((stage, bindings)) = shader.entries.get(entry) else { return Err(format!("no entry point {entry}")) };
     if *stage != naga::ShaderStage::Compute {
         return Err(format!("{entry} isn't a compute shader"));
     }
+    let constants = shader.constants(spec);
+    let constants: Vec<(&str, f64)> = constants.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let pipeline = gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
         layout: None,
         module: &shader.module,
         entry_point: Some(entry),
-        compilation_options: Default::default(),
+        compilation_options: options(&constants),
         cache: None,
     });
     if let Some(e) = pollster::block_on(scope.pop()) {
@@ -193,6 +238,9 @@ pub struct GraphicsState {
     /// binding, format, offset.
     pub buffers: Vec<[u32; 3]>,
     pub attributes: Vec<[u32; 4]>,
+    /// The vertex and fragment shaders' specialization constants.
+    pub vertex_spec: Vec<Spec>,
+    pub fragment_spec: Vec<Spec>,
 }
 
 impl GraphicsState {
@@ -202,7 +250,8 @@ impl GraphicsState {
     /// depth test, write, compare op; stencil test, front (6), back (6);
     /// depth format, samples; then the numbers of color attachments,
     /// vertex buffers and attributes, and each (9, 3 and 4 words); then
-    /// the entry points' names, each padded to 4 bytes.
+    /// the entry points' names, each padded to 4 bytes; then each shader's
+    /// specialization constants: their number, and each (`Spec`'s 4 words).
     pub fn decode(b: &[u8]) -> Res<GraphicsState> {
         let mut r = Reader { b, at: 0 };
         let mut s = GraphicsState::default();
@@ -239,6 +288,12 @@ impl GraphicsState {
         };
         s.vertex = (vs, name(nv)?);
         s.fragment = (fs, name(nf)?);
+        for spec in [&mut s.vertex_spec, &mut s.fragment_spec] {
+            let n = r.u32()?;
+            for _ in 0..n {
+                spec.push([r.u32()?, r.u32()?, r.u32()?, r.u32()?]);
+            }
+        }
         Ok(s)
     }
 }
@@ -407,11 +462,14 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
             Ok(Some(wgpu::ColorTargetState { format: f, blend, write_mask: wgpu::ColorWrites::from_bits_truncate(c[8]) }))
         })
         .collect::<Res<_>>()?;
+    let (vc, fc) = (vs.constants(&s.vertex_spec), fs.map(|fs| fs.constants(&s.fragment_spec)).unwrap_or_default());
+    let vc: Vec<(&str, f64)> = vc.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let fc: Vec<(&str, f64)> = fc.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
         layout: None,
-        vertex: wgpu::VertexState { module: &vs.module, entry_point: Some(&s.vertex.1), compilation_options: Default::default(), buffers: &buffers },
+        vertex: wgpu::VertexState { module: &vs.module, entry_point: Some(&s.vertex.1), compilation_options: options(&vc), buffers: &buffers },
         primitive: wgpu::PrimitiveState {
             topology,
             strip_index_format: None,
@@ -423,7 +481,7 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
         },
         depth_stencil,
         multisample: wgpu::MultisampleState { count: s.samples.max(1), mask: !0, alpha_to_coverage_enabled: false },
-        fragment: fs.map(|fs| wgpu::FragmentState { module: &fs.module, entry_point: Some(&s.fragment.1), compilation_options: Default::default(), targets: &targets }),
+        fragment: fs.map(|fs| wgpu::FragmentState { module: &fs.module, entry_point: Some(&s.fragment.1), compilation_options: options(&fc), targets: &targets }),
         multiview_mask: None,
         cache: None,
     });
@@ -517,6 +575,9 @@ pub enum Command {
     SetStencilReference(u32),
     /// A descriptor set bound for graphics (BindSet's are compute's).
     BindGraphicsSet { set: u32, bindings: Vec<Binding> },
+    /// A region of one image's mip level and layer scaled into another's
+    /// (corners: x0, y0, x1, y1), linearly filtered or not.
+    Blit { src: u64, src_level: [u32; 2], from: [i32; 4], dst: u64, dst_level: [u32; 2], to: [i32; 4], linear: bool },
 }
 
 /// A render pass's color attachment: a view, VkAttachmentLoadOp and
@@ -577,6 +638,9 @@ pub struct DepthAttachment {
 ///  23 SET_BLEND_CONSTANTS  (f32 × 4)
 ///  24 SET_STENCIL_REFERENCE  (u32)
 ///  25 BIND_GRAPHICS_SET  as BIND_SET, for graphics
+///  26 BLIT           source, destination (u64), then u32s: the source's mip
+///                    level, layer, corners (i32 × 4: x0, y0, x1, y1); the
+///                    destination's likewise; VkFilter
 ///
 /// A SUB: mip, layer, layers, aspect (u32), origin (i32 × 3), extent (u32 × 3).
 pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
@@ -651,6 +715,15 @@ pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
             21 | 22 => Command::DrawIndirect { buffer: r.u64()?, offset: r.u64()?, count: r.u32()?, stride: r.u32()?, indexed: op == 22 },
             23 => Command::SetBlendConstants([r.f32()?, r.f32()?, r.f32()?, r.f32()?]),
             24 => Command::SetStencilReference(r.u32()?),
+            26 => {
+                let (src, dst) = (r.u64()?, r.u64()?);
+                let mut w = [0u32; 13];
+                for v in &mut w {
+                    *v = r.u32()?;
+                }
+                let corners = |k: usize| [w[k] as i32, w[k + 1] as i32, w[k + 2] as i32, w[k + 3] as i32];
+                Command::Blit { src, src_level: [w[0], w[1]], from: corners(2), dst, dst_level: [w[6], w[7]], to: corners(8), linear: w[12] == 1 }
+            }
             op => return Err(format!("command {op}")),
         });
         at += len;
@@ -775,6 +848,12 @@ pub fn format_features(gpu: &Gpu, vk: u32) -> (u32, u32) {
         if !depth && flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE) {
             v |= 0x100; // COLOR_ATTACHMENT_BLEND
         }
+        if !depth {
+            v |= 0x800; // BLIT_DST (drawn into)
+        }
+    }
+    if u.contains(wgpu::TextureUsages::TEXTURE_BINDING) && flags.contains(wgpu::TextureFormatFeatureFlags::FILTERABLE) {
+        v |= 0x400; // BLIT_SRC (sampled)
     }
     if u.contains(wgpu::TextureUsages::COPY_SRC) {
         v |= 0x4000; // TRANSFER_SRC
@@ -794,6 +873,10 @@ pub fn image(gpu: &Gpu, dims: u32, vk_format: u32, extent: [u32; 3], mips: u32, 
     let mut u = (wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST) & allowed;
     if usage & (0x4 | 0x80) != 0 {
         u |= wgpu::TextureUsages::TEXTURE_BINDING;
+    }
+    // (A transfer's source, sampled too where it can be: blits draw from it.)
+    if usage & 0x1 != 0 {
+        u |= wgpu::TextureUsages::TEXTURE_BINDING & allowed;
     }
     if usage & 0x8 != 0 {
         u |= wgpu::TextureUsages::STORAGE_BINDING;
@@ -838,6 +921,8 @@ fn aspect(bits: u32) -> wgpu::TextureAspect {
 pub struct View {
     pub view: wgpu::TextureView,
     pub format: wgpu::TextureFormat,
+    /// Its first mip level's width and height.
+    pub size: [u32; 2],
 }
 
 /// A view of an image: Vulkan's view type (VkImageViewType), its format
@@ -865,7 +950,8 @@ pub fn view(t: &wgpu::Texture, kind: u32, vk_format: u32, aspect_bits: u32, mip:
         base_array_layer: layer,
         array_layer_count: if dimension == D::D3 { None } else { Some(layers) },
     });
-    Ok(View { view, format: format.unwrap_or(t.format()) })
+    let size = [(t.width() >> mip).max(1), (t.height() >> mip).max(1)];
+    Ok(View { view, format: format.unwrap_or(t.format()), size })
 }
 
 /// A sampler, from VkSamplerCreateInfo's fields: filters (magnification,
@@ -1004,6 +1090,108 @@ fn bind_groups<'a>(
         }
     }
     Ok(groups)
+}
+
+const BLIT: &str = "
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+// The source's coordinates at the destination's corners: u0, v0, u1, v1.
+@group(0) @binding(2) var<uniform> r: vec4<f32>;
+struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+    let c = vec2<f32>(f32(i & 1u), f32(i >> 1u));
+    return V(vec4<f32>(c.x * 2.0 - 1.0, 1.0 - c.y * 2.0, 0.0, 1.0), mix(r.xy, r.zw, c));
+}
+@fragment fn fs(v: V) -> @location(0) vec4<f32> { return textureSampleLevel(t, s, v.uv, 0.0); }
+";
+
+/// A blit: one mip level and layer's region (corners `from`) scaled into
+/// another's (`to`), mirrored where the corners are; a copy where nothing
+/// is scaled, else drawn (a quad sampling the source: formats of floats).
+#[allow(clippy::too_many_arguments)]
+fn blit(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, src: &wgpu::Texture, [sm, sl]: [u32; 2], from: [i32; 4], dst: &wgpu::Texture, [dm, dl]: [u32; 2], to: [i32; 4], linear: bool) -> Res<()> {
+    let (mut from, mut to) = (from, to);
+    // (The destination's corners in order; the source's swapped with them.)
+    for k in 0..2 {
+        if to[k] > to[k + 2] {
+            to.swap(k, k + 2);
+            from.swap(k, k + 2);
+        }
+    }
+    let (w, h) = ((to[2] - to[0]) as u32, (to[3] - to[1]) as u32);
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    if from[2] - from[0] == w as i32 && from[3] - from[1] == h as i32 && src.format() == dst.format() {
+        let at = |t, mip, layer, x: i32, y: i32| wgpu::TexelCopyTextureInfo { texture: t, mip_level: mip, origin: wgpu::Origin3d { x: x as u32, y: y as u32, z: layer }, aspect: wgpu::TextureAspect::All };
+        enc.copy_texture_to_texture(at(src, sm, sl, from[0], from[1]), at(dst, dm, dl, to[0], to[1]), wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+        return Ok(());
+    }
+    let format = dst.format();
+    let filterable = |f: wgpu::TextureFormat| f.guaranteed_format_features(gpu.device.features()).flags.contains(wgpu::TextureFormatFeatureFlags::FILTERABLE);
+    if !src.usage().contains(wgpu::TextureUsages::TEXTURE_BINDING) || !dst.usage().contains(wgpu::TextureUsages::RENDER_ATTACHMENT) || !filterable(src.format()) {
+        return Err(format!("a scaled blit from {:?} to {format:?}", src.format()));
+    }
+    let mut blits = gpu.blits.lock().unwrap();
+    let pipeline = blits.entry(format).or_insert_with(|| {
+        let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(BLIT.into()) });
+        gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: None,
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(format.into())] }),
+            multiview_mask: None,
+            cache: None,
+        })
+    });
+    let level = |t: &wgpu::Texture, mip, layer| {
+        t.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_mip_level: mip,
+            mip_level_count: Some(1),
+            base_array_layer: layer,
+            array_layer_count: Some(1),
+            ..Default::default()
+        })
+    };
+    let (sw, sh) = ((src.width() >> sm).max(1) as f32, (src.height() >> sm).max(1) as f32);
+    let r = [from[0] as f32 / sw, from[1] as f32 / sh, from[2] as f32 / sw, from[3] as f32 / sh];
+    let uniform = wgpu::util::DeviceExt::create_buffer_init(&gpu.device, &wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: &r.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<_>>(),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let filter = if linear { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest };
+    let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: filter, min_filter: filter, ..Default::default() });
+    let source = level(src, sm, sl);
+    let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&source) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() },
+        ],
+    });
+    let target = level(dst, dm, dl);
+    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: None,
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        })],
+        ..Default::default()
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &group, &[]);
+    pass.set_viewport(to[0] as f32, to[1] as f32, w as f32, h as f32, 0.0, 1.0);
+    pass.draw(0..4, 0..1);
+    Ok(())
 }
 
 /// A color's bits as the format takes it: floats, or integers for an
@@ -1176,6 +1364,12 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     }
                     None => None,
                 };
+                // (Its size: its attachments', for scissors within it.)
+                let first = colors.first().map(|a| a.view).or(depth.as_ref().map(|d| d.view));
+                let size = match first {
+                    Some(h) => view(h)?.size,
+                    None => [0, 0],
+                };
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &color_attachments, depth_stencil_attachment, ..Default::default() });
                 // The pass's commands, to its end.
                 i += 1;
@@ -1195,7 +1389,17 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                         }
                         Command::Push { offset, data } => set_push(&mut push, *offset, data)?,
                         Command::SetViewport([x, y, w, h, near, far]) => pass.set_viewport(*x, *y, *w, *h, *near, *far),
-                        Command::SetScissor([x, y, w, h]) => pass.set_scissor_rect(*x, *y, *w, *h),
+                        Command::SetScissor([x, y, w, h]) => {
+                            // (Within the attachments, as WebGPU's must be:
+                            // Vulkan's offsets are signed.)
+                            let clip = |o: u32, n: u32, max: u32| {
+                                let (o, end) = (o as i32 as i64, o as i32 as i64 + n as i64);
+                                let (o, end) = (o.clamp(0, max as i64), end.clamp(0, max as i64));
+                                (o as u32, (end - o).max(0) as u32)
+                            };
+                            let ((x, w), (y, h)) = (clip(*x, *w, size[0]), clip(*y, *h, size[1]));
+                            pass.set_scissor_rect(x, y, w, h)
+                        }
                         Command::SetBlendConstants([r, g, b, a]) => pass.set_blend_constant(wgpu::Color { r: *r as f64, g: *g as f64, b: *b as f64, a: *a as f64 }),
                         Command::SetStencilReference(r) => pass.set_stencil_reference(*r),
                         Command::BindVertex { first, buffers } => {
@@ -1247,6 +1451,7 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     return Err("a render pass's end with none begun".into());
                 }
             }
+            Command::Blit { src, src_level, from, dst, dst_level, to, linear } => blit(gpu, &mut enc, tex(*src)?, *src_level, *from, tex(*dst)?, *dst_level, *to, *linear)?,
             c @ (Command::Draw(_) | Command::DrawIndexed { .. } | Command::DrawIndirect { .. }) => return Err(format!("{c:?} outside a render pass")),
         }
         i += 1;
@@ -1289,7 +1494,7 @@ var<immediate> p: P;
             ),
         )
         .unwrap();
-        let p = Arc::new(compute_pipeline(&g, &s, "main").unwrap());
+        let p = Arc::new(compute_pipeline(&g, &s, "main", &[]).unwrap());
         let (src, mem, out) = (g.buffer(64).unwrap(), g.buffer(512).unwrap(), g.buffer(64).unwrap());
         let buffers: HashMap<u64, &wgpu::Buffer> = [(1, &src), (2, &mem), (3, &out)].into();
         let input: Vec<u8> = (0..16u32).flat_map(|i| (i * 10).to_le_bytes()).collect();
@@ -1402,12 +1607,14 @@ var<immediate> p: P;
         w.extend([0, 24, 0]);
         w.extend([0, 0, 106, 0, 1, 0, 106, 12]);
         w.extend([u32::from_le_bytes(*b"main"), u32::from_le_bytes(*b"fs\0\0")]);
+        w.extend([1, 7, 4, 1f32.to_bits(), 0, 0]); // specialization: the vertex shader's one, the fragment's none
         let bytes: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
         let s = GraphicsState::decode(&bytes).unwrap();
         assert_eq!((s.vertex, s.fragment), ((5, "main".into()), (6, "fs".into())));
         assert_eq!((s.topology, s.cull, s.front_face, s.bias), (3, 2, 1, (true, 2., 0.5, 0.)));
         assert_eq!((s.depth, s.depth_format, s.samples), ((true, true, 1), 126, 1));
         assert_eq!((s.colors.len(), s.buffers, s.attributes), (1, vec![[0, 24, 0]], vec![[0, 0, 106, 0], [1, 0, 106, 12]]));
+        assert_eq!((s.vertex_spec, s.fragment_spec), (vec![[7, 4, 1f32.to_bits(), 0]], vec![]));
         assert!(GraphicsState::decode(&bytes[..bytes.len() - 4]).is_err());
     }
 }

@@ -277,6 +277,7 @@ compute: 0 of 1000 wrong
 fill and update: right
 the program's own write kept: yes
 images: texels fetched 0 wrong, image 0 wrong
+blit: 0 of 64 wrong
 draw: 5 pixels looked at, 0 wrong
 done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" /opt/tests/vulkan 2>&1)"
 				# vkcube, presenting to the runtime's compositor: its 60th

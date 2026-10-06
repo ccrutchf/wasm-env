@@ -78,7 +78,8 @@ enum {
     DRAW_INDEXED_INDIRECT,
     SET_BLEND_CONSTANTS,
     SET_STENCIL_REFERENCE,
-    BIND_GRAPHICS_SET
+    BIND_GRAPHICS_SET,
+    BLIT
 };
 
 struct request {
@@ -210,7 +211,6 @@ struct VkRenderPass_T {
 struct VkFramebuffer_T {
     uint32_t n;
     VkImageView *views;
-    uint32_t width, height;
 };
 struct VkPipelineLayout_T {
     uint32_t sets;
@@ -855,15 +855,35 @@ static CALL void CC DestroyShaderModule(VkDevice d, VkShaderModule s, const VkAl
     free(s);
 }
 
+// Specialization constants as the runtime takes them: per constant its id,
+// size, and bytes (two words), at `w` (4 words each).
+static void spec_words(const VkSpecializationInfo *s, uint32_t *w) {
+    for (uint32_t k = 0; s && k < s->mapEntryCount; k++) {
+        const VkSpecializationMapEntry *e = &s->pMapEntries[k];
+        uint32_t v[2] = {0, 0};
+        size_t n = e->size < 8 ? e->size : 8;
+        if (e->offset + n <= s->dataSize)
+            memcpy(v, (const uint8_t *)s->pData + e->offset, n);
+        w[4 * k] = e->constantID, w[4 * k + 1] = (uint32_t)e->size, w[4 * k + 2] = v[0], w[4 * k + 3] = v[1];
+    }
+}
+
 static CALL VkResult CC CreateComputePipelines(VkDevice d, VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo *info, const VkAllocationCallbacks *a, VkPipeline *out) {
     VkResult result = VK_SUCCESS;
     for (uint32_t i = 0; i < n; i++) {
         out[i] = VK_NULL_HANDLE;
         const VkPipelineShaderStageCreateInfo *st = &info[i].stage;
         char why[256];
-        struct request q = {VK_PIPELINE, {st->module->handle, (uint64_t)(uintptr_t)st->pName, strlen(st->pName), (uint64_t)(uintptr_t)why, sizeof why}};
+        const VkSpecializationInfo *spec = st->pSpecializationInfo;
+        uint32_t nspec = spec ? spec->mapEntryCount : 0;
+        uint32_t *w = zalloc(nspec * 16);
+        if (w)
+            spec_words(spec, w);
+        struct request q = {VK_PIPELINE, {st->module->handle, (uint64_t)(uintptr_t)st->pName, strlen(st->pName), (uint64_t)(uintptr_t)why, sizeof why, (uint64_t)(uintptr_t)w, nspec}};
         struct VkPipeline_T *p = zalloc(sizeof *p);
-        if (!p || call(&q)) {
+        int failed = !p || !w || call(&q);
+        free(w);
+        if (failed) {
             free(p);
             result = VK_ERROR_INITIALIZATION_FAILED;
             continue;
@@ -1001,6 +1021,20 @@ static VkResult graphics_pipeline(const VkGraphicsPipelineCreateInfo *info, VkPi
     name(&b, vs->pName);
     if (fs)
         name(&b, fs->pName);
+    const VkPipelineShaderStageCreateInfo *stage[2] = {vs, fs};
+    for (int k = 0; k < 2; k++) {
+        const VkSpecializationInfo *spec = stage[k] ? stage[k]->pSpecializationInfo : NULL;
+        uint32_t nspec = spec ? spec->mapEntryCount : 0, w[4 * 8];
+        word(&b, nspec);
+        for (uint32_t e = 0; e < nspec; e += 8) {
+            VkSpecializationInfo part = *spec;
+            part.mapEntryCount = nspec - e < 8 ? nspec - e : 8;
+            part.pMapEntries = spec->pMapEntries + e;
+            spec_words(&part, w);
+            for (uint32_t j = 0; j < 4 * part.mapEntryCount; j++)
+                word(&b, w[j]);
+        }
+    }
     struct VkPipeline_T *p = zalloc(sizeof *p);
     char why[256];
     struct request q = {VK_GRAPHICS, {(uint64_t)(uintptr_t)b.w, b.n * 4, 0, (uint64_t)(uintptr_t)why, sizeof why}};
@@ -1124,8 +1158,6 @@ static CALL VkResult CC CreateFramebuffer(VkDevice d, const VkFramebufferCreateI
         memcpy(views, info->pAttachments, info->attachmentCount * sizeof *views);
     f->n = info->attachmentCount;
     f->views = views;
-    f->width = info->width;
-    f->height = info->height;
     *out = f;
     return VK_SUCCESS;
 }
@@ -1386,6 +1418,14 @@ static CALL void CC FreeCommandBuffers(VkDevice d, VkCommandPool p, uint32_t n, 
 
 static CALL VkResult CC BeginCommandBuffer(VkCommandBuffer c, const VkCommandBufferBeginInfo *info) {
     reset(c);
+    // A secondary command buffer that continues a render pass records as
+    // one inside it (its commands go into the primary's pass).
+    const VkCommandBufferInheritanceInfo *in = info->pInheritanceInfo;
+    if ((info->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) && in && in->renderPass) {
+        c->pass = in->renderPass;
+        c->framebuffer = in->framebuffer;
+        c->subpass = in->subpass;
+    }
     return VK_SUCCESS;
 }
 static CALL VkResult CC EndCommandBuffer(VkCommandBuffer c) {
@@ -1447,26 +1487,9 @@ static void emit_state(VkCommandBuffer c, uint32_t which) {
         return;
     if (which & S_VIEWPORT)
         command(c, SET_VIEWPORT, s->viewport, sizeof s->viewport, NULL, 0);
-    if (which & S_SCISSOR) {
-        // (Within the framebuffer, as WebGPU's must be.)
-        int32_t x = (int32_t)s->scissor[0], y = (int32_t)s->scissor[1];
-        int64_t w = s->scissor[2], h = s->scissor[3];
-        if (x < 0)
-            w += x, x = 0;
-        if (y < 0)
-            h += y, y = 0;
-        uint32_t fw = c->framebuffer->width, fh = c->framebuffer->height;
-        if ((uint32_t)x > fw)
-            x = (int32_t)fw;
-        if ((uint32_t)y > fh)
-            y = (int32_t)fh;
-        if (w > (int64_t)fw - x)
-            w = (int64_t)fw - x;
-        if (h > (int64_t)fh - y)
-            h = (int64_t)fh - y;
-        uint32_t r[4] = {(uint32_t)x, (uint32_t)y, (uint32_t)(w > 0 ? w : 0), (uint32_t)(h > 0 ? h : 0)};
-        command(c, SET_SCISSOR, r, sizeof r, NULL, 0);
-    }
+    // (The runtime keeps scissors within the attachments.)
+    if (which & S_SCISSOR)
+        command(c, SET_SCISSOR, s->scissor, sizeof s->scissor, NULL, 0);
     if (which & S_BLEND)
         command(c, SET_BLEND_CONSTANTS, s->blend, sizeof s->blend, NULL, 0);
     if (which & S_REFERENCE)
@@ -1609,6 +1632,19 @@ static CALL void CC CmdCopyBufferToImage(VkCommandBuffer c, VkBuffer b, VkImage 
 
 static CALL void CC CmdCopyImageToBuffer(VkCommandBuffer c, VkImage im, VkImageLayout l, VkBuffer b, uint32_t n, const VkBufferImageCopy *r) {
     buffer_image(c, IMAGE_TO_BUFFER, b, im, n, r);
+}
+
+// Each region's layers (2D images; a 3D one's first slice), scaled.
+static CALL void CC CmdBlitImage(VkCommandBuffer c, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageBlit *r, VkFilter filter) {
+    uint64_t h[2] = {src->handle, dst->handle};
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t l = 0; l < r[i].srcSubresource.layerCount; l++) {
+            const VkOffset3D *s = r[i].srcOffsets, *d = r[i].dstOffsets;
+            uint32_t w[13] = {r[i].srcSubresource.mipLevel, r[i].srcSubresource.baseArrayLayer + l, (uint32_t)s[0].x, (uint32_t)s[0].y, (uint32_t)s[1].x, (uint32_t)s[1].y,
+                              r[i].dstSubresource.mipLevel, r[i].dstSubresource.baseArrayLayer + l, (uint32_t)d[0].x, (uint32_t)d[0].y, (uint32_t)d[1].x, (uint32_t)d[1].y,
+                              (uint32_t)filter};
+            command(c, BLIT, h, sizeof h, w, sizeof w);
+        }
 }
 
 static CALL void CC CmdCopyImage(VkCommandBuffer c, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageCopy *r) {

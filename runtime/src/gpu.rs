@@ -64,7 +64,9 @@
 //!  20 VK_SHADER   a0: SPIR-V, a1: its length, a3: address, a4: capacity
 //!              r0: shader handle; or, failing, why (text at a3) and its length
 //!  21 VK_PIPELINE a0: shader, a1: entry point's name, a2: its length,
-//!              a3: address, a4: capacity   r0: compute pipeline handle (or
+//!              a3: address, a4: capacity, a5: specialization constants (each
+//!              id, size, low and high words: u32s), a6: their number
+//!              r0: compute pipeline handle (or
 //!              as VK_SHADER's)
 //!  22 VK_SUBMIT   a0: commands, a1: their length (gpu/src/vulkan.rs, `decode`)
 //!  23 VK_LIMITS   a0: address, a1: size   u64s: storage and uniform
@@ -445,7 +447,11 @@ impl Session {
                         _ => return Err(Failure::Cl(VK_ERROR_INITIALIZATION_FAILED)),
                     };
                     let entry = String::from_utf8_lossy(mem::slice(data, a[1], a[2])?).into_owned();
-                    vulkan::compute_pipeline(g, &shader, &entry).map(|p| Vk::Pipeline(Arc::new(p)))
+                    let spec: Vec<vulkan::Spec> = if a[6] == 0 { &[][..] } else { mem::slice(data, a[5], a[6] * 16)? }
+                        .chunks(16)
+                        .map(|c| std::array::from_fn(|k| u32::from_le_bytes(c[4 * k..4 * k + 4].try_into().unwrap())))
+                        .collect();
+                    vulkan::compute_pipeline(g, &shader, &entry, &spec).map(|p| Vk::Pipeline(Arc::new(p)))
                 };
                 match made {
                     Ok(v) => {

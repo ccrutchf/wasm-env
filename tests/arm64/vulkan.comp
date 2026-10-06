@@ -1,13 +1,15 @@
-// tests/arm64/vulkan.c's compute shader: out = in * scale + add, from a
-// read-only buffer, a uniform and push constants, in two descriptor sets.
+// tests/arm64/vulkan.c's compute shader: out = in * scale + add + extra,
+// from a read-only buffer, a uniform and push constants, in two descriptor
+// sets, and a specialization constant.
 #version 450
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0) readonly buffer In { uint a[]; };
 layout(set = 0, binding = 1) buffer Out { uint b[]; };
 layout(set = 1, binding = 0) uniform U { uint add; };
 layout(push_constant) uniform P { uint scale; uint n; };
+layout(constant_id = 5) const uint extra = 1000;
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i < n)
-        b[i] = a[i] * scale + add;
+        b[i] = a[i] * scale + add + extra;
 }

@@ -19,6 +19,8 @@ pub struct Gpu {
     pub limits: wgpu::Limits,
     pub quirks: Quirks,
     pipelines: Mutex<HashMap<(usize, String, Launch), Arc<Pipeline>>>,
+    /// Vulkan's blits: a render pipeline per destination format.
+    pub(crate) blits: Mutex<HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
     lost: std::sync::atomic::AtomicBool,
 }
 
@@ -100,7 +102,7 @@ impl Gpu {
         .map_err(|e| format!("can't open {}: {e}", info.name))?;
         // Errors are reported to the caller (error scopes), not panics.
         device.on_uncaptured_error(Arc::new(|e| eprintln!("wasm-env: GPU: {}", chain(&e))));
-        let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), lost: Default::default() };
+        let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), lost: Default::default() };
         g.quirks = Quirks { native_f64: native_f64 && g.native_doubles_conform()?, ..g.probe_quirks()? };
         Ok(g)
     }
