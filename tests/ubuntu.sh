@@ -58,7 +58,7 @@ done
 "${cc[@]}" -O2 -o "$R/opt/tests/greet" tests/arm64/greet.c -L"$R/usr/lib" -lgreet -ldl
 echo "greet /usr/lib/libplugin.so" > "$R/etc/wasm-env/dlopen"
 t /opt/tests/greet you
-"${cc[@]}" -O2 -o "$R/opt/tests/dlopen_loop" tests/arm64/dlopen_loop.c -ldl && t /opt/tests/dlopen_loop
+"${cc[@]}" -O2 -pthread -o "$R/opt/tests/dlopen_loop" tests/arm64/dlopen_loop.c -ldl && t /opt/tests/dlopen_loop
 
 # Ubuntu's own programs (paths inside the root only: qemu reads the host's
 # files for paths the root lacks).

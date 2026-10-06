@@ -985,11 +985,13 @@ static uint64_t lib_count;
 #define NOT_LIB 0xffff
 static uint16_t fd_lib[LIB_FDS];
 
-// The file most recently opened (1 + fd), until it's mapped. glibc maps a
-// library whose segments are aligned beyond the page size by first
-// reserving an anonymous, inaccessible region, then mapping the file at an
-// aligned address inside it; that reservation must be the library's base.
-static long pending_fd;
+// The file this thread most recently opened (1 + fd), until it's mapped.
+// glibc maps a library whose segments are aligned beyond the page size by
+// first reserving an anonymous, inaccessible region, then mapping the file
+// at an aligned address inside it; that reservation must be the library's
+// base. (Per thread: another thread's open between the dynamic linker's
+// open and its reservation would put the library outside its range.)
+static _Thread_local long pending_fd;
 
 // Reservations made that way: unmapping parts of them is a no-op.
 #define RESERVATIONS 4096
