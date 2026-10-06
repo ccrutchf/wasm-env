@@ -151,6 +151,9 @@ pub enum Device {
     Random,
     /// The GPU service (gpu.rs): opened as an `Open::Gpu` session.
     Gpu,
+    /// The sound card (audio.rs): its control device, and its PCM (opened
+    /// as an `Open::Sound` stream).
+    Sound(crate::audio::SoundDevice),
 }
 
 #[derive(Debug, PartialEq)]
@@ -352,6 +355,7 @@ impl Fs {
             ["zero"] => Some(DevPath::Device(Device::Zero)),
             ["random"] | ["urandom"] => Some(DevPath::Device(Device::Random)),
             ["wasm-env-gpu"] => Some(DevPath::Device(Device::Gpu)),
+            ["snd", name] => crate::audio::device(name).map(|d| DevPath::Device(Device::Sound(d))),
             ["stdin"] => Some(DevPath::Fd(0)),
             ["stdout"] => Some(DevPath::Fd(1)),
             ["stderr"] => Some(DevPath::Fd(2)),
@@ -387,16 +391,18 @@ const SYNTHETIC_DEV: u64 = 6;
 
 /// `struct stat` for a /dev device (Linux's major 1 memory devices).
 pub fn device_stat_bytes(d: Device) -> [u8; 128] {
-    let minor: u64 = match d {
-        Device::Null => 3,
-        Device::Zero => 5,
-        Device::Random => 9,
-        Device::Gpu => 64,
+    let rdev: u64 = match d {
+        Device::Null => 1 << 8 | 3,
+        Device::Zero => 1 << 8 | 5,
+        Device::Random => 1 << 8 | 9,
+        Device::Gpu => 1 << 8 | 64,
+        Device::Sound(s) => s.rdev(),
     };
+    let minor = rdev & 0xff;
     let mut b = [0u8; 128];
     b[16..20].copy_from_slice(&(S_IFCHR | 0o666).to_le_bytes());
     b[20..24].copy_from_slice(&1u32.to_le_bytes());
-    b[32..40].copy_from_slice(&(1 << 8 | minor).to_le_bytes());
+    b[32..40].copy_from_slice(&rdev.to_le_bytes());
     // Distinct device and inode numbers: programs compare them (GNU grep
     // writes nothing when stdout is /dev/null, by st_dev and st_ino).
     b[0..8].copy_from_slice(&SYNTHETIC_DEV.to_le_bytes());
@@ -538,6 +544,8 @@ pub enum Open {
     Inotify(Arc<crate::inotify::Inotify>),
     /// A session with the GPU service (/dev/wasm-env-gpu).
     Gpu(Arc<crate::gpu::Session>),
+    /// A stream of the sound card's PCM (/dev/snd/pcmC0D0p).
+    Sound(Arc<crate::audio::Pcm>),
     /// A Unix socket, the runtime's own (unix.rs).
     Unix(Arc<crate::unix::UnixSocket>),
     /// A host descriptor of a kind the runtime doesn't model itself (a pipe,

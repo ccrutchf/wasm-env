@@ -212,6 +212,7 @@ const MAP_FIXED: i64 = 0x10;
 const MAP_ANONYMOUS: i64 = 0x20;
 const MAP_TYPE: i64 = 0xf;
 const MAP_SHARED: i64 = 0x01;
+const MAP_PRIVATE: i64 = 0x02;
 const MAP_SHARED_VALIDATE: i64 = 0x03;
 #[cfg(unix)]
 const PROT_WRITE: i64 = 0x2;
@@ -258,9 +259,28 @@ pub fn alloc_shared(group: &crate::thread::Group, memory: &SharedMemory, len: u6
 }
 
 fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
-    let [addr, len, prot, flags, fd, off] = *args;
+    let [addr, len, prot, mut flags, fd, off] = *args;
     if len <= 0 {
         return Err(EINVAL);
+    }
+    // A sound card PCM's data (audio.rs): memory of the program's own, which
+    // the stream copies from as the program commits frames. (Its status and
+    // control pages aren't mapped: libasound asks for them by ioctl.)
+    let mut pcm = None;
+    if flags & MAP_ANONYMOUS == 0
+        && let Ok(d) = caller.data().fds.get(fd)
+        && let Open::Sound(p) = &*d.open.lock().unwrap()
+    {
+        if off != 0 {
+            return Err(ENXIO);
+        }
+        pcm = Some(p.clone());
+        flags = (flags & !MAP_TYPE) | MAP_PRIVATE | MAP_ANONYMOUS;
+    }
+    if let Some(p) = pcm {
+        let addr = mmap(caller, &[addr, len, prot, flags, -1, 0])?;
+        p.mapped(addr as u64, len as u64);
+        return Ok(addr);
     }
     let len = page_align(len as u64);
     // A shared mapping is the host's, made of its pages (larger than the
@@ -1504,7 +1524,7 @@ impl Process {
                 Ok(buf.len())
             }
             Open::Stdout | Open::Stderr | Open::Pipe(_) | Open::Socket(_) | Open::Host(_) | Open::Unix(_) => return Err(EBADF),
-            Open::EventFd(_) | Open::Epoll(_) | Open::Inotify(_) | Open::Gpu(_) | Open::Device(Device::Gpu) => return Err(EINVAL),
+            Open::EventFd(_) | Open::Epoll(_) | Open::Inotify(_) | Open::Gpu(_) | Open::Sound(_) | Open::Device(Device::Gpu | Device::Sound(_)) => return Err(EINVAL),
         };
         r.map(|n| n as i64).map_err(|e| fs::errno(&e))
     }
@@ -1546,7 +1566,7 @@ impl Process {
             Open::Dir { .. } => return Err(EISDIR),
             Open::Device(_) => Ok(()), // writes to /dev devices are discarded
             Open::Stdin | Open::Pipe(_) | Open::Socket(_) | Open::Host(_) | Open::Unix(_) => return Err(EBADF),
-            Open::EventFd(_) | Open::Epoll(_) | Open::Inotify(_) | Open::Gpu(_) => return Err(EINVAL),
+            Open::EventFd(_) | Open::Epoll(_) | Open::Inotify(_) | Open::Gpu(_) | Open::Sound(_) => return Err(EINVAL),
         };
         r.map(|_| buf.len() as i64).map_err(|e| fs::errno(&e))
     }
@@ -1591,6 +1611,10 @@ impl Process {
         match self.fs.device(&dir, path) {
             Some(DevPath::Device(Device::Gpu)) => {
                 let open = Arc::new(Mutex::new(Open::Gpu(Arc::new(crate::gpu::Session::open()?))));
+                return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
+            }
+            Some(DevPath::Device(Device::Sound(crate::audio::SoundDevice::Playback))) => {
+                let open = Arc::new(Mutex::new(Open::Sound(crate::audio::Pcm::open())));
                 return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
             }
             Some(DevPath::Device(d)) => {
@@ -1734,6 +1758,7 @@ impl Process {
             Open::Pipe(_) => Ok(fs::fifo_stat_bytes()),
             Open::Device(d) => Ok(fs::device_stat_bytes(*d)),
             Open::Gpu(_) => Ok(fs::device_stat_bytes(Device::Gpu)),
+            Open::Sound(_) => Ok(fs::device_stat_bytes(Device::Sound(crate::audio::SoundDevice::Playback))),
             Open::Host(h) => h.metadata().map(|m| fs::stat_bytes(&m)).map_err(|e| fs::errno(&e)),
             Open::Unix(_) | Open::Socket(_) => Ok(fs::socket_stat_bytes()),
             _ => Ok(fs::stdio_stat_bytes()),
@@ -1982,6 +2007,24 @@ impl Process {
             };
             let guest = wasm_env_gpu::opencl::Guest { root: self.fs.host("/"), cwd: self.fs.host(&self.fs.cwd()) };
             return session.call(data, arg, &guest);
+        }
+        // The sound card's devices (audio.rs): ALSA's ioctls.
+        let (sound, nonblock) = {
+            let d = self.fds.get(fd)?;
+            let sound = match &*d.open.lock().unwrap() {
+                Open::Sound(p) => Some(Ok(p.clone())),
+                Open::Device(Device::Sound(crate::audio::SoundDevice::Control)) => Some(Err(())),
+                _ => None,
+            };
+            (sound, d.flags & o::NONBLOCK != 0)
+        };
+        match sound {
+            Some(Ok(pcm)) => {
+                let interrupted = self.interrupted();
+                return pcm.ioctl(data, req as u32, arg, nonblock, &interrupted);
+            }
+            Some(Err(())) => return crate::audio::control_ioctl(data, req as u32, arg),
+            None => {}
         }
         const TIOCGWINSZ: i64 = 0x5413;
         const FIONREAD: i64 = 0x541b;

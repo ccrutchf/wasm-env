@@ -30,6 +30,9 @@ notify = "8.2"
 wasm-env-translate = { path = "../translator", features = ["lift"] }
 # The GPU service (gpu.rs, /dev/wasm-env-gpu).
 wasm-env-gpu = { path = "../gpu" }
+# The sound card (audio.rs, /dev/snd): the host's output through cpal (CoreAudio,
+# WASAPI, ALSA), on every host.
+cpal = "0.18"
 
 # Windows hosts: polling sockets (WSAPoll), bytes pending (ioctlsocket), file
 # identities (locks.rs), memory (/proc/meminfo).

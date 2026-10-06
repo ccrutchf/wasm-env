@@ -297,13 +297,19 @@ done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" 
 				compare "vkcube ($gpu, the runtime's compositor)" yes "$([ "${colors:-0}" -gt 1000 ] && echo yes || echo "no (${colors:-no frame 60})")"
 				# Doom: Ubuntu's chocolate-doom with Freedoom's data, on SDL3
 				# (packages/sdl3, through sdl2-compat) and its Vulkan
-				# renderer: its 60th frame the title screen or a demo.
+				# renderer: its 60th frame the title screen or a demo; and its
+				# sound (M11: SDL3's ALSA, the runtime's sound card, recorded):
+				# five seconds of the title music, not silence.
 				if [ -n "$doom" ]; then
-					colors=$(WASM_ENV_GPU=$gpu WASM_ENV_DEBUG_WAYLAND=1 timeout 900 "$wasm_env" run --wayland=headless --root "$R" "${only[@]}" \
+					rm -f "$root/build/doom-$gpu.raw"
+					colors=$(WASM_ENV_GPU=$gpu WASM_ENV_DEBUG_WAYLAND=1 WASM_ENV_AUDIO_RECORD="$root/build/doom-$gpu.raw" timeout 900 \
+						"$wasm_env" run --wayland=headless --audio=null --root "$R" "${only[@]}" \
 						--env LD_LIBRARY_PATH=/opt/sdl3/lib --env SDL_RENDER_DRIVER=vulkan --env HOME=/root \
-						/usr/games/chocolate-doom -iwad /usr/share/games/doom/freedoom1.wad -nosound 2>&1 |
-						sed -n 's/.*frame 60: [0-9x]*, \([0-9]*\) colors.*/\1/p;/frame 60:/q')
+						/usr/games/chocolate-doom -iwad /usr/share/games/doom/freedoom1.wad 2>&1 |
+						sed -n 's/.*frame 60: [0-9x]*, \([0-9]*\) colors.*/\1/p;/frame 300:/q')
 					compare "Doom ($gpu, Vulkan through SDL3)" yes "$([ "${colors:-0}" -gt 100 ] && echo yes || echo "no (${colors:-no frame 60})")"
+					sounded=$(tr -d '\0' <"$root/build/doom-$gpu.raw" 2>/dev/null | wc -c)
+					compare "Doom's sound ($gpu, the runtime's sound card)" yes "$([ "$sounded" -gt 100000 ] && echo yes || echo "no ($sounded bytes not silent)")"
 				fi
 			else
 				echo "skipped Vulkan ($gpu): no such GPU adapter"
@@ -314,6 +320,22 @@ done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" 
 	fi
 else
 	echo "skipped Vulkan: can't fetch the packages (offline?)"
+fi
+
+# Audio (M11): the runtime's sound card (/dev/snd) to Ubuntu's own
+# libasound, through its default device (plug over hw), recorded where it
+# plays (--audio=null): a second of random samples aplay plays comes out
+# byte for byte (then aplay's silence, padding its last period).
+if tests/ubuntu-fetch.sh alsa-utils >/dev/null 2>&1; then
+	head -c 176400 /dev/urandom >"$R/tmp/sound.raw"
+	rm -f "$root/build/sound.raw"
+	WASM_ENV_AUDIO_RECORD="$root/build/sound.raw" timeout 600 "$wasm_env" run --audio=null --root "$R" \
+		/usr/bin/aplay -q -t raw -f S16_LE -r 44100 -c 2 /tmp/sound.raw >/dev/null 2>&1
+	played=$(cmp -n 176400 "$R/tmp/sound.raw" "$root/build/sound.raw" >/dev/null 2>&1 && echo same || echo different)
+	padding=$(tail -c +176401 "$root/build/sound.raw" 2>/dev/null | tr -d '\0' | wc -c)
+	compare "aplay through the runtime's sound card" "same, then silence" "$played$([ "$padding" = 0 ] && echo ", then silence")"
+else
+	echo "skipped audio: can't fetch alsa-utils (offline?)"
 fi
 
 # Networking, if PyPI is reachable: DNS (glibc's resolver, over the host's

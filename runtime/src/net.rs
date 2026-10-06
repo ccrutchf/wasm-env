@@ -660,6 +660,9 @@ impl Process {
         let interrupted = self.interrupted();
         loop {
             let mut revents = vec![0i16; fds.len()];
+            // (A sound device waits a millisecond at a time: a period is a
+            // few.)
+            let mut fine = false;
             // Host descriptors (sockets, others passed in), polled on the host:
             // (index, descriptor), and what keeps each open meanwhile.
             let mut host: Vec<(usize, Pollable)> = Vec::new();
@@ -699,6 +702,12 @@ impl Process {
                         revents[k] = events & ((if r { POLLIN } else { 0 }) | (if w { POLLOUT } else { 0 }));
                     }
                     Open::Inotify(i) => revents[k] = if i.readable() { events & POLLIN } else { 0 },
+                    // (A PCM: room for avail_min frames, or a stream stopped.)
+                    Open::Sound(p) => {
+                        fine = true;
+                        let (room, err) = p.readiness();
+                        revents[k] = (if room { events & POLLOUT } else { 0 }) | if err { POLLERR } else { 0 };
+                    }
                     // (An epoll instance inside another isn't modelled: never ready.)
                     Open::Epoll(_) => {}
                     Open::Pipe(end) => {
@@ -737,7 +746,7 @@ impl Process {
                 }
                 drop(keep);
             } else if !others_ready && !wait.is_zero() {
-                std::thread::sleep(wait.min(Duration::from_millis(10)));
+                std::thread::sleep(wait.min(Duration::from_millis(if fine { 1 } else { 10 })));
             }
             if revents.iter().any(|&r| r != 0) || deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(revents);

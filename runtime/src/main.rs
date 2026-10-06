@@ -1,7 +1,7 @@
 //! wasm-env: runs WebAssembly programs built for the wasm-env Linux ABI
 //! (docs/abi.md) on any host.
 //!
-//!   wasm-env run [--root DIR] [--env KEY=VALUE]... [--wayland[=headless|=host]] [--trace] PROGRAM [ARGS]...
+//!   wasm-env run [--root DIR] [--env KEY=VALUE]... [--wayland[=headless|=host]] [--audio=null] [--trace] PROGRAM [ARGS]...
 //!   wasm-env convert [--lazy] [--no-precompile] IMAGE DIR   (see convert.rs)
 //!   wasm-env shell [--wayland] DIR [SHELL-ARGS]...   a login shell in an environment
 //!   wasm-env export DIR OUT[.tar]   an environment as an OCI image (see oci.rs)
@@ -18,12 +18,17 @@
 //!          host (headless if it has no window system). =headless: no
 //!          windows (tests); =host: the host's own compositor instead
 //!          (Linux hosts running Wayland)
+//! --audio=null  the sound card (/dev/snd) plays to no device: its streams
+//!          run on a clock of the runtime's (tests; also where the host has
+//!          no audio output). By default it plays on the host's output.
 
 // (wgpu's types nest deeply enough for the Send and Sync checks of the
 // threads that hold them.)
 #![recursion_limit = "256"]
 
 mod abi;
+mod audio;
+mod audio_host;
 mod convert;
 mod events;
 mod fork;
@@ -56,7 +61,7 @@ use crate::process::{ExecImage, Inherit};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: wasm-env run [--root DIR] [--env KEY=VALUE]... [--argv0 NAME] [--wayland[=headless|=host]] [--trace] PROGRAM [ARGS]...\n\
+        "usage: wasm-env run [--root DIR] [--env KEY=VALUE]... [--argv0 NAME] [--wayland[=headless|=host]] [--audio=null] [--trace] PROGRAM [ARGS]...\n\
          \x20      wasm-env convert [--lazy] [--no-precompile] IMAGE DIR\n\
          \x20      wasm-env shell [--wayland] DIR [SHELL-ARGS]...\n\
          \x20      wasm-env export DIR OUT[.tar]"
@@ -166,6 +171,8 @@ fn main() -> Result<()> {
             Some(a) if a == "--wayland" => wayland = Wayland::Builtin { windows: true },
             Some(a) if a == "--wayland=headless" => wayland = Wayland::Builtin { windows: false },
             Some(a) if a == "--wayland=host" => wayland = Wayland::Host(host_wayland()?),
+            Some(a) if a == "--audio=null" => crate::audio::set_sink(crate::audio::Sink::Null),
+            Some(a) if a == "--audio=host" => crate::audio::set_sink(crate::audio::Sink::Host),
             Some(a) if a == "--argv0" => argv0 = Some(args.next().unwrap_or_else(|| usage())),
             Some(a) if a.starts_with("--") => bail!("unknown option {a}"),
             Some(a) => break a,

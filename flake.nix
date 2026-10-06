@@ -154,6 +154,9 @@
               # wayland-info to compare against (tests/ubuntu.sh).
               pkgs.weston
               pkgs.wayland-utils
+              # M11: the host's sound for the runtime's sound card (cpal, through ALSA).
+              pkgs.alsa-lib
+              pkgs.pkg-config
             ];
             # The wrapped clang injects host flags that break wasm targets,
             # so wasm builds use the unwrapped compiler.
