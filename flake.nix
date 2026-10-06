@@ -110,6 +110,11 @@
                 -fuse-ld=${llvm.lld}/bin/ld.lld -O2 -fvisibility=hidden -fno-stack-protector -mno-outline-atomics \
                 -Wno-incompatible-function-pointer-types -I${pkgs.opencl-headers}/include \
                 -Wl,-soname,libwasm-env-opencl.so -o $out/lib/wasm-env/guest/libwasm-env-opencl.so packages/opencl/icd.c
+              # And its Vulkan driver (packages/vulkan).
+              ${llvm.clang-unwrapped}/bin/clang --target=aarch64-linux-gnu -ffreestanding -nostdlib -shared -fPIC \
+                -fuse-ld=${llvm.lld}/bin/ld.lld -O2 -fvisibility=hidden -fno-stack-protector -mno-outline-atomics \
+                -I${pkgs.vulkan-headers}/include \
+                -Wl,-soname,libwasm-env-vulkan.so -o $out/lib/wasm-env/guest/libwasm-env-vulkan.so packages/vulkan/icd.c
             '';
           };
           default = wasm-env;
@@ -136,6 +141,8 @@
               pkgs.jq # PyPI metadata (tests/wheel-fetch.sh)
               pkgs.unzip # wheels
               pkgs.opencl-headers # packages/opencl (the guest's OpenCL driver)
+              pkgs.vulkan-headers # packages/vulkan (the guest's Vulkan driver)
+              pkgs.glslang # its tests' compute shaders, as SPIR-V
             ]
             # Test references that exist only on Linux hosts; elsewhere the
             # tests that need them skip.
@@ -160,6 +167,7 @@
             # Packages built with the toolchain (packages/*/build.sh).
             BUSYBOX_SRC = "${pkgs.busybox.src}";
             OPENCL_HEADERS = "${pkgs.opencl-headers}";
+            VULKAN_HEADERS = "${pkgs.vulkan-headers}";
             # bindgen (used by the bad64 arm64 decoder crate) needs libclang.
             LIBCLANG_PATH = "${llvm.libclang.lib}/lib";
           } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

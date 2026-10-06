@@ -58,6 +58,24 @@
 //!              (u32s), then a u64 for each lane (a string: u32 length,
 //!              bytes, padded to 4)
 //!
+//! Vulkan's (packages/vulkan; gpu/src/vulkan.rs), whose failures put a
+//! VkResult in r[1]:
+//!
+//!  20 VK_SHADER   a0: SPIR-V, a1: its length, a3: address, a4: capacity
+//!              r0: shader handle; or, failing, why (text at a3) and its length
+//!  21 VK_PIPELINE a0: shader, a1: entry point's name, a2: its length,
+//!              a3: address, a4: capacity   r0: compute pipeline handle (or
+//!              as VK_SHADER's)
+//!  22 VK_SUBMIT   a0: commands, a1: their length (gpu/src/vulkan.rs, `decode`)
+//!  23 VK_LIMITS   a0: address, a1: size   u64s: storage and uniform
+//!              buffer offset alignments, their largest bindings, work
+//!              groups per dimension, work-group size (3) and invocations,
+//!              shared memory, descriptor sets, storage and uniform buffers
+//!              per stage, largest allocation, memory, push constant bytes,
+//!              vendor and device ids, device type (Vulkan's)
+//!
+//! Vulkan's device memory is a buffer (CREATE), read and written as one.
+//!
 //! INFO's description (256 bytes): name, vendor and driver (64 bytes
 //! each), device type (u32: OpenCL's), maximum work-group size, maximum
 //! work-item sizes (3), compute units (u32s), local memory, largest
@@ -70,6 +88,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use wasm_env_gpu::device::{Gpu, choose_local};
 use wasm_env_gpu::ir::Module;
 use wasm_env_gpu::wgpu;
+use wasm_env_gpu::vulkan;
 use wasm_env_gpu::wgsl::{self, ArgKind, Launch};
 
 use crate::abi::errno::*;
@@ -92,6 +111,9 @@ const CL_INVALID_PROGRAM_EXECUTABLE: i64 = -45;
 const CL_INVALID_KERNEL_NAME: i64 = -46;
 const CL_INVALID_KERNEL_ARGS: i64 = -52;
 const CL_INVALID_WORK_GROUP_SIZE: i64 = -54;
+// (Vulkan's, for its operations.)
+const VK_ERROR_INITIALIZATION_FAILED: i64 = -3;
+const VK_ERROR_DEVICE_LOST: i64 = -4;
 
 /// The host's GPU, opened when the environment first asks for it.
 static GPU: OnceLock<Result<Arc<Gpu>, String>> = OnceLock::new();
@@ -115,6 +137,13 @@ struct State {
     programs: HashMap<u64, Program>,
     /// Launches' printf output, for PRINTF.
     printf: Vec<u8>,
+    /// Vulkan's shaders and pipelines.
+    vk: HashMap<u64, Vk>,
+}
+
+enum Vk {
+    Shader(Arc<vulkan::Shader>),
+    Pipeline(Arc<vulkan::Pipeline>),
 }
 
 struct Program {
@@ -182,7 +211,7 @@ impl Session {
             }
             3 => {
                 let mut st = self.state.lock().unwrap();
-                if st.buffers.remove(&a[0]).is_none() {
+                if st.buffers.remove(&a[0]).is_none() && st.vk.remove(&a[0]).is_none() {
                     match st.programs.remove(&a[0]) {
                         Some(p) => self.gpu.forget(p.id),
                         None => return Err(Failure::Cl(CL_INVALID_MEM_OBJECT)),
@@ -367,6 +396,56 @@ impl Session {
                 }
             }
             13 => g.finish().map_err(|_| Failure::Cl(CL_OUT_OF_RESOURCES))?,
+            // Vulkan (packages/vulkan): shaders, pipelines, submissions.
+            20 | 21 => {
+                let made = if op == 20 {
+                    let spirv = mem::slice(data, a[0], a[1])?.to_vec();
+                    vulkan::shader(g, &spirv).map(|s| Vk::Shader(Arc::new(s)))
+                } else {
+                    let shader = match self.state.lock().unwrap().vk.get(&a[0]) {
+                        Some(Vk::Shader(s)) => s.clone(),
+                        _ => return Err(Failure::Cl(VK_ERROR_INITIALIZATION_FAILED)),
+                    };
+                    let entry = String::from_utf8_lossy(mem::slice(data, a[1], a[2])?).into_owned();
+                    vulkan::compute_pipeline(g, &shader, &entry).map(|p| Vk::Pipeline(Arc::new(p)))
+                };
+                match made {
+                    Ok(v) => {
+                        let mut st = self.state.lock().unwrap();
+                        let h = st.next;
+                        st.next += 1;
+                        st.vk.insert(h, v);
+                        r[0] = h;
+                    }
+                    Err(e) => {
+                        // (Why, as text at a3 (capacity a4), for the driver's
+                        // messages.)
+                        let n = (a[4] as usize).min(e.len());
+                        mem::slice_mut(data, a[3], n as u64)?.copy_from_slice(&e.as_bytes()[..n]);
+                        r[0] = e.len() as u64;
+                        return Err(Failure::Cl(VK_ERROR_INITIALIZATION_FAILED));
+                    }
+                }
+            }
+            22 => {
+                let commands = vulkan::decode(mem::slice(data, a[0], a[1])?).map_err(|_| Failure::Errno(EINVAL))?;
+                let st = self.state.lock().unwrap();
+                let pipeline = |h: u64| match st.vk.get(&h) {
+                    Some(Vk::Pipeline(p)) => Some(p.clone()),
+                    _ => None,
+                };
+                if let Err(e) = vulkan::submit(g, &commands, |h| st.buffers.get(&h), pipeline) {
+                    if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
+                        eprintln!("wasm-env: Vulkan submission: {e}");
+                    }
+                    return Err(Failure::Cl(VK_ERROR_DEVICE_LOST));
+                }
+            }
+            23 => {
+                let d = self.vulkan_limits();
+                let n = (a[1] as usize).min(d.len());
+                mem::slice_mut(data, a[0], n as u64)?.copy_from_slice(&d[..n]);
+            }
             _ => return Err(Failure::Errno(EINVAL)),
         }
         Ok(())
@@ -475,6 +554,45 @@ impl Session {
         let st = self.state.lock().unwrap();
         let p = st.programs.get(&h).ok_or(Failure::Cl(CL_INVALID_VALUE))?;
         Ok((p.id, p.module.clone().ok_or(Failure::Cl(CL_INVALID_PROGRAM_EXECUTABLE))?))
+    }
+
+    /// VK_LIMITS's description (u64s): see the operations, above.
+    fn vulkan_limits(&self) -> Vec<u8> {
+        let l = &self.gpu.limits;
+        let info = &self.gpu.info;
+        // (wgpu's device types are in Vulkan's order: other, integrated,
+        // discrete, virtual, CPU.)
+        let kind = match info.device_type {
+            wgpu::DeviceType::Other => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            wgpu::DeviceType::DiscreteGpu => 2,
+            wgpu::DeviceType::VirtualGpu => 3,
+            wgpu::DeviceType::Cpu => 4,
+        };
+        let max_alloc = l.max_buffer_size.min((1 << 32) - 4096);
+        let words: [u64; 19] = [
+            l.min_storage_buffer_offset_alignment as u64,
+            l.min_uniform_buffer_offset_alignment as u64,
+            l.max_storage_buffer_binding_size,
+            l.max_uniform_buffer_binding_size,
+            l.max_compute_workgroups_per_dimension as u64,
+            l.max_compute_workgroup_size_x as u64,
+            l.max_compute_workgroup_size_y as u64,
+            l.max_compute_workgroup_size_z as u64,
+            l.max_compute_invocations_per_workgroup as u64,
+            l.max_compute_workgroup_storage_size as u64,
+            // (One bind group goes to push constants.)
+            l.max_bind_groups.saturating_sub(1) as u64,
+            l.max_storage_buffers_per_shader_stage as u64,
+            l.max_uniform_buffers_per_shader_stage as u64,
+            max_alloc,
+            max_alloc.saturating_mul(4),
+            vulkan::PUSH_BYTES as u64,
+            info.vendor as u64,
+            info.device as u64,
+            kind,
+        ];
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
 
     fn description(&self) -> [u8; 256] {

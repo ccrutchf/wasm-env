@@ -254,6 +254,35 @@ else
 	echo "skipped OpenCL: can't fetch the packages (offline?)"
 fi
 
+# Vulkan (M9): Ubuntu's loader (libvulkan1) with wasm-env's driver
+# (packages/vulkan), likewise: vulkaninfo sees its device, and a compute
+# shader (tests/arm64/vulkan.comp, made SPIR-V by glslang) runs.
+if tests/ubuntu-fetch.sh libvulkan-dev vulkan-tools >/dev/null 2>&1 && packages/vulkan/build.sh >/dev/null; then
+	mkdir -p "$R/usr/lib/wasm-env" "$R/usr/share/vulkan/icd.d" build/vulkan-test
+	cp build/packages/vulkan/libwasm-env-vulkan.so "$R/usr/lib/wasm-env/"
+	cp build/packages/vulkan/wasm-env_icd.aarch64.json "$R/usr/share/vulkan/icd.d/"
+	if glslangValidator -V --quiet --vn compute_spv -o build/vulkan-test/vulkan_spv.h tests/arm64/vulkan.comp \
+		&& "${cc[@]}" -O2 -Ibuild/vulkan-test -o "$R/opt/tests/vulkan" tests/arm64/vulkan.c -lvulkan; then
+		only=(--env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/wasm-env_icd.aarch64.json)
+		for gpu in host software; do
+			devices=$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" /usr/bin/vulkaninfo --summary 2>&1)
+			if grep -q "deviceName .*(wasm-env)$" <<<"$devices"; then
+				compare "Vulkan ($gpu)" "device: wasm-env's
+compute: 0 of 1000 wrong
+fill and update: right
+the program's own write kept: yes
+done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" /opt/tests/vulkan 2>&1)"
+			else
+				echo "skipped Vulkan ($gpu): no such GPU adapter"
+			fi
+		done
+	else
+		compare "vulkan: build" ok failed
+	fi
+else
+	echo "skipped Vulkan: can't fetch the packages (offline?)"
+fi
+
 # Networking, if PyPI is reachable: DNS (glibc's resolver, over the host's
 # resolv.conf), HTTPS (Ubuntu's OpenSSL with its CA certificates), and pip
 # installing a package from PyPI. Ubuntu's ca-certificates package builds

@@ -9,6 +9,8 @@ publish = false
 [dependencies]
 wgpu = "30"
 pollster = "0.4"
+# (SPIR-V shaders, for Vulkan: read, then written as WGSL.)
+naga = { version = "30", features = ["spv-in", "wgsl-out"] }
 
 [dev-dependencies]
-naga = { version = "30", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }

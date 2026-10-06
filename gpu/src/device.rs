@@ -189,7 +189,15 @@ impl Gpu {
         Ok(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: size.max(4).next_multiple_of(4),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            // (Any use: OpenCL's buffers are storage, and Vulkan's memory may
+            // be any kind of buffer.)
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }))
     }

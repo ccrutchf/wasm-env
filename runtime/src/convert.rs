@@ -53,23 +53,37 @@ pub fn convert(image: &str, out: &Path, opts: &Options) -> Result<()> {
     Ok(())
 }
 
-/// Files of wasm-env's own that environments get: its OpenCL driver
-/// (packages/opencl, built by flake.nix into `lib/wasm-env/guest` beside
-/// the program; in the source tree, by packages/opencl/build.sh), and its
-/// registration with the Khronos loader.
+/// Files of wasm-env's own that environments get: its OpenCL and Vulkan
+/// drivers (packages/opencl and packages/vulkan, built by flake.nix into
+/// `lib/wasm-env/guest` beside the program; in the source tree, by their
+/// build.sh), and their registrations with the Khronos loaders.
 pub fn install_guest_files(root: &Path) -> Result<()> {
     let installed = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("../lib/wasm-env/guest")));
-    let source_tree = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../build/packages/opencl");
-    let Some(dir) = [installed, Some(source_tree)].into_iter().flatten().find(|d| d.join("libwasm-env-opencl.so").exists()) else {
-        eprintln!("note: wasm-env's OpenCL driver isn't built (packages/opencl/build.sh); the environment won't have OpenCL");
-        return Ok(());
-    };
-    let lib = root.join("usr/lib/wasm-env");
-    std::fs::create_dir_all(&lib)?;
-    std::fs::copy(dir.join("libwasm-env-opencl.so"), lib.join("libwasm-env-opencl.so"))?;
-    let vendors = root.join("etc/OpenCL/vendors");
-    std::fs::create_dir_all(&vendors)?;
-    std::fs::write(vendors.join("wasm-env.icd"), "/usr/lib/wasm-env/libwasm-env-opencl.so\n")?;
+    let built = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../build/packages");
+    // (The driver's file, the loader's registration and what it says, and
+    // the API, for the note when it isn't built.)
+    let drivers = [
+        ("opencl", "libwasm-env-opencl.so", "etc/OpenCL/vendors/wasm-env.icd", "/usr/lib/wasm-env/libwasm-env-opencl.so\n".to_string(), "OpenCL"),
+        (
+            "vulkan",
+            "libwasm-env-vulkan.so",
+            "usr/share/vulkan/icd.d/wasm-env_icd.aarch64.json",
+            "{\n    \"file_format_version\": \"1.0.1\",\n    \"ICD\": {\n        \"library_path\": \"/usr/lib/wasm-env/libwasm-env-vulkan.so\",\n        \"library_arch\": \"64\",\n        \"api_version\": \"1.0.0\"\n    }\n}\n".to_string(),
+            "Vulkan",
+        ),
+    ];
+    for (package, file, registration, contents, api) in drivers {
+        let Some(dir) = [installed.clone(), Some(built.join(package))].into_iter().flatten().find(|d| d.join(file).exists()) else {
+            eprintln!("note: wasm-env's {api} driver isn't built (packages/{package}/build.sh); the environment won't have {api}");
+            continue;
+        };
+        let lib = root.join("usr/lib/wasm-env");
+        std::fs::create_dir_all(&lib)?;
+        std::fs::copy(dir.join(file), lib.join(file))?;
+        let registration = root.join(registration);
+        std::fs::create_dir_all(registration.parent().unwrap())?;
+        std::fs::write(registration, contents)?;
+    }
     Ok(())
 }
 
