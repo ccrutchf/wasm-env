@@ -44,6 +44,7 @@ fixtures=(
 	"memory:tests/arm64/memory.c:-static"
 	# Threads: exclusives (the default), then LSE atomics.
 	"threads:tests/arm64/threads.c:-static -pthread"
+	"stack:tests/arm64/stack.c:-static"
 	"threads-lse:tests/arm64/threads.c:-static -pthread -march=armv8.1-a"
 	"signals:tests/arm64/signals.c:-static"
 	# Code generated at run time (translated when first jumped to).

@@ -2390,13 +2390,24 @@ impl Gen<'_> {
             format!("select(select(0.0, ({m}) * length({x} / ({m})), ({m}) > 0.0), ({m}), ({m}) > 3.4028235e38)")
         };
         let f1 = |f: &str| format!("{f}({})", v[0]);
+        // sign by the bits (the devices' own differ: one takes -0 for 0,
+        // another denormals): 1 or -1, the zero itself, and for a NaN 0
+        // (sign) or the NaN (normalize).
+        let sign = |x: &str, n: u32, nan_kept: bool| {
+            let (u, f) = if n == 1 { ("u32".to_string(), "f32".to_string()) } else { (format!("vec{n}<u32>"), format!("vec{n}<f32>")) };
+            let b = format!("bitcast<{u}>({x})");
+            let m = format!("({b} & {u}(0x7fffffffu))");
+            let nan = if nan_kept { b.clone() } else { format!("{u}(0u)") };
+            format!("bitcast<{f}>(select(select(({b} & {u}(0x80000000u)) | {u}(0x3f800000u), {b}, {m} == {u}(0u)), {nan}, {m} > {u}(0x7f800000u)))")
+        };
         Ok(match b {
             "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "exp" | "exp2" | "log" | "log2"
-            | "floor" | "ceil" | "trunc" | "sign" | "degrees" | "radians" | "fract"
+            | "floor" | "ceil" | "trunc" | "degrees" | "radians" | "fract"
                 if float =>
             {
                 f1(b)
             }
+            "sign" if float => sign(&v[0], t.lanes(), false),
             "rsqrt" => f1("inverseSqrt"),
             "recip" => format!("(1.0 / {})", v[0]),
             "divide" => format!("({} / {})", v[0], v[1]),
@@ -2439,7 +2450,7 @@ impl Gen<'_> {
                 let m = biggest(&v[0], args[0].ty.lanes());
                 format!("select({x}, normalize({x} / ({m})), ({m}) > 0.0)", x = v[0])
             }
-            "normalize" => format!("sign({})", v[0]),
+            "normalize" => sign(&v[0], 1, true),
             "shuffle" | "shuffle2" => {
                 let (n, m) = (args[0].ty.lanes(), t.lanes());
                 let mask = &args[args.len() - 1];
@@ -2530,7 +2541,20 @@ impl Gen<'_> {
             "bitselect" => {
                 // (a & ~c) | (b & c), on the bits.
                 let t0 = &args[0].ty;
-                if t0.scalar().is_float() && *t0.scalar() != Type::Double {
+                if *t0.scalar() == Type::Half {
+                    // (On a half's bits, not on the float that carries it.)
+                    self.need("f32_to_f16");
+                    self.need("f16_to_f32");
+                    let lanes = t0.lanes();
+                    let lane = |x: &str, k: u32| if lanes > 1 { format!("({x})[{k}]") } else { x.to_string() };
+                    let l: Vec<String> = (0..lanes)
+                        .map(|k| {
+                            let [a, b, c] = [0, 1, 2].map(|i| format!("f32_to_f16({})", lane(&v[i], k)));
+                            format!("f16_to_f32(({a} & ~{c}) | ({b} & {c}))")
+                        })
+                        .collect();
+                    if lanes > 1 { format!("{}({})", self.wty(t0)?, l.join(", ")) } else { l[0].clone() }
+                } else if t0.scalar().is_float() && *t0.scalar() != Type::Double {
                     let lanes = t0.lanes();
                     let u = if lanes > 1 { format!("vec{lanes}<u32>") } else { "u32".into() };
                     format!("bitcast<{}>((bitcast<{u}>({a}) & ~bitcast<{u}>({c})) | (bitcast<{u}>({b}) & bitcast<{u}>({c})))", self.wty(t0)?, a = v[0], b = v[1], c = v[2])
@@ -2656,11 +2680,22 @@ impl Gen<'_> {
                 self.temp += 1;
                 self.f64call("f64_sqrt", &[&dot(self, &d, &d)])
             }
+            // Scaled by its largest component first (as a float's), so its
+            // squares neither overflow nor underflow; a zero vector is itself.
             "normalize" => {
-                self.line(&format!("let nl{} = {};", self.temp, self.f64call("f64_sqrt", &[&dot(self, x, x)])));
-                let l = format!("nl{}", self.temp);
+                let t = self.temp;
                 self.temp += 1;
-                let d: Vec<String> = (0..lanes).map(|k| self.f64call("f64_div", &[&lane(x, k), &l])).collect();
+                let abs = |e: String| format!("vec2<u32>(({e}).x, ({e}).y & 0x7fffffffu)");
+                let m = (1..lanes).fold(abs(lane(x, 0)), |m, k| self.f64call("f64_max", &[&m, &abs(lane(x, k))]));
+                self.line(&format!("let nm{t} = {m};"));
+                let y: Vec<String> = (0..lanes).map(|k| self.f64call("f64_div", &[&lane(x, k), &format!("nm{t}")])).collect();
+                let y = if lanes > 1 { format!("array<vec2<u32>, {lanes}>({})", y.join(", ")) } else { y[0].clone() };
+                self.line(&format!("let ny{t} = {y};"));
+                self.line(&format!("let nl{t} = {};", self.f64call("f64_sqrt", &[&dot(self, &format!("ny{t}"), &format!("ny{t}"))])));
+                self.need("f64_is_zero");
+                let d: Vec<String> = (0..lanes)
+                    .map(|k| format!("select({}, {}, f64_is_zero(nm{t}))", self.f64call("f64_div", &[&lane(&format!("ny{t}"), k), &format!("nl{t}")]), lane(x, k)))
+                    .collect();
                 if lanes > 1 { format!("array<vec2<u32>, {lanes}>({})", d.join(", ")) } else { d[0].clone() }
             }
             "cross" => {

@@ -35,7 +35,8 @@ const WASM_FLAGS: &[&str] = &[
 /// `__wasm_init_tls` its own thread-local block. The exports are what the
 /// runtime needs for that, and `__heap_base` (docs/abi.md).
 fn ld_args(image_end: u64) -> Vec<String> {
-    let mut args: Vec<String> = ["-m", "wasm64", "--no-entry", "-z", "stack-size=1048576"].map(String::from).to_vec();
+    // (The main thread's stack: 8 MiB, as Linux gives and RLIMIT_STACK says.)
+    let mut args: Vec<String> = ["-m", "wasm64", "--no-entry", "-z", "stack-size=8388608"].map(String::from).to_vec();
     args.push(format!("--global-base={}", global_base(image_end)));
     // wasm-ld caps a 64-bit memory at 16 GB; `finish` raises the limit.
     args.extend(["--shared-memory", "--import-memory", "--max-memory=17179869184"].map(String::from));

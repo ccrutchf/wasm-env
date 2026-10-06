@@ -298,11 +298,11 @@ __WENV_V(char) __WENV_V(uchar) __WENV_V(short) __WENV_V(ushort) __WENV_V(int) __
 #endif
 ";
 
-/// clang's arguments including `EXTRA_BUILTINS` and `double_vector_loops` (written
+/// clang's arguments including `EXTRA_BUILTINS` and `vector_loops` (written
 /// into `dir`).
 fn extra_builtins(dir: &Scratch) -> Result<Vec<String>, String> {
     let path = dir.0.join("wasm-env-builtins.h");
-    std::fs::write(&path, format!("{EXTRA_BUILTINS}{}", double_vector_loops())).map_err(|e| e.to_string())?;
+    std::fs::write(&path, format!("{EXTRA_BUILTINS}{}", vector_loops())).map_err(|e| e.to_string())?;
     Ok(vec!["-include".into(), path.display().to_string()])
 }
 
@@ -505,14 +505,16 @@ mod image_tests {
     }
 }
 
-/// Double-precision math builtins (software doubles, see f64.rs: libclc's
-/// functions, each hundreds of operations) on vectors, as a loop over the
-/// lanes: one copy of the function in the kernel rather than one per lane.
-/// GPU drivers inline every function call (Mesa does), so it takes a loop
-/// to keep a double16 `sin` from being sixteen `sin`s, which lavapipe takes
-/// minutes to compile. A macro per builtin calls an overload that loops
-/// for double vectors and calls the builtin itself for everything else.
-fn double_vector_loops() -> String {
+/// Math builtins (libclc's functions, each tens to hundreds of operations;
+/// a double's hundreds more in software, see f64.rs) on vectors, as a loop
+/// over the lanes: one copy of the function in the kernel rather than one
+/// per lane. GPU drivers inline every function call (Mesa does), so it
+/// takes a loop to keep a double16 `sin` from being sixteen `sin`s, which
+/// lavapipe takes minutes to compile, and a float16 `sin` (software fma on
+/// Intel's GPU) from taking its compiler over 24 GB. Doubles of every
+/// width, floats and halves of 8 and 16 lanes. A macro per builtin calls an
+/// overload that loops for those and calls the builtin itself for the rest.
+fn vector_loops() -> String {
     const UNARY: &[&str] = &[
         "acos", "acosh", "acospi", "asin", "asinh", "asinpi", "atan", "atanh", "atanpi", "cbrt", "cos", "cosh", "cospi", "erf", "erfc", "exp", "exp2",
         "exp10", "expm1", "lgamma", "log", "log10", "log1p", "log2", "logb", "rsqrt", "sin", "sinh", "sinpi", "sqrt", "tan", "tanh", "tanpi", "tgamma",
@@ -522,7 +524,13 @@ fn double_vector_loops() -> String {
     const INT: &[&str] = &["pown", "rootn"];
     const TERNARY: &[&str] = &["fma"];
     let widths = ["2", "3", "4", "8", "16"];
-    let others: Vec<String> = ["float", "half"].iter().flat_map(|t| std::iter::once(t.to_string()).chain(widths.iter().map(move |n| format!("{t}{n}")))).chain(["double".to_string()]).collect();
+    // (Vectors looped over: element type and width.)
+    let looped: Vec<(&str, &str)> = widths.iter().map(|&n| ("double", n)).chain(["float", "half"].iter().flat_map(|&e| ["8", "16"].map(|n| (e, n)))).collect();
+    let others: Vec<String> = ["float", "half", "double"]
+        .iter()
+        .flat_map(|t| std::iter::once(t.to_string()).chain(widths.iter().map(move |n| format!("{t}{n}"))))
+        .filter(|t| !looped.iter().any(|(e, n)| *t == format!("{e}{n}")))
+        .collect();
     let mut s = String::from(
         "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n\
          #if __OPENCL_C_VERSION__ >= 120\n#define __WENV_F static __attribute__((overloadable, always_inline))\n\
@@ -548,17 +556,17 @@ fn double_vector_loops() -> String {
                 let i = t.replace("float", "int").replace("half", "int").replace("double", "int");
                 s.push_str(&format!("__WENV_F {t} __wenv_{f}({}) {{ return ({f})({args}); }}\n", params(t, &i)));
             }
-            for n in widths {
-                let t = format!("double{n}");
+            for &(e, n) in &looped {
+                let t = format!("{e}{n}");
                 let i = format!("int{n}");
                 let call = match arity {
-                    1 => format!("({f})({})", lane("x", "double")),
-                    2 => format!("({f})({}, {})", lane("x", "double"), lane("y", "double")),
-                    3 => format!("({f})({}, {}, {})", lane("x", "double"), lane("y", "double"), lane("z", "double")),
-                    _ => format!("({f})({}, {})", lane("x", "double"), lane("y", "int")),
+                    1 => format!("({f})({})", lane("x", e)),
+                    2 => format!("({f})({}, {})", lane("x", e), lane("y", e)),
+                    3 => format!("({f})({}, {}, {})", lane("x", e), lane("y", e), lane("z", e)),
+                    _ => format!("({f})({}, {})", lane("x", e), lane("y", "int")),
                 };
                 s.push_str(&format!(
-                    "__WENV_F {t} __wenv_{f}({}) {{ {t} r; __attribute__((opencl_unroll_hint(1))) for (int k = 0; k < {n}; k++) ((double *)&r)[k] = {call}; return r; }}\n",
+                    "__WENV_F {t} __wenv_{f}({}) {{ {t} r; __attribute__((opencl_unroll_hint(1))) for (int k = 0; k < {n}; k++) (({e} *)&r)[k] = {call}; return r; }}\n",
                     params(&t, &i)
                 ));
             }
@@ -581,14 +589,14 @@ fn double_vector_loops() -> String {
                 let p = if int_result { i } else { t.clone() };
                 s.push_str(&format!("__WENV_F {t} __wenv_{f}({}) {{ return ({f})({args}); }}\n", params(t, &p)));
             }
-            for n in widths {
-                let t = format!("double{n}");
-                let (p, pe) = if int_result { (format!("int{n}"), "int") } else { (t.clone(), "double") };
-                let y = if binary { format!(", {}", lane("y", "double")) } else { String::new() };
+            for &(el, n) in &looped {
+                let t = format!("{el}{n}");
+                let (p, pe) = if int_result { (format!("int{n}"), "int") } else { (t.clone(), el) };
+                let y = if binary { format!(", {}", lane("y", el)) } else { String::new() };
                 s.push_str(&format!(
-                    "__WENV_F {t} __wenv_{f}({}) {{ {t} r; __attribute__((opencl_unroll_hint(1))) for (int k = 0; k < {n}; k++) {{ {pe} e; ((double *)&r)[k] = ({f})({}{y}, &e); (({space} {pe} *)q)[k] = e; }} return r; }}\n",
+                    "__WENV_F {t} __wenv_{f}({}) {{ {t} r; __attribute__((opencl_unroll_hint(1))) for (int k = 0; k < {n}; k++) {{ {pe} e; (({el} *)&r)[k] = ({f})({}{y}, &e); (({space} {pe} *)q)[k] = e; }} return r; }}\n",
                     params(&t, &p),
-                    lane("x", "double")
+                    lane("x", el)
                 ));
             }
         }
@@ -607,6 +615,23 @@ mod loop_tests {
         // (Which has no `static`: the header's functions are plain there.)
         let src = "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n__kernel void k(__global double4 *p) { p[0] = sin(p[1]); }";
         build(&test_clang(), src, "-cl-std=CL1.1", None).unwrap();
+    }
+
+    #[test]
+    fn wide_float_and_half_math_is_a_loop() {
+        let src = "#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void k(__global float16 *o, __global half16 *h) { o[0] = sin(o[1]); h[0] = sin(h[1]); }";
+        let ir = clang_ir(&test_clang(), src, "", None).unwrap();
+        assert!(ir.lines().filter(|l| l.contains("!llvm.loop")).count() >= 2);
+        let scalars = clang_ir(
+            &test_clang(),
+            "#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void k(__global float *o, __global half *h) { o[0] = sin(o[1]); h[0] = sin(h[1]); }",
+            "",
+            None,
+        )
+        .unwrap();
+        assert!(ir.len() < 2 * scalars.len(), "{} bytes of IR, {} for scalars", ir.len(), scalars.len());
     }
 
     #[test]

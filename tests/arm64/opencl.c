@@ -146,6 +146,12 @@ int main(void) {
     clGetProgramBuildInfo(broken, dev, CL_PROGRAM_BUILD_LOG, sizeof log, log, NULL);
     printf("bad program: %s, log mentions it: %s\n", e == CL_BUILD_PROGRAM_FAILURE ? "fails" : "builds?", strstr(log, "undefined_thing") ? "yes" : "no");
 
+    // How many image formats there are, asked with room for many and no
+    // array (the conformance tests ask so).
+    cl_uint formats = 0;
+    e = clGetSupportedImageFormats(ctx, CL_MEM_READ_ONLY, CL_MEM_OBJECT_IMAGE2D, 5000, NULL, &formats);
+    printf("image formats counted: %s\n", e == CL_SUCCESS && formats > 0 ? "yes" : "no");
+
     // printf in a kernel: on stdout, after what the program printed before.
     const char *hello = "__kernel void hello(int n) {\n"
                         "    if (get_global_id(0) == 1) printf(\"hello %d %.2f %s %v2d %c %lx%%\\n\", n, 1.5f, \"there\", (int2)(-1, 2), 'x', 0xabcdefl);\n"

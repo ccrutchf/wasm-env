@@ -1331,6 +1331,115 @@ __kernel void k(__global uint *a, __global uchar *b, __global int *c, __global u
     }
 
     #[test]
+    fn doubles_normalize_without_overflow() {
+        let Some(g) = gpu() else { return };
+        let src = r#"
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+__kernel void k(__global const double *a, __global double *o) {
+    o[0] = normalize(a[0]);
+    double2 p = normalize(vload2(0, a + 1));
+    vstore2(p, 0, o + 1);
+    double3 q = normalize(vload3(0, a + 3));
+    vstore3(q, 0, o + 3);
+    double2 z = normalize((double2)(0.0, -0.0));
+    vstore2(z, 0, o + 6);
+}
+"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        // (The conformance tests' cases: squares that underflow, and ones
+        // that overflow.)
+        let a = [2.24591e-247f64, 1.1702e96, 6.18547e300, 2.61897e300, 1.69085e-44, -7.11027e-12];
+        let (ba, bo) = (g.buffer(48).unwrap(), g.buffer(64).unwrap());
+        g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: [1, 1, 1], ..Default::default() };
+        g.run(1, &m, &info, &launch, 1, [1, 1, 1], [0; 3], &[0u8; 8], &[(0, &ba), (1, &bo)]).unwrap();
+        let o: Vec<f64> = g.read(&bo, 0, 64).unwrap().chunks(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+        let norm = |v: &[f64]| {
+            let m = v.iter().fold(0f64, |m, x| m.max(x.abs()));
+            let l = v.iter().map(|x| (x / m) * (x / m)).sum::<f64>().sqrt();
+            v.iter().map(|x| x / m / l).collect::<Vec<_>>()
+        };
+        let want: Vec<f64> = [norm(&a[..1]), norm(&a[1..3]), norm(&a[3..6]), vec![0.0, -0.0]].concat();
+        for (k, (&got, &w)) in o.iter().zip(&want).enumerate() {
+            let ok = got.to_bits() == w.to_bits() || (got - w).abs() <= 4.0 * f64::EPSILON * w.abs();
+            assert!(ok, "normalize, lane {k}: got {got:e}, want {w:e}");
+        }
+    }
+
+    #[test]
+    fn halves_bitselect_their_own_bits() {
+        let Some(g) = gpu() else { return };
+        let src = r#"
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void k(__global const ushort *a, __global const ushort *b, __global const ushort *c, __global ushort *o) {
+    int i = get_global_id(0);
+    o[i] = as_ushort(bitselect(as_half(a[i]), as_half(b[i]), as_half(c[i])));
+    if (i < 16) {
+        half2 r = bitselect(as_half2(vload2(i, a)), as_half2(vload2(i, b)), as_half2(vload2(i, c)));
+        vstore2(as_ushort2(r), i, o + 64);
+    }
+}
+"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        let n = 64usize;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u16
+        };
+        let [a, b, c]: [Vec<u16>; 3] = std::array::from_fn(|_| (0..n).map(|_| next()).collect());
+        let buf = |v: &[u16]| {
+            let x = g.buffer(v.len() as u64 * 2).unwrap();
+            g.write(&x, 0, &v.iter().flat_map(|h| h.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+            x
+        };
+        let (ba, bb, bc, bo) = (buf(&a), buf(&b), buf(&c), g.buffer(n as u64 * 2 + 64).unwrap());
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: [64, 1, 1], ..Default::default() };
+        g.run(1, &m, &info, &launch, 1, [n as u32, 1, 1], [0; 3], &[0u8; 16], &[(0, &ba), (1, &bb), (2, &bc), (3, &bo)]).unwrap();
+        let o: Vec<u16> = g.read(&bo, 0, n as u64 * 2 + 64).unwrap().chunks(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect();
+        let want: Vec<u16> = (0..n).map(|i| (a[i] & !c[i]) | (b[i] & c[i])).collect();
+        // (A NaN's bits may come back quieted: any NaN for a NaN.)
+        let nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x3ff != 0;
+        for (k, &w) in want.iter().chain(&want[..32]).enumerate() {
+            let got = o[k];
+            assert!(got == w || (nan(got) && nan(w)), "bitselect {k}: got {got:#06x}, want {w:#06x}");
+        }
+    }
+
+    #[test]
+    fn signs_keep_zeros_and_give_nans_zero() {
+        let Some(g) = gpu() else { return };
+        let src = r#"
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void k(__global const float *a, __global float *o) {
+    int i = get_global_id(0);
+    o[i] = sign(a[i]);
+    o[i + 8] = sign((half)a[i]);
+}
+"#;
+        let m = build(&test_clang(), src, "", None).unwrap();
+        // (OpenCL: 1 or -1, the zero itself, 0 for a NaN; a float denormal
+        // is greater than zero.)
+        let a = [-0.0f32, 0.0, f32::NAN, 1e-40, -3.0, 2.0, f32::NEG_INFINITY, -1e-40];
+        let want_float = [-0.0f32, 0.0, 0.0, 1.0, -1.0, 1.0, -1.0, -1.0];
+        // (As halves the denormals are zeros.)
+        let want_half = [-0.0f32, 0.0, 0.0, 0.0, -1.0, 1.0, -1.0, -0.0];
+        let (ba, bo) = (g.buffer(32).unwrap(), g.buffer(64).unwrap());
+        g.write(&ba, 0, &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        let info = wgsl::kernel_info(&m, "k").unwrap();
+        let launch = Launch { local: [8, 1, 1], ..Default::default() };
+        g.run(1, &m, &info, &launch, 1, [8, 1, 1], [0; 3], &[0u8; 8], &[(0, &ba), (1, &bo)]).unwrap();
+        let o: Vec<u32> = words(&g.read(&bo, 0, 64).unwrap());
+        let want: Vec<u32> = want_float.iter().chain(&want_half).map(|f| f.to_bits()).collect();
+        let show = |v: &[u32]| v.iter().map(|&b| format!("{:e}", f32::from_bits(b))).collect::<Vec<_>>().join(" ");
+        assert_eq!(o, want, "got {}\nwant {}", show(&o), show(&want));
+    }
+
+    #[test]
     fn halves_in_kernels() {
         let Some(g) = gpu() else { return };
         let src = r#"

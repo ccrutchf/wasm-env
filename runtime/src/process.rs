@@ -27,7 +27,7 @@ pub const SIG_IGN: u64 = 1;
 
 /// A program ready to run: the result of resolving an execve.
 /// The main thread's stack (translator/src/link.rs: `-z stack-size`).
-const STACK_BYTES: u64 = 1 << 20;
+const STACK_BYTES: u64 = 8 << 20;
 
 pub struct ExecImage {
     /// The WebAssembly file on the host.
@@ -697,7 +697,7 @@ fn global_i64(v: Val) -> Result<u64> {
 
 /// Writes argc, argv, envp and the auxiliary vector below `top` in the
 /// Linux layout, and returns the new stack pointer (16-byte aligned).
-/// (The stack below: the translator links modules with a 1 MiB stack.)
+/// (The stack below: the translator links modules with an 8 MiB stack.)
 fn write_initial_stack(data: &mut [u8], top: u64, image: &ExecImage, extra: &[(u64, u64)]) -> Result<u64> {
     let fault = |_| anyhow::anyhow!("initial stack doesn't fit in memory");
 

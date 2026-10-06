@@ -1149,7 +1149,9 @@ static cl_int GetSupportedImageFormats(cl_context c, cl_mem_flags flags, cl_mem_
     (void)flags;
     if (!c)
         return CL_INVALID_CONTEXT;
-    if (n && !formats)
+    // (No room with somewhere to put them is the error; a count alone, with
+    // no array, is a question.)
+    if (!n && formats)
         return CL_INVALID_VALUE;
     if (!image_type(type) && type != CL_MEM_OBJECT_IMAGE1D_BUFFER)
         return CL_INVALID_VALUE;
@@ -1159,7 +1161,7 @@ static cl_int GetSupportedImageFormats(cl_context c, cl_mem_flags flags, cl_mem_
             cl_image_format f = {orders[o], types[t]};
             if (!image_format(&f))
                 continue;
-            if (k < n)
+            if (formats && k < n)
                 formats[k] = f;
             k++;
         }

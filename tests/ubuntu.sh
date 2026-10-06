@@ -239,6 +239,7 @@ add: 0 of 100000 wrong
 reduce: right
 bytes: 0 of 3200 wrong
 bad program: fails, log mentions it: yes
+image formats counted: yes
 hello 42 1.50 there -1,2 x abcdef%
 profiled kernel time covers its run: yes
 done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" /opt/tests/opencl 2>&1)"
