@@ -255,13 +255,15 @@ else
 fi
 
 # Vulkan (M9): Ubuntu's loader (libvulkan1) with wasm-env's driver
-# (packages/vulkan), likewise: vulkaninfo sees its device, and a compute
-# shader (tests/arm64/vulkan.comp, made SPIR-V by glslang) runs.
+# (packages/vulkan), likewise: vulkaninfo sees its device, a compute shader
+# (tests/arm64/vulkan.comp, made SPIR-V by glslang) runs, and another
+# samples an image through a combined image sampler (vulkan_image.comp).
 if tests/ubuntu-fetch.sh libvulkan-dev vulkan-tools >/dev/null 2>&1 && packages/vulkan/build.sh >/dev/null; then
 	mkdir -p "$R/usr/lib/wasm-env" "$R/usr/share/vulkan/icd.d" build/vulkan-test
 	cp build/packages/vulkan/libwasm-env-vulkan.so "$R/usr/lib/wasm-env/"
 	cp build/packages/vulkan/wasm-env_icd.aarch64.json "$R/usr/share/vulkan/icd.d/"
 	if glslangValidator -V --quiet --vn compute_spv -o build/vulkan-test/vulkan_spv.h tests/arm64/vulkan.comp \
+		&& glslangValidator -V --quiet --vn image_spv -o build/vulkan-test/vulkan_image_spv.h tests/arm64/vulkan_image.comp \
 		&& "${cc[@]}" -O2 -Ibuild/vulkan-test -o "$R/opt/tests/vulkan" tests/arm64/vulkan.c -lvulkan; then
 		only=(--env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/wasm-env_icd.aarch64.json)
 		for gpu in host software; do
@@ -271,6 +273,7 @@ if tests/ubuntu-fetch.sh libvulkan-dev vulkan-tools >/dev/null 2>&1 && packages/
 compute: 0 of 1000 wrong
 fill and update: right
 the program's own write kept: yes
+images: texels fetched 0 wrong, image 0 wrong
 done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" /opt/tests/vulkan 2>&1)"
 			else
 				echo "skipped Vulkan ($gpu): no such GPU adapter"

@@ -73,6 +73,16 @@
 //!              shared memory, descriptor sets, storage and uniform buffers
 //!              per stage, largest allocation, memory, push constant bytes,
 //!              vendor and device ids, device type (Vulkan's)
+//!  24 VK_IMAGE    a0: u32s: dimensions (1, 2, 3), format (VkFormat), width,
+//!              height, depth, mip levels, layers, samples, usage
+//!              (VkImageUsageFlags)   r0: image handle
+//!  25 VK_VIEW     a0: image, a1: u32s: view type (VkImageViewType), format (0:
+//!              the image's), aspect, mip level, levels, layer, layers   r0: handle
+//!  26 VK_SAMPLER  a0: u32s: filters (magnification, minification, mipmap),
+//!              address modes (u, v, w), maximum anisotropy, comparison
+//!              (VkCompareOp + 1, or 0), LOD minimum and maximum (f32)   r0: handle
+//!  27 VK_FORMAT   a0: VkFormat   r0: its VkFormatFeatureFlags (optimal
+//!              tiling), r2: a texel's bytes (0: not supported)
 //!
 //! Vulkan's device memory is a buffer (CREATE), read and written as one.
 //!
@@ -85,7 +95,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use wasm_env_gpu::device::{Gpu, choose_local};
+use wasm_env_gpu::device::{Api, Gpu, choose_local};
 use wasm_env_gpu::ir::Module;
 use wasm_env_gpu::wgpu;
 use wasm_env_gpu::vulkan;
@@ -114,19 +124,24 @@ const CL_INVALID_WORK_GROUP_SIZE: i64 = -54;
 // (Vulkan's, for its operations.)
 const VK_ERROR_INITIALIZATION_FAILED: i64 = -3;
 const VK_ERROR_DEVICE_LOST: i64 = -4;
+const VK_ERROR_FORMAT_NOT_SUPPORTED: i64 = -11;
 
-/// The host's GPU, opened when the environment first asks for it.
+/// The host's GPU, opened when the environment first asks for it, for the
+/// API that asks (device.rs, `open_for`: lavapipe takes OpenCL's and
+/// Vulkan's shaders best at different widths, fixed once a process).
 static GPU: OnceLock<Result<Arc<Gpu>, String>> = OnceLock::new();
 
-pub fn gpu() -> Result<Arc<Gpu>, String> {
-    GPU.get_or_init(|| Gpu::open().map(Arc::new)).clone()
+fn gpu(api: Api) -> Result<Arc<Gpu>, String> {
+    GPU.get_or_init(|| Gpu::open_for(api).map(Arc::new)).clone()
 }
 
 /// Programs' identities, for the service's pipeline cache.
 static PROGRAMS: AtomicUsize = AtomicUsize::new(1);
 
 pub struct Session {
-    gpu: Arc<Gpu>,
+    /// The GPU, opened at the session's first request (whose operation says
+    /// which API it's for).
+    gpu: OnceLock<Arc<Gpu>>,
     state: Mutex<State>,
 }
 
@@ -144,6 +159,9 @@ struct State {
 enum Vk {
     Shader(Arc<vulkan::Shader>),
     Pipeline(Arc<vulkan::Pipeline>),
+    Image(wgpu::Texture),
+    View(wgpu::TextureView),
+    Sampler(wgpu::Sampler),
 }
 
 struct Program {
@@ -157,19 +175,17 @@ struct Program {
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Session({})", self.gpu.info.name)
+        write!(f, "Session({})", self.gpu.get().map_or("not open yet", |g| g.info.name.as_str()))
     }
 }
 
 impl Session {
     pub fn open() -> SysResult<Session> {
-        let gpu = gpu().map_err(|e| {
-            if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
-                eprintln!("wasm-env: no GPU: {e}");
-            }
-            ENODEV
-        })?;
-        Ok(Session { gpu, state: Mutex::new(State { next: 1, ..Default::default() }) })
+        Ok(Session { gpu: OnceLock::new(), state: Mutex::new(State { next: 1, ..Default::default() }) })
+    }
+
+    fn gpu(&self) -> &Arc<Gpu> {
+        self.gpu.get().expect("opened by the session's first request")
     }
 
     /// One request: the block at `arg` in the caller's memory.
@@ -179,6 +195,17 @@ impl Session {
         let w = |k: usize| u64::from_le_bytes(block[k * 8..k * 8 + 8].try_into().unwrap());
         let op = w(0);
         let a: [u64; 9] = std::array::from_fn(|k| w(k + 1));
+        // (ENODEV where there's no GPU at all.)
+        if self.gpu.get().is_none() {
+            let api = if op >= 20 { Api::Vulkan } else { Api::OpenCl };
+            let g = gpu(api).map_err(|e| {
+                if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
+                    eprintln!("wasm-env: no GPU: {e}");
+                }
+                ENODEV
+            })?;
+            let _ = self.gpu.set(g);
+        }
         let mut r = [0u64; 6];
         let status = match self.op(data, op, &a, &mut r, guest) {
             Ok(()) => CL_SUCCESS,
@@ -194,7 +221,7 @@ impl Session {
     }
 
     fn op(&self, data: &mut [u8], op: u64, a: &[u64; 9], r: &mut [u64; 6], guest: &wasm_env_gpu::opencl::Guest) -> Result<(), Failure> {
-        let g = &self.gpu;
+        let g = self.gpu();
         match op {
             1 => {
                 let d = self.description();
@@ -213,7 +240,7 @@ impl Session {
                 let mut st = self.state.lock().unwrap();
                 if st.buffers.remove(&a[0]).is_none() && st.vk.remove(&a[0]).is_none() {
                     match st.programs.remove(&a[0]) {
-                        Some(p) => self.gpu.forget(p.id),
+                        Some(p) => self.gpu().forget(p.id),
                         None => return Err(Failure::Cl(CL_INVALID_MEM_OBJECT)),
                     }
                 }
@@ -430,11 +457,15 @@ impl Session {
             22 => {
                 let commands = vulkan::decode(mem::slice(data, a[0], a[1])?).map_err(|_| Failure::Errno(EINVAL))?;
                 let st = self.state.lock().unwrap();
-                let pipeline = |h: u64| match st.vk.get(&h) {
-                    Some(Vk::Pipeline(p)) => Some(p.clone()),
+                let object = |h: u64| match (st.buffers.get(&h), st.vk.get(&h)) {
+                    (Some(b), _) => Some(vulkan::Object::Buffer(b)),
+                    (_, Some(Vk::Pipeline(p))) => Some(vulkan::Object::Pipeline(p.clone())),
+                    (_, Some(Vk::Image(t))) => Some(vulkan::Object::Texture(t)),
+                    (_, Some(Vk::View(v))) => Some(vulkan::Object::View(v)),
+                    (_, Some(Vk::Sampler(s))) => Some(vulkan::Object::Sampler(s)),
                     _ => None,
                 };
-                if let Err(e) = vulkan::submit(g, &commands, |h| st.buffers.get(&h), pipeline) {
+                if let Err(e) = vulkan::submit(g, &commands, object) {
                     if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
                         eprintln!("wasm-env: Vulkan submission: {e}");
                     }
@@ -445,6 +476,45 @@ impl Session {
                 let d = self.vulkan_limits();
                 let n = (a[1] as usize).min(d.len());
                 mem::slice_mut(data, a[0], n as u64)?.copy_from_slice(&d[..n]);
+            }
+            24..=26 => {
+                let words = |at: u64, n: u64| -> Result<Vec<u32>, Failure> { Ok(mem::slice(data, at, n * 4)?.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()) };
+                let made = match op {
+                    24 => {
+                        let w = words(a[0], 9)?;
+                        vulkan::image(g, w[0], w[1], [w[2], w[3], w[4]], w[5], w[6], w[7], w[8]).map(Vk::Image)
+                    }
+                    25 => {
+                        let w = words(a[1], 7)?;
+                        match self.state.lock().unwrap().vk.get(&a[0]) {
+                            Some(Vk::Image(t)) => vulkan::view(t, w[0], w[1], w[2], w[3], w[4], w[5], w[6]).map(Vk::View),
+                            _ => return Err(Failure::Cl(VK_ERROR_INITIALIZATION_FAILED)),
+                        }
+                    }
+                    _ => {
+                        let w = words(a[0], 10)?;
+                        Ok(Vk::Sampler(vulkan::sampler(g, [w[0], w[1], w[2]], [w[3], w[4], w[5]], w[6] as u16, w[7], [f32::from_bits(w[8]), f32::from_bits(w[9])])))
+                    }
+                };
+                match made {
+                    Ok(v) => {
+                        let mut st = self.state.lock().unwrap();
+                        let h = st.next;
+                        st.next += 1;
+                        st.vk.insert(h, v);
+                        r[0] = h;
+                    }
+                    Err(e) => {
+                        if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
+                            eprintln!("wasm-env: Vulkan: {e}");
+                        }
+                        return Err(Failure::Cl(VK_ERROR_FORMAT_NOT_SUPPORTED));
+                    }
+                }
+            }
+            27 => {
+                let (features, bytes) = vulkan::format_features(g, a[0] as u32);
+                (r[0], r[2]) = (features as u64, bytes as u64);
             }
             _ => return Err(Failure::Errno(EINVAL)),
         }
@@ -470,7 +540,7 @@ impl Session {
             offset[d] = s(3 + d);
             local[d] = s(6 + d);
         }
-        let limits = &self.gpu.limits;
+        let limits = &self.gpu().limits;
         let max = limits.max_compute_invocations_per_workgroup;
         if local[..dims as usize].contains(&0) {
             // WASM_ENV_GPU_GROUPS_OF_ONE: work-groups of one work-item where the
@@ -495,7 +565,7 @@ impl Session {
         let handles = mem::slice(data, a[7], n * 8)?.to_vec();
         let locals = mem::slice(data, a[8], n * 4)?.to_vec();
         // What a null buffer argument binds (a kernel mustn't use it).
-        let placeholder = self.gpu.buffer(4).map_err(|_| Failure::Cl(CL_OUT_OF_RESOURCES))?;
+        let placeholder = self.gpu().buffer(4).map_err(|_| Failure::Cl(CL_OUT_OF_RESOURCES))?;
         let mut local_bytes = Vec::new();
         let st = self.state.lock().unwrap();
         let mut bound = Vec::new();
@@ -519,7 +589,7 @@ impl Session {
             return Err(Failure::Cl(CL_OUT_OF_RESOURCES));
         }
         let launch = Launch { local, local_bytes, ..Default::default() };
-        let words = self.gpu.run(id, &m, &info, &launch, dims, global, offset, &block, &bound).map_err(|e| {
+        let words = self.gpu().run(id, &m, &info, &launch, dims, global, offset, &block, &bound).map_err(|e| {
             if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
                 eprintln!("wasm-env: GPU: {e}");
             }
@@ -558,8 +628,8 @@ impl Session {
 
     /// VK_LIMITS's description (u64s): see the operations, above.
     fn vulkan_limits(&self) -> Vec<u8> {
-        let l = &self.gpu.limits;
-        let info = &self.gpu.info;
+        let l = &self.gpu().limits;
+        let info = &self.gpu().info;
         // (wgpu's device types are in Vulkan's order: other, integrated,
         // discrete, virtual, CPU.)
         let kind = match info.device_type {
@@ -596,7 +666,7 @@ impl Session {
     }
 
     fn description(&self) -> [u8; 256] {
-        let g = &self.gpu;
+        let g = self.gpu();
         let l = &g.limits;
         let mut d = [0u8; 256];
         let mut text = |at: usize, s: &str| {

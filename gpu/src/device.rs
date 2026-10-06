@@ -33,12 +33,33 @@ struct Pipeline {
 /// sub-buffer, is in the argument's bytes).
 pub type Bound<'a> = (usize, &'a wgpu::Buffer);
 
+/// Which API a process's GPU is for (`Gpu::open_for`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Api {
+    OpenCl,
+    Vulkan,
+}
+
 impl Gpu {
+    /// The GPU, for OpenCL.
     pub fn open() -> Res<Gpu> {
+        Gpu::open_for(Api::OpenCl)
+    }
+
+    pub fn open_for(api: Api) -> Res<Gpu> {
         // lavapipe (llvmpipe) at its default 256-bit width miscompiles
         // large shaders (software doubles: wrong results, and builds four
-        // times as long); at 128 bits it doesn't. It reads this when it
-        // starts, so before the instance is made.
+        // times as long) and reads textures' texels wrongly; at 128 bits it
+        // doesn't, but its code for CPUs with AVX2 and AVX-512 crashes
+        // sampling a texture (Mesa 26.2). So 128 bits for both APIs, and
+        // for Vulkan llvmpipe's AVX code (OpenCL keeps the code its
+        // conformance tests passed with). It reads these when it starts,
+        // so before the instance is made: once a process.
+        #[cfg(target_arch = "x86_64")]
+        if api == Api::Vulkan && std::env::var_os("GALLIUM_OVERRIDE_CPU_CAPS").is_none() && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: as below.
+            unsafe { std::env::set_var("GALLIUM_OVERRIDE_CPU_CAPS", "avx") };
+        }
         if std::env::var_os("LP_NATIVE_VECTOR_WIDTH").is_none() {
             // SAFETY: while the GPU opens, before wgpu or its drivers read the
             // environment from other threads.

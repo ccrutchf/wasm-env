@@ -34,6 +34,7 @@ int strcmp(const char *, const char *);
 int snprintf(char *, size_t, const char *, ...);
 int open(const char *, int, ...);
 int ioctl(int, unsigned long, ...);
+int close(int);
 #define O_RDWR 02
 #define O_CLOEXEC 02000000
 
@@ -42,9 +43,9 @@ int ioctl(int, unsigned long, ...);
 #define CALL VKAPI_ATTR
 #define CC VKAPI_CALL
 
-enum { INFO = 1, CREATE, FREE, WRITE, READ, FINISH = 13, VK_SHADER = 20, VK_PIPELINE, VK_SUBMIT, VK_LIMITS };
+enum { INFO = 1, CREATE, FREE, WRITE, READ, FINISH = 13, VK_SHADER = 20, VK_PIPELINE, VK_SUBMIT, VK_LIMITS, VK_IMAGE, VK_VIEW, VK_SAMPLER, VK_FORMAT };
 // The command stream's operations (gpu/src/vulkan.rs, `decode`).
-enum { BIND_PIPELINE = 1, BIND_SET, PUSH, DISPATCH, DISPATCH_INDIRECT, COPY, FILL, UPDATE };
+enum { BIND_PIPELINE = 1, BIND_SET, PUSH, DISPATCH, DISPATCH_INDIRECT, COPY, FILL, UPDATE, BUFFER_TO_IMAGE, IMAGE_TO_BUFFER, COPY_IMAGE, CLEAR_COLOR };
 
 struct request {
     uint64_t op, a[9], r[6];
@@ -92,8 +93,13 @@ static int open_device(void) {
     char info[256];
     struct request q = {INFO, {(uint64_t)(uintptr_t)info, sizeof info}};
     struct request l = {VK_LIMITS, {(uint64_t)(uintptr_t)limits, sizeof limits}};
-    if (call(&q) || call(&l))
+    // (A Vulkan request first: the runtime opens the GPU for the API that
+    // asks first. It fails where there's no GPU.)
+    if (call(&l) || call(&q)) {
+        close(f);
+        fd = -1;
         return -1;
+    }
     memcpy(device_name, info, 63);
     return 0;
 }
@@ -121,6 +127,7 @@ struct VkDeviceMemory_T {
 };
 struct VkQueue_T {
     VK_LOADER_DATA loader;
+    struct VkDevice_T *device;
 };
 struct VkDevice_T {
     VK_LOADER_DATA loader;
@@ -147,13 +154,30 @@ struct VkPipelineLayout_T {
 struct VkDescriptorSetLayout_T {
     uint32_t n;
     VkDescriptorSetLayoutBinding *bindings;
+    // Per binding: its immutable sampler (or NULL).
+    VkSampler *immutable;
 };
-// A descriptor: a buffer's range (its memory's handle and the range's
-// place in it).
+struct VkImage_T {
+    uint64_t handle;
+    VkImageType type;
+    VkFormat format;
+    VkExtent3D extent;
+    uint32_t mips, layers, texel;
+};
+struct VkImageView_T {
+    uint64_t handle;
+};
+struct VkSampler_T {
+    uint64_t handle;
+};
+// A descriptor: a buffer's range, an image view, a sampler, or a view and
+// sampler.
 struct descriptor {
     VkDescriptorType type;
     VkBuffer buffer;
     VkDeviceSize offset, range;
+    VkImageView view;
+    VkSampler sampler;
 };
 struct VkDescriptorSet_T {
     VkDescriptorSetLayout layout;
@@ -328,12 +352,53 @@ static CALL void CC GetPhysicalDeviceMemoryProperties(VkPhysicalDevice pd, VkPhy
     m->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 }
 
+// A format's features for optimal tiling (the device's: VK_FORMAT), and
+// its texel's bytes (0: not supported).
+static VkFormatFeatureFlags format_features(VkFormat f, uint32_t *texel) {
+    struct request q = {VK_FORMAT, {(uint64_t)f}};
+    if (call(&q))
+        q.r[0] = q.r[2] = 0;
+    if (texel)
+        *texel = (uint32_t)q.r[2];
+    return (VkFormatFeatureFlags)q.r[0];
+}
+
+// (Images are optimal tiling only: linear ones would be memory the
+// program reads and writes as an image.)
 static CALL void CC GetPhysicalDeviceFormatProperties(VkPhysicalDevice pd, VkFormat f, VkFormatProperties *p) {
     memset(p, 0, sizeof *p);
+    p->optimalTilingFeatures = format_features(f, NULL);
+}
+
+// The features an image's usage needs.
+static VkFormatFeatureFlags needs(VkImageUsageFlags u) {
+    VkFormatFeatureFlags n = 0;
+    if (u & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+        n |= VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    if (u & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+        n |= VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    if (u & VK_IMAGE_USAGE_SAMPLED_BIT)
+        n |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (u & VK_IMAGE_USAGE_STORAGE_BIT)
+        n |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    if (u & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+        n |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    if (u & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+        n |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    return n;
 }
 
 static CALL VkResult CC GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice pd, VkFormat f, VkImageType t, VkImageTiling tl, VkImageUsageFlags u, VkImageCreateFlags c, VkImageFormatProperties *p) {
-    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    VkFormatFeatureFlags have = format_features(f, NULL);
+    if (tl != VK_IMAGE_TILING_OPTIMAL || !have || (have & needs(u)) != needs(u) || (c & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT))
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    memset(p, 0, sizeof *p);
+    p->maxExtent = t == VK_IMAGE_TYPE_3D ? (VkExtent3D){256, 256, 256} : t == VK_IMAGE_TYPE_1D ? (VkExtent3D){4096, 1, 1} : (VkExtent3D){4096, 4096, 1};
+    p->maxMipLevels = t == VK_IMAGE_TYPE_3D ? 9 : 13;
+    p->maxArrayLayers = t == VK_IMAGE_TYPE_3D ? 1 : 256;
+    p->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    p->maxResourceSize = (VkDeviceSize)1 << 31;
+    return VK_SUCCESS;
 }
 
 static CALL void CC GetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice pd, VkFormat f, VkImageType t, VkSampleCountFlagBits s, VkImageUsageFlags u, VkImageTiling tl, uint32_t *count, VkSparseImageFormatProperties *p) {
@@ -364,7 +429,7 @@ static CALL void CC GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice pd,
     *count = *count < 1 ? *count : 1;
 }
 static CALL VkResult CC GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *i, VkImageFormatProperties2 *p) {
-    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    return GetPhysicalDeviceImageFormatProperties(pd, i->format, i->type, i->tiling, i->usage, i->flags, &p->imageFormatProperties);
 }
 static CALL void CC GetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice pd, const VkPhysicalDeviceSparseImageFormatInfo2 *i, uint32_t *count, VkSparseImageFormatProperties2 *p) {
     *count = 0;
@@ -400,6 +465,7 @@ static CALL VkResult CC CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateIn
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     set_loader_magic_value(d);
     set_loader_magic_value(&d->queue);
+    d->queue.device = d;
     *out = d;
     return VK_SUCCESS;
 }
@@ -553,6 +619,128 @@ static CALL VkResult CC BindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory 
     return VK_SUCCESS;
 }
 
+// ---- Images, views and samplers ----
+
+// An image is a texture in the runtime, not part of its memory: binding
+// memory to it changes nothing.
+static CALL VkResult CC CreateImage(VkDevice d, const VkImageCreateInfo *info, const VkAllocationCallbacks *a, VkImage *out) {
+    uint32_t texel;
+    if (info->tiling != VK_IMAGE_TILING_OPTIMAL || !format_features(info->format, &texel))
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    struct VkImage_T *im = zalloc(sizeof *im);
+    if (!im)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    uint32_t w[9] = {info->imageType == VK_IMAGE_TYPE_1D ? 1u : info->imageType == VK_IMAGE_TYPE_3D ? 3u : 2u,
+                     (uint32_t)info->format,
+                     info->extent.width,
+                     info->extent.height,
+                     info->extent.depth,
+                     info->mipLevels,
+                     info->arrayLayers,
+                     (uint32_t)info->samples,
+                     info->usage};
+    struct request q = {VK_IMAGE, {(uint64_t)(uintptr_t)w}};
+    if (call(&q)) {
+        free(im);
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    *im = (struct VkImage_T){q.r[0], info->imageType, info->format, info->extent, info->mipLevels, info->arrayLayers, texel};
+    *out = im;
+    return VK_SUCCESS;
+}
+
+static CALL void CC DestroyImage(VkDevice d, VkImage im, const VkAllocationCallbacks *a) {
+    if (!im)
+        return;
+    struct request q = {FREE, {im->handle}};
+    call(&q);
+    free(im);
+}
+
+static CALL void CC GetImageMemoryRequirements(VkDevice d, VkImage im, VkMemoryRequirements *r) {
+    // (What its texels would take: the program allocates that much, which
+    // the image doesn't use.)
+    VkDeviceSize size = 0;
+    for (uint32_t m = 0; m < im->mips; m++) {
+        VkDeviceSize w = im->extent.width >> m, h = im->extent.height >> m, z = im->extent.depth >> m;
+        size += (w ? w : 1) * (h ? h : 1) * (z ? z : 1) * im->layers * im->texel;
+    }
+    r->size = (size + 255) & ~(VkDeviceSize)255;
+    r->alignment = 256;
+    r->memoryTypeBits = 1;
+}
+
+static CALL VkResult CC BindImageMemory(VkDevice d, VkImage im, VkDeviceMemory m, VkDeviceSize offset) {
+    return VK_SUCCESS;
+}
+
+static CALL void CC GetImageSubresourceLayout(VkDevice d, VkImage im, const VkImageSubresource *s, VkSubresourceLayout *l) {
+    memset(l, 0, sizeof *l);
+}
+
+static CALL void CC GetImageSparseMemoryRequirements(VkDevice d, VkImage im, uint32_t *count, VkSparseImageMemoryRequirements *r) {
+    *count = 0;
+}
+
+static CALL VkResult CC CreateImageView(VkDevice d, const VkImageViewCreateInfo *info, const VkAllocationCallbacks *a, VkImageView *out) {
+    VkImage im = info->image;
+    const VkImageSubresourceRange *r = &info->subresourceRange;
+    uint32_t mips = r->levelCount == VK_REMAINING_MIP_LEVELS ? im->mips - r->baseMipLevel : r->levelCount;
+    uint32_t layers = r->layerCount == VK_REMAINING_ARRAY_LAYERS ? im->layers - r->baseArrayLayer : r->layerCount;
+    uint32_t w[7] = {(uint32_t)info->viewType, info->format == im->format ? 0u : (uint32_t)info->format, r->aspectMask, r->baseMipLevel, mips, r->baseArrayLayer, layers};
+    struct request q = {VK_VIEW, {im->handle, (uint64_t)(uintptr_t)w}};
+    struct VkImageView_T *v = zalloc(sizeof *v);
+    if (!v || call(&q)) {
+        free(v);
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    v->handle = q.r[0];
+    *out = v;
+    return VK_SUCCESS;
+}
+
+static CALL void CC DestroyImageView(VkDevice d, VkImageView v, const VkAllocationCallbacks *a) {
+    if (!v)
+        return;
+    struct request q = {FREE, {v->handle}};
+    call(&q);
+    free(v);
+}
+
+static CALL VkResult CC CreateSampler(VkDevice d, const VkSamplerCreateInfo *info, const VkAllocationCallbacks *a, VkSampler *out) {
+    union {
+        float f;
+        uint32_t u;
+    } lo = {info->minLod}, hi = {info->maxLod};
+    uint32_t w[10] = {(uint32_t)info->magFilter,
+                      (uint32_t)info->minFilter,
+                      (uint32_t)info->mipmapMode,
+                      (uint32_t)info->addressModeU,
+                      (uint32_t)info->addressModeV,
+                      (uint32_t)info->addressModeW,
+                      info->anisotropyEnable ? (uint32_t)info->maxAnisotropy : 1u,
+                      info->compareEnable ? (uint32_t)info->compareOp + 1 : 0u,
+                      lo.u,
+                      hi.u};
+    struct request q = {VK_SAMPLER, {(uint64_t)(uintptr_t)w}};
+    struct VkSampler_T *s = zalloc(sizeof *s);
+    if (!s || call(&q)) {
+        free(s);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    s->handle = q.r[0];
+    *out = s;
+    return VK_SUCCESS;
+}
+
+static CALL void CC DestroySampler(VkDevice d, VkSampler s, const VkAllocationCallbacks *a) {
+    if (!s)
+        return;
+    struct request q = {FREE, {s->handle}};
+    call(&q);
+    free(s);
+}
+
 // ---- Shaders and pipelines ----
 
 static CALL VkResult CC CreateShaderModule(VkDevice d, const VkShaderModuleCreateInfo *info, const VkAllocationCallbacks *a, VkShaderModule *out) {
@@ -659,12 +847,21 @@ static int buffer_descriptor(VkDescriptorType t) {
            t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
 }
 
+static int image_descriptor(VkDescriptorType t) {
+    return t == VK_DESCRIPTOR_TYPE_SAMPLER || t == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || t == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+           t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+}
+
 static CALL VkResult CC CreateDescriptorSetLayout(VkDevice d, const VkDescriptorSetLayoutCreateInfo *info, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
-    for (uint32_t i = 0; i < info->bindingCount; i++)
-        if (info->pBindings[i].descriptorCount > 1 || (info->pBindings[i].descriptorCount && !buffer_descriptor(info->pBindings[i].descriptorType)))
+    for (uint32_t i = 0; i < info->bindingCount; i++) {
+        const VkDescriptorSetLayoutBinding *b = &info->pBindings[i];
+        if (b->descriptorCount > 1 || (b->descriptorCount && !buffer_descriptor(b->descriptorType) && !image_descriptor(b->descriptorType)))
             return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
     struct VkDescriptorSetLayout_T *l = zalloc(sizeof *l);
-    if (!l || !(l->bindings = zalloc(info->bindingCount * sizeof *l->bindings))) {
+    if (!l || !(l->bindings = zalloc(info->bindingCount * sizeof *l->bindings)) || !(l->immutable = zalloc(info->bindingCount * sizeof *l->immutable))) {
+        if (l)
+            free(l->bindings);
         free(l);
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
@@ -677,12 +874,20 @@ static CALL VkResult CC CreateDescriptorSetLayout(VkDevice d, const VkDescriptor
             l->bindings[j] = l->bindings[j - 1];
             l->bindings[j - 1] = t;
         }
+    // (Immutable samplers kept: the program's array needn't outlive this.)
+    for (uint32_t k = 0; k < l->n; k++) {
+        VkDescriptorSetLayoutBinding *b = &l->bindings[k];
+        int has = (b->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || b->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) && b->pImmutableSamplers && b->descriptorCount;
+        l->immutable[k] = has ? b->pImmutableSamplers[0] : VK_NULL_HANDLE;
+        b->pImmutableSamplers = NULL;
+    }
     *out = l;
     return VK_SUCCESS;
 }
 static CALL void CC DestroyDescriptorSetLayout(VkDevice d, VkDescriptorSetLayout l, const VkAllocationCallbacks *a) {
     if (l) {
         free(l->bindings);
+        free(l->immutable);
         free(l);
     }
 }
@@ -726,8 +931,10 @@ static CALL VkResult CC AllocateDescriptorSets(VkDevice d, const VkDescriptorSet
         s->pool = info->descriptorPool;
         s->next = s->pool->sets;
         s->pool->sets = s;
-        for (uint32_t k = 0; k < l->n; k++)
+        for (uint32_t k = 0; k < l->n; k++) {
             s->d[k].type = l->bindings[k].descriptorType;
+            s->d[k].sampler = l->immutable[k];
+        }
         out[i] = s;
     }
     return VK_SUCCESS;
@@ -758,16 +965,24 @@ static struct descriptor *slot(VkDescriptorSet s, uint32_t binding) {
 
 static CALL void CC UpdateDescriptorSets(VkDevice d, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c) {
     for (uint32_t i = 0; i < nw; i++) {
-        if (!buffer_descriptor(w[i].descriptorType))
-            continue;
+        VkDescriptorType t = w[i].descriptorType;
         for (uint32_t k = 0; k < w[i].descriptorCount; k++) {
             struct descriptor *e = slot(w[i].dstSet, w[i].dstBinding + k);
             if (!e)
                 continue;
-            const VkDescriptorBufferInfo *b = &w[i].pBufferInfo[k];
-            e->buffer = b->buffer;
-            e->offset = b->offset;
-            e->range = b->range == VK_WHOLE_SIZE ? b->buffer->size - b->offset : b->range;
+            if (buffer_descriptor(t)) {
+                const VkDescriptorBufferInfo *b = &w[i].pBufferInfo[k];
+                e->buffer = b->buffer;
+                e->offset = b->offset;
+                e->range = b->range == VK_WHOLE_SIZE ? b->buffer->size - b->offset : b->range;
+            } else if (image_descriptor(t)) {
+                const VkDescriptorImageInfo *im = &w[i].pImageInfo[k];
+                if (t != VK_DESCRIPTOR_TYPE_SAMPLER)
+                    e->view = im->imageView;
+                // (An immutable sampler stays.)
+                if ((t == VK_DESCRIPTOR_TYPE_SAMPLER || t == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) && !w[i].dstSet->layout->immutable[e - w[i].dstSet->d])
+                    e->sampler = im->sampler;
+            }
         }
     }
     for (uint32_t i = 0; i < nc; i++)
@@ -887,9 +1102,11 @@ static CALL void CC CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint
         VkDescriptorSet s = sets[i];
         if (!s)
             continue;
+        // Its descriptors that are set (kind 0 a buffer, 1 a view, 2 a
+        // sampler, 3 a view and sampler: gpu/src/vulkan.rs, `decode`).
         uint32_t count = 0;
         for (uint32_t k = 0; k < s->layout->n; k++)
-            count += s->d[k].buffer != VK_NULL_HANDLE;
+            count += s->d[k].buffer || s->d[k].view || s->d[k].sampler;
         uint32_t head[2] = {first + i, count};
         uint32_t h[2] = {BIND_SET, 8 + 8 + count * 32};
         put(c, h, 8);
@@ -899,14 +1116,28 @@ static CALL void CC CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint
             VkDeviceSize offset = e->offset;
             if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC || e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
                 offset += used < ndyn ? dyn[used++] : 0;
-            if (!e->buffer)
-                continue;
             uint32_t b[2] = {s->layout->bindings[k].binding, 0};
-            uint64_t r[3] = {e->buffer->memory->handle, e->buffer->offset + offset, e->range};
+            uint64_t r[3] = {0, 0, 0};
+            if (e->buffer) {
+                r[0] = e->buffer->memory->handle;
+                r[1] = e->buffer->offset + offset;
+                r[2] = e->range;
+                if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+                    writes(c, e->buffer, offset, e->range);
+            } else if (e->view && e->sampler) {
+                b[1] = 3;
+                r[0] = e->view->handle;
+                r[1] = e->sampler->handle;
+            } else if (e->view) {
+                b[1] = 1;
+                r[0] = e->view->handle;
+            } else if (e->sampler) {
+                b[1] = 2;
+                r[0] = e->sampler->handle;
+            } else
+                continue;
             put(c, b, 8);
             put(c, r, 24);
-            if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
-                writes(c, e->buffer, offset, e->range);
         }
     }
 }
@@ -949,6 +1180,60 @@ static CALL void CC CmdUpdateBuffer(VkCommandBuffer c, VkBuffer b, VkDeviceSize 
     } __attribute__((packed)) head = {{b->memory->handle, b->offset + offset}, (uint32_t)size};
     command(c, UPDATE, &head, sizeof head, data, (uint32_t)size);
     writes(c, b, offset, size);
+}
+
+// An image's region in a command (a SUB: gpu/src/vulkan.rs, `decode`).
+static void sub(VkCommandBuffer c, const VkImageSubresourceLayers *s, VkOffset3D o, VkExtent3D e) {
+    uint32_t w[10] = {s->mipLevel, s->baseArrayLayer, s->layerCount, s->aspectMask, (uint32_t)o.x, (uint32_t)o.y, (uint32_t)o.z, e.width, e.height, e.depth};
+    put(c, w, sizeof w);
+}
+
+static void buffer_image(VkCommandBuffer c, uint32_t op, VkBuffer b, VkImage im, uint32_t n, const VkBufferImageCopy *r) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t h[2] = {op, 8 + 24 + 8 + 40};
+        uint64_t o[3] = {b->memory->handle, b->offset + r[i].bufferOffset, im->handle};
+        uint32_t rows[2] = {r[i].bufferRowLength, r[i].bufferImageHeight};
+        put(c, h, 8);
+        put(c, o, 24);
+        put(c, rows, 8);
+        sub(c, &r[i].imageSubresource, r[i].imageOffset, r[i].imageExtent);
+        if (op == IMAGE_TO_BUFFER) {
+            // (The bytes the copy reaches in the buffer.)
+            VkExtent3D e = r[i].imageExtent;
+            VkDeviceSize row = (VkDeviceSize)(r[i].bufferRowLength ? r[i].bufferRowLength : e.width) * im->texel;
+            VkDeviceSize height = r[i].bufferImageHeight ? r[i].bufferImageHeight : e.height;
+            VkDeviceSize slices = im->type == VK_IMAGE_TYPE_3D ? e.depth : r[i].imageSubresource.layerCount;
+            writes(c, b, r[i].bufferOffset, (slices - 1) * height * row + (e.height - 1) * row + (VkDeviceSize)e.width * im->texel);
+        }
+    }
+}
+
+static CALL void CC CmdCopyBufferToImage(VkCommandBuffer c, VkBuffer b, VkImage im, VkImageLayout l, uint32_t n, const VkBufferImageCopy *r) {
+    buffer_image(c, BUFFER_TO_IMAGE, b, im, n, r);
+}
+
+static CALL void CC CmdCopyImageToBuffer(VkCommandBuffer c, VkImage im, VkImageLayout l, VkBuffer b, uint32_t n, const VkBufferImageCopy *r) {
+    buffer_image(c, IMAGE_TO_BUFFER, b, im, n, r);
+}
+
+static CALL void CC CmdCopyImage(VkCommandBuffer c, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageCopy *r) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t h[2] = {COPY_IMAGE, 8 + 8 + 40 + 8 + 40};
+        put(c, h, 8);
+        put(c, &src->handle, 8);
+        sub(c, &r[i].srcSubresource, r[i].srcOffset, r[i].extent);
+        put(c, &dst->handle, 8);
+        sub(c, &r[i].dstSubresource, r[i].dstOffset, r[i].extent);
+    }
+}
+
+static CALL void CC CmdClearColorImage(VkCommandBuffer c, VkImage im, VkImageLayout l, const VkClearColorValue *color, uint32_t n, const VkImageSubresourceRange *r) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t mips = r[i].levelCount == VK_REMAINING_MIP_LEVELS ? im->mips - r[i].baseMipLevel : r[i].levelCount;
+        uint32_t layers = r[i].layerCount == VK_REMAINING_ARRAY_LAYERS ? im->layers - r[i].baseArrayLayer : r[i].layerCount;
+        uint32_t w[8] = {r[i].baseMipLevel, mips, r[i].baseArrayLayer, layers, color->uint32[0], color->uint32[1], color->uint32[2], color->uint32[3]};
+        command(c, CLEAR_COLOR, &im->handle, 8, w, sizeof w);
+    }
 }
 
 // Barriers and events: the commands run in order (wgpu orders a
@@ -999,7 +1284,7 @@ static void note_writes(VkCommandBuffer c) {
 }
 
 static VkDevice the_device(VkQueue q) {
-    return (VkDevice)((char *)q - offsetof(struct VkDevice_T, queue));
+    return q->device;
 }
 
 static CALL VkResult CC QueueSubmit(VkQueue queue, uint32_t n, const VkSubmitInfo *info, VkFence fence) {
@@ -1153,6 +1438,16 @@ static const struct entry {
       F(DestroyBuffer),
       F(GetBufferMemoryRequirements),
       F(BindBufferMemory),
+      F(CreateImage),
+      F(DestroyImage),
+      F(GetImageMemoryRequirements),
+      F(BindImageMemory),
+      F(GetImageSubresourceLayout),
+      F(GetImageSparseMemoryRequirements),
+      F(CreateImageView),
+      F(DestroyImageView),
+      F(CreateSampler),
+      F(DestroySampler),
       F(CreateShaderModule),
       F(DestroyShaderModule),
       F(CreateComputePipelines),
@@ -1188,6 +1483,10 @@ static const struct entry {
       F(CmdCopyBuffer),
       F(CmdFillBuffer),
       F(CmdUpdateBuffer),
+      F(CmdCopyBufferToImage),
+      F(CmdCopyImageToBuffer),
+      F(CmdCopyImage),
+      F(CmdClearColorImage),
       F(CmdPipelineBarrier),
       F(CmdSetEvent),
       F(CmdResetEvent),

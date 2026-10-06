@@ -14,5 +14,6 @@ pub mod wgsl;
 mod f64;
 pub mod opencl;
 pub mod device;
+pub mod spirv;
 pub mod vulkan;
 pub use wgpu;
