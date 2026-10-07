@@ -1613,8 +1613,9 @@ impl Process {
                 let open = Arc::new(Mutex::new(Open::Gpu(Arc::new(crate::gpu::Session::open()?))));
                 return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
             }
-            Some(DevPath::Device(Device::Sound(crate::audio::SoundDevice::Playback))) => {
-                let open = Arc::new(Mutex::new(Open::Sound(crate::audio::Pcm::open())));
+            Some(DevPath::Device(Device::Sound(d @ (crate::audio::SoundDevice::Playback | crate::audio::SoundDevice::Capture)))) => {
+                let capture = d == crate::audio::SoundDevice::Capture;
+                let open = Arc::new(Mutex::new(Open::Sound(crate::audio::Pcm::open(capture))));
                 return self.fds.insert(Fd { open, cloexec: flags & o::CLOEXEC != 0, flags }, 0);
             }
             Some(DevPath::Device(d)) => {
@@ -1758,7 +1759,7 @@ impl Process {
             Open::Pipe(_) => Ok(fs::fifo_stat_bytes()),
             Open::Device(d) => Ok(fs::device_stat_bytes(*d)),
             Open::Gpu(_) => Ok(fs::device_stat_bytes(Device::Gpu)),
-            Open::Sound(_) => Ok(fs::device_stat_bytes(Device::Sound(crate::audio::SoundDevice::Playback))),
+            Open::Sound(p) => Ok(fs::device_stat_bytes(Device::Sound(p.device()))),
             Open::Host(h) => h.metadata().map(|m| fs::stat_bytes(&m)).map_err(|e| fs::errno(&e)),
             Open::Unix(_) | Open::Socket(_) => Ok(fs::socket_stat_bytes()),
             _ => Ok(fs::stdio_stat_bytes()),

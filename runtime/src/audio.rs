@@ -1,20 +1,24 @@
 //! `/dev/snd`: the runtime's sound card (docs/abi.md, "Audio"), so the
 //! environment's own `libasound` (and SDL, GStreamer, everything over ALSA)
 //! plays sound on every host. It speaks ALSA's kernel interface: a control
-//! device (`controlC0`: the card, "wasm-env") and a playback PCM
-//! (`pcmC0D0p`). The card's driver matches no card configuration of
+//! device (`controlC0`: the card, "wasm-env", and its master volume and
+//! switch), a playback PCM (`pcmC0D0p`) and a capture one (`pcmC0D0c`).
+//! The card's driver matches no card configuration of
 //! `libasound`'s, so its `default` is `plug` over `hw`: conversions the card
 //! lacks happen in the guest.
 //!
 //! A PCM takes U8, S16_LE, S32_LE and FLOAT_LE, one or two channels, at 8 to
-//! 192 kHz, through `WRITEI_FRAMES` and `WRITEN_FRAMES` (no mmap: the
-//! status and control pages refused, `libasound` uses `SYNC_PTR`). Its
-//! frames wait in a ring buffer of the size its parameters chose, which a
-//! mixer drains: every running stream, converted to float stereo at the
-//! sink's rate (resampled linearly), summed. The sink is the host's audio
+//! 192 kHz, through `WRITEI_FRAMES` and `WRITEN_FRAMES` (or `READ`s), or
+//! memory of the program's own (the status and control pages refused,
+//! `libasound` uses `SYNC_PTR`). Its frames wait in a ring buffer of the
+//! size its parameters chose, which a mixer drains: every running playback
+//! stream, converted to float stereo at the sink's rate (resampled
+//! linearly), summed, at the master volume. The sink is the host's audio
 //! output (`cpal`) or none (`--audio=null`: the mixer on a clock of its own),
 //! which can record what each stream played (`WASM_ENV_AUDIO_RECORD`: the
-//! bytes as written, for tests).
+//! bytes as written, for tests). Capture streams fill from the host's input
+//! the same way round, or from silence on a clock (or `WASM_ENV_AUDIO_SOURCE`:
+//! bytes as read, for tests).
 
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -43,6 +47,9 @@ const XFER_SIZE: usize = 24;
 const CHANNEL_INFO_SIZE: usize = 24;
 const CARD_INFO_SIZE: usize = 376;
 const ELEM_LIST_SIZE: usize = 80;
+const ELEM_ID_SIZE: usize = 64;
+const ELEM_INFO_SIZE: usize = 272;
+const ELEM_VALUE_SIZE: usize = 1224;
 
 const PCM_PVERSION: u32 = ioc(R, b'A', 0x00, 4);
 const PCM_INFO: u32 = ioc(R, b'A', 0x01, PCM_INFO_SIZE);
@@ -71,12 +78,18 @@ const PCM_XRUN: u32 = ioc(NONE, b'A', 0x48, 0);
 const PCM_FORWARD: u32 = ioc(W, b'A', 0x49, 8);
 const PCM_WRITEI: u32 = ioc(W, b'A', 0x50, XFER_SIZE);
 const PCM_WRITEN: u32 = ioc(W, b'A', 0x52, XFER_SIZE);
+const PCM_READI: u32 = ioc(R, b'A', 0x51, XFER_SIZE);
+const PCM_READN: u32 = ioc(R, b'A', 0x53, XFER_SIZE);
 const PCM_LINK: u32 = ioc(W, b'A', 0x60, 4);
 const PCM_UNLINK: u32 = ioc(NONE, b'A', 0x61, 0);
 
 const CTL_PVERSION: u32 = ioc(R, b'U', 0x00, 4);
 const CTL_CARD_INFO: u32 = ioc(R, b'U', 0x01, CARD_INFO_SIZE);
 const CTL_ELEM_LIST: u32 = ioc(RW, b'U', 0x10, ELEM_LIST_SIZE);
+const CTL_ELEM_INFO: u32 = ioc(RW, b'U', 0x11, ELEM_INFO_SIZE);
+const CTL_ELEM_READ: u32 = ioc(RW, b'U', 0x12, ELEM_VALUE_SIZE);
+const CTL_ELEM_WRITE: u32 = ioc(RW, b'U', 0x13, ELEM_VALUE_SIZE);
+const CTL_TLV_READ: u32 = ioc(RW, b'U', 0x1a, 8);
 const CTL_SUBSCRIBE_EVENTS: u32 = ioc(RW, b'U', 0x16, 4);
 const CTL_HWDEP_NEXT_DEVICE: u32 = ioc(RW, b'U', 0x20, 4);
 const CTL_PCM_NEXT_DEVICE: u32 = ioc(R, b'U', 0x30, 4);
@@ -143,6 +156,16 @@ impl Format {
             Format::S16 => i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0,
             Format::S32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2147483648.0,
             Format::F32 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        }
+    }
+    /// A float in [-1, 1] as a sample, into `b`.
+    fn put(self, v: f32, b: &mut [u8]) {
+        let v = v.clamp(-1.0, 1.0);
+        match self {
+            Format::U8 => b[0] = (v * 127.0 + 128.0).round() as u8,
+            Format::S16 => b.copy_from_slice(&((v * 32767.0).round() as i16).to_le_bytes()),
+            Format::S32 => b.copy_from_slice(&((v as f64 * 2147483647.0).round() as i32).to_le_bytes()),
+            Format::F32 => b.copy_from_slice(&v.to_le_bytes()),
         }
     }
 }
@@ -513,9 +536,10 @@ impl HwParams {
 
 // ---- The card's streams and its mixer ----
 
-/// A playback stream: its setup, its ring buffer, and where the program
-/// and the hardware are in it (frames, wrapping at `boundary`).
+/// A stream, playback or capture: its setup, its ring buffer, and where the
+/// program and the hardware are in it (frames, wrapping at `boundary`).
 struct Stream {
+    capture: bool,
     state: u32,
     format: Format,
     channels: usize,
@@ -537,6 +561,9 @@ struct Stream {
     prev: [f32; 2],
     next: [f32; 2],
     record: Option<std::fs::File>,
+    /// What a capture stream captures instead (`WASM_ENV_AUDIO_SOURCE`:
+    /// frames as the stream takes them, then silence).
+    source: Option<std::io::BufReader<std::fs::File>>,
     /// The program's mapping of the data (memory-mapped access): its
     /// address and length, which committed frames are copied from.
     area: Option<(u64, u64)>,
@@ -546,15 +573,17 @@ impl Stream {
     fn frame_bytes(&self) -> usize {
         (self.format.bits() / 8) as usize * self.channels
     }
-    /// Frames written and not yet played: negative once the hardware has
-    /// run past the program's pointer (an underrun, playing on).
-    fn hw_avail(&self) -> i64 {
-        let d = (self.appl + self.boundary - self.hw) % self.boundary;
+    /// Frames in the ring: written and not yet played (negative once the
+    /// hardware has run past the program's pointer, an underrun playing on),
+    /// or captured and not yet read.
+    fn filled(&self) -> i64 {
+        let (ahead, behind) = if self.capture { (self.hw, self.appl) } else { (self.appl, self.hw) };
+        let d = (ahead + self.boundary - behind) % self.boundary;
         if d > self.boundary / 2 { d as i64 - self.boundary as i64 } else { d as i64 }
     }
-    /// Room for the program.
+    /// What the program can do: room to write, or frames to read.
     fn avail(&self) -> i64 {
-        self.buffer_size as i64 - self.hw_avail()
+        if self.capture { self.filled() } else { self.buffer_size as i64 - self.filled() }
     }
     fn running(&self) -> bool {
         self.state == STATE_RUNNING || self.state == STATE_DRAINING
@@ -583,9 +612,31 @@ impl Stream {
         }
         Ok(())
     }
+    /// Captured frames, the `n` after the program's pointer, from the ring
+    /// out to its mapping of the data.
+    fn copy_out(&self, data: &mut [u8], n: u64) -> SysResult<()> {
+        let Some((addr, len)) = self.area else { return Ok(()) };
+        let sb = (self.format.bits() / 8) as u64;
+        let fb = self.frame_bytes() as u64;
+        if len < self.buffer_size * fb {
+            return Err(EINVAL);
+        }
+        for k in 0..n {
+            let at = (self.appl + k) % self.buffer_size;
+            if self.interleaved {
+                mem::write(data, addr + at * fb, &self.ring[(at * fb) as usize..((at + 1) * fb) as usize])?;
+            } else {
+                for c in 0..self.channels as u64 {
+                    let off = c * self.buffer_size * sb + at * sb;
+                    mem::write(data, addr + off, &self.ring[off as usize..(off + sb) as usize])?;
+                }
+            }
+        }
+        Ok(())
+    }
     /// The next frame played, as float stereo (None: none written).
     fn take(&mut self) -> Option<[f32; 2]> {
-        if self.hw_avail() <= 0 {
+        if self.filled() <= 0 {
             return None;
         }
         let fb = self.frame_bytes();
@@ -641,15 +692,96 @@ impl Stream {
             self.phase += step;
         }
     }
+    /// Captures `input` (float stereo frames at `rate`), resampled to the
+    /// stream's rate, into the ring, until it overruns.
+    fn capture(&mut self, input: &[f32], rate: u32) {
+        let step = rate as f64 / self.rate as f64;
+        for f in input.chunks_exact(2) {
+            self.prev = self.next;
+            self.next = [f[0], f[1]];
+            while self.phase < 1.0 {
+                let t = self.phase as f32;
+                let frame = [self.prev[0] + (self.next[0] - self.prev[0]) * t, self.prev[1] + (self.next[1] - self.prev[1]) * t];
+                self.put(frame);
+                if self.state != STATE_RUNNING {
+                    return;
+                }
+                self.phase += step;
+            }
+            self.phase -= 1.0;
+        }
+    }
+    /// One captured frame into the ring (or the source's, if there is
+    /// one): an overrun once as many as the stop threshold wait.
+    fn put(&mut self, [l, r]: [f32; 2]) {
+        let fb = self.frame_bytes();
+        let sb = (self.format.bits() / 8) as usize;
+        let mut frame = vec![0u8; fb];
+        if let Some(src) = &mut self.source {
+            use std::io::Read;
+            // (Past its end, silence.)
+            let mut got = 0;
+            while got < fb {
+                match src.read(&mut frame[got..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got += n,
+                }
+            }
+            if got < fb {
+                frame.fill(0);
+                if self.format == Format::U8 {
+                    frame.fill(0x80);
+                }
+            }
+        } else {
+            let values = if self.channels == 1 { vec![0.5 * (l + r)] } else { vec![l, r] };
+            for (c, v) in values.into_iter().enumerate() {
+                self.format.put(v, &mut frame[c * sb..(c + 1) * sb]);
+            }
+        }
+        let at = (self.hw % self.buffer_size) as usize;
+        if self.interleaved {
+            self.ring[at * fb..(at + 1) * fb].copy_from_slice(&frame);
+        } else {
+            for c in 0..self.channels {
+                let off = c * self.buffer_size as usize * sb + at * sb;
+                self.ring[off..off + sb].copy_from_slice(&frame[c * sb..(c + 1) * sb]);
+            }
+        }
+        self.hw = (self.hw + 1) % self.boundary;
+        if self.avail() >= self.stop_threshold as i64 {
+            self.state = STATE_XRUN;
+        }
+    }
 }
 
-/// The card: its streams (for the mixer), woken writers, and the sink.
+/// The card: its streams (for the mixer and the source), its sink and
+/// source started, and its mixer controls.
 struct Card {
     streams: Mutex<Vec<Weak<Pcm>>>,
     started: OnceLock<()>,
+    listening: OnceLock<()>,
+    /// Its mixer controls: the master volume (left, right: 0 to
+    /// VOLUME_MAX) and switch.
+    volume: Mutex<([i64; 2], bool)>,
 }
 
-static CARD: Card = Card { streams: Mutex::new(Vec::new()), started: OnceLock::new() };
+static CARD: Card = Card { streams: Mutex::new(Vec::new()), started: OnceLock::new(), listening: OnceLock::new(), volume: Mutex::new(([VOLUME_MAX; 2], true)) };
+
+/// The master volume's steps: half a decibel each, from -50 dB (0 is
+/// silence) to 0 dB.
+const VOLUME_MAX: i64 = 100;
+const VOLUME_DB_MIN: i64 = -5000; // in 0.01 dB
+const VOLUME_DB_STEP: i64 = 50;
+
+/// A volume step's gain.
+fn gain(step: i64) -> f32 {
+    if step <= 0 {
+        return 0.0;
+    }
+    let db = (VOLUME_DB_MIN + step.min(VOLUME_MAX) * VOLUME_DB_STEP) as f32 / 100.0;
+    10f32.powf(db / 20.0)
+}
 
 /// Where the card's sound goes (`--audio`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -674,22 +806,47 @@ const NULL_RATE: u32 = 48000;
 /// waking writers and drains.
 pub fn mix(out: &mut [f32], rate: u32) {
     out.fill(0.0);
-    let streams: Vec<Arc<Pcm>> = {
-        let mut s = CARD.streams.lock().unwrap();
-        s.retain(|w| w.strong_count() > 0);
-        s.iter().filter_map(Weak::upgrade).collect()
-    };
-    for p in streams {
+    for p in streams() {
         let mut s = p.stream.lock().unwrap();
-        if s.running() {
+        if !s.capture && s.running() {
             s.mix(out, rate);
             drop(s);
             p.wake.notify_all();
         }
     }
+    turn_down(out, *CARD.volume.lock().unwrap());
     for v in out.iter_mut() {
         *v = v.clamp(-1.0, 1.0);
     }
+}
+
+/// Applies the master volume (left, right) and switch to mixed frames.
+fn turn_down(out: &mut [f32], (volume, on): ([i64; 2], bool)) {
+    let gains = if on { [gain(volume[0]), gain(volume[1])] } else { [0.0; 2] };
+    for frame in out.chunks_exact_mut(2) {
+        frame[0] *= gains[0];
+        frame[1] *= gains[1];
+    }
+}
+
+/// Captures `input` (float stereo frames at `rate`, from the host's input
+/// or silence) into every running capture stream, waking readers.
+pub fn capture(input: &[f32], rate: u32) {
+    for p in streams() {
+        let mut s = p.stream.lock().unwrap();
+        if s.capture && s.state == STATE_RUNNING {
+            s.capture(input, rate);
+            drop(s);
+            p.wake.notify_all();
+        }
+    }
+}
+
+/// The card's open streams.
+fn streams() -> Vec<Arc<Pcm>> {
+    let mut s = CARD.streams.lock().unwrap();
+    s.retain(|w| w.strong_count() > 0);
+    s.iter().filter_map(Weak::upgrade).collect()
 }
 
 /// Starts the sink, when the first stream needs it.
@@ -699,39 +856,61 @@ fn start_sink() {
         if sink == Sink::Host && crate::audio_host::start() {
             return;
         }
-        std::thread::Builder::new()
-            .name("wasm-env audio".into())
-            .spawn(|| {
-                // (Ten milliseconds at a time, by the clock.)
-                let begun = Instant::now();
-                let mut done = 0u64;
-                let mut buf = Vec::new();
-                loop {
-                    std::thread::sleep(Duration::from_millis(5));
-                    let due = (begun.elapsed().as_secs_f64() * NULL_RATE as f64) as u64;
-                    if due > done {
-                        buf.resize(2 * (due - done) as usize, 0.0);
-                        mix(&mut buf, NULL_RATE);
-                        done = due;
-                    }
-                }
-            })
-            .expect("audio thread");
+        on_a_clock("wasm-env audio", |buf| mix(buf, NULL_RATE));
     });
+}
+
+/// Starts the source, when the first capture stream needs it: the host's
+/// default input, else silence on a clock of its own.
+fn start_source() {
+    CARD.listening.get_or_init(|| {
+        let sink = *SINK.get_or_init(|| Sink::Host);
+        if sink == Sink::Host && crate::audio_host::start_input() {
+            return;
+        }
+        on_a_clock("wasm-env audio in", |buf| {
+            buf.fill(0.0);
+            capture(buf, NULL_RATE);
+        });
+    });
+}
+
+/// Calls `f` on a thread of its own with float stereo frames at NULL_RATE,
+/// as many as have come due by the clock (a few milliseconds' at a time).
+fn on_a_clock(name: &str, f: fn(&mut [f32])) {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let begun = Instant::now();
+            let mut done = 0u64;
+            let mut buf = Vec::new();
+            loop {
+                std::thread::sleep(Duration::from_millis(5));
+                let due = (begun.elapsed().as_secs_f64() * NULL_RATE as f64) as u64;
+                if due > done {
+                    buf.resize(2 * (due - done) as usize, 0.0);
+                    f(&mut buf);
+                    done = due;
+                }
+            }
+        })
+        .expect("audio thread");
 }
 
 // ---- The devices ----
 
-/// The PCM device (`/dev/snd/pcmC0D0p`), one per open.
+/// A PCM device (`/dev/snd/pcmC0D0p`, playback, or `pcmC0D0c`, capture), one
+/// per open.
 pub struct Pcm {
     stream: Mutex<Stream>,
     wake: Condvar,
 }
 
 impl Pcm {
-    pub fn open() -> Arc<Pcm> {
+    pub fn open(capture: bool) -> Arc<Pcm> {
         let p = Arc::new(Pcm {
             stream: Mutex::new(Stream {
+                capture,
                 state: STATE_OPEN,
                 format: Format::S16,
                 channels: 2,
@@ -751,6 +930,7 @@ impl Pcm {
                 prev: [0.0; 2],
                 next: [0.0; 2],
                 record: None,
+                source: None,
                 area: None,
             }),
             wake: Condvar::new(),
@@ -764,12 +944,18 @@ impl Pcm {
         self.stream.lock().unwrap().area = Some((addr, len));
     }
 
-    /// For poll: room to write (as many frames as avail_min), or an error
-    /// state.
-    pub fn readiness(&self) -> (bool, bool) {
+    /// Which device it is.
+    pub fn device(&self) -> SoundDevice {
+        if self.stream.lock().unwrap().capture { SoundDevice::Capture } else { SoundDevice::Playback }
+    }
+
+    /// For poll: frames to read, room to write (as many as avail_min), or
+    /// an error state.
+    pub fn readiness(&self) -> (bool, bool, bool) {
         let s = self.stream.lock().unwrap();
         let err = s.state == STATE_XRUN || s.state == STATE_OPEN;
-        (s.state != STATE_OPEN && s.avail() >= s.avail_min as i64, err)
+        let ready = s.state != STATE_OPEN && s.avail() >= s.avail_min as i64;
+        (ready && s.capture, ready && !s.capture, err)
     }
 
     /// An ioctl: `interrupted` says when a wait should end (a signal).
@@ -779,7 +965,7 @@ impl Pcm {
             PCM_PVERSION => word(data, PCM_VERSION),
             PCM_INFO => {
                 let mut b = vec![0u8; PCM_INFO_SIZE];
-                pcm_info(&mut b);
+                pcm_info(&mut b, self.stream.lock().unwrap().capture);
                 mem::write(data, arg, &b).map(|_| 0)
             }
             PCM_TSTAMP | PCM_TTSTAMP | PCM_USER_PVERSION | PCM_LINK | PCM_UNLINK | PCM_HWSYNC => Ok(0),
@@ -827,7 +1013,7 @@ impl Pcm {
                 b[24..40].copy_from_slice(&now);
                 b[40..48].copy_from_slice(&s.appl.to_le_bytes());
                 b[48..56].copy_from_slice(&s.hw.to_le_bytes());
-                b[56..64].copy_from_slice(&s.hw_avail().max(0).to_le_bytes());
+                b[56..64].copy_from_slice(&s.filled().max(0).to_le_bytes());
                 b[64..72].copy_from_slice(&s.avail().max(0).to_le_bytes());
                 b[72..80].copy_from_slice(&s.avail().max(0).to_le_bytes());
                 b[112..128].copy_from_slice(&now);
@@ -838,7 +1024,7 @@ impl Pcm {
                 if s.state == STATE_XRUN {
                     return Err(EPIPE);
                 }
-                mem::write(data, arg, &s.hw_avail().to_le_bytes()).map(|_| 0)
+                mem::write(data, arg, &s.filled().to_le_bytes()).map(|_| 0)
             }
             PCM_SYNC_PTR => {
                 let mut b = mem::slice(data, arg, SYNC_PTR_SIZE as u64)?.to_vec();
@@ -848,7 +1034,11 @@ impl Pcm {
                 // ours.)
                 if flags & 2 == 0 {
                     let appl = u64::from_le_bytes(b[72..80].try_into().unwrap());
-                    if s.state != STATE_OPEN {
+                    if s.state != STATE_OPEN && s.capture {
+                        // (Frames the program read from its mapping: done
+                        // with.)
+                        s.appl = appl % s.boundary;
+                    } else if s.state != STATE_OPEN {
                         // (Frames the program committed in its mapping of
                         // the data: copied in.)
                         let appl = appl % s.boundary;
@@ -862,6 +1052,11 @@ impl Pcm {
                 if flags & 4 == 0 {
                     s.avail_min = u64::from_le_bytes(b[80..88].try_into().unwrap()).max(1);
                 }
+                // (Frames captured since: out to the program's mapping.)
+                if s.capture && s.state != STATE_OPEN {
+                    let n = s.filled().clamp(0, s.buffer_size as i64) as u64;
+                    s.copy_out(data, n)?;
+                }
                 b[8..12].copy_from_slice(&s.state.to_le_bytes());
                 b[16..24].copy_from_slice(&s.hw.to_le_bytes());
                 b[24..40].copy_from_slice(&timespec(Instant::now()));
@@ -869,7 +1064,6 @@ impl Pcm {
                 b[80..88].copy_from_slice(&s.avail_min.to_le_bytes());
                 mem::write(data, arg, &b).map(|_| 0)
             }
-            // (No mmap: libasound reads and writes through ioctls.)
             // Where a channel's samples are in the mapping: one area, the
             // frames interleaved or the channels one after another.
             PCM_CHANNEL_INFO => {
@@ -908,7 +1102,7 @@ impl Pcm {
                 }
                 // (Nothing to play: an underrun at once, so not started, as
                 // the kernel has it; the first write starts it.)
-                if s.hw_avail() <= 0 && s.stop_threshold < s.boundary {
+                if !s.capture && s.filled() <= 0 && s.stop_threshold < s.boundary {
                     return Err(EPIPE);
                 }
                 self.start(&mut s);
@@ -926,9 +1120,19 @@ impl Pcm {
             }
             PCM_DRAIN => {
                 let mut s = self.stream.lock().unwrap();
+                // (Capture stops at once; what it captured stays to read.)
+                if s.capture {
+                    if s.state == STATE_OPEN {
+                        return Err(EBADFD);
+                    }
+                    s.state = STATE_SETUP;
+                    drop(s);
+                    self.wake.notify_all();
+                    return Ok(0);
+                }
                 match s.state {
                     STATE_OPEN => return Err(EBADFD),
-                    STATE_PREPARED if s.hw_avail() > 0 => self.start(&mut s),
+                    STATE_PREPARED if s.filled() > 0 => self.start(&mut s),
                     STATE_PREPARED | STATE_SETUP | STATE_XRUN => {
                         s.state = STATE_SETUP;
                         return Ok(0);
@@ -965,11 +1169,16 @@ impl Pcm {
                 s.state = STATE_XRUN;
                 Ok(0)
             }
-            PCM_WRITEI | PCM_WRITEN => {
+            PCM_WRITEI | PCM_WRITEN | PCM_READI | PCM_READN => {
                 let x = mem::slice(data, arg, XFER_SIZE as u64)?.to_vec();
                 let buf = u64::from_le_bytes(x[8..16].try_into().unwrap());
                 let frames = u64::from_le_bytes(x[16..24].try_into().unwrap());
-                let n = self.write(data, buf, frames, req == PCM_WRITEN, nonblock, interrupted)?;
+                let reading = req == PCM_READI || req == PCM_READN;
+                if reading != self.stream.lock().unwrap().capture {
+                    return Err(EINVAL);
+                }
+                let separate = req == PCM_WRITEN || req == PCM_READN;
+                let n = self.transfer(data, buf, frames, separate, nonblock, interrupted)?;
                 let mut out = x;
                 out[0..8].copy_from_slice(&(n as i64).to_le_bytes());
                 mem::write(data, arg, &out).map(|_| 0)
@@ -1007,7 +1216,11 @@ impl Pcm {
         s.appl = 0;
         s.hw = 0;
         s.state = STATE_SETUP;
-        s.record = std::env::var_os("WASM_ENV_AUDIO_RECORD").and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+        if s.capture {
+            s.source = std::env::var_os("WASM_ENV_AUDIO_SOURCE").and_then(|p| std::fs::File::open(p).ok()).map(std::io::BufReader::new);
+        } else {
+            s.record = std::env::var_os("WASM_ENV_AUDIO_RECORD").and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+        }
         if std::env::var_os("WASM_ENV_DEBUG_AUDIO").is_some() {
             let access = (0..5).find(|&b| p.has(ACCESS, b)).unwrap_or(9);
             eprintln!("wasm-env: sound: access {access}, {:?}, {} channels, {} Hz, period {}, buffer {}", s.format, s.channels, s.rate, s.period_size, s.buffer_size);
@@ -1018,14 +1231,21 @@ impl Pcm {
     fn start(&self, s: &mut Stream) {
         s.state = STATE_RUNNING;
         s.trigger = Instant::now();
-        s.phase = 1.0;
-        start_sink();
+        if s.capture {
+            // (From silence: the first frame captured is before the input's.)
+            s.phase = 0.0;
+            s.next = [0.0; 2];
+            start_source();
+        } else {
+            s.phase = 1.0;
+            start_sink();
+        }
     }
 
-    /// `frames` frames from the program's memory at `buf` (interleaved, or
-    /// an array of per-channel pointers), waiting for room unless
-    /// `nonblock`; the frames written.
-    fn write(&self, data: &mut [u8], buf: u64, frames: u64, separate: bool, nonblock: bool, interrupted: &dyn Fn() -> bool) -> SysResult<u64> {
+    /// `frames` frames between the program's memory at `buf` (interleaved,
+    /// or an array of per-channel pointers) and the ring, written or read,
+    /// waiting for room or frames unless `nonblock`; how many.
+    fn transfer(&self, data: &mut [u8], buf: u64, frames: u64, separate: bool, nonblock: bool, interrupted: &dyn Fn() -> bool) -> SysResult<u64> {
         let mut s = self.stream.lock().unwrap();
         if separate == s.interleaved {
             return Err(EINVAL);
@@ -1044,8 +1264,12 @@ impl Pcm {
                 STATE_SETUP | STATE_OPEN | STATE_DRAINING => return if done > 0 { Ok(done) } else { Err(EBADFD) },
                 _ => return Err(EBADFD),
             }
-            let room = s.avail().max(0) as u64;
-            if room == 0 {
+            // (Reading starts capture.)
+            if s.capture && s.state == STATE_PREPARED {
+                self.start(&mut s);
+            }
+            let avail = s.avail().max(0) as u64;
+            if avail == 0 {
                 if nonblock {
                     return if done > 0 { Ok(done) } else { Err(EAGAIN) };
                 }
@@ -1059,32 +1283,41 @@ impl Pcm {
                 s = self.wake.wait_timeout(s, Duration::from_millis(20)).unwrap().0;
                 continue;
             }
-            let n = room.min(frames - done);
+            let n = avail.min(frames - done);
             let fb = s.frame_bytes();
             let sb = (s.format.bits() / 8) as usize;
             for k in 0..n {
                 let at = (s.appl % s.buffer_size) as usize;
                 if separate {
                     for (c, &p) in pointers.iter().enumerate() {
-                        let src = mem::slice(data, p + (done + k) * sb as u64, sb as u64)?;
+                        let addr = p + (done + k) * sb as u64;
                         let off = c * s.buffer_size as usize * sb + at * sb;
-                        s.ring[off..off + sb].copy_from_slice(src);
+                        if s.capture {
+                            mem::write(data, addr, &s.ring[off..off + sb])?;
+                        } else {
+                            let src = mem::slice(data, addr, sb as u64)?;
+                            s.ring[off..off + sb].copy_from_slice(src);
+                        }
                     }
                 } else {
-                    let src = mem::slice(data, buf + (done + k) * fb as u64, fb as u64)?;
-                    s.ring[at * fb..at * fb + fb].copy_from_slice(src);
+                    let addr = buf + (done + k) * fb as u64;
+                    if s.capture {
+                        mem::write(data, addr, &s.ring[at * fb..at * fb + fb])?;
+                    } else {
+                        let src = mem::slice(data, addr, fb as u64)?;
+                        s.ring[at * fb..at * fb + fb].copy_from_slice(src);
+                    }
                 }
                 s.appl = (s.appl + 1) % s.boundary;
             }
             done += n;
-            if s.state == STATE_PREPARED && s.hw_avail() as u64 >= s.start_threshold.max(1) {
+            if !s.capture && s.state == STATE_PREPARED && s.filled() as u64 >= s.start_threshold.max(1) {
                 self.start(&mut s);
             }
         }
         Ok(done)
     }
 }
-
 
 /// A timespec of an instant (since the runtime's start: a monotonic clock).
 fn timespec(t: Instant) -> [u8; 16] {
@@ -1096,8 +1329,9 @@ fn timespec(t: Instant) -> [u8; 16] {
     b
 }
 
-/// struct snd_pcm_info for the card's one PCM (playback).
-fn pcm_info(b: &mut [u8]) {
+/// struct snd_pcm_info for the card's one PCM, playback or capture.
+fn pcm_info(b: &mut [u8], capture: bool) {
+    b[8..12].copy_from_slice(&(capture as u32).to_le_bytes()); // stream
     b[12..16].copy_from_slice(&0i32.to_le_bytes()); // card
     let name = b"wasm-env";
     b[16..16 + name.len()].copy_from_slice(name); // id
@@ -1106,6 +1340,50 @@ fn pcm_info(b: &mut [u8]) {
     b[160..160 + sub.len()].copy_from_slice(sub); // subname
     b[200..204].copy_from_slice(&1u32.to_le_bytes()); // subdevices_count
     b[204..208].copy_from_slice(&1u32.to_le_bytes()); // subdevices_avail
+}
+
+/// A mixer control of the card's.
+struct Control {
+    numid: u32,
+    name: &'static str,
+    /// SNDRV_CTL_ELEM_TYPE_: 1 boolean, 2 integer.
+    kind: u32,
+    access: u32,
+    count: u32,
+    max: i64,
+}
+
+impl Control {
+    /// Its snd_ctl_elem_id.
+    fn id(&self) -> [u8; ELEM_ID_SIZE] {
+        let mut b = [0u8; ELEM_ID_SIZE];
+        b[0..4].copy_from_slice(&self.numid.to_le_bytes());
+        b[4..8].copy_from_slice(&2u32.to_le_bytes()); // SNDRV_CTL_ELEM_IFACE_MIXER
+        b[16..16 + self.name.len()].copy_from_slice(self.name.as_bytes());
+        b
+    }
+}
+
+/// The card's controls: its master volume (with a dB scale) and switch.
+static CONTROLS: [Control; 2] = [
+    Control { numid: 1, name: "Master Playback Volume", kind: 2, access: 0x3 | 0x10, count: 2, max: VOLUME_MAX },
+    Control { numid: 2, name: "Master Playback Switch", kind: 1, access: 0x3, count: 1, max: 1 },
+];
+
+/// The control an snd_ctl_elem_id names: by its numid, or (numid 0) by its
+/// interface, name and index.
+fn control(id: &[u8]) -> SysResult<&'static Control> {
+    let numid = u32::from_le_bytes(id[0..4].try_into().unwrap());
+    let found = if numid != 0 {
+        CONTROLS.iter().find(|c| c.numid == numid)
+    } else {
+        let name = &id[16..60];
+        let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())];
+        let iface = u32::from_le_bytes(id[4..8].try_into().unwrap());
+        let index = u32::from_le_bytes(id[60..64].try_into().unwrap());
+        CONTROLS.iter().find(|c| iface == 2 && index == 0 && c.name.as_bytes() == name)
+    };
+    found.ok_or(ENOENT)
 }
 
 /// The control device (`/dev/snd/controlC0`).
@@ -1124,10 +1402,68 @@ pub fn control_ioctl(data: &mut [u8], req: u32, arg: u64) -> SysResult<i64> {
             mem::write(data, arg, &b).map(|_| 0)
         }
         CTL_ELEM_LIST => {
-            // (No controls yet: none listed.)
             let mut b = mem::slice(data, arg, ELEM_LIST_SIZE as u64)?.to_vec();
-            b[8..16].fill(0); // used, count
+            let w = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            let (offset, space) = (w(&b, 0) as usize, w(&b, 4) as usize);
+            let pids = u64::from_le_bytes(b[16..24].try_into().unwrap());
+            let listed: Vec<&Control> = CONTROLS.iter().skip(offset).take(space).collect();
+            for (k, c) in listed.iter().enumerate() {
+                mem::write(data, pids + (k * ELEM_ID_SIZE) as u64, &c.id())?;
+            }
+            b[8..12].copy_from_slice(&(listed.len() as u32).to_le_bytes());
+            b[12..16].copy_from_slice(&(CONTROLS.len() as u32).to_le_bytes());
             mem::write(data, arg, &b).map(|_| 0)
+        }
+        CTL_ELEM_INFO => {
+            let mut b = mem::slice(data, arg, ELEM_INFO_SIZE as u64)?.to_vec();
+            let c = control(&b)?;
+            b[..ELEM_ID_SIZE].copy_from_slice(&c.id());
+            b[64..68].copy_from_slice(&c.kind.to_le_bytes());
+            b[68..72].copy_from_slice(&c.access.to_le_bytes());
+            b[72..76].copy_from_slice(&c.count.to_le_bytes());
+            b[76..80].copy_from_slice(&(-1i32).to_le_bytes()); // no owner
+            b[80..88].copy_from_slice(&0i64.to_le_bytes());
+            b[88..96].copy_from_slice(&c.max.to_le_bytes());
+            b[96..104].copy_from_slice(&1i64.to_le_bytes());
+            mem::write(data, arg, &b).map(|_| 0)
+        }
+        CTL_ELEM_READ | CTL_ELEM_WRITE => {
+            let mut b = mem::slice(data, arg, ELEM_VALUE_SIZE as u64)?.to_vec();
+            let c = control(&b)?;
+            b[..ELEM_ID_SIZE].copy_from_slice(&c.id());
+            let mut v = CARD.volume.lock().unwrap();
+            let value = |b: &[u8], k: usize| i64::from_le_bytes(b[72 + 8 * k..80 + 8 * k].try_into().unwrap());
+            if req == CTL_ELEM_WRITE {
+                let before = *v;
+                if c.numid == 1 {
+                    v.0 = [value(&b, 0).clamp(0, VOLUME_MAX), value(&b, 1).clamp(0, VOLUME_MAX)];
+                } else {
+                    v.1 = value(&b, 0) != 0;
+                }
+                // (1: changed; 0: as it was.)
+                return Ok((*v != before) as i64);
+            }
+            let values: Vec<i64> = if c.numid == 1 { v.0.to_vec() } else { vec![v.1 as i64] };
+            for (k, x) in values.iter().enumerate() {
+                b[72 + 8 * k..80 + 8 * k].copy_from_slice(&x.to_le_bytes());
+            }
+            mem::write(data, arg, &b).map(|_| 0)
+        }
+        CTL_TLV_READ => {
+            // The volume's dB scale (SNDRV_CTL_TLVT_DB_SCALE: its minimum,
+            // its step, and that the minimum is silence).
+            let head = mem::slice(data, arg, 8)?.to_vec();
+            let numid = u32::from_le_bytes(head[0..4].try_into().unwrap());
+            let room = u32::from_le_bytes(head[4..8].try_into().unwrap());
+            if numid != 1 {
+                return Err(ENXIO);
+            }
+            if room < 16 {
+                return Err(ENOMEM);
+            }
+            let tlv: [u32; 4] = [1, 8, VOLUME_DB_MIN as i32 as u32, VOLUME_DB_STEP as u32 | 0x10000];
+            let bytes: Vec<u8> = tlv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            mem::write(data, arg + 8, &bytes).map(|_| 0)
         }
         CTL_SUBSCRIBE_EVENTS | CTL_PCM_PREFER_SUBDEVICE => Ok(0),
         CTL_PCM_NEXT_DEVICE => {
@@ -1138,14 +1474,15 @@ pub fn control_ioctl(data: &mut [u8], req: u32, arg: u64) -> SysResult<i64> {
         CTL_PCM_INFO => {
             let mut b = mem::slice(data, arg, PCM_INFO_SIZE as u64)?.to_vec();
             let w = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
-            // (Device 0, subdevice 0, playback: the only one.)
+            // (Device 0, subdevice 0, playback or capture: the only one.)
             if w(0) != 0 || w(4) != 0 {
                 return Err(ENXIO);
             }
-            if w(8) != 0 {
+            if w(8) > 1 {
                 return Err(ENOENT);
             }
-            pcm_info(&mut b);
+            let capture = w(8) == 1;
+            pcm_info(&mut b, capture);
             mem::write(data, arg, &b).map(|_| 0)
         }
         CTL_POWER_STATE => int(data, 0),
@@ -1158,6 +1495,7 @@ pub fn device(name: &str) -> Option<SoundDevice> {
     match name {
         "controlC0" => Some(SoundDevice::Control),
         "pcmC0D0p" => Some(SoundDevice::Playback),
+        "pcmC0D0c" => Some(SoundDevice::Capture),
         _ => None,
     }
 }
@@ -1166,6 +1504,7 @@ pub fn device(name: &str) -> Option<SoundDevice> {
 pub enum SoundDevice {
     Control,
     Playback,
+    Capture,
 }
 
 impl SoundDevice {
@@ -1174,6 +1513,7 @@ impl SoundDevice {
         let minor = match self {
             SoundDevice::Control => 0,
             SoundDevice::Playback => 16,
+            SoundDevice::Capture => 24,
         };
         (116 << 8) | minor
     }
@@ -1261,7 +1601,7 @@ mod tests {
 
     #[test]
     fn a_stream_is_mixed_resampled() {
-        let pcm = Pcm::open();
+        let pcm = Pcm::open(false);
         let mut p = any();
         p.masks[FORMAT] = [0; 8];
         p.masks[FORMAT][0] = 1 << 2;
@@ -1284,5 +1624,55 @@ mod tests {
         // between silence and the first frame.)
         assert_eq!(s.hw, 50);
         assert!((out[198] - 0.5).abs() < 1e-6 && out[198] == out[199]);
+    }
+
+    #[test]
+    fn a_capture_stream_fills_resampled_and_overruns() {
+        let pcm = Pcm::open(true);
+        let mut p = any();
+        p.masks[FORMAT] = [0; 8];
+        p.masks[FORMAT][0] = 1 << 2;
+        set(&mut p, CHANNELS, 1);
+        set(&mut p, RATE, 24000);
+        p.choose().unwrap();
+        pcm.setup(&p).unwrap();
+        let mut s = pcm.stream.lock().unwrap();
+        // (Started as start starts it, without the host's input.)
+        s.state = STATE_RUNNING;
+        s.phase = 0.0;
+        // (Half scale in, at twice the rate: 100 frames in make 50, the
+        // first silence.)
+        s.capture(&[0.5f32; 2 * 100], 48000);
+        assert_eq!((s.hw, s.avail()), (50, 50));
+        assert_eq!(&s.ring[0..2], &0i16.to_le_bytes());
+        assert_eq!(&s.ring[2..4], &16384i16.to_le_bytes());
+        // Read half; then more than the ring holds: an overrun.
+        s.appl = 25;
+        assert_eq!(s.avail(), 25);
+        let more = vec![0.5f32; 4 * s.buffer_size as usize];
+        s.capture(&more, 48000);
+        assert_eq!((s.state, s.avail()), (STATE_XRUN, s.buffer_size as i64));
+    }
+
+    #[test]
+    fn the_volume_follows_its_db_scale() {
+        // Full volume leaves samples as they are; each step is 0.5 dB; the
+        // bottom is silence.
+        assert_eq!(gain(VOLUME_MAX), 1.0);
+        assert!((gain(VOLUME_MAX - 12) - 0.5).abs() < 0.01); // -6 dB
+        assert_eq!(gain(0), 0.0);
+        let mut out = [0.5f32; 4];
+        turn_down(&mut out, ([VOLUME_MAX, 0], true));
+        assert_eq!(out, [0.5, 0.0, 0.5, 0.0]);
+        turn_down(&mut out, ([VOLUME_MAX; 2], false));
+        assert_eq!(out, [0.0; 4]);
+        let mut id = [0u8; ELEM_ID_SIZE];
+        id[4] = 2;
+        id[16..38].copy_from_slice(b"Master Playback Switch");
+        assert_eq!(control(&id).unwrap().numid, 2);
+        id[0] = 1;
+        assert_eq!(control(&id).unwrap().numid, 1);
+        id[0] = 3;
+        assert_eq!(control(&id).err(), Some(ENOENT));
     }
 }

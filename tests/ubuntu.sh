@@ -363,6 +363,25 @@ if tests/ubuntu-fetch.sh alsa-utils >/dev/null 2>&1; then
 	played=$(cmp -n 176400 "$R/tmp/sound.raw" "$root/build/sound.raw" >/dev/null 2>&1 && echo same || echo different)
 	padding=$(tail -c +176401 "$root/build/sound.raw" 2>/dev/null | tr -d '\0' | wc -c)
 	compare "aplay through the runtime's sound card" "same, then silence" "$played$([ "$padding" = 0 ] && echo ", then silence")"
+	# Its mixer (amixer): the master volume, its dB scale, and its switch.
+	mixer=$(timeout 600 "$wasm_env" run --audio=null --root "$R" /bin/sh -c \
+		'amixer -q sset Master 50% mute && amixer cget numid=1 | tail -1 && amixer get Master | tail -1' 2>&1)
+	compare "amixer: volume and mute" "  | dBscale-min=-50.00dB,step=0.50dB,mute=1
+  Front Right: Playback 50 [50%] [-25.00dB] [off]" "$mixer"
+	# Capture (arecord), from a source in place of the host's input: half a
+	# second of it comes out byte for byte, read and memory-mapped, then
+	# silence.
+	head -c 88200 /dev/urandom >"$root/build/source.raw"
+	rm -f "$R/tmp/captured.raw" "$R/tmp/mapped.raw"
+	WASM_ENV_AUDIO_SOURCE="$root/build/source.raw" timeout 600 "$wasm_env" run --audio=null --root "$R" /bin/sh -c \
+		'arecord -q -t raw -f S16_LE -r 44100 -c 2 -d 1 /tmp/captured.raw &&
+		arecord -q -M -D hw:0 -t raw -f S16_LE -r 44100 -c 2 -d 1 /tmp/mapped.raw' >/dev/null 2>&1
+	for f in captured mapped; do
+		got=$(cmp -n 88200 "$root/build/source.raw" "$R/tmp/$f.raw" >/dev/null 2>&1 && echo same || echo different)
+		rest=$(tail -c +88201 "$R/tmp/$f.raw" 2>/dev/null | tr -d '\0' | wc -c)
+		size=$(wc -c <"$R/tmp/$f.raw" 2>/dev/null)
+		compare "arecord ($f)" "same, then silence" "$got$([ "$rest" = 0 ] && [ "${size:-0}" = 176400 ] && echo ", then silence")"
+	done
 else
 	echo "skipped audio: can't fetch alsa-utils (offline?)"
 fi

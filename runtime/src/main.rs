@@ -18,9 +18,10 @@
 //!          host (headless if it has no window system). =headless: no
 //!          windows (tests); =host: the host's own compositor instead
 //!          (Linux hosts running Wayland)
-//! --audio=null  the sound card (/dev/snd) plays to no device: its streams
-//!          run on a clock of the runtime's (tests; also where the host has
-//!          no audio output). By default it plays on the host's output.
+//! --audio=null  the sound card (/dev/snd) plays to no device and captures
+//!          silence: its streams run on a clock of the runtime's (tests;
+//!          also where the host has no audio). By default it plays on the
+//!          host's output and captures from its input.
 
 // (wgpu's types nest deeply enough for the Send and Sync checks of the
 // threads that hold them.)

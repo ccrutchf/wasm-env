@@ -702,11 +702,12 @@ impl Process {
                         revents[k] = events & ((if r { POLLIN } else { 0 }) | (if w { POLLOUT } else { 0 }));
                     }
                     Open::Inotify(i) => revents[k] = if i.readable() { events & POLLIN } else { 0 },
-                    // (A PCM: room for avail_min frames, or a stream stopped.)
+                    // (A PCM: avail_min frames to read or room for them, or
+                    // a stream stopped.)
                     Open::Sound(p) => {
                         fine = true;
-                        let (room, err) = p.readiness();
-                        revents[k] = (if room { events & POLLOUT } else { 0 }) | if err { POLLERR } else { 0 };
+                        let (frames, room, err) = p.readiness();
+                        revents[k] = (if frames { events & POLLIN } else { 0 }) | (if room { events & POLLOUT } else { 0 }) | if err { POLLERR } else { 0 };
                     }
                     // (An epoll instance inside another isn't modelled: never ready.)
                     Open::Epoll(_) => {}
