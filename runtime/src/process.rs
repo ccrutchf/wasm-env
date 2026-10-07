@@ -59,8 +59,51 @@ pub struct Inherit {
 
 impl Inherit {
     pub fn initial() -> Self {
-        Inherit { fds: FdTable::with_stdio(), cwd: "/".into(), umask: 0o022, ignored: 0, creds: Creds::default(), sigmask: 0 }
+        Inherit { fds: FdTable::with_stdio(), cwd: "/".into(), umask: 0o022, ignored: host_ignored(), creds: Creds::default(), sigmask: 0 }
     }
+}
+
+/// The signals the host process was started with ignored, as Linux's
+/// numbers: a program started with them ignored (`trap '' INT`, `nohup`, a
+/// shell's background job) keeps them so, as across an exec. (Not SIGPIPE:
+/// Rust's startup ignores it before main, so the host's is unknown.)
+#[cfg(unix)]
+pub fn host_ignored() -> u64 {
+    // (Host signals by name, and Linux's number for each.)
+    let signals = [
+        (libc::SIGHUP, 1),
+        (libc::SIGINT, 2),
+        (libc::SIGQUIT, 3),
+        (libc::SIGUSR1, 10),
+        (libc::SIGUSR2, 12),
+        (libc::SIGALRM, 14),
+        (libc::SIGTERM, 15),
+        (libc::SIGTSTP, 20),
+        (libc::SIGTTIN, 21),
+        (libc::SIGTTOU, 22),
+        (libc::SIGURG, 23),
+        (libc::SIGXCPU, 24),
+        (libc::SIGXFSZ, 25),
+        (libc::SIGVTALRM, 26),
+        (libc::SIGPROF, 27),
+        (libc::SIGWINCH, 28),
+    ];
+    static IGNORED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *IGNORED.get_or_init(|| {
+        let mut m = 0u64;
+        for (host, linux) in signals {
+            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+            if unsafe { libc::sigaction(host, std::ptr::null(), &mut old) } == 0 && old.sa_sigaction == libc::SIG_IGN {
+                m |= 1 << linux;
+            }
+        }
+        m
+    })
+}
+
+#[cfg(not(unix))]
+pub fn host_ignored() -> u64 {
+    0
 }
 /// A process's signal dispositions: the raw `struct k_sigaction` (handler,
 /// flags, restorer, mask) set for each signal. A handle, shared by the

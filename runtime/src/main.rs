@@ -146,6 +146,9 @@ fn host_wayland() -> Result<PathBuf> {
 }
 
 fn main() -> Result<()> {
+    // (The signals the host started us with ignored, before the runtime
+    // sets any of its own: see process::host_ignored.)
+    let _ = process::host_ignored();
     let mut args = std::env::args().skip(1);
     let mut args: Box<dyn Iterator<Item = String>> = match args.next().as_deref() {
         Some("run") => Box::new(args),

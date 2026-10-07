@@ -100,6 +100,10 @@ t /usr/bin/python3.12 /root/threads_demo.py
 # Python signal handlers, KeyboardInterrupt, a handler ending a blocking read, setitimer.
 cp tests/python/signals_demo.py "$R/root/"
 t /usr/bin/python3.12 -u /root/signals_demo.py
+# A signal ignored when the program starts (a shell's `trap ''`, nohup)
+# stays ignored, as across an exec: Python leaves its handler out.
+ignored='import signal; print(signal.getsignal(signal.SIGINT))'
+compare "SIGINT ignored at the start" "$(trap '' INT; q /usr/bin/python3.12 -c "$ignored")" "$(trap '' INT; w /usr/bin/python3.12 -c "$ignored")"
 
 # PyTorch's CPU wheel (from PyTorch's index, not PyPI) and its pure-Python
 # dependencies: a small model's forward pass, training steps and linear
