@@ -567,6 +567,19 @@ struct Stream {
     /// The program's mapping of the data (memory-mapped access): its
     /// address and length, which committed frames are copied from.
     area: Option<(u64, u64)>,
+    /// A stream of the runtime's own PulseAudio server's (pulse.rs) rather
+    /// than a program's PCM: full, it drops what it captures; it has a
+    /// volume of its own (left, right gains); and it counts its underruns.
+    /// Run dry, it waits to be filled to its start threshold again if it
+    /// `refills` (PulseAudio's prebuffering), else runs on through silence
+    /// (frames written for the time it passed are dropped), as PulseAudio's
+    /// streams without prebuffering do.
+    held: bool,
+    refills: bool,
+    dry: bool,
+    gain: [f32; 2],
+    underruns: u64,
+    overruns: u64,
 }
 
 impl Stream {
@@ -587,6 +600,38 @@ impl Stream {
     }
     fn running(&self) -> bool {
         self.state == STATE_RUNNING || self.state == STATE_DRAINING
+    }
+    /// Set up (`period` and `buffer` in frames): an empty ring, the
+    /// kernel's defaults for the rest.
+    fn configure(&mut self, format: Format, interleaved: bool, channels: u32, rate: u32, period: u64, buffer: u64) {
+        self.format = format;
+        self.interleaved = interleaved;
+        self.channels = channels as usize;
+        self.rate = rate;
+        self.period_size = period;
+        self.buffer_size = buffer;
+        // (The kernel's boundary: the buffer size doubled while it fits.)
+        let mut boundary = self.buffer_size;
+        while boundary * 2 <= (i64::MAX as u64) / 2 - self.buffer_size {
+            boundary *= 2;
+        }
+        self.boundary = boundary;
+        self.avail_min = self.period_size;
+        self.start_threshold = 1;
+        self.stop_threshold = self.buffer_size;
+        self.ring = vec![0; self.buffer_size as usize * self.frame_bytes()];
+        self.appl = 0;
+        self.hw = 0;
+        self.state = STATE_SETUP;
+        if self.capture {
+            self.source = std::env::var_os("WASM_ENV_AUDIO_SOURCE").and_then(|p| std::fs::File::open(p).ok()).map(std::io::BufReader::new);
+        } else {
+            self.record = std::env::var_os("WASM_ENV_AUDIO_RECORD").and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+        }
+        if std::env::var_os("WASM_ENV_DEBUG_AUDIO").is_some() {
+            let way = if self.capture { "capture" } else { "playback" };
+            eprintln!("wasm-env: sound: {way}, {:?}, {} channels, {} Hz, period {}, buffer {}", self.format, self.channels, self.rate, self.period_size, self.buffer_size);
+        }
     }
     /// The `n` frames after the program's pointer, from its mapping of the
     /// data (laid out as the ring is) into the ring.
@@ -658,7 +703,7 @@ impl Stream {
             let _ = f.write_all(&bytes);
         }
         self.hw = (self.hw + 1) % self.boundary;
-        Some([l, r])
+        Some([l * self.gain[0], r * self.gain[1]])
     }
     /// Adds `out.len() / 2` frames of float stereo at `rate` into `out`.
     fn mix(&mut self, out: &mut [f32], rate: u32) {
@@ -667,7 +712,10 @@ impl Stream {
             while self.phase >= 1.0 {
                 self.prev = self.next;
                 match self.take() {
-                    Some(f) => self.next = f,
+                    Some(f) => {
+                        self.next = f;
+                        self.dry = false;
+                    }
                     None => {
                         // Nothing left: drained, or an underrun (the
                         // hardware runs on, through silence, until the
@@ -675,6 +723,20 @@ impl Stream {
                         if self.state == STATE_DRAINING {
                             self.state = STATE_SETUP;
                             return;
+                        }
+                        // (A server's stream: an underrun counted once; it
+                        // waits to be filled again, or runs on.)
+                        if self.held {
+                            if !self.dry {
+                                self.dry = true;
+                                self.underruns += 1;
+                            }
+                            if self.refills {
+                                self.state = STATE_PREPARED;
+                                self.phase = 1.0;
+                                self.next = [0.0; 2];
+                                return;
+                            }
                         }
                         self.next = [0.0; 2];
                         self.hw = (self.hw + 1) % self.boundary;
@@ -714,6 +776,12 @@ impl Stream {
     /// One captured frame into the ring (or the source's, if there is
     /// one): an overrun once as many as the stop threshold wait.
     fn put(&mut self, [l, r]: [f32; 2]) {
+        // (A server's stream, full: what it captures is dropped.)
+        if self.held && self.avail() >= self.buffer_size as i64 {
+            self.overruns += 1;
+            return;
+        }
+        let (l, r) = (l * self.gain[0], r * self.gain[1]);
         let fb = self.frame_bytes();
         let sb = (self.format.bits() / 8) as usize;
         let mut frame = vec![0u8; fb];
@@ -932,6 +1000,12 @@ impl Pcm {
                 record: None,
                 source: None,
                 area: None,
+                held: false,
+                refills: true,
+                dry: false,
+                gain: [1.0; 2],
+                underruns: 0,
+                overruns: 0,
             }),
             wake: Condvar::new(),
         });
@@ -1197,34 +1271,7 @@ impl Pcm {
         if s.running() {
             return Err(EBADFD);
         }
-        s.format = format;
-        s.interleaved = interleaved;
-        s.channels = channels as usize;
-        s.rate = rate;
-        s.period_size = period as u64;
-        s.buffer_size = buffer as u64;
-        // (The kernel's boundary: the buffer size doubled while it fits.)
-        let mut boundary = s.buffer_size;
-        while boundary * 2 <= (i64::MAX as u64) / 2 - s.buffer_size {
-            boundary *= 2;
-        }
-        s.boundary = boundary;
-        s.avail_min = s.period_size;
-        s.start_threshold = 1;
-        s.stop_threshold = s.buffer_size;
-        s.ring = vec![0; s.buffer_size as usize * s.frame_bytes()];
-        s.appl = 0;
-        s.hw = 0;
-        s.state = STATE_SETUP;
-        if s.capture {
-            s.source = std::env::var_os("WASM_ENV_AUDIO_SOURCE").and_then(|p| std::fs::File::open(p).ok()).map(std::io::BufReader::new);
-        } else {
-            s.record = std::env::var_os("WASM_ENV_AUDIO_RECORD").and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
-        }
-        if std::env::var_os("WASM_ENV_DEBUG_AUDIO").is_some() {
-            let access = (0..5).find(|&b| p.has(ACCESS, b)).unwrap_or(9);
-            eprintln!("wasm-env: sound: access {access}, {:?}, {} channels, {} Hz, period {}, buffer {}", s.format, s.channels, s.rate, s.period_size, s.buffer_size);
-        }
+        s.configure(format, interleaved, channels, rate, period as u64, buffer as u64);
         Ok(())
     }
 
@@ -1316,6 +1363,184 @@ impl Pcm {
             }
         }
         Ok(done)
+    }
+}
+
+// ---- For the runtime's PulseAudio server (pulse.rs) ----
+
+/// The sample formats a server's stream takes (the card's own).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sample {
+    U8,
+    S16,
+    S32,
+    F32,
+}
+
+/// Where a server's stream is.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Position {
+    /// Frames in the ring: written and not yet played (negative: run on
+    /// past what was written), or captured and not yet read.
+    pub filled: i64,
+    /// Playing (or capturing), and not waiting to be filled.
+    pub running: bool,
+    /// Draining, and not yet drained.
+    pub draining: bool,
+    pub underruns: u64,
+}
+
+impl Pcm {
+    /// A stream of the server's: `channels` (one or two) interleaved
+    /// samples at `rate`, a ring of `buffer` frames, playback starting once
+    /// `start` frames are written (capture at once).
+    pub fn server(capture: bool, sample: Sample, channels: u32, rate: u32, buffer: u64, start: u64) -> Arc<Pcm> {
+        let p = Pcm::open(capture);
+        {
+            let mut s = p.stream.lock().unwrap();
+            let format = match sample {
+                Sample::U8 => Format::U8,
+                Sample::S16 => Format::S16,
+                Sample::S32 => Format::S32,
+                Sample::F32 => Format::F32,
+            };
+            s.configure(format, true, channels, rate.clamp(RATES.0, RATES.1), (buffer / 4).max(1), buffer.max(2));
+            s.held = true;
+            s.start_threshold = start.clamp(1, s.buffer_size);
+            s.refills = start > 0;
+            s.stop_threshold = s.boundary;
+            s.state = STATE_PREPARED;
+            if capture {
+                p.start(&mut s);
+            }
+        }
+        p
+    }
+
+    /// Frames at the end of the ring, from `bytes` (whole frames, as many
+    /// as there's room for): how many bytes it took. Playback starts at its
+    /// start threshold (unless paused).
+    pub fn put(&self, bytes: &[u8]) -> usize {
+        let mut s = self.stream.lock().unwrap();
+        if s.state == STATE_SETUP {
+            s.state = STATE_PREPARED;
+        }
+        let fb = s.frame_bytes();
+        let frames = bytes.len() / fb;
+        // (Frames for the time a stream ran on through: passed, dropped.)
+        let late = ((-s.filled()).max(0) as usize).min(frames);
+        s.appl = (s.appl + late as u64) % s.boundary;
+        let n = (frames - late).min(s.avail().max(0) as usize);
+        for k in late..late + n {
+            let at = (s.appl % s.buffer_size) as usize;
+            s.ring[at * fb..(at + 1) * fb].copy_from_slice(&bytes[k * fb..(k + 1) * fb]);
+            s.appl = (s.appl + 1) % s.boundary;
+        }
+        if s.state == STATE_PREPARED && s.filled() > 0 && s.filled() as u64 >= s.start_threshold {
+            self.start(&mut s);
+        }
+        (late + n) * fb
+    }
+
+    /// Captured frames, up to `max` bytes (whole frames), out of the ring.
+    pub fn get(&self, max: usize) -> Vec<u8> {
+        let mut s = self.stream.lock().unwrap();
+        let fb = s.frame_bytes();
+        let n = (max / fb).min(s.avail().max(0) as usize);
+        let mut out = Vec::with_capacity(n * fb);
+        for _ in 0..n {
+            let at = (s.appl % s.buffer_size) as usize;
+            out.extend_from_slice(&s.ring[at * fb..(at + 1) * fb]);
+            s.appl = (s.appl + 1) % s.boundary;
+        }
+        out
+    }
+
+    pub fn position(&self) -> Position {
+        let s = self.stream.lock().unwrap();
+        Position {
+            filled: s.filled(),
+            running: s.running(),
+            draining: s.state == STATE_DRAINING,
+            underruns: s.underruns,
+        }
+    }
+
+    /// Its own volume: left and right gains.
+    pub fn set_gain(&self, gain: [f32; 2]) {
+        self.stream.lock().unwrap().gain = gain;
+    }
+
+    /// How many frames playback waits for before it starts.
+    pub fn set_start(&self, frames: u64) {
+        let mut s = self.stream.lock().unwrap();
+        s.start_threshold = frames.clamp(1, s.buffer_size);
+        s.refills = frames > 0;
+    }
+
+    /// Paused (corked) or not. Unpaused, playback runs if it's filled to
+    /// its start threshold, else waits to be.
+    pub fn pause(&self, on: bool) {
+        let mut s = self.stream.lock().unwrap();
+        if on {
+            if s.state != STATE_SETUP {
+                s.state = STATE_PAUSED;
+            }
+        } else if s.state == STATE_PAUSED {
+            s.state = STATE_PREPARED;
+            if s.capture || (s.filled() > 0 && s.filled() as u64 >= s.start_threshold) {
+                self.start(&mut s);
+            }
+        }
+    }
+
+    /// Everything in the ring dropped.
+    pub fn flush(&self) {
+        let mut s = self.stream.lock().unwrap();
+        s.appl = s.hw;
+        if !s.capture && s.state == STATE_RUNNING {
+            s.state = STATE_PREPARED;
+        }
+    }
+
+    /// Playback started now, whatever is in it (if it isn't paused).
+    pub fn trigger(&self) {
+        let mut s = self.stream.lock().unwrap();
+        if s.state == STATE_PREPARED && s.filled() > 0 {
+            self.start(&mut s);
+        }
+    }
+
+    /// Playback plays what it has and stops (position().draining until it
+    /// has).
+    pub fn drain(&self) {
+        let mut s = self.stream.lock().unwrap();
+        if s.filled() <= 0 {
+            s.state = STATE_SETUP;
+            return;
+        }
+        if s.state == STATE_PREPARED {
+            self.start(&mut s);
+        }
+        if s.state == STATE_RUNNING {
+            s.state = STATE_DRAINING;
+        }
+    }
+}
+
+/// The master volume (left, right: 0 to 100, half-decibel steps from
+/// -50 dB) and switch.
+pub fn master() -> ([i64; 2], bool) {
+    *CARD.volume.lock().unwrap()
+}
+
+pub fn set_master(volume: Option<[i64; 2]>, on: Option<bool>) {
+    let mut v = CARD.volume.lock().unwrap();
+    if let Some(volume) = volume {
+        v.0 = volume.map(|x| x.clamp(0, VOLUME_MAX));
+    }
+    if let Some(on) = on {
+        v.1 = on;
     }
 }
 

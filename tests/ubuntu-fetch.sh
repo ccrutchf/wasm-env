@@ -30,11 +30,13 @@ fi
 [ $# -gt 0 ] || exit 0
 
 # Package indexes: noble-updates first (newer versions win), then noble.
+# noble-updates' again after a day: the mirror drops the versions it
+# replaces.
 indexes=()
 for suite in noble-updates noble; do
 	for comp in main universe; do
 		f=$cache/Packages-$suite-$comp
-		if [ ! -e "$f" ]; then
+		if [ ! -e "$f" ] || { [ $suite = noble-updates ] && [ -n "$(find "$f" -mtime +0)" ]; }; then
 			curl -sSfL "$mirror/dists/$suite/$comp/binary-arm64/Packages.xz" | xz -d >"$f.part"
 			mv "$f.part" "$f"
 		fi

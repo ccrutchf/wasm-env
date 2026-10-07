@@ -308,9 +308,11 @@ fn mmap(caller: &mut Caller<'_, Process>, args: &[i64; 6]) -> SysResult<i64> {
         };
         (addr, mm.space.top.max(addr + len))
     };
-    // Executable anonymous memory is where a JIT puts its code; a new
-    // mapping replaces whatever code was translated from the old one.
-    let exec = prot & PROT_EXEC != 0 && flags & MAP_ANONYMOUS != 0;
+    // Executable anonymous memory is where a JIT puts its code, and so is a
+    // shared mapping of a file, executable, that it writes through another
+    // (ORC's, for W^X: libraries are private mappings, and the loader's);
+    // a new mapping replaces whatever code was translated from the old one.
+    let exec = prot & PROT_EXEC != 0 && (flags & MAP_ANONYMOUS != 0 || shared_asked);
     caller.data().group.mm.lock().unwrap().set_code(addr, addr + len, exec);
     crate::modules::retire_code(&caller.data().group, addr, addr + len);
     grow_to(caller, top)?;

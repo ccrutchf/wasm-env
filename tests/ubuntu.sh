@@ -386,6 +386,39 @@ else
 	echo "skipped audio: can't fetch alsa-utils (offline?)"
 fi
 
+# PulseAudio (M11): the runtime's own server, on the sound card, for
+# programs that speak PulseAudio (libpulse): its sink and source, its
+# volume the card's master volume, paplay byte for byte, parecord from a
+# source, and GStreamer's pulsesink (through ORC's JIT) to the end.
+if tests/ubuntu-fetch.sh pulseaudio-utils alsa-utils gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-pulseaudio >/dev/null 2>&1; then
+	info=$(timeout 600 "$wasm_env" run --audio=null --root "$R" /bin/sh -c \
+		'pactl info | grep -E "^(Server Protocol Version|Default Sink|Default Source)" &&
+		pactl set-sink-volume @DEFAULT_SINK@ 50% && amixer get Master | tail -1' 2>&1)
+	compare "pactl: the server" "Server Protocol Version: 35
+Default Sink: wasm-env-output
+Default Source: wasm-env-input
+  Front Right: Playback 64 [64%] [-18.00dB] [on]" "$info"
+	rm -f "$root/build/sound.raw"
+	WASM_ENV_AUDIO_RECORD="$root/build/sound.raw" timeout 600 "$wasm_env" run --audio=null --root "$R" \
+		/usr/bin/paplay --raw --format=s16le --rate=44100 --channels=2 /tmp/sound.raw >/dev/null 2>&1
+	compare "paplay through the server" same "$(cmp "$R/tmp/sound.raw" "$root/build/sound.raw" >/dev/null 2>&1 && echo same || echo different)"
+	rm -f "$R/tmp/recorded.raw"
+	WASM_ENV_AUDIO_SOURCE="$root/build/source.raw" timeout 600 "$wasm_env" run --audio=null --root "$R" /bin/sh -c \
+		'timeout -s INT 2 parecord --raw --format=s16le --rate=44100 --channels=2 /tmp/recorded.raw' >/dev/null 2>&1
+	compare "parecord through the server" same "$(cmp -n 88200 "$root/build/source.raw" "$R/tmp/recorded.raw" >/dev/null 2>&1 && echo same || echo different)"
+	rm -f "$root/build/sound.raw"
+	gst=$(WASM_ENV_AUDIO_RECORD="$root/build/sound.raw" timeout 600 "$wasm_env" run --audio=null --root "$R" /usr/bin/gst-launch-1.0 -q \
+		audiotestsrc num-buffers=100 ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! pulsesink 2>&1; echo "[$?]")
+	# (Played to the end, and most of it heard: a stream without
+	# prebuffering runs on through an underrun, as PulseAudio's do, and
+	# what comes too late for it is dropped, so how much depends on the
+	# machine's load.)
+	played=$(wc -c <"$root/build/sound.raw" 2>/dev/null || echo 0)
+	compare "GStreamer's pulsesink" "[0] most" "$gst $([ "$played" -ge 327680 ] && [ "$played" -le 409600 ] && echo most || echo "$played bytes")"
+else
+	echo "skipped PulseAudio: can't fetch its packages (offline?)"
+fi
+
 # Networking, if PyPI is reachable: DNS (glibc's resolver, over the host's
 # resolv.conf), HTTPS (Ubuntu's OpenSSL with its CA certificates), and pip
 # installing a package from PyPI. Ubuntu's ca-certificates package builds

@@ -51,6 +51,7 @@ mod terminal;
 mod thread;
 mod translate;
 mod unix;
+mod pulse;
 mod wayland;
 
 use std::path::PathBuf;
@@ -262,6 +263,8 @@ fn main() -> Result<()> {
             let _ = std::fs::File::create(kernel.root.join(wayland::SOCKET.trim_start_matches('/')));
         }
     }
+    // The PulseAudio server, on the sound card.
+    pulse::start(&kernel.unix, &kernel.root);
     let pid = kernel.create(0);
     let terminal = terminal::Terminal::take(kernel.clone());
     // wasmtime runs guest code on the host stack, so give it room.
