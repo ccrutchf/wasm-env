@@ -357,6 +357,9 @@ pub fn translate_code(mut store: impl AsContextMut<Data = Process>, pc: u64, obj
         return Err(ENOEXEC);
     }
     let started = std::time::Instant::now();
+    // (Code a JIT wrote through another mapping of its file, where shared
+    // mappings are copies.)
+    crate::shared::bring_over(&group, lo, hi);
     let bytes = crate::memory::slice(crate::syscall::shared_bytes(&threading.memory), lo, hi - lo)?.to_vec();
     // In this process, from pc alone: the module chains to the older code
     // on its pages (an address it has no block for goes on to the older

@@ -13,4 +13,6 @@ pollster = "0.4"
 naga = { version = "30", features = ["spv-in", "wgsl-out"] }
 
 [dev-dependencies]
+# (Correctly rounded references: MinGW's fma isn't.)
+libm = "0.2"
 naga = { version = "30", features = ["wgsl-in", "spv-out"] }

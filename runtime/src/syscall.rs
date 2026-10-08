@@ -1139,6 +1139,25 @@ impl Process {
             nr::UMASK => Ok(std::mem::replace(&mut self.umask, (a & 0o777) as u32) as i64),
             // Shared mappings are the files' own pages: nothing to write back.
             nr::MSYNC => Ok(0),
+            // (Windows: a temporary file, deleted when it's closed.)
+            #[cfg(windows)]
+            nr::MEMFD_CREATE => {
+                use std::os::windows::fs::OpenOptionsExt;
+                const MFD_CLOEXEC: i64 = 1;
+                const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+                let name = mem::cstr(data, ua)?;
+                let host = std::env::temp_dir().join(format!("wasm-env-memfd-{}", crate::translate::unique()));
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                    .open(&host)
+                    .map_err(|e| fs::errno(&e))?;
+                let open = Open::File { file, path: format!("/memfd:{name}"), append: false };
+                let fd = Fd { open: std::sync::Arc::new(std::sync::Mutex::new(open)), cloexec: b & MFD_CLOEXEC != 0, flags: 2 };
+                self.fds.insert(fd, 0)
+            }
             #[cfg(unix)]
             nr::MEMFD_CREATE => {
                 const MFD_CLOEXEC: i64 = 1;
@@ -1751,12 +1770,12 @@ impl Process {
         let open = self.fds.get(fd)?.open.clone();
         let open = open.lock().unwrap();
         match &*open {
-            Open::File { file, .. } => file.metadata().map(|m| fs::stat_bytes(&m)).map_err(|e| fs::errno(&e)),
+            Open::File { file, path, .. } => file.metadata().map(|m| fs::stat_bytes_of(&m, path)).map_err(|e| fs::errno(&e)),
             Open::Dir { path, .. } => {
                 if let Some(DevPath::SyntheticDir(p, _)) = self.fs.device("/", path) {
                     return Ok(fs::synthetic_dir_stat_bytes(&p));
                 }
-                std::fs::metadata(self.fs.host(path)).map(|m| fs::stat_bytes(&m)).map_err(|e| fs::errno(&e))
+                std::fs::metadata(self.fs.host(path)).map(|m| fs::stat_bytes_of(&m, path)).map_err(|e| fs::errno(&e))
             }
             Open::Pipe(_) => Ok(fs::fifo_stat_bytes()),
             Open::Device(d) => Ok(fs::device_stat_bytes(*d)),
@@ -1818,7 +1837,7 @@ impl Process {
         let guest = self.fs.resolve(&dir, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
         let host = self.fs.host(&guest);
         let meta = std::fs::symlink_metadata(&host).map_err(|e| fs::errno(&e))?;
-        let mut st = fs::stat_bytes(&meta);
+        let mut st = fs::stat_bytes_of(&meta, &guest);
         // A link file (Windows hosts: fs::links): a symlink, as long as its target.
         if !meta.file_type().is_symlink() && fs::links::is_link(&host, &meta) {
             const S_IFLNK: u32 = 0o120000;

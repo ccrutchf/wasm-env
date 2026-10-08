@@ -135,6 +135,10 @@ pub(crate) fn test_clang() -> Compiler {
     let clang = std::env::var_os("WASM_CC").map_or_else(|| "clang".into(), Into::into);
     // (The builtins too, if packages/libclc/build.sh has built them.)
     let builtins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../build/libclc/clspv--.bc");
+    // (Built on Linux and run under Wine, tests/cross.sh: the path is
+    // Linux's, Wine's Z: drive to Windows' clang.)
+    #[cfg(windows)]
+    let builtins = if builtins.starts_with("/") { std::path::PathBuf::from(format!("Z:{}", builtins.display())) } else { builtins };
     Compiler { clang, builtins: builtins.exists().then_some(builtins) }
 }
 

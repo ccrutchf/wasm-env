@@ -3439,6 +3439,7 @@ dependencies = [
 name = "wasm-env-gpu"
 version = "0.1.0"
 dependencies = [
+ "libm",
  "naga",
  "pollster",
  "wgpu",

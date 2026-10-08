@@ -1172,7 +1172,7 @@ __kernel void k(__global uint *a, __global uchar *b, __global int *c, __global u
         let out = run_wgsl(g, &code, &input, cases.len(), cases.len() as u32);
         let mut failures = Vec::new();
         for (&[a, b, c], &r) in cases.iter().zip(&out) {
-            let want = a.mul_add(b, c);
+            let want = libm::fmaf(a, b, c);
             let got = f32::from_bits(r);
             if !(r == want.to_bits() || (got.is_nan() && want.is_nan())) && failures.len() < 20 {
                 failures.push(format!("fma({a:e}, {b:e}, {c:e}): got {got:e} ({r:#x}), want {want:e} ({:#x})", want.to_bits()));
@@ -1247,7 +1247,7 @@ __kernel void k(__global uint *a, __global uchar *b, __global int *c, __global u
                 (a - b).to_bits(),
                 (a * b).to_bits(),
                 (a / b).to_bits(),
-                a.mul_add(b, c).to_bits(),
+                libm::fma(a, b, c).to_bits(),
                 a.sqrt().to_bits(),
                 a.min(b).to_bits(),
                 a.max(b).to_bits(),
@@ -1532,7 +1532,7 @@ __kernel void k(__global const float *a, __global const half *hs, __global float
         let mut bad = Vec::new();
         for i in 0..n {
             let (x, y) = (h(a[2 * i]), h(a[2 * i + 1]));
-            let want = [h(x + y), h(x * y), h(x / y), h(x.abs().sqrt()), h(x.mul_add(y, 1.0)), nearest_half_value(hs[i]), x as i32 as f32, h(x.sin())];
+            let want = [h(x + y), h(x * y), h(x / y), h(x.abs().sqrt()), h(libm::fmaf(x, y, 1.0)), nearest_half_value(hs[i]), x as i32 as f32, h(x.sin())];
             for (k, &w) in want.iter().enumerate() {
                 let got = o[i * 8 + k];
                 // (sin from libclc: within 2 half ulps.)
@@ -1804,8 +1804,8 @@ __kernel void k(__global const double *a, __global const double *b, __global dou
             let want = [
                 (x + y, 0),
                 // (Contracted: OpenCL allows it, clang does it.)
-                (x.mul_add(y, -(x / y)), 0),
-                (x.mul_add(y, -1.0), 0),
+                (libm::fma(x, y, -(x / y)), 0),
+                (libm::fma(x, y, -1.0), 0),
                 (x.abs().sqrt(), 0),
                 ((y / 1e3).exp(), 4),
                 (x.sin(), 4),

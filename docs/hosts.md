@@ -66,10 +66,31 @@ translated program, `--trace`'s last lines) is what's needed to fix it.
 
 Status: the runtime and translator build for `x86_64-pc-windows-gnu`
 (cross-compiled on Linux with MinGW's gcc), and the runtime runs under Wine:
-its unit tests (75; the few that need a Unix host are left out), M1's 34
+its unit tests (90; the few that need a Unix host are left out), M1's 34
 checks (processes, a shell, pipes, sockets, networking) and M0's 20;
 and it translates arm64 programs itself, with LLVM's Windows build as the
 toolchain (M2's `hello`, translated and run on first use).
+
+Ubuntu's own programs run there too, in the Ubuntu environment converted
+by the Windows build (the Linux one exported, `wasm-env export build/ubuntu
+build/ubuntu-oci.tar`, then `wasm-env convert --lazy --no-precompile` of
+that under Wine), checked under Wine: the sound card (`aplay` and
+`arecord` byte for byte, `amixer`), the PulseAudio server (`pactl`,
+`paplay`, `parecord`, and GStreamer's `pulsesink`, its ORC JIT included),
+and the Vulkan driver (tests/arm64/vulkan.c all right, `vkcube`, and
+vkQuake 1.36.0 to its 300th frame, through Wine's Vulkan on the Intel GPU
+and on lavapipe). What it took: inodes (Windows' metadata has none, and
+with every file's 0 glibc's loader took a program's second library for
+its first, so no program with two ran), `memfd_create` (a temporary file
+deleted on close; libasound uses one), and a JIT's code written through
+one mapping of a file and run through another brought over, shared
+mappings being copies there (`WASM_ENV_NO_SHARED_MAPPINGS=1` tests that
+on Linux). Under Wine, lavapipe needs the settings the GPU service gives
+it on Linux (`GALLIUM_OVERRIDE_CPU_CAPS=avx LP_NATIVE_VECTOR_WIDTH=128`,
+set outside: a Windows process's environment doesn't reach it), else its
+textures are wrong. Under Wine, two of the GPU service's unit tests fail:
+an OpenCL program's absolute `#include` within its environment (clang's
+overlay on Windows), and OpenCL's doubles in one kernel test.
 
 **Symlinks** in an environment are link files on Windows (making real ones
 needs privileges): a small file with the System attribute holding a marker

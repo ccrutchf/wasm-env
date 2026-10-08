@@ -449,6 +449,24 @@ fn dtype(meta: &Metadata) -> u8 {
     }
 }
 
+/// As stat_bytes, for the file at `path` (the environment's, resolved):
+/// where the host's metadata has no inode (Windows), one made from the
+/// path, so different files' differ. (glibc's loader tells libraries apart
+/// by their device and inode: with every inode 0, a program's second
+/// library was taken for its first.)
+pub fn stat_bytes_of(meta: &Metadata, path: &str) -> [u8; 128] {
+    #[allow(unused_mut)]
+    let mut b = stat_bytes(meta);
+    #[cfg(not(unix))]
+    {
+        // (FNV-1a of the path, never 0.)
+        let ino = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3)) | 1;
+        b[8..16].copy_from_slice(&ino.to_le_bytes());
+    }
+    let _ = path;
+    b
+}
+
 /// Encodes metadata as arm64 Linux `struct stat` (128 bytes). Everything
 /// in the environment is presented as owned by root, like a container.
 pub fn stat_bytes(meta: &Metadata) -> [u8; 128] {

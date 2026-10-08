@@ -243,6 +243,35 @@ pub fn uncopied(group: &Arc<crate::thread::Group>, start: u64, end: u64) {
     copies.retain(|c| !(std::ptr::eq(c.group.as_ptr(), Arc::as_ptr(group)) && c.addr < end && start < c.addr + c.len));
 }
 
+/// Where shared mappings are copies, two of one file in a process are
+/// separate: a JIT that writes its code through one mapping and runs it
+/// through another (ORC's, for W^X) would run what was there before. So
+/// [start, end) of a process's memory, about to be run as code, is brought
+/// up to date with the file's other copies in the process first.
+pub fn bring_over(group: &Arc<crate::thread::Group>, start: u64, end: u64) {
+    if host_mappings() {
+        return;
+    }
+    let Some(threading) = group.threading.get() else { return };
+    let data = crate::syscall::shared_bytes(&threading.memory);
+    let copies = COPIES.lock().unwrap();
+    let ours = |c: &&Copy| std::ptr::eq(c.group.as_ptr(), Arc::as_ptr(group));
+    for here in copies.iter().filter(ours).filter(|c| c.addr < end && start < c.addr + c.len) {
+        for there in copies.iter().filter(ours).filter(|c| c.addr != here.addr && std::ptr::eq(c.file.as_ptr(), here.file.as_ptr())) {
+            // (The part of the file both hold.)
+            let (lo, hi) = (here.offset.max(there.offset), (here.offset + here.len).min(there.offset + there.len));
+            if lo >= hi {
+                continue;
+            }
+            let (from, to) = ((there.addr + (lo - there.offset)) as usize, (here.addr + (lo - here.offset)) as usize);
+            let n = (hi - lo) as usize;
+            if from + n <= data.len() && to + n <= data.len() {
+                data.copy_within(from..from + n, to);
+            }
+        }
+    }
+}
+
 /// Reads `buf.len()` bytes of `file` from `offset` out of a process's copy
 /// of it, if a copy holds them all.
 pub fn read_copy(file: &Arc<std::sync::Mutex<crate::fs::Open>>, offset: u64, buf: &mut [u8]) -> bool {
