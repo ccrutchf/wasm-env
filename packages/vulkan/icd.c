@@ -51,7 +51,7 @@ int close(int);
 #define CALL VKAPI_ATTR
 #define CC VKAPI_CALL
 
-enum { INFO = 1, CREATE, FREE, WRITE, READ, FINISH = 13, VK_SHADER = 20, VK_PIPELINE, VK_SUBMIT, VK_LIMITS, VK_IMAGE, VK_VIEW, VK_SAMPLER, VK_FORMAT, VK_GRAPHICS, VK_BUFFER_VIEW };
+enum { INFO = 1, CREATE, FREE, WRITE, READ, FINISH = 13, VK_SHADER = 20, VK_PIPELINE, VK_SUBMIT, VK_LIMITS, VK_IMAGE, VK_VIEW, VK_SAMPLER, VK_FORMAT, VK_GRAPHICS, VK_BUFFER_VIEW, VK_QUERY_POOL, VK_QUERY_RESULTS, VK_SEND };
 // The command stream's operations (gpu/src/vulkan.rs, `decode`).
 enum {
     BIND_PIPELINE = 1,
@@ -79,7 +79,15 @@ enum {
     SET_BLEND_CONSTANTS,
     SET_STENCIL_REFERENCE,
     BIND_GRAPHICS_SET,
-    BLIT
+    BLIT,
+    CLEAR_DEPTH,
+    RESOLVE,
+    CLEAR_ATTACHMENTS,
+    BEGIN_QUERY,
+    END_QUERY,
+    RESET_QUERIES,
+    TIMESTAMP,
+    COPY_QUERIES
 };
 
 struct request {
@@ -110,6 +118,7 @@ enum {
     L_VENDOR,
     L_DEVICE,
     L_TYPE,
+    L_TIMESTAMP,
     L_COUNT
 };
 static uint64_t limits[L_COUNT];
@@ -198,6 +207,8 @@ struct VkPipeline_T {
 struct subpass {
     uint32_t ncolors;
     uint32_t colors[8];
+    // Each color attachment's resolve attachment (VK_ATTACHMENT_UNUSED: none).
+    uint32_t resolves[8];
     uint32_t depth; // VK_ATTACHMENT_UNUSED: none
 };
 struct VkRenderPass_T {
@@ -237,6 +248,10 @@ struct VkImageView_T {
 };
 struct VkBufferView_T {
     uint64_t handle;
+};
+struct VkQueryPool_T {
+    uint64_t handle;
+    uint32_t count;
 };
 struct VkSampler_T {
     uint64_t handle;
@@ -421,9 +436,19 @@ static CALL void CC GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalD
     l->maxFramebufferWidth = l->maxFramebufferHeight = 4096;
     l->maxFramebufferLayers = 256;
     l->maxColorAttachments = 4;
+    // (One sample, or four: WebGPU's.)
+    l->framebufferColorSampleCounts = l->framebufferDepthSampleCounts = l->framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    l->framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    l->sampledImageColorSampleCounts = l->sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    l->sampledImageDepthSampleCounts = l->sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+    l->storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
     l->maxSamplerAnisotropy = 1;
-    l->timestampComputeAndGraphics = VK_FALSE;
-    l->timestampPeriod = 1;
+    // (Timestamps where the device takes them: their period.)
+    uint32_t period = (uint32_t)limits[L_TIMESTAMP];
+    l->timestampComputeAndGraphics = period != 0;
+    memcpy(&l->timestampPeriod, &period, 4);
+    if (!period)
+        l->timestampPeriod = 1;
     l->optimalBufferCopyOffsetAlignment = 4;
     l->optimalBufferCopyRowPitchAlignment = 256;
     l->nonCoherentAtomSize = 4;
@@ -433,9 +458,14 @@ static CALL void CC GetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDev
     memset(f, 0, sizeof *f);
 }
 
-static const VkQueueFamilyProperties family = {VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT, 1, 0, {1, 1, 1}};
+// The one queue family (its timestamps 64 bits, if the device takes them).
+static VkQueueFamilyProperties queue_family(void) {
+    VkQueueFamilyProperties f = {VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT, 1, limits[L_TIMESTAMP] ? 64 : 0, {1, 1, 1}};
+    return f;
+}
 
 static CALL void CC GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice pd, uint32_t *count, VkQueueFamilyProperties *out) {
+    VkQueueFamilyProperties family = queue_family();
     enumerate(count, out, &family, 1, sizeof family);
 }
 
@@ -494,6 +524,12 @@ static CALL VkResult CC GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice 
     p->maxMipLevels = t == VK_IMAGE_TYPE_3D ? 9 : 13;
     p->maxArrayLayers = t == VK_IMAGE_TYPE_3D ? 1 : 256;
     p->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    // (Four samples, as WebGPU has them: 2D attachments, one level and
+    // layer, of formats it multisamples; not storage.)
+    int f32 = f == VK_FORMAT_R32_SFLOAT || f == VK_FORMAT_R32G32_SFLOAT || f == VK_FORMAT_R32G32B32A32_SFLOAT;
+    if (t == VK_IMAGE_TYPE_2D && !f32 && !(u & VK_IMAGE_USAGE_STORAGE_BIT) && !(c & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+        (have & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)))
+        p->sampleCounts |= VK_SAMPLE_COUNT_4_BIT;
     p->maxResourceSize = (VkDeviceSize)1 << 31;
     return VK_SUCCESS;
 }
@@ -522,7 +558,7 @@ static CALL void CC GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice pd,
         return;
     }
     if (*count >= 1)
-        out[0].queueFamilyProperties = family;
+        out[0].queueFamilyProperties = queue_family();
     *count = *count < 1 ? *count : 1;
 }
 static CALL VkResult CC GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *i, VkImageFormatProperties2 *p) {
@@ -1146,19 +1182,15 @@ static CALL VkResult CC CreateRenderPass(VkDevice d, const VkRenderPassCreateInf
     for (uint32_t s = 0; s < p->nsub; s++) {
         const VkSubpassDescription *sd = &info->pSubpasses[s];
         struct subpass *sub = &p->sub[s];
-        // (Multisampled attachments resolved: not yet.)
-        if (sd->pResolveAttachments)
-            for (uint32_t k = 0; k < sd->colorAttachmentCount; k++)
-                if (sd->pResolveAttachments[k].attachment != VK_ATTACHMENT_UNUSED) {
-                    free(p->attachments), free(p->first), free(p->last), free(p->sub), free(p);
-                    return VK_ERROR_FEATURE_NOT_PRESENT;
-                }
+        // (Each color attachment with the one it's resolved into, if any.)
         for (uint32_t k = 0; k < sd->colorAttachmentCount && sub->ncolors < 8; k++)
-            if (sd->pColorAttachments[k].attachment != VK_ATTACHMENT_UNUSED)
+            if (sd->pColorAttachments[k].attachment != VK_ATTACHMENT_UNUSED) {
+                sub->resolves[sub->ncolors] = sd->pResolveAttachments ? sd->pResolveAttachments[k].attachment : VK_ATTACHMENT_UNUSED;
                 sub->colors[sub->ncolors++] = sd->pColorAttachments[k].attachment;
+            }
         sub->depth = sd->pDepthStencilAttachment ? sd->pDepthStencilAttachment->attachment : VK_ATTACHMENT_UNUSED;
-        for (uint32_t k = 0; k <= sub->ncolors; k++) {
-            uint32_t at = k < sub->ncolors ? sub->colors[k] : sub->depth;
+        for (uint32_t k = 0; k <= 2 * sub->ncolors; k++) {
+            uint32_t at = k < sub->ncolors ? sub->colors[k] : k < 2 * sub->ncolors ? sub->resolves[k - sub->ncolors] : sub->depth;
             if (at == VK_ATTACHMENT_UNUSED)
                 continue;
             if (p->first[at] == VK_ATTACHMENT_UNUSED)
@@ -1744,6 +1776,140 @@ static CALL void CC CmdClearColorImage(VkCommandBuffer c, VkImage im, VkImageLay
     }
 }
 
+static CALL void CC CmdClearDepthStencilImage(VkCommandBuffer c, VkImage im, VkImageLayout l, const VkClearDepthStencilValue *v, uint32_t n, const VkImageSubresourceRange *r) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t mips = r[i].levelCount == VK_REMAINING_MIP_LEVELS ? im->mips - r[i].baseMipLevel : r[i].levelCount;
+        uint32_t layers = r[i].layerCount == VK_REMAINING_ARRAY_LAYERS ? im->layers - r[i].baseArrayLayer : r[i].layerCount;
+        uint32_t w[7] = {r[i].baseMipLevel, mips, r[i].baseArrayLayer, layers, r[i].aspectMask, bits(v->depth), v->stencil};
+        command(c, CLEAR_DEPTH, &im->handle, 8, w, sizeof w);
+    }
+}
+
+// (Whole levels and layers: WebGPU resolves whole attachments.)
+static CALL void CC CmdResolveImage(VkCommandBuffer c, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageResolve *r) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t images[2] = {src->handle, dst->handle};
+        uint32_t w[5] = {r[i].srcSubresource.mipLevel, r[i].srcSubresource.baseArrayLayer, r[i].dstSubresource.mipLevel, r[i].dstSubresource.baseArrayLayer, r[i].srcSubresource.layerCount};
+        command(c, RESOLVE, images, sizeof images, w, sizeof w);
+    }
+}
+
+// Inside a render pass: the attachments named (a color attachment of the
+// subpass, or its depth and stencil) cleared within the rectangles.
+static CALL void CC CmdClearAttachments(VkCommandBuffer c, uint32_t n, const VkClearAttachment *a, uint32_t nrects, const VkClearRect *rects) {
+    uint32_t head[2] = {n, nrects};
+    uint32_t h[2] = {CLEAR_ATTACHMENTS, 8 + 8 + n * 24 + nrects * 24};
+    put(c, h, 8);
+    put(c, head, 8);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t w[6] = {a[i].aspectMask, a[i].colorAttachment};
+        if (a[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
+            memcpy(w + 2, a[i].clearValue.color.uint32, 16);
+        else
+            w[2] = bits(a[i].clearValue.depthStencil.depth), w[3] = a[i].clearValue.depthStencil.stencil;
+        put(c, w, sizeof w);
+    }
+    for (uint32_t i = 0; i < nrects; i++) {
+        const VkClearRect *r = &rects[i];
+        uint32_t w[6] = {(uint32_t)r->rect.offset.x, (uint32_t)r->rect.offset.y, r->rect.extent.width, r->rect.extent.height, r->baseArrayLayer, r->layerCount};
+        put(c, w, sizeof w);
+    }
+    // (The clear draws: the pass's state set again after.)
+    emit_state(c, ~0u);
+}
+
+// ---- Queries: occlusion (inside render passes) and timestamps ----
+
+static CALL VkResult CC CreateQueryPool(VkDevice d, const VkQueryPoolCreateInfo *info, const VkAllocationCallbacks *a, VkQueryPool *out) {
+    struct VkQueryPool_T *p = zalloc(sizeof *p);
+    if (!p)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    struct request q = {VK_QUERY_POOL, {(uint64_t)info->queryType, info->queryCount}};
+    if (call(&q)) {
+        free(p);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    p->handle = q.r[0];
+    p->count = info->queryCount;
+    *out = p;
+    return VK_SUCCESS;
+}
+
+static CALL void CC DestroyQueryPool(VkDevice d, VkQueryPool p, const VkAllocationCallbacks *a) {
+    if (!p)
+        return;
+    struct request q = {FREE, {p->handle}};
+    call(&q);
+    free(p);
+}
+
+// Results as of the last submission that ended them (submissions are
+// done when they return): those not ended since their reset aren't
+// available.
+static CALL VkResult CC GetQueryPoolResults(VkDevice d, VkQueryPool p, uint32_t first, uint32_t n, size_t size, void *data, VkDeviceSize stride, VkQueryResultFlags flags) {
+    if (first + n > p->count)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    uint64_t *values = malloc((n ? n : 1) * sizeof *values);
+    if (!values)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    struct request q = {VK_QUERY_RESULTS, {p->handle, first, n, (uint64_t)(uintptr_t)values}};
+    if (call(&q)) {
+        free(values);
+        return VK_ERROR_DEVICE_LOST;
+    }
+    VkResult result = VK_SUCCESS;
+    int wide = !!(flags & VK_QUERY_RESULT_64_BIT);
+    for (uint32_t k = 0; k < n; k++) {
+        uint8_t *at = (uint8_t *)data + k * stride;
+        int available = values[k] != UINT64_MAX;
+        if (!available)
+            result = VK_NOT_READY;
+        if (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
+            uint64_t v = available ? values[k] : 0;
+            memcpy(at, &v, wide ? 8 : 4);
+        }
+        if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
+            uint64_t a = available;
+            memcpy(at + (wide ? 8 : 4), &a, wide ? 8 : 4);
+        }
+    }
+    free(values);
+    (void)size;
+    return result;
+}
+
+static CALL void CC CmdBeginQuery(VkCommandBuffer c, VkQueryPool p, uint32_t index, VkQueryControlFlags flags) {
+    uint32_t w[2] = {index, flags};
+    command(c, BEGIN_QUERY, &p->handle, 8, w, sizeof w);
+}
+
+static CALL void CC CmdEndQuery(VkCommandBuffer c, VkQueryPool p, uint32_t index) {
+    command(c, END_QUERY, &p->handle, 8, &index, 4);
+}
+
+static CALL void CC CmdResetQueryPool(VkCommandBuffer c, VkQueryPool p, uint32_t first, uint32_t n) {
+    uint32_t w[2] = {first, n};
+    command(c, RESET_QUERIES, &p->handle, 8, w, sizeof w);
+}
+
+static CALL void CC CmdWriteTimestamp(VkCommandBuffer c, VkPipelineStageFlagBits stage, VkQueryPool p, uint32_t index) {
+    command(c, TIMESTAMP, &p->handle, 8, &index, 4);
+}
+
+static CALL void CC CmdCopyQueryPoolResults(VkCommandBuffer c, VkQueryPool p, uint32_t first, uint32_t n, VkBuffer b, VkDeviceSize offset, VkDeviceSize stride, VkQueryResultFlags flags) {
+    uint32_t h[2] = {COPY_QUERIES, 8 + 8 + 8 + 24 + 4};
+    uint32_t w[2] = {first, n};
+    uint64_t at[3] = {b->memory->handle, b->offset + offset, stride};
+    uint32_t f = flags;
+    put(c, h, 8);
+    put(c, &p->handle, 8);
+    put(c, w, 8);
+    put(c, at, sizeof at);
+    put(c, &f, 4);
+    if (n)
+        writes(c, b, offset, (n - 1) * stride + ((flags & VK_QUERY_RESULT_64_BIT) ? 16 : 8));
+}
+
 // ---- Drawing ----
 
 // A subpass begun: a WebGPU render pass of its attachments, which load as
@@ -1755,7 +1921,7 @@ static void begin_subpass(VkCommandBuffer c) {
     uint32_t s = c->subpass;
     const struct subpass *sp = &p->sub[s];
     uint32_t head[2] = {sp->ncolors, sp->depth != VK_ATTACHMENT_UNUSED};
-    uint32_t h[2] = {BEGIN_PASS, 8 + 8 + sp->ncolors * 32 + (head[1] ? 32 : 0)};
+    uint32_t h[2] = {BEGIN_PASS, 8 + 8 + sp->ncolors * 40 + (head[1] ? 32 : 0)};
     put(c, h, 8);
     put(c, head, 8);
     VkClearValue zero = {0};
@@ -1777,6 +1943,12 @@ static void begin_subpass(VkCommandBuffer c) {
         }
         put(c, &f->views[at]->handle, 8);
         put(c, w, sizeof w);
+        // (A color attachment's resolve attachment's view, or none.)
+        if (k < sp->ncolors) {
+            uint64_t none = 0;
+            uint32_t r = sp->resolves[k];
+            put(c, r != VK_ATTACHMENT_UNUSED ? &f->views[r]->handle : &none, 8);
+        }
     }
     // (State set before: each WebGPU pass starts without it.)
     emit_state(c, ~0u);
@@ -1914,7 +2086,7 @@ static CALL void CC CmdExecuteCommands(VkCommandBuffer c, uint32_t n, const VkCo
 // then the program's copies sent.
 static int send_mapped(VkDevice d) {
     for (VkDeviceMemory m = d->mapped; m; m = m->next)
-        if (catch_up(m) || transfer(WRITE, m, 0, m->size))
+        if (catch_up(m) || transfer(VK_SEND, m, 0, m->size))
             return -1;
     return 0;
 }
@@ -2129,14 +2301,17 @@ static CALL VkResult CC GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice
     return VK_SUCCESS;
 }
 
-// wl_shm's formats, which are BGRA in memory.
+// wl_shm's formats, which are BGRA in memory; and RGBA, swapped as
+// presented.
 static const VkSurfaceFormatKHR surface_formats[] = {
     {VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
     {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+    {VK_FORMAT_R8G8B8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+    {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
 };
 
 static CALL VkResult CC GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice pd, VkSurfaceKHR surface, uint32_t *count, VkSurfaceFormatKHR *out) {
-    return enumerate(count, out, surface_formats, 2, sizeof *out);
+    return enumerate(count, out, surface_formats, sizeof surface_formats / sizeof *surface_formats, sizeof *out);
 }
 
 static CALL VkResult CC GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice pd, VkSurfaceKHR surface, uint32_t *count, VkPresentModeKHR *out) {
@@ -2159,6 +2334,9 @@ struct VkSwapchainKHR_T {
     size_t size;
     // The device's copy of an image presented, read into its buffer.
     struct VkDeviceMemory_T copy;
+    // For an RGBA swapchain: a BGRA image each presented one is drawn
+    // into first (wl_shm's formats are BGRA).
+    VkImage bgra;
     uint32_t next;
     int lost;
 };
@@ -2216,6 +2394,8 @@ static CALL void CC DestroySwapchainKHR(VkDevice d, VkSwapchainKHR s, const VkAl
         struct request q = {FREE, {s->copy.handle}};
         call(&q);
     }
+    if (s->bgra)
+        DestroyImage(d, s->bgra, NULL);
     free(s->slots);
     free(s);
 }
@@ -2292,6 +2472,21 @@ static CALL VkResult CC CreateSwapchainKHR(VkDevice d, const VkSwapchainCreateIn
         if ((r = CreateImage(d, &ii, NULL, &sl->image)) != VK_SUCCESS)
             goto fail;
     }
+    // (RGBA: drawn into BGRA as presented, sRGB kept sRGB.)
+    int srgb = info->imageFormat == VK_FORMAT_R8G8B8A8_SRGB;
+    if (srgb || info->imageFormat == VK_FORMAT_R8G8B8A8_UNORM) {
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                .imageType = VK_IMAGE_TYPE_2D,
+                                .format = srgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM,
+                                .extent = {s->width, s->height, 1},
+                                .mipLevels = 1,
+                                .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        if ((r = CreateImage(d, &ii, NULL, &s->bgra)) != VK_SUCCESS)
+            goto fail;
+    }
     wl.flush(s->display);
     *out = s;
     return VK_SUCCESS;
@@ -2344,7 +2539,14 @@ static VkResult present(VkSwapchainKHR s, uint32_t i) {
     struct VkCommandBuffer_T c = {0};
     struct VkBuffer_T b = {s->copy.size, 0, &s->copy, 0};
     VkBufferImageCopy whole = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {s->width, s->height, 1}};
-    buffer_image(&c, IMAGE_TO_BUFFER, &b, sl->image, 1, &whole);
+    VkImage shown = sl->image;
+    if (s->bgra) {
+        VkImageBlit all = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)s->width, (int32_t)s->height, 1}},
+                           {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)s->width, (int32_t)s->height, 1}}};
+        CmdBlitImage(&c, sl->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->bgra, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &all, VK_FILTER_NEAREST);
+        shown = s->bgra;
+    }
+    buffer_image(&c, IMAGE_TO_BUFFER, &b, shown, 1, &whole);
     struct request q = {VK_SUBMIT, {(uint64_t)(uintptr_t)c.s, c.n}};
     int failed = c.failed || call(&q);
     free(c.s);

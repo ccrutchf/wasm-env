@@ -592,6 +592,125 @@ static int blits(VkDevice dev, VkQueue queue) {
     return 0;
 }
 
+// Clears and resolves: an 8 × 8 RGBA8 image of four samples, cleared red
+// as a render pass begins, a 4 × 4 square in its middle cleared green inside
+// the pass (vkCmdClearAttachments), resolved into another image as the pass
+// ends and into a third by vkCmdResolveImage; and a depth image cleared to
+// 0.25 (vkCmdClearDepthStencilImage). All read back.
+static int clears(VkDevice dev, VkPhysicalDevice pd, VkQueue queue) {
+    enum { W = 8 };
+    VkFormat rgba = VK_FORMAT_R8G8B8A8_UNORM;
+    VkImageFormatProperties fp;
+    CHECK(vkGetPhysicalDeviceImageFormatProperties(pd, rgba, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &fp));
+    if (!(fp.sampleCounts & VK_SAMPLE_COUNT_4_BIT)) {
+        printf("clears: no four samples\n");
+        return 1;
+    }
+    VkSampleCountFlagBits samples[3] = {VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT};
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImage im[3];
+    VkImageView view[2];
+    for (int k = 0; k < 3; k++) {
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = rgba, .extent = {W, W, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = samples[k], .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage};
+        CHECK(vkCreateImage(dev, &ii, NULL, &im[k]));
+        if (k < 2) {
+            VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im[k], .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = rgba,
+                                        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+            CHECK(vkCreateImageView(dev, &vi, NULL, &view[k]));
+        }
+    }
+    VkImageCreateInfo di = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_D32_SFLOAT, .extent = {W, W, 1}, .mipLevels = 1,
+                            .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    VkImage depth;
+    CHECK(vkCreateImage(dev, &di, NULL, &depth));
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 3 * W * W * 4, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer buf;
+    CHECK(vkCreateBuffer(dev, &bi, NULL, &buf));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev, buf, &req);
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = 0};
+    VkDeviceMemory mem;
+    CHECK(vkAllocateMemory(dev, &mi, NULL, &mem));
+    CHECK(vkBindBufferMemory(dev, buf, mem, 0));
+    uint8_t *px;
+    CHECK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, (void **)&px));
+
+    VkAttachmentDescription att[2] = {
+        {0, rgba, VK_SAMPLE_COUNT_4_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+        {0, rgba, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+    };
+    VkAttachmentReference color = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, resolve = {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &color, .pResolveAttachments = &resolve};
+    VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 2, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub};
+    VkRenderPass pass;
+    CHECK(vkCreateRenderPass(dev, &rpi, NULL, &pass));
+    VkFramebufferCreateInfo fbi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = pass, .attachmentCount = 2, .pAttachments = view, .width = W, .height = W, .layers = 1};
+    VkFramebuffer fb;
+    CHECK(vkCreateFramebuffer(dev, &fbi, NULL, &fb));
+
+    VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0};
+    VkCommandPool cpool;
+    CHECK(vkCreateCommandPool(dev, &cpi, NULL, &cpool));
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkCommandBuffer cmd;
+    CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    VkClearValue red = {.color = {.float32 = {1, 0, 0, 1}}};
+    VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = pass, .framebuffer = fb, .renderArea = {{0, 0}, {W, W}}, .clearValueCount = 1, .pClearValues = &red};
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    VkClearAttachment green = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {.float32 = {0, 1, 0, 1}}}};
+    VkClearRect middle = {{{2, 2}, {4, 4}}, 0, 1};
+    vkCmdClearAttachments(cmd, 1, &green, 1, &middle);
+    vkCmdEndRenderPass(cmd);
+    VkImageResolve whole = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W, W, 1}};
+    vkCmdResolveImage(cmd, im[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im[2], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole);
+    VkClearDepthStencilValue quarter = {0.25f, 0};
+    VkImageSubresourceRange depth_range = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    vkCmdClearDepthStencilImage(cmd, depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &quarter, 1, &depth_range);
+    for (int k = 0; k < 3; k++) {
+        VkBufferImageCopy copy = {k * W * W * 4, 0, 0, {k < 2 ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {W, W, 1}};
+        vkCmdCopyImageToBuffer(cmd, k == 0 ? im[1] : k == 1 ? im[2] : depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &copy);
+    }
+    CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+    CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+    CHECK(vkQueueWaitIdle(queue));
+
+    int wrong = 0;
+    for (int k = 0; k < 2; k++)
+        for (int y = 0; y < W; y++)
+            for (int x = 0; x < W; x++) {
+                int inside = x >= 2 && x < 6 && y >= 2 && y < 6;
+                const uint8_t *p = px + k * W * W * 4 + (y * W + x) * 4;
+                wrong += p[0] != (inside ? 0 : 255) || p[1] != (inside ? 255 : 0) || p[2] != 0 || p[3] != 255;
+            }
+    float d[W * W];
+    memcpy(d, px + 2 * W * W * 4, sizeof d);
+    for (int k = 0; k < W * W; k++)
+        wrong += d[k] != 0.25f;
+    printf("clears and resolves: %d of %d wrong\n", wrong, 3 * W * W);
+
+    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+    vkDestroyCommandPool(dev, cpool, NULL);
+    vkDestroyFramebuffer(dev, fb, NULL);
+    vkDestroyRenderPass(dev, pass, NULL);
+    for (int k = 0; k < 3; k++) {
+        if (k < 2)
+            vkDestroyImageView(dev, view[k], NULL);
+        vkDestroyImage(dev, im[k], NULL);
+    }
+    vkDestroyImage(dev, depth, NULL);
+    vkDestroyBuffer(dev, buf, NULL);
+    vkUnmapMemory(dev, mem);
+    vkFreeMemory(dev, mem, NULL);
+    return 0;
+}
+
 // Drawing into a 64 × 64 RGBA8 image with a depth buffer, read back: a
 // green square over everything (indexed), then three triangles in its
 // corners: a red one in front of it, a blue one behind it, and a yellow one
@@ -755,10 +874,20 @@ static int draw(VkDevice dev, VkQueue queue) {
     VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
     VkCommandBuffer cmd;
     CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    // (Queries: occlusion around the square and around nothing; timestamps
+    // around the pass.)
+    VkQueryPool qp[2];
+    VkQueryPoolCreateInfo qi[2] = {{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = 2},
+                                   {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2}};
+    for (int k = 0; k < 2; k++)
+        CHECK(vkCreateQueryPool(dev, &qi[k], NULL, &qp[k]));
     VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     CHECK(vkBeginCommandBuffer(cmd, &cbi));
     VkViewport viewport = {0, 0, W, W, 0, 1};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
+    for (int k = 0; k < 2; k++)
+        vkCmdResetQueryPool(cmd, qp[k], 0, 2);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp[1], 0);
     VkClearValue clears[2] = {{.color = {.float32 = {0, 0, 0, 1}}}, {.depthStencil = {1, 0}}};
     VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = pass, .framebuffer = fb, .renderArea = {{0, 0}, {W, W}}, .clearValueCount = 2, .pClearValues = clears};
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
@@ -769,9 +898,14 @@ static int draw(VkDevice dev, VkQueue queue) {
     VkDeviceSize zero = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &buf[0], &zero);
     vkCmdBindIndexBuffer(cmd, buf[1], 0, VK_INDEX_TYPE_UINT16);
+    vkCmdBeginQuery(cmd, qp[0], 0, 0);
     vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+    vkCmdEndQuery(cmd, qp[0], 0);
+    vkCmdBeginQuery(cmd, qp[0], 1, 0);
+    vkCmdEndQuery(cmd, qp[0], 1);
     vkCmdDraw(cmd, 9, 1, 4, 0);
     vkCmdEndRenderPass(cmd);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp[1], 1);
     VkBufferImageCopy whole = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W, W, 1}};
     vkCmdCopyImageToBuffer(cmd, im[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf[3], 1, &whole);
     CHECK(vkEndCommandBuffer(cmd));
@@ -797,6 +931,12 @@ static int draw(VkDevice dev, VkQueue queue) {
         wrong += bad;
     }
     printf("draw: 5 pixels looked at, %d wrong\n", wrong);
+    uint64_t occluded[2], stamps[2];
+    CHECK(vkGetQueryPoolResults(dev, qp[0], 0, 2, sizeof occluded, occluded, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+    CHECK(vkGetQueryPoolResults(dev, qp[1], 0, 2, sizeof stamps, stamps, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+    printf("queries: occlusion %s, timestamps %s\n", occluded[0] > 0 && occluded[1] == 0 ? "right" : "wrong", stamps[1] > stamps[0] ? "in order" : "out of order");
+    for (int k = 0; k < 2; k++)
+        vkDestroyQueryPool(dev, qp[k], NULL);
 
     vkFreeCommandBuffers(dev, cpool, 1, &cmd);
     vkDestroyCommandPool(dev, cpool, NULL);
@@ -942,7 +1082,7 @@ int main(void) {
     printf("compute: %d of %d wrong\n", wrong, N);
     printf("fill and update: %s\n", filled[0] == 0x5a5a5a5a && filled[2] == 0xc0ffee && filled[3] == 0xbeef && filled[15] == 0x5a5a5a5a ? "right" : "wrong");
     printf("the program's own write kept: %s\n", unused[0] == 12345 ? "yes" : "no");
-    if (images(dev, queue) || blits(dev, queue) || draw(dev, queue) || subpasses(dev, queue) || texels(dev, queue) || arrays(dev, queue))
+    if (images(dev, queue) || blits(dev, queue) || clears(dev, pd, queue) || draw(dev, queue) || subpasses(dev, queue) || texels(dev, queue) || arrays(dev, queue))
         return 1;
 
     vkDestroyFence(dev, fence, NULL);

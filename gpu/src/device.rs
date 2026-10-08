@@ -24,6 +24,9 @@ pub struct Gpu {
     /// Vulkan's copies of buffers at any size and offset (WebGPU's are of
     /// whole words): a compute pipeline copying bytes.
     pub(crate) byte_copy: Mutex<Option<wgpu::ComputePipeline>>,
+    /// Vulkan's clears inside render passes: a render pipeline per pass's
+    /// targets and what it clears.
+    pub(crate) clears: Mutex<HashMap<String, wgpu::RenderPipeline>>,
     lost: std::sync::atomic::AtomicBool,
 }
 
@@ -103,7 +106,11 @@ impl Gpu {
             | wgpu::Features::BUFFER_BINDING_ARRAY
             | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
             // (and blending 32-bit float attachments, as Vulkan devices do)
-            | wgpu::Features::FLOAT32_BLENDABLE;
+            | wgpu::Features::FLOAT32_BLENDABLE
+            // (and timestamps, anywhere in a submission)
+            | wgpu::Features::TIMESTAMP_QUERY
+            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         let arrays = if api == Api::Vulkan { adapter.features() & arrays } else { wgpu::Features::empty() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("wasm-env"),
@@ -114,7 +121,7 @@ impl Gpu {
         .map_err(|e| format!("can't open {}: {e}", info.name))?;
         // Errors are reported to the caller (error scopes), not panics.
         device.on_uncaptured_error(Arc::new(|e| eprintln!("wasm-env: GPU: {}", chain(&e))));
-        let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), byte_copy: Default::default(), lost: Default::default() };
+        let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), byte_copy: Default::default(), clears: Default::default(), lost: Default::default() };
         g.quirks = Quirks { native_f64: native_f64 && g.native_doubles_conform()?, ..g.probe_quirks()? };
         Ok(g)
     }

@@ -74,7 +74,8 @@
 //!              groups per dimension, work-group size (3) and invocations,
 //!              shared memory, descriptor sets, storage and uniform buffers
 //!              per stage, largest allocation, memory, push constant bytes,
-//!              vendor and device ids, device type (Vulkan's)
+//!              vendor and device ids, device type (Vulkan's), timestamp
+//!              period (nanoseconds, an f32's bits; 0: no timestamps)
 //!  24 VK_IMAGE    a0: u32s: dimensions (1, 2, 3), format (VkFormat), width,
 //!              height, depth, mip levels, layers, samples, usage
 //!              (VkImageUsageFlags)   r0: image handle
@@ -90,6 +91,13 @@
 //!              graphics pipeline handle
 //!  29 VK_BUFFER_VIEW a0: buffer (device memory), a1: offset, a2: range,
 //!              a3: VkFormat   r0: texel buffer view handle
+//!  30 VK_QUERY_POOL a0: VkQueryType (occlusion, timestamps), a1: queries
+//!              r0: query pool handle
+//!  31 VK_QUERY_RESULTS a0: pool, a1: first, a2: count, a3: address: each
+//!              query's value (u64), u64::MAX if it isn't available
+//!  32 VK_SEND     as WRITE, sending only what differs from what VK_SEND
+//!              last sent there (or READ since read): a mapped memory's
+//!              program copy, sent at each submission
 //!
 //! Vulkan's device memory is a buffer (CREATE), read and written as one.
 //!
@@ -131,6 +139,7 @@ const CL_INVALID_WORK_GROUP_SIZE: i64 = -54;
 // (Vulkan's, for its operations.)
 const VK_ERROR_INITIALIZATION_FAILED: i64 = -3;
 const VK_ERROR_DEVICE_LOST: i64 = -4;
+const VK_ERROR_FEATURE_NOT_PRESENT: i64 = -8;
 const VK_ERROR_FORMAT_NOT_SUPPORTED: i64 = -11;
 
 /// The host's GPU, opened when the environment first asks for it, for the
@@ -161,6 +170,9 @@ struct State {
     printf: Vec<u8>,
     /// Vulkan's shaders and pipelines.
     vk: HashMap<u64, Vk>,
+    /// Vulkan's mapped memories, as the device last had them from the
+    /// program (VK_SEND): by buffer, their offset and bytes.
+    sent: HashMap<u64, (u64, Vec<u8>)>,
 }
 
 enum Vk {
@@ -170,6 +182,7 @@ enum Vk {
     View(vulkan::View),
     Texel(vulkan::TexelView),
     Sampler(wgpu::Sampler),
+    Queries(vulkan::QueryPool),
 }
 
 struct Program {
@@ -246,6 +259,7 @@ impl Session {
             }
             3 => {
                 let mut st = self.state.lock().unwrap();
+                st.sent.remove(&a[0]);
                 if st.buffers.remove(&a[0]).is_none() && st.vk.remove(&a[0]).is_none() {
                     match st.programs.remove(&a[0]) {
                         Some(p) => self.gpu().forget(p.id),
@@ -264,6 +278,14 @@ impl Session {
                 self.check(&b, a[1], a[3])?;
                 let bytes = g.read(&b, a[1], a[3]).map_err(|_| Failure::Cl(CL_OUT_OF_RESOURCES))?;
                 mem::slice_mut(data, a[2], a[3])?.copy_from_slice(&bytes);
+                // (What VK_SEND last sent of it, if anything, now the device's.)
+                if let Some((at, sent)) = self.state.lock().unwrap().sent.get_mut(&a[0])
+                    && a[1] >= *at
+                    && a[1] - *at + a[3] <= sent.len() as u64
+                {
+                    let from = (a[1] - *at) as usize;
+                    sent[from..from + a[3] as usize].copy_from_slice(&bytes);
+                }
             }
             6 => {
                 let (s, d) = (self.buffer(a[0])?, self.buffer(a[2])?);
@@ -487,6 +509,7 @@ impl Session {
                     (_, Some(Vk::View(v))) => Some(vulkan::Object::View(v)),
                     (_, Some(Vk::Texel(t))) => Some(vulkan::Object::Texel(t)),
                     (_, Some(Vk::Sampler(s))) => Some(vulkan::Object::Sampler(s)),
+                    (_, Some(Vk::Queries(q))) => Some(vulkan::Object::Queries(q)),
                     _ => None,
                 };
                 if let Err(e) = vulkan::submit(g, &commands, object) {
@@ -495,6 +518,73 @@ impl Session {
                     }
                     return Err(Failure::Cl(VK_ERROR_DEVICE_LOST));
                 }
+            }
+            32 => {
+                // As WRITE, but only what differs from what was sent last
+                // (a program's mapped memory is sent at every submission:
+                // most of it hasn't changed).
+                let b = self.buffer(a[0])?;
+                self.check(&b, a[1], a[3])?;
+                let now = mem::slice(data, a[2], a[3])?;
+                let mut st = self.state.lock().unwrap();
+                let fail = |_| Failure::Cl(CL_OUT_OF_RESOURCES);
+                match st.sent.get_mut(&a[0]) {
+                    Some((at, sent)) if *at == a[1] && sent.len() == now.len() => {
+                        const CHUNK: usize = 4096;
+                        let mut k = 0;
+                        while k < now.len() {
+                            let end = (k + CHUNK).min(now.len());
+                            if now[k..end] == sent[k..end] {
+                                k = end;
+                                continue;
+                            }
+                            // (A run of chunks that differ, written as one.)
+                            let mut run = end;
+                            while run < now.len() {
+                                let next = (run + CHUNK).min(now.len());
+                                if now[run..next] == sent[run..next] {
+                                    break;
+                                }
+                                run = next;
+                            }
+                            g.write(&b, a[1] + k as u64, &now[k..run]).map_err(fail)?;
+                            sent[k..run].copy_from_slice(&now[k..run]);
+                            k = run;
+                        }
+                    }
+                    _ => {
+                        g.write(&b, a[1], now).map_err(fail)?;
+                        st.sent.insert(a[0], (a[1], now.to_vec()));
+                    }
+                }
+            }
+            30 => match vulkan::query_pool(g, a[0] as u32, a[1] as u32) {
+                Ok(q) => {
+                    let mut st = self.state.lock().unwrap();
+                    let h = st.next;
+                    st.next += 1;
+                    st.vk.insert(h, Vk::Queries(q));
+                    r[0] = h;
+                }
+                Err(e) => {
+                    if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
+                        eprintln!("wasm-env: Vulkan: {e}");
+                    }
+                    return Err(Failure::Cl(VK_ERROR_FEATURE_NOT_PRESENT));
+                }
+            },
+            31 => {
+                let values: Vec<u8> = {
+                    let st = self.state.lock().unwrap();
+                    let Some(Vk::Queries(q)) = st.vk.get(&a[0]) else { return Err(Failure::Cl(VK_ERROR_INITIALIZATION_FAILED)) };
+                    let v = q.values.lock().unwrap();
+                    let (first, count) = (a[1] as usize, a[2] as usize);
+                    if first + count > v.len() {
+                        return Err(Failure::Errno(EINVAL));
+                    }
+                    v[first..first + count].iter().flat_map(|x| x.unwrap_or(u64::MAX).to_le_bytes()).collect()
+                };
+                mem::write(data, a[3], &values)?;
             }
             23 => {
                 let d = self.vulkan_limits();
@@ -682,7 +772,9 @@ impl Session {
             wgpu::DeviceType::Cpu => 4,
         };
         let max_alloc = l.max_buffer_size.min((1 << 32) - 4096);
-        let words: [u64; 19] = [
+        // (Timestamps: nanoseconds a tick, as an f32's bits; 0 if none.)
+        let timestamp = if vulkan::timestamps(self.gpu()) { self.gpu().queue.get_timestamp_period().to_bits() as u64 } else { 0 };
+        let words: [u64; 20] = [
             l.min_storage_buffer_offset_alignment as u64,
             l.min_uniform_buffer_offset_alignment as u64,
             l.max_storage_buffer_binding_size,
@@ -703,6 +795,7 @@ impl Session {
             info.vendor as u64,
             info.device as u64,
             kind,
+            timestamp,
         ];
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
