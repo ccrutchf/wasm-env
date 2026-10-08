@@ -1,0 +1,31 @@
+// tests/arm64/vulkan.c's layouts: what WGSL can't say as Vulkan does,
+// read into floats. A std140 block's float array (16 bytes apart), mat2
+// (columns 16 bytes apart) and row-major mat2x3; a texel buffer longer than
+// a 1D texture; a descriptor array of blocks; and a work group sized by a
+// specialization constant (6 invocations: gl_WorkGroupSize too).
+#version 450
+layout(local_size_x_id = 0) in;
+layout(set = 0, binding = 0, std140) uniform U {
+    float f[4];
+    mat2 m;
+    layout(row_major) mat2x3 r;
+} u;
+layout(set = 0, binding = 1, std430) buffer O { float o[]; };
+layout(set = 0, binding = 2) uniform samplerBuffer big;
+layout(set = 0, binding = 3, std430) buffer B { float x; } blocks[2];
+
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    if (i < 4) {
+        o[i] = u.f[i];
+        o[4 + i] = u.m[i / 2][i % 2];
+    }
+    mat2x3 r = u.r;
+    o[8 + i] = r[i / 3][i % 3];
+    o[14 + i] = u.r[i / 3][i % 3];
+    o[20 + i] = texelFetch(big, 70000 + int(i)).x;
+    if (i < 2)
+        o[26 + i] = blocks[i].x;
+    if (i == 0)
+        o[28] = float(gl_WorkGroupSize.x);
+}

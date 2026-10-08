@@ -29,6 +29,8 @@ pub struct Shader {
     overrides: BTreeMap<u16, naga::Scalar>,
     /// Its binding arrays: set and binding (WebGPU's), and how many.
     arrays: BTreeMap<(u32, u32), u32>,
+    /// Its buffers' least sizes: set and binding, and that size.
+    sizes: BTreeMap<(u32, u32), u64>,
     /// Each binding's type, for a pipeline that can't have its layout made
     /// for it (wgpu's are of single items: binding arrays need their own).
     types: BTreeMap<(u32, u32), Res<(wgpu::BindingType, Option<std::num::NonZeroU32>)>>,
@@ -47,11 +49,18 @@ pub struct Pipeline {
     uses: BTreeMap<u32, Vec<u32>>,
     push_group: Option<u32>,
     /// A graphics pipeline's vertex buffers: the Vulkan binding of each of
-    /// WebGPU's slots.
-    vertex_bindings: Vec<u32>,
+    /// WebGPU's slots, and how far into the buffer bound there the slot
+    /// starts (attributes past their binding's stride have slots of their
+    /// own, where they're within it).
+    vertex_bindings: Vec<(u32, u64)>,
     /// Its binding arrays (Vulkan's descriptor arrays): WebGPU's set and
     /// binding, and how many.
     arrays: BTreeMap<(u32, u32), u32>,
+    /// Its buffers' least sizes: the least a range bound there is
+    /// (WebGPU's sizes are rounded up to their alignment, a `bvec3` block's
+    /// 12 bytes to 16, and a runtime array has an element; Vulkan's
+    /// aren't, and haven't).
+    sizes: BTreeMap<(u32, u32), u64>,
     /// A graphics pipeline's making, and the variants made of it: for
     /// render passes whose color formats aren't its own (Vulkan's drivers
     /// draw with a pipeline made for RGBA into BGRA; WebGPU's won't), and
@@ -76,6 +85,9 @@ pub struct Dynamic {
     pub bias: Option<[u32; 3]>,
     pub compare_mask: Option<u32>,
     pub write_mask: Option<u32>,
+    /// And, for an indexed draw of strips, its indices' format (WebGPU's
+    /// pipeline names it).
+    pub strip_index: Option<wgpu::IndexFormat>,
 }
 
 /// What a graphics pipeline is made of (owned, to make it again).
@@ -108,6 +120,11 @@ impl Recipe {
             if let Some(m) = d.write_mask {
                 s.stencil.write_mask = m;
             }
+            // (A format without stencil: no stencil test, which Vulkan
+            // ignores there and WebGPU refuses.)
+            if !s.format.has_stencil_aspect() {
+                s.stencil = Default::default();
+            }
             s
         });
         let buffers: Vec<Option<wgpu::VertexBufferLayout>> = self.buffers.iter().map(|(array_stride, step_mode, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *array_stride, step_mode: *step_mode, attributes })).collect();
@@ -115,22 +132,19 @@ impl Recipe {
             c.iter().map(|(k, v)| (k.as_str(), *v)).collect()
         }
         let (vc, fc) = (constants(&self.vs.2), self.fs.as_ref().map(|f| constants(&f.2)).unwrap_or_default());
-        let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        caught(gpu, "pipeline", || {
+            gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
             layout: Some(&self.layout),
             vertex: wgpu::VertexState { module: &self.vs.0, entry_point: Some(&self.vs.1), compilation_options: options(&vc), buffers: &buffers },
-            primitive: self.primitive,
+                primitive: wgpu::PrimitiveState { strip_index_format: d.strip_index, ..self.primitive },
             depth_stencil,
             multisample: self.multisample,
             fragment: self.fs.as_ref().map(|fs| wgpu::FragmentState { module: &fs.0, entry_point: Some(&fs.1), compilation_options: options(&fc), targets: &targets }),
             multiview_mask: None,
             cache: None,
-        });
-        if let Some(e) = pollster::block_on(scope.pop()) {
-            return Err(format!("pipeline: {}", describe(&e)));
-        }
-        Ok(pipeline)
+            })
+        })
     }
 }
 
@@ -159,6 +173,7 @@ impl Pipeline {
             bias: d.bias.filter(|_| self.dynamic & 1 != 0),
             compare_mask: d.compare_mask.filter(|_| self.dynamic & 2 != 0),
             write_mask: d.write_mask.filter(|_| self.dynamic & 4 != 0),
+            strip_index: d.strip_index.filter(|_| recipe.primitive.topology.is_strip()),
         };
         if formats == own && d == Dynamic::default() {
             return Ok(rp.clone());
@@ -222,6 +237,15 @@ fn uses_of(shaders: &[(&Shader, &BTreeSet<(u32, u32)>)]) -> (BTreeMap<u32, Vec<u
 /// specialization constants is made with their defaults, and again for
 /// each pipeline's values (`Shader::variant`).
 pub fn shader(gpu: &Gpu, spirv: &[u8]) -> Res<Shader> {
+    let made = shader_of(gpu, spirv);
+    // (One that can't be, kept for a look: WASM_ENV_DEBUG_SPIRV=FILE.)
+    if let (Err(_), Some(path)) = (&made, std::env::var_os("WASM_ENV_DEBUG_SPIRV")) {
+        let _ = std::fs::write(path, spirv);
+    }
+    made
+}
+
+fn shader_of(gpu: &Gpu, spirv: &[u8]) -> Res<Shader> {
     if crate::spirv::computes_with_spec_constants(spirv) {
         let mut s = build(gpu, &crate::spirv::specialize(spirv, &[])?)?;
         s.spirv = Some(spirv.to_vec());
@@ -252,6 +276,29 @@ fn build(gpu: &Gpu, spirv: &[u8]) -> Res<Shader> {
     // a graphics shader, where a render pass's vertex and index buffers
     // (read-only uses) are often in that memory too, a buffer is read-only
     // unless the shader writes it.
+    // An array of blocks is a descriptor array of buffers, which naga reads
+    // as one buffer of them: a binding array. (The array's type goes: one
+    // of blocks of no fixed size isn't valid.)
+    let mut arrays_of_blocks = false;
+    for (_, g) in module.global_variables.iter_mut() {
+        if let (Some(_), naga::AddressSpace::Storage { .. } | naga::AddressSpace::Uniform) = (&g.binding, g.space) {
+            if let naga::TypeInner::Array { base, size: naga::ArraySize::Constant(n), .. } = module.types[g.ty].inner {
+                if matches!(module.types[base].inner, naga::TypeInner::Struct { .. }) {
+                    // (Its block a type of its own: naga makes one of
+                    // blocks alike, and a block both a binding array's and
+                    // a buffer's makes SPIR-V drivers refuse.)
+                    let name = Some(format!("block_array_{}", g.binding.as_ref().map_or(0, |b| b.group * 1000 + b.binding)));
+                    let base = module.types.insert(naga::Type { name, inner: module.types[base].inner.clone() }, naga::Span::UNDEFINED);
+                    let inner = naga::TypeInner::BindingArray { base, size: naga::ArraySize::Constant(n) };
+                    g.ty = module.types.insert(naga::Type { name: None, inner }, naga::Span::UNDEFINED);
+                    arrays_of_blocks = true;
+                }
+            }
+        }
+    }
+    if arrays_of_blocks {
+        naga::compact::compact(&mut module, naga::compact::KeepUnused::Yes);
+    }
     let graphics = module.entry_points.iter().any(|e| e.stage != naga::ShaderStage::Compute);
     let written: BTreeSet<naga::Handle<naga::GlobalVariable>> = if graphics {
         let info = validate(&module)?;
@@ -297,6 +344,20 @@ fn build(gpu: &Gpu, spirv: &[u8]) -> Res<Shader> {
             _ => None,
         })
         .collect();
+    let sizes = module
+        .global_variables
+        .iter()
+        .filter_map(|(_, g)| {
+            let b = g.binding.as_ref()?;
+            let ty = match module.types[g.ty].inner {
+                naga::TypeInner::BindingArray { base, .. } => base,
+                _ => g.ty,
+            };
+            // (A runtime array's size counts one element, as WebGPU's
+            // least binding does.)
+            matches!(g.space, naga::AddressSpace::Storage { .. } | naga::AddressSpace::Uniform).then(|| ((b.group, b.binding), module.types[ty].inner.size(module.to_ctx()) as u64))
+        })
+        .collect();
     let overrides = module
         .overrides
         .iter()
@@ -305,27 +366,65 @@ fn build(gpu: &Gpu, spirv: &[u8]) -> Res<Shader> {
             _ => None,
         })
         .collect();
+    let sampled = sampled_images(&module);
     let types = module
         .global_variables
         .iter()
-        .filter_map(|(_, g)| Some(((g.binding.as_ref()?.group, g.binding.as_ref()?.binding), binding_type(&module, g))))
+        .filter_map(|(h, g)| Some(((g.binding.as_ref()?.group, g.binding.as_ref()?.binding), binding_type(&module, g, sampled.contains(&h)))))
         .collect();
-    let wgsl = naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty()).map_err(|e| format!("shader: {e}"))?;
-    if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
+    // (Given to wgpu as naga's IR, not WGSL: WGSL can't say the SPIR-V's
+    // explicit layout, a std140 array's stride of 16 or a member's offset.)
+    // (As WGSL, to look at: WASM_ENV_DEBUG_WGSL.)
+    if std::env::var_os("WASM_ENV_DEBUG_WGSL").is_some() {
+        let wgsl = naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty()).unwrap_or_else(|e| e.to_string());
         eprintln!("wasm-env: Vulkan shader:\n{wgsl}");
     }
-    let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(wgsl.into()) });
-    if let Some(e) = pollster::block_on(scope.pop()) {
-        return Err(format!("shader: {}", describe(&e)));
+    let module =
+        caught(gpu, "shader", || gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)) }))?;
+    Ok(Shader { module, entries, overrides, arrays, sizes, types, push_group: has_push.then_some(push_group), spirv: None, variants: Default::default() })
     }
-    Ok(Shader { module, entries, overrides, arrays, types, push_group: has_push.then_some(push_group), spirv: None, variants: Default::default() })
+
+/// What `make` makes, or the error wgpu found making it: a validation
+/// error, or an internal one (a backend's shader that didn't compile).
+fn caught<T>(gpu: &Gpu, what: &str, make: impl FnOnce() -> T) -> Res<T> {
+    let memory = gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal = gpu.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let made = make();
+    let errors = [pollster::block_on(validation.pop()), pollster::block_on(internal.pop()), pollster::block_on(memory.pop())];
+    match errors.into_iter().flatten().next() {
+        Some(e) => Err(format!("{what}: {}", describe(&e))),
+        None => Ok(made),
+    }
+}
+
+/// The images a module samples (rather than only fetching from).
+fn sampled_images(module: &naga::Module) -> BTreeSet<naga::Handle<naga::GlobalVariable>> {
+    let mut sampled = BTreeSet::new();
+    for f in module.functions.iter().map(|(_, f)| f).chain(module.entry_points.iter().map(|e| &e.function)) {
+        for (_, e) in f.expressions.iter() {
+            let naga::Expression::ImageSample { mut image, .. } = *e else {
+                continue;
+            };
+            loop {
+                match f.expressions[image] {
+                    naga::Expression::GlobalVariable(g) => {
+                        sampled.insert(g);
+                        break;
+                    }
+                    naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => image = base,
+                    _ => break,
+                }
+            }
+        }
+    }
+    sampled
 }
 
 /// A global's binding type as a layout declares it (and, for a binding
 /// array, how many): what wgpu derives for a layout of its own, reflected
 /// from the shader.
-fn binding_type(module: &naga::Module, g: &naga::GlobalVariable) -> Res<(wgpu::BindingType, Option<std::num::NonZeroU32>)> {
+fn binding_type(module: &naga::Module, g: &naga::GlobalVariable, sampled: bool) -> Res<(wgpu::BindingType, Option<std::num::NonZeroU32>)> {
     use naga::{ImageClass, ImageDimension as Dim, ScalarKind as K, TypeInner as T};
     let (ty, count) = match module.types[g.ty].inner {
         T::BindingArray { base, size: naga::ArraySize::Constant(n) } => (base, Some(n)),
@@ -346,7 +445,9 @@ fn binding_type(module: &naga::Module, g: &naga::GlobalVariable) -> Res<(wgpu::B
                 sample_type: match kind {
                     K::Sint => wgpu::TextureSampleType::Sint,
                     K::Uint => wgpu::TextureSampleType::Uint,
-                    _ => wgpu::TextureSampleType::Float { filterable: true },
+                    // (Filterable if it's sampled: one only fetched from
+                    // may be of floats that aren't, a texel buffer's R32F.)
+                    _ => wgpu::TextureSampleType::Float { filterable: sampled },
                 },
                 view_dimension: view_dimension(dim, arrayed),
                 multisampled: multi,
@@ -443,6 +544,7 @@ fn explicit_layout(gpu: &Gpu, stages: &[(&Shader, &BTreeSet<(u32, u32)>, wgpu::S
         }
     }
     let last = groups.keys().max().copied();
+    caught(gpu, "layout", || {
     let layouts: Vec<wgpu::BindGroupLayout> = (0..last.map_or(0, |l| l + 1))
         .map(|g| {
             let entries: Vec<wgpu::BindGroupLayoutEntry> = groups.get(&g).map(|m| m.values().cloned().collect()).unwrap_or_default();
@@ -450,7 +552,8 @@ fn explicit_layout(gpu: &Gpu, stages: &[(&Shader, &BTreeSet<(u32, u32)>, wgpu::S
         })
         .collect();
     let refs: Vec<Option<&wgpu::BindGroupLayout>> = layouts.iter().map(Some).collect();
-    Ok(gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, immediate_size: 0 }))
+        gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &refs, immediate_size: 0 })
+    })
 }
 
 /// A specialization constant's value from Vulkan: its id, its size in
@@ -514,21 +617,31 @@ pub fn compute_pipeline(gpu: &Gpu, shader: &Shader, entry: &str, spec: &[Spec]) 
     let constants: Vec<(&str, f64)> = constants.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     // (Binding arrays: a layout of its own.)
     let explicit = if shader.arrays.is_empty() { None } else { Some(explicit_layout(gpu, &[(shader, bindings, wgpu::ShaderStages::COMPUTE)])?) };
-    let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let pipeline = gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    let pipeline = caught(gpu, "pipeline", || {
+        gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
         layout: explicit.as_ref(),
         module: &shader.module,
         entry_point: Some(entry),
         compilation_options: options(&constants),
         cache: None,
-    });
-    if let Some(e) = pollster::block_on(scope.pop()) {
-        return Err(format!("pipeline: {}", describe(&e)));
-    }
+        })
+    })?;
     let (uses, push_group) = uses_of(&[(shader, bindings)]);
     let written = written_of(&[(shader, bindings)]);
-    Ok(Pipeline { kind: Kind::Compute(pipeline), uses, push_group, vertex_bindings: Vec::new(), arrays: shader.arrays.clone(), recipe: None, dynamic: 0, fan: false, written, variants: Default::default() })
+    Ok(Pipeline {
+        kind: Kind::Compute(pipeline),
+        uses,
+        push_group,
+        vertex_bindings: Vec::new(),
+        arrays: shader.arrays.clone(),
+        sizes: shader.sizes.clone(),
+        recipe: None,
+        dynamic: 0,
+        fan: false,
+        written,
+        variants: Default::default(),
+    })
 }
 
 /// A graphics pipeline's state, from the words the driver sends (u32s,
@@ -629,6 +742,15 @@ impl GraphicsState {
 fn vertex_format(vk: u32) -> Option<wgpu::VertexFormat> {
     use wgpu::VertexFormat as V;
     Some(match vk {
+        9 => V::Unorm8,
+        10 => V::Snorm8,
+        13 => V::Uint8,
+        14 => V::Sint8,
+        70 => V::Unorm16,
+        71 => V::Snorm16,
+        74 => V::Uint16,
+        75 => V::Sint16,
+        76 => V::Float16,
         16 => V::Unorm8x2,
         17 => V::Snorm8x2,
         20 => V::Uint8x2,
@@ -732,18 +854,30 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
         }
         None => None,
     };
-    // Vertex buffers, in WebGPU's slots.
+    // Vertex buffers, in WebGPU's slots: one a binding, and one more for
+    // each place past its stride an attribute is at (WebGPU's attributes
+    // are within it; Vulkan's needn't be): the binding's buffer from there.
+    let mut slots: Vec<(u32, u64, [u32; 3])> = s.buffers.iter().map(|b| (b[0], 0, *b)).collect();
     let mut attributes: Vec<Vec<wgpu::VertexAttribute>> = vec![Vec::new(); s.buffers.len()];
     for a in &s.attributes {
-        let slot = s.buffers.iter().position(|b| b[0] == a[1]).ok_or_else(|| format!("an attribute of vertex binding {}, which there isn't", a[1]))?;
+        let b = *s.buffers.iter().find(|b| b[0] == a[1]).ok_or_else(|| format!("an attribute of vertex binding {}, which there isn't", a[1]))?;
         let format = vertex_format(a[2]).ok_or_else(|| format!("vertex format {}", a[2]))?;
-        attributes[slot].push(wgpu::VertexAttribute { format, offset: a[3] as u64, shader_location: a[0] });
+        let (offset, stride) = (a[3] as u64, b[1] as u64);
+        let from = if stride != 0 && offset + format.size() > stride { offset & !3 } else { 0 };
+        let slot = match slots.iter().position(|s| s.0 == a[1] && s.1 == from) {
+            Some(k) => k,
+            None => {
+                slots.push((a[1], from, b));
+                attributes.push(Vec::new());
+                slots.len() - 1
     }
-    let buffers: Vec<Option<wgpu::VertexBufferLayout>> = s
-        .buffers
+        };
+        attributes[slot].push(wgpu::VertexAttribute { format, offset: offset - from, shader_location: a[0] });
+    }
+    let buffers: Vec<Option<wgpu::VertexBufferLayout>> = slots
         .iter()
         .zip(&attributes)
-        .map(|(b, a)| {
+        .map(|((_, _, b), a)| {
             Some(wgpu::VertexBufferLayout {
                 array_stride: b[1] as u64,
                 step_mode: if b[2] == 1 { wgpu::VertexStepMode::Instance } else { wgpu::VertexStepMode::Vertex },
@@ -834,12 +968,18 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
     let (uses, push_group) = uses_of(&stages);
     let written = written_of(&stages);
     let arrays = vs.arrays.iter().chain(fs.iter().flat_map(|f| f.arrays.iter())).map(|(k, v)| (*k, *v)).collect();
+    let mut sizes = vs.sizes.clone();
+    for (&k, &v) in fs.iter().flat_map(|f| f.sizes.iter()) {
+        let size = sizes.entry(k).or_insert(v);
+        *size = (*size).max(v);
+    }
     Ok(Pipeline {
         kind: Kind::Render(pipeline),
         uses,
         push_group,
-        vertex_bindings: s.buffers.iter().map(|b| b[0]).collect(),
+        vertex_bindings: slots.iter().map(|s| (s.0, s.1)).collect(),
         arrays,
+        sizes,
         recipe: Some(recipe),
         dynamic: s.dynamic,
         fan: s.topology == 5,
@@ -1279,15 +1419,19 @@ pub fn format(vk: u32) -> Option<wgpu::TextureFormat> {
 /// What the device does with a format, as Vulkan's VkFormatFeatureFlags
 /// for optimal tiling: WebGPU's guarantees for it (the same on every
 /// device), and the texel's size in bytes (0: not a format it has).
-pub fn format_features(gpu: &Gpu, vk: u32) -> (u32, u32) {
-    let Some(f) = format(vk) else { return (0, 0) };
+pub fn format_features(gpu: &Gpu, vk: u32) -> (u32, u32, u32) {
+    // (Vertex attributes' formats: VERTEX_BUFFER; some are only that.)
+    let vertex = if vertex_format(vk).is_some() { 0x40 } else { 0 };
+    let Some(f) = format(vk) else {
+        return (vertex, 0, 0);
+    };
     if !gpu.device.features().contains(f.required_features()) {
-        return (0, 0);
+        return (vertex, 0, 0);
     }
     let ff = f.guaranteed_format_features(gpu.device.features());
     let (u, flags) = (ff.allowed_usages, ff.flags);
     let depth = f.is_depth_stencil_format();
-    let mut v = 0;
+    let mut v = vertex;
     if u.contains(wgpu::TextureUsages::TEXTURE_BINDING) {
         v |= 0x1; // SAMPLED_IMAGE
         if flags.contains(wgpu::TextureFormatFeatureFlags::FILTERABLE) {
@@ -1315,7 +1459,9 @@ pub fn format_features(gpu: &Gpu, vk: u32) -> (u32, u32) {
     if u.contains(wgpu::TextureUsages::COPY_DST) {
         v |= 0x8000; // TRANSFER_DST
     }
-    (v, f.block_copy_size(None).or_else(|| f.block_copy_size(Some(wgpu::TextureAspect::DepthOnly))).unwrap_or(0))
+    // (Its sample counts, as VkSampleCountFlags: four where it multisamples.)
+    let samples = if flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4) { 0x1 | 0x4 } else { 0x1 };
+    (v, f.block_copy_size(None).or_else(|| f.block_copy_size(Some(wgpu::TextureAspect::DepthOnly))).unwrap_or(0), samples)
 }
 
 /// An image: `dims` 1, 2 or 3, Vulkan's format and usage
@@ -1335,8 +1481,11 @@ pub fn image(gpu: &Gpu, dims: u32, vk_format: u32, extent: [u32; 3], mips: u32, 
     if usage & 0x8 != 0 && samples <= 1 {
         u |= wgpu::TextureUsages::STORAGE_BINDING;
     }
-    // (Clears are render passes: attachments whenever the format can be.)
+    // (Clears are render passes: attachments whenever the format can be,
+    // and the image isn't 1D, which WebGPU's attachments never are.)
+    if dims != 1 {
     u |= allowed & wgpu::TextureUsages::RENDER_ATTACHMENT;
+    }
     if !allowed.contains(u) {
         return Err(format!("{f:?} images can't be used so ({:?})", u - allowed));
     }
@@ -1382,6 +1531,8 @@ pub struct View {
     pub attachment: Option<wgpu::TextureView>,
     /// Its image's samples.
     pub samples: u32,
+    /// Its first mip level and layer.
+    pub base: [u32; 2],
 }
 
 /// A view of an image: Vulkan's view type (VkImageViewType), its format
@@ -1420,7 +1571,7 @@ pub fn view(t: &wgpu::Texture, kind: u32, vk_format: u32, aspect_bits: u32, mip:
             ..Default::default()
         })
     });
-    Ok(View { view, format: format.unwrap_or(t.format()), size, attachment, samples: t.sample_count() })
+    Ok(View { view, format: format.unwrap_or(t.format()), size, attachment, samples: t.sample_count(), base: [mip, layer] })
 }
 
 /// A query pool (VkQueryPool): WebGPU's query set, occlusion or timestamps,
@@ -1472,10 +1623,10 @@ pub fn query_pool(gpu: &Gpu, kind: u32, count: u32) -> Res<QueryPool> {
     Ok(QueryPool { set, count, resolved, spill, values: Mutex::new(vec![None; count as usize]) })
 }
 
-/// A texel buffer's view (VkBufferView): a 1D texture of its format (WGSL
-/// has no texel buffers: the shader's buffer images are made 1D, spirv.rs),
-/// copied from its range of the buffer before each pass or dispatch that
-/// uses it (`refresh`). As many texels as a 1D texture can have.
+/// A texel buffer's view (VkBufferView): a 2D texture of its format, its
+/// texels `TEXEL_ROW` a row (WGSL has no texel buffers: the shader's buffer
+/// images are made 2D, spirv.rs), copied from its range of the buffer
+/// before each pass or dispatch that uses it (`refresh`).
 pub struct TexelView {
     pub buffer: u64,
     pub offset: u64,
@@ -1490,17 +1641,19 @@ pub fn texel_view(gpu: &Gpu, buffer: u64, offset: u64, range: u64, vk_format: u3
     let f = format(vk_format).ok_or_else(|| format!("format {vk_format}"))?;
     let size = f.block_copy_size(None).ok_or_else(|| format!("{f:?} texel buffers"))? as u64;
     let texels = (range / size).max(1);
-    let max = gpu.device.limits().max_texture_dimension_1d as u64;
+    let row = crate::spirv::TEXEL_ROW as u64;
+    let max = row * gpu.device.limits().max_texture_dimension_2d as u64;
     if texels > max {
         return Err(format!("a texel buffer view of {texels} texels (at most {max})"));
     }
+    let (width, height) = (texels.min(row) as u32, texels.div_ceil(row) as u32);
     let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: wgpu::Extent3d { width: texels as u32, height: 1, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
-        dimension: wgpu::TextureDimension::D1,
+        dimension: wgpu::TextureDimension::D2,
         format: f,
         // (A storage texel buffer too, where its format can be one: written,
         // it's copied back, `write_back`.)
@@ -1512,28 +1665,56 @@ pub fn texel_view(gpu: &Gpu, buffer: u64, offset: u64, range: u64, vk_format: u3
     if let Some(e) = pollster::block_on(scope.pop()) {
         return Err(format!("texel buffer view: {}", describe(&e)));
     }
-    let view = View { view: texture.create_view(&Default::default()), format: f, size: [texels as u32, 1], attachment: None, samples: 1 };
+    let view = View { view: texture.create_view(&Default::default()), format: f, size: [width, height], attachment: None, samples: 1, base: [0, 0] };
     Ok(TexelView { buffer, offset, texels: texels as u32, texture, view })
+}
+
+/// A texel view's rows, as copies: where in the buffer each starts, its
+/// first row, how many rows, and how wide (the whole rows, then what's
+/// left over).
+fn texel_rows(t: &TexelView) -> Vec<(u64, u32, u32, u32)> {
+    let row = crate::spirv::TEXEL_ROW;
+    let size = t.texture.format().block_copy_size(None).unwrap_or(1) as u64;
+    let (whole, rest) = (t.texels / row, t.texels % row);
+    let mut copies = Vec::new();
+    if whole > 0 || t.texels < row {
+        copies.push((t.offset, 0, whole.max(1), t.texels.min(row)));
+    }
+    if rest > 0 && whole > 0 {
+        copies.push((t.offset + (whole * row) as u64 * size, whole, 1, rest));
+    }
+    copies
+}
+
+fn texel_copy(t: &TexelView, row: u32, width: u32) -> (wgpu::TexelCopyBufferLayout, wgpu::TexelCopyTextureInfo<'_>, wgpu::Extent3d) {
+    let size = t.texture.format().block_copy_size(None).unwrap_or(1);
+    (
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(crate::spirv::TEXEL_ROW * size), rows_per_image: None },
+        wgpu::TexelCopyTextureInfo { texture: &t.texture, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: row, z: 0 }, aspect: wgpu::TextureAspect::All },
+        wgpu::Extent3d { width, height: 1, depth_or_array_layers: 1 },
+    )
 }
 
 /// A texel view's texture brought up to date with its buffer.
 fn refresh(enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, t: &TexelView) {
-    enc.copy_buffer_to_texture(
-        wgpu::TexelCopyBufferInfo { buffer, layout: wgpu::TexelCopyBufferLayout { offset: t.offset, bytes_per_row: None, rows_per_image: None } },
-        t.texture.as_image_copy(),
-        wgpu::Extent3d { width: t.texels, height: 1, depth_or_array_layers: 1 },
-    );
+    for (offset, first, rows, width) in texel_rows(t) {
+        let (mut layout, texture, mut extent) = texel_copy(t, first, width);
+        layout.offset = offset;
+        extent.height = rows;
+        enc.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer, layout }, texture, extent);
+    }
 }
 
 /// A storage texel view's texture written back to its buffer (after a
 /// dispatch or a pass that may have written it).
 fn write_back(enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, t: &TexelView) {
     if t.texture.usage().contains(wgpu::TextureUsages::STORAGE_BINDING) {
-        enc.copy_texture_to_buffer(
-            t.texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo { buffer, layout: wgpu::TexelCopyBufferLayout { offset: t.offset, bytes_per_row: None, rows_per_image: None } },
-            wgpu::Extent3d { width: t.texels, height: 1, depth_or_array_layers: 1 },
-        );
+        for (offset, first, rows, width) in texel_rows(t) {
+            let (mut layout, texture, mut extent) = texel_copy(t, first, width);
+            layout.offset = offset;
+            extent.height = rows;
+            enc.copy_texture_to_buffer(texture, wgpu::TexelCopyBufferInfo { buffer, layout }, extent);
+        }
     }
 }
 
@@ -1601,6 +1782,10 @@ fn on_texture<'t>(t: &'t wgpu::Texture, s: &Sub) -> (wgpu::TexelCopyTextureInfo<
 /// buffer's rows 256 bytes apart; where Vulkan's aren't, a row at a time.
 fn buffer_image(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, t: &wgpu::Texture, r: &Region, to_image: bool) -> Res<()> {
     let (place, extent) = on_texture(t, &r.sub);
+    // (24-bit depth, which WebGPU won't copy, read by a compute shader.)
+    if !to_image && t.format().block_copy_size(Some(place.aspect)).is_none() && matches!(t.format(), wgpu::TextureFormat::Depth24Plus | wgpu::TextureFormat::Depth24PlusStencil8) {
+        return depth24_to_buffer(gpu, enc, buffer, t, r);
+    }
     let block = t.format().block_copy_size(Some(place.aspect)).ok_or("an image whose texels can't be copied")?;
     // (Rows and their lengths in blocks: a compressed format's are of
     // several texels.)
@@ -1621,24 +1806,36 @@ fn buffer_image(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer
         // (Depth and stencil go whole, not a row at a time: through a
         // buffer of WebGPU's pitch, the rows moved to and from Vulkan's.)
         let tight = extent.width * block;
-        if !tight.is_multiple_of(4) || !row_bytes.is_multiple_of(4) || !r.offset.is_multiple_of(4) {
-            return Err(format!("copying {} bytes a row of a {:?} image", tight, t.format()));
-        }
+        // (Rows moved a word at a time, or, where they aren't whole words,
+        // a byte at a time by a compute shader: stencil's.)
+        let aligned = tight.is_multiple_of(4) && row_bytes.is_multiple_of(4) && r.offset.is_multiple_of(4);
         let pitch = tight.next_multiple_of(256);
         let planes = extent.height as u64 * extent.depth_or_array_layers as u64;
-        let tmp = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: pitch as u64 * planes, usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let tmp = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: pitch as u64 * planes,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let staged = wgpu::TexelCopyBufferInfo { buffer: &tmp, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pitch), rows_per_image: Some(extent.height) } };
         let row_at = |z: u32, y: u32| r.offset + (z as u64 * rows as u64 + y as u64) * row_bytes as u64;
         let rows_of = || (0..extent.depth_or_array_layers).flat_map(|z| (0..extent.height).map(move |y| (z, y)));
+        let row = |enc: &mut wgpu::CommandEncoder, src: &wgpu::Buffer, from: u64, dst: &wgpu::Buffer, to: u64| {
+            if aligned {
+                enc.copy_buffer_to_buffer(src, from, dst, to, tight as u64);
+            } else {
+                copy_bytes(gpu, enc, src, from, dst, to, tight as u64);
+            }
+        };
         if to_image {
             for (z, y) in rows_of() {
-                enc.copy_buffer_to_buffer(buffer, row_at(z, y), &tmp, (z as u64 * extent.height as u64 + y as u64) * pitch as u64, tight as u64);
+                row(enc, buffer, row_at(z, y), &tmp, (z as u64 * extent.height as u64 + y as u64) * pitch as u64);
             }
             enc.copy_buffer_to_texture(staged, place, extent);
         } else {
             enc.copy_texture_to_buffer(place, staged, extent);
             for (z, y) in rows_of() {
-                enc.copy_buffer_to_buffer(&tmp, (z as u64 * extent.height as u64 + y as u64) * pitch as u64, buffer, row_at(z, y), tight as u64);
+                row(enc, &tmp, (z as u64 * extent.height as u64 + y as u64) * pitch as u64, buffer, row_at(z, y));
             }
         }
     } else {
@@ -1651,6 +1848,79 @@ fn buffer_image(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer
                 let height = (extent.height - y * bh).min(bh);
                 copy(offset, p, wgpu::Extent3d { width: extent.width, height, depth_or_array_layers: 1 }, None);
             }
+        }
+    }
+    Ok(())
+}
+
+/// A 24-bit depth image's region read into a buffer, as Vulkan lays it
+/// out (X8_D24_UNORM_PACK32: the depth in a word's low 24 bits): each
+/// texel loaded by a compute shader into a buffer of the region's rows,
+/// which go to Vulkan's.
+fn depth24_to_buffer(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, t: &wgpu::Texture, r: &Region) -> Res<()> {
+    const DEPTH24: &str = "
+struct P { x: u32, y: u32, layer: u32, mip: u32, width: u32, height: u32 }
+@group(0) @binding(0) var depth: texture_depth_2d_array;
+@group(0) @binding(1) var<storage, read_write> out: array<u32>;
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(8, 8, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= p.width || id.y >= p.height { return; }
+    let d = textureLoad(depth, vec2(p.x + id.x, p.y + id.y), p.layer + id.z, p.mip);
+    out[(id.z * p.height + id.y) * p.width + id.x] = u32(round(clamp(d, 0.0, 1.0) * 16777215.0));
+}
+";
+    let s = &r.sub;
+    if t.dimension() != wgpu::TextureDimension::D2 || t.sample_count() > 1 || !t.usage().contains(wgpu::TextureUsages::TEXTURE_BINDING) {
+        return Err(format!("reading a {:?} image's depth", t.format()));
+    }
+    let pipeline = gpu
+        .depth24
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| {
+            let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(DEPTH24.into()) });
+            gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        })
+        .clone();
+    let (w, h, layers) = (s.extent[0], s.extent[1], s.layers.max(1));
+    let words = w as u64 * h as u64 * layers as u64;
+    let out = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: words * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let p: Vec<u8> = [s.origin[0] as u32, s.origin[1] as u32, s.layer, s.mip, w, h, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let uniform = wgpu::util::DeviceExt::create_buffer_init(&gpu.device, &wgpu::util::BufferInitDescriptor { label: None, contents: &p, usage: wgpu::BufferUsages::UNIFORM });
+    let view = t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), aspect: wgpu::TextureAspect::DepthOnly, ..Default::default() });
+    let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() },
+        ],
+    });
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), layers);
+    }
+    // (Its rows, to Vulkan's places for them.)
+    let row_length = if r.row_length == 0 { w } else { r.row_length } as u64;
+    let rows = if r.image_height == 0 { h } else { r.image_height } as u64;
+    for z in 0..layers as u64 {
+        for y in 0..h as u64 {
+            enc.copy_buffer_to_buffer(&out, (z * h as u64 + y) * w as u64 * 4, buffer, r.offset + (z * rows + y) * row_length * 4, w as u64 * 4);
         }
     }
     Ok(())
@@ -1673,10 +1943,15 @@ fn bind_groups<'a>(
         View(&'r wgpu::TextureView),
         Sampler(&'r wgpu::Sampler),
     }
-    let one = |g: u32, d: &Binding, sampler_part: bool| -> Res<One<'a>> {
+    let one = |g: u32, w: u32, d: &Binding, sampler_part: bool| -> Res<One<'a>> {
         Ok(match (&d.resource, sampler_part) {
+            // (A range as big as the shader's buffer is, where the memory
+            // has room.)
             (Resource::Buffer { buffer: h, offset, size }, false) => match object(*h) {
-                Some(Object::Buffer(b)) => One::Buffer(wgpu::BufferBinding { buffer: b, offset: *offset, size: wgpu::BufferSize::new(*size) }),
+                Some(Object::Buffer(b)) => {
+                    let size = p.sizes.get(&(g, w)).map_or(*size, |&least| (*size).max(least.min(b.size().saturating_sub(*offset))));
+                    One::Buffer(wgpu::BufferBinding { buffer: b, offset: *offset, size: wgpu::BufferSize::new(size) })
+                }
                 _ => return Err(format!("no buffer {h}")),
             },
             (Resource::View(v), false) | (Resource::Combined { view: v, .. }, false) => match object(*v) {
@@ -1711,7 +1986,7 @@ fn bind_groups<'a>(
                 let (b, sampler_part) = crate::spirv::vulkan_binding(w);
                 let element = |e: u32| {
                     let d = set.iter().find(|d| d.binding == b && d.element == e).ok_or_else(|| format!("set {g} has no binding {b}[{e}]"))?;
-                    one(g, d, sampler_part)
+                    one(g, w, d, sampler_part)
                 };
                 let Some(&n) = p.arrays.get(&(g, w)) else { return Ok((w, Gathered::One(element(0)?))) };
                 let all = (0..n).map(element).collect::<Res<Vec<_>>>()?;
@@ -1889,7 +2164,11 @@ fn clear_attachments(gpu: &Gpu, pass: &mut wgpu::RenderPass<'_>, t: &Targets, si
                     format,
                     depth_write_enabled: Some(depth.is_some()),
                     depth_compare: Some(wgpu::CompareFunction::Always),
-                    stencil: wgpu::StencilState { front: face, back: face, read_mask: 0xff, write_mask: if stencil.is_some() { 0xff } else { 0 } },
+                    stencil: if format.has_stencil_aspect() {
+                        wgpu::StencilState { front: face, back: face, read_mask: 0xff, write_mask: if stencil.is_some() { 0xff } else { 0 } }
+                    } else {
+                        Default::default()
+                    },
                     bias: Default::default(),
                 });
                 gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2116,6 +2395,85 @@ fn color(format: wgpu::TextureFormat, bits: &[u32; 4]) -> wgpu::Color {
     wgpu::Color { r: value(0), g: value(1), b: value(2), a: value(3) }
 }
 
+/// A clear color (Vulkan's clear value's bits) as a texel of `format`'s
+/// bytes, for the formats images that aren't attachments have.
+fn packed(format: wgpu::TextureFormat, bits: &[u32; 4]) -> Option<Vec<u8>> {
+    use wgpu::TextureFormat as F;
+    let f = |k: usize| f32::from_bits(bits[k]);
+    let unorm8 = |k: usize| (f(k).clamp(0.0, 1.0) * 255.0).round() as u8;
+    let snorm8 = |k: usize| (f(k).clamp(-1.0, 1.0) * 127.0).round() as i8 as u8;
+    let unorm16 = |k: usize| ((f(k).clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes();
+    let snorm16 = |k: usize| ((f(k).clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes();
+    let half = |k: usize| half_bits(f(k)).to_le_bytes();
+    let srgb = |k: usize| {
+        let c = f(k).clamp(0.0, 1.0);
+        let s = if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+        (s * 255.0).round() as u8
+    };
+    let lanes = |n: usize, one: &dyn Fn(usize) -> Vec<u8>| (0..n).flat_map(one).collect::<Vec<u8>>();
+    Some(match format {
+        F::R8Unorm => lanes(1, &|k| vec![unorm8(k)]),
+        F::Rg8Unorm => lanes(2, &|k| vec![unorm8(k)]),
+        F::Rgba8Unorm => lanes(4, &|k| vec![unorm8(k)]),
+        F::Rgba8UnormSrgb => vec![srgb(0), srgb(1), srgb(2), unorm8(3)],
+        F::Bgra8Unorm => vec![unorm8(2), unorm8(1), unorm8(0), unorm8(3)],
+        F::Bgra8UnormSrgb => vec![srgb(2), srgb(1), srgb(0), unorm8(3)],
+        F::R8Snorm => lanes(1, &|k| vec![snorm8(k)]),
+        F::Rg8Snorm => lanes(2, &|k| vec![snorm8(k)]),
+        F::Rgba8Snorm => lanes(4, &|k| vec![snorm8(k)]),
+        F::R8Uint | F::R8Sint => lanes(1, &|k| vec![bits[k] as u8]),
+        F::Rg8Uint | F::Rg8Sint => lanes(2, &|k| vec![bits[k] as u8]),
+        F::Rgba8Uint | F::Rgba8Sint => lanes(4, &|k| vec![bits[k] as u8]),
+        F::R16Unorm => lanes(1, &|k| unorm16(k).to_vec()),
+        F::Rg16Unorm => lanes(2, &|k| unorm16(k).to_vec()),
+        F::Rgba16Unorm => lanes(4, &|k| unorm16(k).to_vec()),
+        F::R16Snorm => lanes(1, &|k| snorm16(k).to_vec()),
+        F::Rg16Snorm => lanes(2, &|k| snorm16(k).to_vec()),
+        F::Rgba16Snorm => lanes(4, &|k| snorm16(k).to_vec()),
+        F::R16Uint | F::R16Sint => lanes(1, &|k| (bits[k] as u16).to_le_bytes().to_vec()),
+        F::Rg16Uint | F::Rg16Sint => lanes(2, &|k| (bits[k] as u16).to_le_bytes().to_vec()),
+        F::Rgba16Uint | F::Rgba16Sint => lanes(4, &|k| (bits[k] as u16).to_le_bytes().to_vec()),
+        F::R16Float => lanes(1, &|k| half(k).to_vec()),
+        F::Rg16Float => lanes(2, &|k| half(k).to_vec()),
+        F::Rgba16Float => lanes(4, &|k| half(k).to_vec()),
+        F::R32Uint | F::R32Sint | F::R32Float => lanes(1, &|k| bits[k].to_le_bytes().to_vec()),
+        F::Rg32Uint | F::Rg32Sint | F::Rg32Float => lanes(2, &|k| bits[k].to_le_bytes().to_vec()),
+        F::Rgba32Uint | F::Rgba32Sint | F::Rgba32Float => lanes(4, &|k| bits[k].to_le_bytes().to_vec()),
+        _ => return None,
+    })
+}
+
+/// A float's half-precision bits, rounded to nearest even.
+fn half_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rest = m & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let round = (rest > mid || (rest == mid && half & 1 == 1)) as u32;
+        return sign | (half + round) as u16;
+    }
+    let half = ((e as u32) << 10) | (man >> 13);
+    let rest = man & 0x1fff;
+    let round = (rest > 0x1000 || (rest == 0x1000 && half & 1 == 1)) as u32;
+    sign | (half + round) as u16
+}
+
 /// Runs commands in order, as one submission: `object` finds what their
 /// handles name.
 pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Object<'a>>) -> Res<()> {
@@ -2249,8 +2607,44 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
             }
             Command::ClearColor { image, mip, mips, layer, layers, color: bits } => {
                 let t = tex(*image)?;
+                // (An image that can't be an attachment, a 1D one: its
+                // texels copied in, each the color packed.)
                 if !t.usage().contains(wgpu::TextureUsages::RENDER_ATTACHMENT) {
-                    return Err(format!("clearing a {:?} image", t.format()));
+                    let texel = packed(t.format(), bits).ok_or_else(|| format!("clearing a {:?} image", t.format()))?;
+                    let d3 = t.dimension() == wgpu::TextureDimension::D3;
+                    for m in *mip..mip + mips {
+                        let size = t.size().mip_level_size(m, t.dimension());
+                        let pitch = (size.width as usize * texel.len()).next_multiple_of(256);
+                        let rows = size.height as usize * if d3 { size.depth_or_array_layers as usize } else { 1 };
+                        let mut bytes = vec![0u8; pitch * rows];
+                        for row in bytes.chunks_mut(pitch) {
+                            for x in 0..size.width as usize {
+                                row[x * texel.len()..(x + 1) * texel.len()].copy_from_slice(&texel);
+                            }
+                        }
+                        let b = wgpu::util::DeviceExt::create_buffer_init(
+                            &gpu.device,
+                            &wgpu::util::BufferInitDescriptor { label: None, contents: &bytes, usage: wgpu::BufferUsages::COPY_SRC },
+                        );
+                        for l in *layer..layer + if d3 { 1 } else { *layers } {
+                            let depth = if d3 { size.depth_or_array_layers } else { 1 };
+                            enc.copy_buffer_to_texture(
+                                wgpu::TexelCopyBufferInfo {
+                                    buffer: &b,
+                                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pitch as u32), rows_per_image: Some(size.height) },
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: t,
+                                    mip_level: m,
+                                    origin: wgpu::Origin3d { x: 0, y: 0, z: if d3 { 0 } else { l } },
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: depth },
+                            );
+                        }
+                    }
+                    i += 1;
+                    continue;
                 }
                 // (A render pass per mip level and layer, cleared.)
                 let clear = color(t.format(), bits);
@@ -2367,6 +2761,48 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     (None, Some((h, _, _))) => Some(&queries(*h)?.spill.as_ref().ok_or("an occlusion query of a pool of timestamps")?.0),
                     (None, None) => None,
                 };
+                // (Views of its own attachments its draws read, as input
+                // attachments of a subpass that draws into them, a
+                // self-dependency: copies made as it begins, which WebGPU
+                // reads, as it won't read an attachment.)
+                let attached: Vec<&wgpu::Texture> = colors.iter().map(|a| a.view).chain(depth.iter().map(|d| d.view)).map(|h| Ok(view(h)?.view.texture())).collect::<Res<_>>()?;
+                let mut snapshots: HashMap<u64, View> = HashMap::new();
+                let ahead = commands[i + 1..].iter().take_while(|c| **c != Command::EndPass).filter_map(|c| match c {
+                    Command::BindGraphicsSet { bindings, .. } => Some(bindings),
+                    _ => None,
+                });
+                for b in graphics_sets.values().flatten().chain(ahead.flatten()) {
+                    let (Resource::View(h) | Resource::Combined { view: h, .. }) = b.resource else {
+                        continue;
+                    };
+                    let v = view(h)?;
+                    let t = v.view.texture();
+                    if snapshots.contains_key(&h) || !attached.contains(&t) || v.samples > 1 {
+                        continue;
+                    }
+                    let size = wgpu::Extent3d { width: v.size[0], height: v.size[1], depth_or_array_layers: 1 };
+                    let copy = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                        label: None,
+                        size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: t.format(),
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let from =
+                        wgpu::TexelCopyTextureInfo { texture: t, mip_level: v.base[0], origin: wgpu::Origin3d { x: 0, y: 0, z: v.base[1] }, aspect: wgpu::TextureAspect::All };
+                    enc.copy_texture_to_texture(from, copy.as_image_copy(), size);
+                    let aspect =
+                        if v.format.has_depth_aspect() && t.format().is_combined_depth_stencil_format() { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
+                    let snapshot = copy.create_view(&wgpu::TextureViewDescriptor { format: Some(v.format), aspect, ..Default::default() });
+                    snapshots.insert(h, View { view: snapshot, format: v.format, size: v.size, attachment: None, samples: 1, base: [0, 0] });
+                }
+                let object = |h: u64| match snapshots.get(&h) {
+                    Some(v) => Some(Object::View(v)),
+                    None => object(h),
+                };
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &color_attachments, depth_stencil_attachment, occlusion_query_set, ..Default::default() });
                 if let Some((h, _, slots)) = &mut spanning {
                     let next = spill_next.entry(*h).or_insert(0);
@@ -2434,14 +2870,18 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                         Command::BindIndex { buffer, offset, wide } => index = Some((*buffer, *offset, if *wide { wgpu::IndexFormat::Uint32 } else { wgpu::IndexFormat::Uint16 })),
                         c @ (Command::Draw(_) | Command::DrawIndexed { .. } | Command::DrawIndirect { .. }) => {
                             let p = graphics.as_ref().ok_or("a draw with no pipeline bound")?;
-                            // (Its pipeline again: one bound before the pass.)
-                            pass.set_pipeline(&p.render_for(gpu, &targets.colors, dynamic)?);
+                            // (Its pipeline again: one bound before the pass,
+                            // and an indexed one's for its indices' format.)
+                            let indexed = matches!(c, Command::DrawIndexed { .. } | Command::DrawIndirect { indexed: true, .. });
+                            let d = Dynamic { strip_index: index.filter(|_| indexed).map(|(_, _, f)| f), ..dynamic };
+                            pass.set_pipeline(&p.render_for(gpu, &targets.colors, d)?);
                             for (g, group) in bind_groups(gpu, p, &graphics_sets, &push, &object, &staged)? {
                                 pass.set_bind_group(g, &group, &[]);
                             }
-                            for (slot, b) in p.vertex_bindings.iter().enumerate() {
+                            for (slot, (b, from)) in p.vertex_bindings.iter().enumerate() {
                                 let &(h, offset) = vertex.get(b).ok_or_else(|| format!("no vertex buffer bound to binding {b}"))?;
-                                pass.set_vertex_buffer(slot as u32, buf(h)?.slice(offset..));
+                                let b = buf(h)?;
+                                pass.set_vertex_buffer(slot as u32, b.slice((offset + from).min(b.size())..));
                             }
                             // (A triangle fan's: a list of its triangles' indices.)
                             if p.fan {

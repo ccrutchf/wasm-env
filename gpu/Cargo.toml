@@ -7,9 +7,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
-wgpu = "30"
+wgpu = { version = "30", features = ["naga-ir"] }
 pollster = "0.4"
-# (SPIR-V shaders, for Vulkan: read, then written as WGSL.)
+# (wgpu's own warnings, shown under WASM_ENV_DEBUG_GPU.)
+log = "0.4"
+# (SPIR-V shaders, for Vulkan: read, and given to wgpu as naga's IR.)
 naga = { version = "30", features = ["spv-in", "wgsl-out"] }
 
 [dev-dependencies]

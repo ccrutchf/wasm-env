@@ -8,11 +8,15 @@
 //! `OpSampledImage`, which naga does read.
 //!
 //! And writes of `gl_PointSize`, which WGSL hasn't (WebGPU's points are one
-//! pixel), are dropped: naga leaves out the builtins nothing touches.
+//! pixel), are dropped: naga leaves out the builtins nothing touches; and
+//! so are decorations of memory as coherent or volatile.
 
 use std::collections::HashMap;
 
 use crate::ir::Res;
+
+mod interface;
+mod matrices;
 
 const OP_ENTRY_POINT: u32 = 15;
 const OP_TYPE_SAMPLER: u32 = 26;
@@ -31,6 +35,8 @@ const OP_DECORATE: u32 = 71;
 const OP_SAMPLED_IMAGE: u32 = 86;
 const DECORATION_BINDING: u32 = 33;
 const DECORATION_DESCRIPTOR_SET: u32 = 34;
+const DECORATION_VOLATILE: u32 = 21;
+const DECORATION_COHERENT: u32 = 23;
 const UNIFORM_CONSTANT: u32 = 0;
 
 /// The WebGPU binding for a Vulkan binding (`sampler`: a combined image
@@ -46,6 +52,7 @@ pub fn vulkan_binding(wgpu: u32) -> (u32, bool) {
 }
 
 /// An instruction: its opcode and operands.
+#[derive(Clone)]
 struct Inst {
     op: u32,
     words: Vec<u32>,
@@ -165,15 +172,24 @@ fn subpass_inputs(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Inst
 
 const OP_COPY_OBJECT: u32 = 83;
 const OP_IMAGE: u32 = 100;
-const DIM_1D: u32 = 0;
+const OP_IMAGE_WRITE: u32 = 99;
+const OP_IMAGE_QUERY_SIZE: u32 = 104;
+const OP_COMPOSITE_CONSTRUCT: u32 = 80;
+const OP_COMPOSITE_EXTRACT: u32 = 81;
+const OP_I_MUL: u32 = 132;
+const OP_SHIFT_RIGHT_LOGICAL: u32 = 194;
 const DIM_BUFFER: u32 = 5;
 
 /// Texel buffers (GLSL's `samplerBuffer`, `textureBuffer`, `imageBuffer`),
-/// which WGSL hasn't, as 1D images (the runtime binds a texel buffer view
-/// as a 1D texture of its texels: vulkan.rs, `TexelView`). A `samplerBuffer`
-/// has no sampler (its descriptor holds none): its variable becomes the
-/// image's, its `OpImage` a copy. A fetch from a buffer has no level: it
-/// gets level 0.
+/// which WGSL hasn't, as 2D images (the runtime binds a texel buffer view
+/// as a 2D texture of its texels, `TEXEL_ROW` a row: vulkan.rs,
+/// `TexelView`; a 1D one would hold too few). Texel `i` is at
+/// (`i % TEXEL_ROW`, `i / TEXEL_ROW`), and a buffer's size the texture's
+/// width times its height. A `samplerBuffer` has no sampler (its
+/// descriptor holds none): its variable becomes the image's, its `OpImage`
+/// a copy. A fetch from a buffer has no level: it gets level 0.
+pub const TEXEL_ROW: u32 = 4096;
+
 fn texel_buffers(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Inst> {
     use std::collections::{HashMap, HashSet};
     let buffers: HashSet<u32> = insts.iter().filter(|i| i.op == OP_TYPE_IMAGE && i.words[2] == DIM_BUFFER).map(|i| i.words[0]).collect();
@@ -192,21 +208,44 @@ fn texel_buffers(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Inst>
             values.insert(i.words[1]);
         }
     }
-    let int = insts.iter().find(|i| i.op == OP_TYPE_INT && i.words[1..] == [32, 1]).map(|i| i.words[0]);
-    let zero = int.and_then(|int| insts.iter().find(|i| i.op == OP_CONSTANT && i.words[0] == int && i.words[2] == 0).map(|i| i.words[1]));
+    // (An int, an ivec2, and the constants a texel's place takes.)
     let mut made = Vec::new();
-    let zero = match zero {
-        Some(zero) => zero,
-        None => {
-            let int = int.unwrap_or_else(|| {
+    let int = insts
+        .iter()
+        .find(|i| i.op == OP_TYPE_INT && i.words[1..] == [32, 1])
+        .map(|i| i.words[0])
+        .unwrap_or_else(|| {
                 let id = fresh();
                 made.push(inst(OP_TYPE_INT, &[id, 32, 1]));
                 id
             });
+    let ivec2 = insts
+        .iter()
+        .find(|i| i.op == OP_TYPE_VECTOR && i.words[1..] == [int, 2])
+        .map(|i| i.words[0])
+        .unwrap_or_else(|| {
             let id = fresh();
-            made.push(inst(OP_CONSTANT, &[int, id, 0]));
+            made.push(inst(OP_TYPE_VECTOR, &[id, int, 2]));
             id
-        }
+        });
+    let mut constant = |v: u32| {
+        let id = fresh();
+        made.push(inst(OP_CONSTANT, &[int, id, v]));
+        id
+    };
+    let (zero, column, shift) = (
+        constant(0),
+        constant(TEXEL_ROW - 1),
+        constant(TEXEL_ROW.trailing_zeros()),
+    );
+    // (Texel `coordinate`'s place, as instructions put before its use.)
+    let place = |coordinate: u32, out: &mut Vec<Inst>, fresh: &mut dyn FnMut() -> u32| {
+        let (c, x, y, v) = (fresh(), fresh(), fresh(), fresh());
+        out.push(inst(OP_BITCAST, &[int, c, coordinate]));
+        out.push(inst(OP_BITWISE_AND, &[int, x, c, column]));
+        out.push(inst(OP_SHIFT_RIGHT_LOGICAL, &[int, y, c, shift]));
+        out.push(inst(OP_COMPOSITE_CONSTRUCT, &[ivec2, v, x, y]));
+        v
     };
 
     let mut out = Vec::with_capacity(insts.len() + 2);
@@ -219,8 +258,11 @@ fn texel_buffers(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Inst>
         match i.op {
             OP_TYPE_IMAGE if buffers.contains(&i.words[0]) => {
                 let mut w = i.words.clone();
-                w[2] = DIM_1D;
-                out.push(Inst { op: OP_TYPE_IMAGE, words: w });
+                w[2] = DIM_2D;
+                out.push(Inst {
+                    op: OP_TYPE_IMAGE,
+                    words: w,
+                });
             }
             // (Pointers to a samplerBuffer point to its image.)
             OP_TYPE_POINTER if sampled.contains_key(&i.words[2]) => out.push(inst(OP_TYPE_POINTER, &[i.words[0], i.words[1], sampled[&i.words[2]]])),
@@ -230,8 +272,115 @@ fn texel_buffers(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Inst>
                 out.push(Inst { op: OP_LOAD, words: w });
             }
             OP_IMAGE if values.contains(&i.words[2]) => out.push(inst(OP_COPY_OBJECT, &i.words)),
-            OP_IMAGE_FETCH if values.contains(&i.words[2]) && i.words.len() == 4 => {
-                out.push(Inst { op: OP_IMAGE_FETCH, words: [i.words.clone(), vec![IMAGE_OPERANDS_LOD, zero]].concat() });
+            OP_IMAGE_FETCH | OP_IMAGE_READ if values.contains(&i.words[2]) => {
+                let mut w = i.words.clone();
+                w[3] = place(w[3], &mut out, fresh);
+                if i.op == OP_IMAGE_FETCH && w.len() == 4 {
+                    w.extend([IMAGE_OPERANDS_LOD, zero]);
+                }
+                out.push(Inst { op: i.op, words: w });
+            }
+            OP_IMAGE_WRITE if values.contains(&i.words[0]) => {
+                let mut w = i.words.clone();
+                w[1] = place(w[1], &mut out, fresh);
+                out.push(Inst { op: i.op, words: w });
+            }
+            // (Its size: the texture's width times its height.)
+            OP_IMAGE_QUERY_SIZE if values.contains(&i.words[2]) => {
+                let (q, x, y, n) = (fresh(), fresh(), fresh(), fresh());
+                out.push(inst(OP_IMAGE_QUERY_SIZE, &[ivec2, q, i.words[2]]));
+                out.push(inst(OP_COMPOSITE_EXTRACT, &[int, x, q, 0]));
+                out.push(inst(OP_COMPOSITE_EXTRACT, &[int, y, q, 1]));
+                out.push(inst(OP_I_MUL, &[int, n, x, y]));
+                out.push(inst(OP_BITCAST, &[i.words[0], i.words[1], n]));
+            }
+            _ => out.push(i),
+        }
+    }
+    out
+}
+
+const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u32 = 87;
+const OP_IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88;
+const OP_IMAGE_QUERY_SIZE_LOD: u32 = 103;
+const OP_CONVERT_S_TO_F: u32 = 111;
+const OP_F_MUL: u32 = 133;
+
+/// Samples of integer 2D images (a `usampler2D`'s `texture`), which WGSL
+/// hasn't (Vulkan's take the nearest texel): fetches of the texel at the
+/// coordinates times the image's size, from level 0.
+fn integer_samples(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Inst> {
+    let ints: std::collections::HashSet<u32> = insts
+        .iter()
+        .filter(|i| i.op == OP_TYPE_INT)
+        .map(|i| i.words[0])
+        .collect();
+    let images: std::collections::HashSet<u32> = insts
+        .iter()
+        .filter(|i| {
+            i.op == OP_TYPE_IMAGE
+                && ints.contains(&i.words[1])
+                && i.words[2] == DIM_2D
+                && i.words[4] == 0
+                && i.words[5] == 0
+        })
+        .map(|i| i.words[0])
+        .collect();
+    let sampled_types: std::collections::HashSet<u32> = insts
+        .iter()
+        .filter(|i| i.op == OP_TYPE_SAMPLED_IMAGE && images.contains(&i.words[1]))
+        .map(|i| i.words[0])
+        .collect();
+    // (A sampled image of one: its image.)
+    let of: HashMap<u32, u32> = insts
+        .iter()
+        .filter(|i| i.op == OP_SAMPLED_IMAGE && sampled_types.contains(&i.words[0]))
+        .map(|i| (i.words[1], i.words[2]))
+        .collect();
+    if !insts.iter().any(|i| {
+        matches!(
+            i.op,
+            OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD
+        ) && of.contains_key(&i.words[2])
+    }) {
+        return insts;
+    }
+    let float = insts
+        .iter()
+        .find(|i| i.op == OP_TYPE_FLOAT && i.words[1] == 32)
+        .map(|i| i.words[0]);
+    let (int, ivec2, vec2, zero) = (fresh(), fresh(), fresh(), fresh());
+    let mut made = vec![
+        inst(OP_TYPE_INT, &[int, 32, 1]),
+        inst(OP_TYPE_VECTOR, &[ivec2, int, 2]),
+        inst(OP_CONSTANT, &[int, zero, 0]),
+    ];
+    let float = float.unwrap_or_else(|| {
+        let f = fresh();
+        made.push(inst(OP_TYPE_FLOAT, &[f, 32]));
+        f
+    });
+    made.push(inst(OP_TYPE_VECTOR, &[vec2, float, 2]));
+    let mut out = Vec::with_capacity(insts.len() + made.len());
+    for i in insts {
+        if i.op == OP_FUNCTION && !made.is_empty() {
+            out.append(&mut made);
+        }
+        match i.op {
+            OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD
+                if of.contains_key(&i.words[2]) =>
+            {
+                let (ty, result, image, coordinate) =
+                    (i.words[0], i.words[1], of[&i.words[2]], i.words[3]);
+                let (size, scale, at, texel) = (fresh(), fresh(), fresh(), fresh());
+                out.push(inst(OP_IMAGE_QUERY_SIZE_LOD, &[ivec2, size, image, zero]));
+                out.push(inst(OP_CONVERT_S_TO_F, &[vec2, scale, size]));
+                out.push(inst(OP_F_MUL, &[vec2, at, coordinate, scale]));
+                out.push(inst(OP_CONVERT_F_TO_S, &[ivec2, texel, at]));
+                out.push(inst(
+                    OP_IMAGE_FETCH,
+                    &[ty, result, image, texel, IMAGE_OPERANDS_LOD, zero],
+                ));
             }
             _ => out.push(i),
         }
@@ -352,12 +501,24 @@ const OP_SPEC_CONSTANT: u32 = 50;
 const OP_SPEC_CONSTANT_COMPOSITE: u32 = 51;
 const OP_SPEC_CONSTANT_OP: u32 = 52;
 const DECORATION_SPEC_ID: u32 = 1;
+const OP_EXECUTION_MODE: u32 = 16;
+const OP_EXECUTION_MODE_ID: u32 = 331;
+const MODE_LOCAL_SIZE: u32 = 17;
+const MODE_LOCAL_SIZE_ID: u32 = 38;
+const BUILTIN_WORKGROUP_SIZE: u32 = 25;
 
 /// Whether a module computes with specialization constants
-/// (`OpSpecConstantOp`), which naga doesn't read: it's specialized first
-/// (`specialize`).
+/// (`OpSpecConstantOp`), or makes composites of them (`gl_WorkGroupSize`
+/// is one), which naga doesn't read: it's specialized first (`specialize`).
 pub fn computes_with_spec_constants(spirv: &[u8]) -> bool {
-    parse(spirv).is_ok_and(|(_, insts)| insts.iter().any(|i| i.op == OP_SPEC_CONSTANT_OP))
+    parse(spirv).is_ok_and(|(_, insts)| {
+        insts.iter().any(|i| {
+            matches!(
+                i.op,
+                OP_SPEC_CONSTANT_OP | OP_SPEC_CONSTANT_COMPOSITE | OP_EXECUTION_MODE_ID
+            )
+        })
+    })
 }
 
 /// The module with its specialization constants made constants: those
@@ -491,6 +652,40 @@ pub fn specialize(spirv: &[u8], values: &[(u32, u64)]) -> Res<Vec<u8>> {
             _ => out.push(i),
         }
     }
+    // The work group's size, if constants give it (`local_size_x_id`): a
+    // composite that's `gl_WorkGroupSize`, which wins, or `LocalSizeId`'s,
+    // as `LocalSize`.
+    let composites: HashMap<u32, Vec<u32>> = out
+        .iter()
+        .filter(|i| i.op == OP_CONSTANT_COMPOSITE)
+        .map(|i| (i.words[1], i.words[2..].to_vec()))
+        .collect();
+    let builtin = out
+        .iter()
+        .find(|i| {
+            i.op == OP_DECORATE && i.words[1..] == [DECORATION_BUILTIN, BUILTIN_WORKGROUP_SIZE]
+        })
+        .and_then(|i| composites.get(&i.words[0]))
+        .and_then(|c| {
+            c.iter()
+                .map(|id| known.get(id).map(|&(v, _)| v as u32))
+                .collect::<Option<Vec<u32>>>()
+        });
+    for i in out.iter_mut() {
+        let local_size = match (i.op, i.words.get(1)) {
+            (OP_EXECUTION_MODE, Some(&MODE_LOCAL_SIZE)) => i.words[2..].to_vec(),
+            (OP_EXECUTION_MODE_ID, Some(&MODE_LOCAL_SIZE_ID)) => i.words[2..]
+                .iter()
+                .map(|id| known.get(id).map_or(1, |&(v, _)| v as u32))
+                .collect(),
+            _ => continue,
+        };
+        let size = builtin.clone().unwrap_or(local_size);
+        *i = inst(
+            OP_EXECUTION_MODE,
+            &[&[i.words[0], MODE_LOCAL_SIZE][..], &size].concat(),
+        );
+    }
     Ok(emit(header, &out))
 }
 
@@ -505,6 +700,10 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
     let insts = texel_buffers(insts, &mut fresh);
     let insts = subpass_inputs(insts, &mut fresh);
     let insts = nan_tests(insts, &mut fresh);
+    let insts = matrices::arrays(insts, &mut fresh);
+    let insts = interface::flatten(insts, &mut fresh);
+    let insts = interface::widen_outputs(insts, &mut fresh);
+    let insts = interface::sample_mask(insts, &mut fresh);
 
     // Combined image sampler types (to their image type), pointers to them
     // (to the type), and variables of those (to the image type).
@@ -550,6 +749,14 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
             OP_ACCESS_CHAIN | OP_IN_BOUNDS_ACCESS_CHAIN if point_chains.contains(&i.words[1]) => {}
             OP_VARIABLE if point_vars.contains(&i.words[1]) => {}
             OP_DECORATE if point_vars.contains(&i.words[0]) => {}
+            // (Memory that's coherent, or volatile: WGSL's storage is as
+            // coherent as it needs, between its barriers.)
+            OP_DECORATE if matches!(i.words[1], DECORATION_COHERENT | DECORATION_VOLATILE) => {}
+            OP_MEMBER_DECORATE
+                if matches!(
+                    i.words.get(2),
+                    Some(&(DECORATION_COHERENT | DECORATION_VOLATILE))
+                ) => {}
             // (What it needs declared before the first combined variable.)
             OP_VARIABLE if combined.contains_key(&i.words[1]) => {
                 let v = i.words[1];
@@ -595,6 +802,7 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
             _ => out.push(i),
         }
     }
+    let out = integer_samples(out, &mut fresh);
     header[3] = next;
     Ok(emit(header, &out))
 }
@@ -635,4 +843,12 @@ mod tests {
         s.extend(((5u32 << 16) | 1).to_le_bytes());
         assert!(prepare(&s).is_err());
     }
+}
+
+/// (A module prepared, for a look: SPIRV_IN to SPIRV_OUT.)
+#[test]
+#[ignore]
+fn prepare_file() {
+    let s = std::fs::read(std::env::var("SPIRV_IN").unwrap()).unwrap();
+    std::fs::write(std::env::var("SPIRV_OUT").unwrap(), prepare(&s).unwrap()).unwrap();
 }

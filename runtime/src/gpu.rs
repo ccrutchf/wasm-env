@@ -78,7 +78,10 @@
 //!              vendor and device ids, device type (Vulkan's), timestamp
 //!              period (nanoseconds, an f32's bits; 0: no timestamps), features
 //!              (bits: binding arrays, 64-bit floats and integers, indirect
-//!              draws' first instance, BC compression)
+//!              draws' first instance, BC compression); samplers, sampled and
+//!              storage images per stage, vertex attributes, vertex
+//!              buffers, vertex stride, inter-stage variables, color
+//!              attachments, 1D, 2D and 3D image sizes, array layers
 //!  24 VK_IMAGE    a0: u32s: dimensions (1, 2, 3), format (VkFormat), width,
 //!              height, depth, mip levels, layers, samples, usage
 //!              (VkImageUsageFlags)   r0: image handle
@@ -88,7 +91,8 @@
 //!              address modes (u, v, w), maximum anisotropy, comparison
 //!              (VkCompareOp + 1, or 0), LOD minimum and maximum (f32)   r0: handle
 //!  27 VK_FORMAT   a0: VkFormat   r0: its VkFormatFeatureFlags (optimal
-//!              tiling), r2: a texel's bytes (0: not supported)
+//!              tiling), r2: a texel's bytes (0: not supported), r3: its
+//!              sample counts (VkSampleCountFlags: 1, or 1 and 4)
 //!  28 VK_GRAPHICS a0: state, a1: its length (gpu/src/vulkan.rs,
 //!              `GraphicsState::decode`), a3, a4: as VK_SHADER's   r0:
 //!              graphics pipeline handle, r2: as VK_PIPELINE's
@@ -666,8 +670,8 @@ impl Session {
                 }
             }
             27 => {
-                let (features, bytes) = vulkan::format_features(g, a[0] as u32);
-                (r[0], r[2]) = (features as u64, bytes as u64);
+                let (features, bytes, samples) = vulkan::format_features(g, a[0] as u32);
+                (r[0], r[2], r[3]) = (features as u64, bytes as u64, samples as u64);
             }
             _ => return Err(Failure::Errno(EINVAL)),
         }
@@ -810,7 +814,7 @@ impl Session {
         .enumerate()
         .filter(|(_, f)| has.contains(**f))
         .fold(0u64, |m, (k, _)| m | 1 << k);
-        let words: [u64; 21] = [
+        let words: [u64; 33] = [
             l.min_storage_buffer_offset_alignment as u64,
             l.min_uniform_buffer_offset_alignment as u64,
             l.max_storage_buffer_binding_size,
@@ -833,6 +837,18 @@ impl Session {
             kind,
             timestamp,
             features,
+            l.max_samplers_per_shader_stage as u64,
+            l.max_sampled_textures_per_shader_stage as u64,
+            l.max_storage_textures_per_shader_stage as u64,
+            l.max_vertex_attributes as u64,
+            l.max_vertex_buffers as u64,
+            l.max_vertex_buffer_array_stride as u64,
+            l.max_inter_stage_shader_variables as u64,
+            l.max_color_attachments as u64,
+            l.max_texture_dimension_1d as u64,
+            l.max_texture_dimension_2d as u64,
+            l.max_texture_dimension_3d as u64,
+            l.max_texture_array_layers as u64,
         ];
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }

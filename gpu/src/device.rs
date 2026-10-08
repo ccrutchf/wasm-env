@@ -30,6 +30,8 @@ pub struct Gpu {
     /// Vulkan's triangle fans: a compute pipeline making their indices a
     /// list's.
     pub(crate) fans: Mutex<Option<wgpu::ComputePipeline>>,
+    /// And 24-bit depth read into a buffer (WebGPU copies none).
+    pub(crate) depth24: Mutex<Option<wgpu::ComputePipeline>>,
     lost: std::sync::atomic::AtomicBool,
 }
 
@@ -110,6 +112,8 @@ impl Gpu {
             | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
             // (and blending 32-bit float attachments, as Vulkan devices do)
             | wgpu::Features::FLOAT32_BLENDABLE
+            // (and filtering them)
+            | wgpu::Features::FLOAT32_FILTERABLE
             // (and timestamps, anywhere in a submission)
             | wgpu::Features::TIMESTAMP_QUERY
             | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
@@ -128,10 +132,27 @@ impl Gpu {
         .map_err(|e| format!("can't open {}: {e}", info.name))?;
         // Errors are reported to the caller (error scopes), not panics.
         device.on_uncaptured_error(Arc::new(|e| eprintln!("wasm-env: GPU: {}", chain(&e))));
-        let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), byte_copy: Default::default(), clears: Default::default(), fans: Default::default(), lost: Default::default() };
+        let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), byte_copy: Default::default(), clears: Default::default(), fans: Default::default(), depth24: Default::default(), lost: Default::default() };
         g.quirks = Quirks { native_f64: native_f64 && g.native_doubles_conform()?, ..g.probe_quirks()? };
         if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
             eprintln!("wasm-env: GPU {}: {:?}", g.info.name, g.quirks);
+            // (And wgpu's warnings.)
+            struct Warnings;
+            impl log::Log for Warnings {
+                fn enabled(&self, m: &log::Metadata) -> bool {
+                    // (Not naga's reader's: decorations it skips.)
+                    m.level() <= log::Level::Warn && !m.target().starts_with("naga::front")
+                }
+                fn log(&self, r: &log::Record) {
+                    if self.enabled(r.metadata()) {
+                        eprintln!("wasm-env: {} {}: {}", r.level(), r.target(), r.args());
+                    }
+                }
+                fn flush(&self) {}
+            }
+            if log::set_logger(&Warnings).is_ok() {
+                log::set_max_level(log::LevelFilter::Warn);
+            }
         }
         Ok(g)
     }

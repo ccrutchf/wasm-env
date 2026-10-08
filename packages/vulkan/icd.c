@@ -124,6 +124,18 @@ enum {
     L_TYPE,
     L_TIMESTAMP,
     L_FEATURES,
+    L_SAMPLERS,
+    L_SAMPLED_IMAGES,
+    L_STORAGE_IMAGES,
+    L_ATTRIBUTES,
+    L_VERTEX_BUFFERS,
+    L_VERTEX_STRIDE,
+    L_INTER_STAGE,
+    L_COLORS,
+    L_DIM_1D,
+    L_DIM_2D,
+    L_DIM_3D,
+    L_LAYERS,
     L_COUNT
 };
 static uint64_t limits[L_COUNT];
@@ -253,6 +265,10 @@ struct VkImage_T {
     VkFormat format;
     VkExtent3D extent;
     uint32_t mips, layers, texel;
+    // A linear image (VK_IMAGE_TILING_LINEAR): no texture, but the memory
+    // bound to it, as a buffer of its texels, row after row.
+    int linear;
+    struct VkBuffer_T memory;
 };
 struct VkImageView_T {
     uint64_t handle;
@@ -429,11 +445,15 @@ static CALL void CC GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalD
     snprintf(p->deviceName, sizeof p->deviceName, "%s (wasm-env)", device_name);
     memcpy(p->pipelineCacheUUID, "wasm-env-vulkan", 16);
     VkPhysicalDeviceLimits *l = &p->limits;
-    // Images and graphics: Vulkan's minimums (not supported yet).
-    l->maxImageDimension1D = l->maxImageDimension2D = l->maxImageDimensionCube = 4096;
-    l->maxImageDimension3D = 256;
-    l->maxImageArrayLayers = 256;
-    l->maxTexelBufferElements = 65536;
+    // The device's limits (WebGPU's), each at least Vulkan's minimum.
+#define AT_LEAST(v, min) ((uint32_t)((v) > (min) ? (v) : (min)))
+    uint32_t dim2 = AT_LEAST(limits[L_DIM_2D], 4096);
+    l->maxImageDimension1D = AT_LEAST(limits[L_DIM_1D], 4096);
+    l->maxImageDimension2D = l->maxImageDimensionCube = dim2;
+    l->maxImageDimension3D = AT_LEAST(limits[L_DIM_3D], 256);
+    l->maxImageArrayLayers = AT_LEAST(limits[L_LAYERS], 256);
+    // (A texel buffer is a 2D texture 4096 texels wide: vulkan.rs.)
+    l->maxTexelBufferElements = AT_LEAST(limits[L_DIM_2D] * 4096, 65536);
     l->maxUniformBufferRange = (uint32_t)(limits[L_UNIFORM_RANGE] < 0xffffffffu ? limits[L_UNIFORM_RANGE] : 0xffffffffu);
     l->maxStorageBufferRange = (uint32_t)(limits[L_STORAGE_RANGE] < 0xffffffffu ? limits[L_STORAGE_RANGE] : 0xffffffffu);
     l->maxPushConstantsSize = (uint32_t)limits[L_PUSH];
@@ -441,13 +461,33 @@ static CALL void CC GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalD
     l->maxSamplerAllocationCount = 4000;
     l->bufferImageGranularity = 1;
     l->maxBoundDescriptorSets = (uint32_t)limits[L_SETS];
-    l->maxPerStageDescriptorUniformBuffers = (uint32_t)limits[L_UNIFORM_BUFFERS];
-    l->maxPerStageDescriptorStorageBuffers = (uint32_t)limits[L_STORAGE_BUFFERS];
-    l->maxPerStageResources = (uint32_t)(limits[L_UNIFORM_BUFFERS] + limits[L_STORAGE_BUFFERS]);
-    l->maxDescriptorSetUniformBuffers = (uint32_t)limits[L_UNIFORM_BUFFERS];
+    // (Per stage the device's; per set, as many as every stage has.)
+    uint32_t samplers = AT_LEAST(limits[L_SAMPLERS], 16), sampled = AT_LEAST(limits[L_SAMPLED_IMAGES], 16), storage = AT_LEAST(limits[L_STORAGE_IMAGES], 4);
+    uint32_t uniform = AT_LEAST(limits[L_UNIFORM_BUFFERS], 12), storage_buffers = AT_LEAST(limits[L_STORAGE_BUFFERS], 4);
+    l->maxPerStageDescriptorSamplers = samplers;
+    l->maxPerStageDescriptorUniformBuffers = uniform;
+    l->maxPerStageDescriptorStorageBuffers = storage_buffers;
+    l->maxPerStageDescriptorSampledImages = sampled;
+    l->maxPerStageDescriptorStorageImages = storage;
+    l->maxPerStageDescriptorInputAttachments = AT_LEAST(sampled < 8 ? sampled : 8, 4);
+    l->maxPerStageResources = AT_LEAST(uniform + storage_buffers + sampled + storage, 128);
+    l->maxDescriptorSetSamplers = AT_LEAST(6 * samplers, 96);
+    l->maxDescriptorSetUniformBuffers = AT_LEAST(6 * uniform, 72);
     l->maxDescriptorSetUniformBuffersDynamic = 8;
-    l->maxDescriptorSetStorageBuffers = (uint32_t)limits[L_STORAGE_BUFFERS];
+    l->maxDescriptorSetStorageBuffers = AT_LEAST(6 * storage_buffers, 24);
     l->maxDescriptorSetStorageBuffersDynamic = 4;
+    l->maxDescriptorSetSampledImages = AT_LEAST(6 * sampled, 96);
+    l->maxDescriptorSetStorageImages = AT_LEAST(6 * storage, 24);
+    l->maxDescriptorSetInputAttachments = l->maxPerStageDescriptorInputAttachments;
+    // Vertex input and stages' interfaces.
+    l->maxVertexInputAttributes = AT_LEAST(limits[L_ATTRIBUTES], 16);
+    l->maxVertexInputBindings = AT_LEAST(limits[L_VERTEX_BUFFERS], 16);
+    l->maxVertexInputBindingStride = AT_LEAST(limits[L_VERTEX_STRIDE], 2048);
+    l->maxVertexInputAttributeOffset = l->maxVertexInputBindingStride - 1;
+    l->maxVertexOutputComponents = l->maxFragmentInputComponents = AT_LEAST(4 * limits[L_INTER_STAGE], 64);
+    l->maxFragmentOutputAttachments = l->maxColorAttachments = AT_LEAST(limits[L_COLORS], 4);
+    l->maxFragmentDualSrcAttachments = 0;
+    l->maxFragmentCombinedOutputResources = l->maxColorAttachments + storage_buffers + storage;
     l->maxComputeSharedMemorySize = (uint32_t)limits[L_SHARED];
     for (int k = 0; k < 3; k++)
         l->maxComputeWorkGroupCount[k] = (uint32_t)limits[L_GROUPS];
@@ -455,20 +495,40 @@ static CALL void CC GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalD
     l->maxComputeWorkGroupSize[0] = (uint32_t)limits[L_SIZE_X];
     l->maxComputeWorkGroupSize[1] = (uint32_t)limits[L_SIZE_Y];
     l->maxComputeWorkGroupSize[2] = (uint32_t)limits[L_SIZE_Z];
+    // (WebGPU's: 32-bit indices, indirect draws looped over, texel offsets
+    // of -8 to 7, and precision as Vulkan's minimums.)
+    l->maxDrawIndexedIndexValue = 0xffffffffu;
+    l->maxDrawIndirectCount = 0xffffffffu;
+    l->minTexelOffset = l->minTexelGatherOffset = -8;
+    l->maxTexelOffset = l->maxTexelGatherOffset = 7;
+    l->minInterpolationOffset = -0.5f;
+    l->maxInterpolationOffset = 0.4375f;
+    l->subPixelInterpolationOffsetBits = 4;
+    l->subPixelPrecisionBits = l->subTexelPrecisionBits = l->mipmapPrecisionBits = 4;
+    l->maxSamplerLodBias = 2;
+    l->maxClipDistances = l->maxCullDistances = l->maxCombinedClipAndCullDistances = 0;
+    l->maxSampleMaskWords = 1;
+    l->discreteQueuePriorities = 2;
+    // (Points and lines of one pixel: no large points or wide lines.)
+    l->pointSizeRange[0] = l->pointSizeRange[1] = 1;
+    l->lineWidthRange[0] = l->lineWidthRange[1] = 1;
+    l->pointSizeGranularity = l->lineWidthGranularity = 0;
+    l->strictLines = VK_FALSE;
+    l->standardSampleLocations = VK_TRUE;
     l->minMemoryMapAlignment = 64;
     l->minTexelBufferOffsetAlignment = 256;
     l->minUniformBufferOffsetAlignment = limits[L_UNIFORM_ALIGN];
     l->minStorageBufferOffsetAlignment = limits[L_STORAGE_ALIGN];
     l->maxViewports = 1;
-    l->maxViewportDimensions[0] = l->maxViewportDimensions[1] = 4096;
-    l->viewportBoundsRange[0] = -8192;
-    l->viewportBoundsRange[1] = 8191;
-    l->maxFramebufferWidth = l->maxFramebufferHeight = 4096;
-    l->maxFramebufferLayers = 256;
-    l->maxColorAttachments = 4;
+    l->maxViewportDimensions[0] = l->maxViewportDimensions[1] = dim2;
+    l->viewportBoundsRange[0] = -2.0f * dim2;
+    l->viewportBoundsRange[1] = 2.0f * dim2 - 1;
+    l->viewportSubPixelBits = 0;
+    l->maxFramebufferWidth = l->maxFramebufferHeight = dim2;
+    l->maxFramebufferLayers = l->maxImageArrayLayers;
     // (One sample, or four: WebGPU's.)
     l->framebufferColorSampleCounts = l->framebufferDepthSampleCounts = l->framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
-    l->framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    l->framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     l->sampledImageColorSampleCounts = l->sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     l->sampledImageDepthSampleCounts = l->sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     l->storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
@@ -529,20 +589,59 @@ static CALL void CC GetPhysicalDeviceMemoryProperties(VkPhysicalDevice pd, VkPhy
 
 // A format's features for optimal tiling (the device's: VK_FORMAT), and
 // its texel's bytes (0: not supported).
-static VkFormatFeatureFlags format_features(VkFormat f, uint32_t *texel) {
+static VkFormatFeatureFlags format_samples(VkFormat f, uint32_t *texel, VkSampleCountFlags *samples) {
     struct request q = {VK_FORMAT, {(uint64_t)f}};
     if (call(&q))
-        q.r[0] = q.r[2] = 0;
+        q.r[0] = q.r[2] = q.r[3] = 0;
     if (texel)
         *texel = (uint32_t)q.r[2];
-    return (VkFormatFeatureFlags)q.r[0];
+    if (samples)
+        *samples = (VkSampleCountFlags)q.r[3];
+    // (Images' features: a vertex attribute's is a buffer's, below.)
+    return (VkFormatFeatureFlags)q.r[0] & ~VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
 }
 
-// (Images are optimal tiling only: linear ones would be memory the
-// program reads and writes as an image.)
+// A format's features in buffers: vertex attributes, and texel buffers
+// where images of it can be sampled or stored (2D textures of their
+// texels: vulkan.rs).
+static VkFormatFeatureFlags buffer_features(VkFormat f) {
+    struct request q = {VK_FORMAT, {(uint64_t)f}};
+    if (call(&q))
+        return 0;
+    VkFormatFeatureFlags have = (VkFormatFeatureFlags)q.r[0], b = have & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+    int blocks = f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+    if (q.r[2] && !blocks && !(have & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+        if (have & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+            b |= VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
+        if (have & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
+            b |= VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT;
+    }
+    return b;
+}
+
+// A format's features (VkFormatFeatureFlags), and the bytes of a texel.
+static VkFormatFeatureFlags format_features(VkFormat f, uint32_t *texel) {
+    return format_samples(f, texel, NULL);
+}
+
+// The features a format has in linear images: copies, where its texels
+// are whole bytes of color (not depth or blocks).
+static VkFormatFeatureFlags linear_features(VkFormat f) {
+    uint32_t texel;
+    VkFormatFeatureFlags have = format_features(f, &texel);
+    int blocks = f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+    if (!texel || blocks || (have & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))
+        return 0;
+    return have & (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+}
+
+// (Optimal images are textures; linear ones are memory, which only
+// copies reach.)
 static CALL void CC GetPhysicalDeviceFormatProperties(VkPhysicalDevice pd, VkFormat f, VkFormatProperties *p) {
     memset(p, 0, sizeof *p);
     p->optimalTilingFeatures = format_features(f, NULL);
+    p->linearTilingFeatures = linear_features(f);
+    p->bufferFeatures = buffer_features(f);
 }
 
 // The features an image's usage needs.
@@ -564,18 +663,46 @@ static VkFormatFeatureFlags needs(VkImageUsageFlags u) {
 }
 
 static CALL VkResult CC GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice pd, VkFormat f, VkImageType t, VkImageTiling tl, VkImageUsageFlags u, VkImageCreateFlags c, VkImageFormatProperties *p) {
-    VkFormatFeatureFlags have = format_features(f, NULL);
+    if (tl == VK_IMAGE_TILING_LINEAR) {
+        // (Linear: one level and layer, copied to and from.)
+        VkImageUsageFlags copies = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!linear_features(f) || (u & ~copies) || c)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        memset(p, 0, sizeof *p);
+        uint32_t d2 = AT_LEAST(limits[L_DIM_2D], 4096), d3 = AT_LEAST(limits[L_DIM_3D], 256);
+        p->maxExtent = t == VK_IMAGE_TYPE_3D ? (VkExtent3D){d3, d3, d3} : t == VK_IMAGE_TYPE_1D ? (VkExtent3D){d2, 1, 1} : (VkExtent3D){d2, d2, 1};
+        p->maxMipLevels = p->maxArrayLayers = 1;
+        p->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        p->maxResourceSize = (VkDeviceSize)1 << 31;
+        return VK_SUCCESS;
+    }
+    VkSampleCountFlags samples;
+    VkFormatFeatureFlags have = format_samples(f, NULL, &samples);
     if (tl != VK_IMAGE_TILING_OPTIMAL || !have || (have & needs(u)) != needs(u) || (c & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT))
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     memset(p, 0, sizeof *p);
-    p->maxExtent = t == VK_IMAGE_TYPE_3D ? (VkExtent3D){256, 256, 256} : t == VK_IMAGE_TYPE_1D ? (VkExtent3D){4096, 1, 1} : (VkExtent3D){4096, 4096, 1};
-    p->maxMipLevels = t == VK_IMAGE_TYPE_3D ? 9 : 13;
-    p->maxArrayLayers = t == VK_IMAGE_TYPE_3D ? 1 : 256;
+    uint32_t d1 = AT_LEAST(limits[L_DIM_1D], 4096), d2 = AT_LEAST(limits[L_DIM_2D], 4096), d3 = AT_LEAST(limits[L_DIM_3D], 256);
+    p->maxExtent = t == VK_IMAGE_TYPE_3D ? (VkExtent3D){d3, d3, d3} : t == VK_IMAGE_TYPE_1D ? (VkExtent3D){d1, 1, 1} : (VkExtent3D){d2, d2, 1};
+    uint32_t largest = t == VK_IMAGE_TYPE_3D ? d3 : t == VK_IMAGE_TYPE_1D ? d1 : d2;
+    p->maxMipLevels = 1;
+    while (largest >>= 1)
+        p->maxMipLevels++;
+    p->maxArrayLayers = t == VK_IMAGE_TYPE_3D ? 1 : AT_LEAST(limits[L_LAYERS], 256);
+    // (WebGPU's 1D images are of one level and layer, and of neither depth
+    // nor blocks; its 3D ones of neither either.)
+    int depth = have & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    int blocks = f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+    if (t == VK_IMAGE_TYPE_1D) {
+        if (depth || blocks)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        p->maxMipLevels = p->maxArrayLayers = 1;
+    }
+    if (t == VK_IMAGE_TYPE_3D && (depth || blocks))
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
     p->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
     // (Four samples, as WebGPU has them: 2D attachments, one level and
     // layer, of formats it multisamples; not storage.)
-    int f32 = f == VK_FORMAT_R32_SFLOAT || f == VK_FORMAT_R32G32_SFLOAT || f == VK_FORMAT_R32G32B32A32_SFLOAT;
-    if (t == VK_IMAGE_TYPE_2D && !f32 && !(u & VK_IMAGE_USAGE_STORAGE_BIT) && !(c & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+    if (t == VK_IMAGE_TYPE_2D && (samples & VK_SAMPLE_COUNT_4_BIT) && !(u & VK_IMAGE_USAGE_STORAGE_BIT) && !(c & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
         (have & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)))
         p->sampleCounts |= VK_SAMPLE_COUNT_4_BIT;
     p->maxResourceSize = (VkDeviceSize)1 << 31;
@@ -815,8 +942,11 @@ static CALL void CC DestroyBuffer(VkDevice d, VkBuffer b, const VkAllocationCall
 
 static CALL void CC GetBufferMemoryRequirements(VkDevice d, VkBuffer b, VkMemoryRequirements *r) {
     VkDeviceSize align = limits[L_STORAGE_ALIGN] > limits[L_UNIFORM_ALIGN] ? limits[L_STORAGE_ALIGN] : limits[L_UNIFORM_ALIGN];
-    r->alignment = align > 4 ? align : 4;
-    r->size = (b->size + 3) & ~(VkDeviceSize)3;
+    // (And a texel buffer view's offset's, minTexelBufferOffsetAlignment.)
+    r->alignment = align > 256 ? align : 256;
+    // (Rounded up to 16: room for a shader whose block WebGPU rounds up, a
+    // bvec3's 12 bytes to 16.)
+    r->size = (b->size + 15) & ~(VkDeviceSize)15;
     r->memoryTypeBits = 1;
 }
 
@@ -829,9 +959,21 @@ static CALL VkResult CC BindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory 
 // ---- Images, views and samplers ----
 
 // An image is a texture in the runtime, not part of its memory: binding
-// memory to it changes nothing.
+// memory to it changes nothing. A linear one is its memory.
 static CALL VkResult CC CreateImage(VkDevice d, const VkImageCreateInfo *info, const VkAllocationCallbacks *a, VkImage *out) {
     uint32_t texel;
+    if (info->tiling == VK_IMAGE_TILING_LINEAR) {
+        if (!linear_features(info->format) || info->mipLevels != 1 || info->arrayLayers != 1 || info->samples != VK_SAMPLE_COUNT_1_BIT)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        format_features(info->format, &texel);
+        struct VkImage_T *im = zalloc(sizeof *im);
+        if (!im)
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *im = (struct VkImage_T){0, info->imageType, info->format, info->extent, 1, 1, texel, 1};
+        im->memory.size = (VkDeviceSize)info->extent.width * info->extent.height * info->extent.depth * texel;
+        *out = im;
+        return VK_SUCCESS;
+    }
     if (info->tiling != VK_IMAGE_TILING_OPTIMAL || !format_features(info->format, &texel))
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     struct VkImage_T *im = zalloc(sizeof *im);
@@ -859,14 +1001,16 @@ static CALL VkResult CC CreateImage(VkDevice d, const VkImageCreateInfo *info, c
 static CALL void CC DestroyImage(VkDevice d, VkImage im, const VkAllocationCallbacks *a) {
     if (!im)
         return;
-    struct request q = {FREE, {im->handle}};
-    call(&q);
+    if (!im->linear) {
+        struct request q = {FREE, {im->handle}};
+        call(&q);
+    }
     free(im);
 }
 
 static CALL void CC GetImageMemoryRequirements(VkDevice d, VkImage im, VkMemoryRequirements *r) {
     // (What its texels would take: the program allocates that much, which
-    // the image doesn't use.)
+    // the image doesn't use, but a linear one does.)
     VkDeviceSize size = 0;
     for (uint32_t m = 0; m < im->mips; m++) {
         VkDeviceSize w = im->extent.width >> m, h = im->extent.height >> m, z = im->extent.depth >> m;
@@ -878,11 +1022,19 @@ static CALL void CC GetImageMemoryRequirements(VkDevice d, VkImage im, VkMemoryR
 }
 
 static CALL VkResult CC BindImageMemory(VkDevice d, VkImage im, VkDeviceMemory m, VkDeviceSize offset) {
+    im->memory.memory = m;
+    im->memory.offset = offset;
     return VK_SUCCESS;
 }
 
+// (A linear image's rows are its texels, one after another.)
 static CALL void CC GetImageSubresourceLayout(VkDevice d, VkImage im, const VkImageSubresource *s, VkSubresourceLayout *l) {
     memset(l, 0, sizeof *l);
+    if (im->linear) {
+        l->rowPitch = (VkDeviceSize)im->extent.width * im->texel;
+        l->arrayPitch = l->depthPitch = l->rowPitch * im->extent.height;
+        l->size = im->memory.size;
+    }
 }
 
 static CALL void CC GetImageSparseMemoryRequirements(VkDevice d, VkImage im, uint32_t *count, VkSparseImageMemoryRequirements *r) {
@@ -1907,12 +2059,37 @@ static void buffer_image(VkCommandBuffer c, uint32_t op, VkBuffer b, VkImage im,
     }
 }
 
+// A copy between a buffer (rows of `row` texels, `height` rows an image)
+// and a linear image's memory, a row at a time.
+static void linear_rows(VkCommandBuffer c, VkBuffer b, VkDeviceSize at, uint32_t row, uint32_t height, VkImage im, VkOffset3D o, VkExtent3D e, int to_image) {
+    for (uint32_t z = 0; z < e.depth; z++)
+        for (uint32_t y = 0; y < e.height; y++) {
+            VkDeviceSize in_buffer = at + ((VkDeviceSize)z * height + y) * row * im->texel;
+            VkDeviceSize in_image = ((((VkDeviceSize)o.z + z) * im->extent.height + o.y + y) * im->extent.width + o.x) * im->texel;
+            VkBufferCopy r = {to_image ? in_buffer : in_image, to_image ? in_image : in_buffer, (VkDeviceSize)e.width * im->texel};
+            CmdCopyBuffer(c, to_image ? b : &im->memory, to_image ? &im->memory : b, 1, &r);
+        }
+}
+
+static void linear_copies(VkCommandBuffer c, VkBuffer b, VkImage im, uint32_t n, const VkBufferImageCopy *r, int to_image) {
+    for (uint32_t i = 0; i < n; i++) {
+        VkExtent3D e = r[i].imageExtent;
+        linear_rows(c, b, r[i].bufferOffset, r[i].bufferRowLength ? r[i].bufferRowLength : e.width, r[i].bufferImageHeight ? r[i].bufferImageHeight : e.height, im, r[i].imageOffset, e, to_image);
+    }
+}
+
 static CALL void CC CmdCopyBufferToImage(VkCommandBuffer c, VkBuffer b, VkImage im, VkImageLayout l, uint32_t n, const VkBufferImageCopy *r) {
-    buffer_image(c, BUFFER_TO_IMAGE, b, im, n, r);
+    if (im->linear)
+        linear_copies(c, b, im, n, r, 1);
+    else
+        buffer_image(c, BUFFER_TO_IMAGE, b, im, n, r);
 }
 
 static CALL void CC CmdCopyImageToBuffer(VkCommandBuffer c, VkImage im, VkImageLayout l, VkBuffer b, uint32_t n, const VkBufferImageCopy *r) {
-    buffer_image(c, IMAGE_TO_BUFFER, b, im, n, r);
+    if (im->linear)
+        linear_copies(c, b, im, n, r, 0);
+    else
+        buffer_image(c, IMAGE_TO_BUFFER, b, im, n, r);
 }
 
 // Each region's layers (2D images; a 3D one's first slice), scaled.
@@ -1928,8 +2105,23 @@ static CALL void CC CmdBlitImage(VkCommandBuffer c, VkImage src, VkImageLayout s
         }
 }
 
+// (A linear image's side of a copy is a buffer's: its memory.)
 static CALL void CC CmdCopyImage(VkCommandBuffer c, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageCopy *r) {
     for (uint32_t i = 0; i < n; i++) {
+        if (src->linear || dst->linear) {
+            VkImage linear = src->linear ? src : dst, other = src->linear ? dst : src;
+            VkOffset3D lo = src->linear ? r[i].srcOffset : r[i].dstOffset;
+            VkDeviceSize at = (((VkDeviceSize)lo.z * linear->extent.height + lo.y) * linear->extent.width + lo.x) * linear->texel;
+            if (other->linear) {
+                // (Both: the source's rows into the destination's.)
+                linear_rows(c, &src->memory, at, src->extent.width, src->extent.height, dst, r[i].dstOffset, r[i].extent, 1);
+                continue;
+            }
+            VkBufferImageCopy b = {at, linear->extent.width, linear->extent.height, src->linear ? r[i].dstSubresource : r[i].srcSubresource,
+                                   src->linear ? r[i].dstOffset : r[i].srcOffset, r[i].extent};
+            buffer_image(c, src->linear ? BUFFER_TO_IMAGE : IMAGE_TO_BUFFER, &linear->memory, other, 1, &b);
+            continue;
+        }
         uint32_t h[2] = {COPY_IMAGE, 8 + 8 + 40 + 8 + 40};
         put(c, h, 8);
         put(c, &src->handle, 8);

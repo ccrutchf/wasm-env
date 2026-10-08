@@ -18,6 +18,7 @@
 #include "vulkan_fan_vert.h"
 #include "vulkan_fan_frag.h"
 #include "vulkan_texel_write_spv.h"
+#include "vulkan_layout_spv.h"
 
 #define N 1000
 #define CHECK(x)                                                    \
@@ -379,6 +380,128 @@ static int texels(VkDevice dev, VkQueue queue) {
     vkDestroyShaderModule(dev, shader, NULL);
     vkDestroyBufferView(dev, view, NULL);
     for (int k = 0; k < 2; k++)
+        vkDestroyBuffer(dev, buf[k], NULL);
+    vkUnmapMemory(dev, mem);
+    vkFreeMemory(dev, mem, NULL);
+    return 0;
+}
+
+// Layouts WGSL can't say (vulkan_layout.comp): a std140 block's float
+// array, mat2 and row-major mat2x3, read whole and a component at a time;
+// a texel buffer of 70006 R32F texels, its last six read; a descriptor
+// array of two blocks; and gl_WorkGroupSize from a specialization
+// constant (6). 29 floats come back.
+static int layouts(VkDevice dev, VkQueue queue) {
+    enum { TEXELS = 70006 };
+    VkDeviceSize size[5] = {144, 29 * 4, TEXELS * 4, 4, 4}, at[5], total = 0;
+    VkBufferUsageFlags use[5] = {VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT,
+                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VkBuffer buf[5];
+    for (int k = 0; k < 5; k++) {
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size[k], .usage = use[k]};
+        CHECK(vkCreateBuffer(dev, &bi, NULL, &buf[k]));
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(dev, buf[k], &req);
+        at[k] = (total + req.alignment - 1) / req.alignment * req.alignment;
+        total = at[k] + req.size;
+    }
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = total, .memoryTypeIndex = 0};
+    VkDeviceMemory mem;
+    CHECK(vkAllocateMemory(dev, &mi, NULL, &mem));
+    for (int k = 0; k < 5; k++)
+        CHECK(vkBindBufferMemory(dev, buf[k], mem, at[k]));
+    uint8_t *map;
+    CHECK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, (void **)&map));
+    // The block: f[k] at 16k; m's column c, row r at 64 + 16c + 4r; r's
+    // (row-major) at 96 + 16 × row + 4 × column. Each float its offset.
+    float *u = (float *)(map + at[0]), *out = (float *)(map + at[1]), *big = (float *)(map + at[2]);
+    for (int k = 0; k < 36; k++)
+        u[k] = (float)(4 * k);
+    for (int k = 0; k < TEXELS; k++)
+        big[k] = (float)k;
+    *(float *)(map + at[3]) = 0.5f;
+    *(float *)(map + at[4]) = 1.5f;
+    float want[29];
+    for (int i = 0; i < 6; i++) {
+        if (i < 4) {
+            want[i] = 16 * i;
+            want[4 + i] = 64 + 16 * (i / 2) + 4 * (i % 2);
+        }
+        want[8 + i] = want[14 + i] = 96 + 16 * (i % 3) + 4 * (i / 3);
+        want[20 + i] = 70000 + i;
+    }
+    want[26] = 0.5f, want[27] = 1.5f, want[28] = 6;
+
+    VkBufferViewCreateInfo bvi = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = buf[2], .format = VK_FORMAT_R32_SFLOAT, .offset = 0, .range = VK_WHOLE_SIZE};
+    VkBufferView view;
+    CHECK(vkCreateBufferView(dev, &bvi, NULL, &view));
+    VkShaderModuleCreateInfo si = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof layout_spv, .pCode = layout_spv};
+    VkShaderModule shader;
+    CHECK(vkCreateShaderModule(dev, &si, NULL, &shader));
+    VkDescriptorSetLayoutBinding b[4] = {{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
+                                         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
+                                         {2, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
+                                         {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2, VK_SHADER_STAGE_COMPUTE_BIT}};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 4, .pBindings = b};
+    VkDescriptorSetLayout sl;
+    CHECK(vkCreateDescriptorSetLayout(dev, &li, NULL, &sl));
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl};
+    VkPipelineLayout layout;
+    CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &layout));
+    uint32_t six = 6;
+    VkSpecializationMapEntry entry = {0, 0, 4};
+    VkSpecializationInfo spec = {1, &entry, 4, &six};
+    VkComputePipelineCreateInfo ci = {
+        VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main", .pSpecializationInfo = &spec},
+        .layout = layout};
+    VkPipeline pipeline;
+    CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipeline));
+    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1}};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 3, .pPoolSizes = ps};
+    VkDescriptorPool pool;
+    CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &pool));
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &sl};
+    VkDescriptorSet set;
+    CHECK(vkAllocateDescriptorSets(dev, &dai, &set));
+    VkDescriptorBufferInfo bo[4] = {{buf[0], 0, VK_WHOLE_SIZE}, {buf[1], 0, VK_WHOLE_SIZE}, {buf[3], 0, VK_WHOLE_SIZE}, {buf[4], 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[4] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bo[0]},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bo[1]},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 2, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .pTexelBufferView = &view},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 3, .descriptorCount = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bo[2]},
+    };
+    vkUpdateDescriptorSets(dev, 4, w, 0, NULL);
+
+    VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0};
+    VkCommandPool cpool;
+    CHECK(vkCreateCommandPool(dev, &cpi, NULL, &cpool));
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkCommandBuffer cmd;
+    CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+    vkCmdDispatch(cmd, 1, 1, 1);
+    CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+    CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+    CHECK(vkQueueWaitIdle(queue));
+    int wrong = 0;
+    for (int i = 0; i < 29; i++)
+        wrong += out[i] != want[i];
+    printf("layouts: %d of 29 wrong\n", wrong);
+
+    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+    vkDestroyCommandPool(dev, cpool, NULL);
+    vkDestroyDescriptorPool(dev, pool, NULL);
+    vkDestroyPipeline(dev, pipeline, NULL);
+    vkDestroyPipelineLayout(dev, layout, NULL);
+    vkDestroyDescriptorSetLayout(dev, sl, NULL);
+    vkDestroyShaderModule(dev, shader, NULL);
+    vkDestroyBufferView(dev, view, NULL);
+    for (int k = 0; k < 5; k++)
         vkDestroyBuffer(dev, buf[k], NULL);
     vkUnmapMemory(dev, mem);
     vkFreeMemory(dev, mem, NULL);
@@ -1362,7 +1485,7 @@ int main(void) {
     printf("compute: %d of %d wrong\n", wrong, N);
     printf("fill and update: %s\n", filled[0] == 0x5a5a5a5a && filled[2] == 0xc0ffee && filled[3] == 0xbeef && filled[15] == 0x5a5a5a5a ? "right" : "wrong");
     printf("the program's own write kept: %s\n", unused[0] == 12345 ? "yes" : "no");
-    if (images(dev, queue) || blits(dev, queue) || clears(dev, pd, queue) || draw(dev, queue) || subpasses(dev, queue) || texels(dev, queue) || arrays(dev, queue) || gaps(pd, dev, queue))
+    if (images(dev, queue) || blits(dev, queue) || clears(dev, pd, queue) || draw(dev, queue) || subpasses(dev, queue) || texels(dev, queue) || arrays(dev, queue) || gaps(pd, dev, queue) || layouts(dev, queue))
         return 1;
 
     vkDestroyFence(dev, fence, NULL);
