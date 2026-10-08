@@ -66,7 +66,8 @@
 //!  21 VK_PIPELINE a0: shader, a1: entry point's name, a2: its length,
 //!              a3: address, a4: capacity, a5: specialization constants (each
 //!              id, size, low and high words: u32s), a6: their number
-//!              r0: compute pipeline handle (or
+//!              r0: compute pipeline handle, r2: the Vulkan bindings it
+//!              writes (bits: set × 16 + binding, all where past 3 or 15) (or
 //!              as VK_SHADER's)
 //!  22 VK_SUBMIT   a0: commands, a1: their length (gpu/src/vulkan.rs, `decode`)
 //!  23 VK_LIMITS   a0: address, a1: size   u64s: storage and uniform
@@ -75,7 +76,9 @@
 //!              shared memory, descriptor sets, storage and uniform buffers
 //!              per stage, largest allocation, memory, push constant bytes,
 //!              vendor and device ids, device type (Vulkan's), timestamp
-//!              period (nanoseconds, an f32's bits; 0: no timestamps)
+//!              period (nanoseconds, an f32's bits; 0: no timestamps), features
+//!              (bits: binding arrays, 64-bit floats and integers, indirect
+//!              draws' first instance, BC compression)
 //!  24 VK_IMAGE    a0: u32s: dimensions (1, 2, 3), format (VkFormat), width,
 //!              height, depth, mip levels, layers, samples, usage
 //!              (VkImageUsageFlags)   r0: image handle
@@ -88,16 +91,17 @@
 //!              tiling), r2: a texel's bytes (0: not supported)
 //!  28 VK_GRAPHICS a0: state, a1: its length (gpu/src/vulkan.rs,
 //!              `GraphicsState::decode`), a3, a4: as VK_SHADER's   r0:
-//!              graphics pipeline handle
+//!              graphics pipeline handle, r2: as VK_PIPELINE's
 //!  29 VK_BUFFER_VIEW a0: buffer (device memory), a1: offset, a2: range,
 //!              a3: VkFormat   r0: texel buffer view handle
 //!  30 VK_QUERY_POOL a0: VkQueryType (occlusion, timestamps), a1: queries
 //!              r0: query pool handle
 //!  31 VK_QUERY_RESULTS a0: pool, a1: first, a2: count, a3: address: each
 //!              query's value (u64), u64::MAX if it isn't available
-//!  32 VK_SEND     as WRITE, sending only what differs from what VK_SEND
-//!              last sent there (or READ since read): a mapped memory's
-//!              program copy, sent at each submission
+//!  32 VK_SEND     as WRITE, sending only what differs from what the device
+//!              last had from it: a mapped memory's program copy, sent
+//!              whole when it's mapped (kept, then), and in parts where
+//!              submissions read it (READ and WRITE keep the copy in step)
 //!
 //! Vulkan's device memory is a buffer (CREATE), read and written as one.
 //!
@@ -272,6 +276,14 @@ impl Session {
                 self.check(&b, a[1], a[3])?;
                 let bytes = mem::slice(data, a[2], a[3])?.to_vec();
                 g.write(&b, a[1], &bytes).map_err(|_| Failure::Cl(CL_OUT_OF_RESOURCES))?;
+                // (What VK_SEND last sent of it, if anything, as written now.)
+                if let Some((at, sent)) = self.state.lock().unwrap().sent.get_mut(&a[0])
+                    && a[1] >= *at
+                    && a[1] - *at + a[3] <= sent.len() as u64
+                {
+                    let from = (a[1] - *at) as usize;
+                    sent[from..from + bytes.len()].copy_from_slice(&bytes);
+                }
             }
             5 => {
                 let b = self.buffer(a[0])?;
@@ -483,6 +495,10 @@ impl Session {
                         let mut st = self.state.lock().unwrap();
                         let h = st.next;
                         st.next += 1;
+                        // (A pipeline's: the bindings it writes.)
+                        if let Vk::Pipeline(p) = &v {
+                            r[2] = p.written;
+                        }
                         st.vk.insert(h, v);
                         r[0] = h;
                     }
@@ -521,15 +537,18 @@ impl Session {
             }
             32 => {
                 // As WRITE, but only what differs from what was sent last
-                // (a program's mapped memory is sent at every submission:
-                // most of it hasn't changed).
+                // (a program's mapped memory, sent where each submission
+                // reads it: most of it hasn't changed). What was sent is
+                // kept for the whole memory, once it's been sent whole.
                 let b = self.buffer(a[0])?;
                 self.check(&b, a[1], a[3])?;
                 let now = mem::slice(data, a[2], a[3])?;
                 let mut st = self.state.lock().unwrap();
                 let fail = |_| Failure::Cl(CL_OUT_OF_RESOURCES);
                 match st.sent.get_mut(&a[0]) {
-                    Some((at, sent)) if *at == a[1] && sent.len() == now.len() => {
+                    Some((at, sent)) if a[1] >= *at && a[1] - *at + a[3] <= sent.len() as u64 => {
+                        let from = (a[1] - *at) as usize;
+                        let sent = &mut sent[from..from + now.len()];
                         const CHUNK: usize = 4096;
                         let mut k = 0;
                         while k < now.len() {
@@ -554,7 +573,9 @@ impl Session {
                     }
                     _ => {
                         g.write(&b, a[1], now).map_err(fail)?;
-                        st.sent.insert(a[0], (a[1], now.to_vec()));
+                        if a[1] == 0 && a[3] == b.size() {
+                            st.sent.insert(a[0], (0, now.to_vec()));
+                        }
                     }
                 }
             }
@@ -774,7 +795,22 @@ impl Session {
         let max_alloc = l.max_buffer_size.min((1 << 32) - 4096);
         // (Timestamps: nanoseconds a tick, as an f32's bits; 0 if none.)
         let timestamp = if vulkan::timestamps(self.gpu()) { self.gpu().queue.get_timestamp_period().to_bits() as u64 } else { 0 };
-        let words: [u64; 20] = [
+        // (Features of the device's that Vulkan's depend on: 1 binding
+        // arrays, 2 64-bit floats, 4 64-bit integers, 8 indirect draws' first
+        // instance, 16 BC compression.)
+        let has = self.gpu().device.features();
+        let features = [
+            wgpu::Features::TEXTURE_BINDING_ARRAY,
+            wgpu::Features::SHADER_F64,
+            wgpu::Features::SHADER_INT64,
+            wgpu::Features::INDIRECT_FIRST_INSTANCE,
+            wgpu::Features::TEXTURE_COMPRESSION_BC,
+        ]
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| has.contains(**f))
+        .fold(0u64, |m, (k, _)| m | 1 << k);
+        let words: [u64; 21] = [
             l.min_storage_buffer_offset_alignment as u64,
             l.min_uniform_buffer_offset_alignment as u64,
             l.max_storage_buffer_binding_size,
@@ -796,6 +832,7 @@ impl Session {
             info.device as u64,
             kind,
             timestamp,
+            features,
         ];
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }

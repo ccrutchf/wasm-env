@@ -52,11 +52,30 @@ pub struct Pipeline {
     /// Its binding arrays (Vulkan's descriptor arrays): WebGPU's set and
     /// binding, and how many.
     arrays: BTreeMap<(u32, u32), u32>,
-    /// A graphics pipeline's making, and the variants made of it for
+    /// A graphics pipeline's making, and the variants made of it: for
     /// render passes whose color formats aren't its own (Vulkan's drivers
-    /// draw with a pipeline made for RGBA into BGRA; WebGPU's won't).
+    /// draw with a pipeline made for RGBA into BGRA; WebGPU's won't), and
+    /// for the state it leaves to commands (`GraphicsState::dynamic`) as
+    /// they set it.
     recipe: Option<Recipe>,
-    variants: Mutex<HashMap<Vec<wgpu::TextureFormat>, wgpu::RenderPipeline>>,
+    dynamic: u32,
+    /// A triangle fan's (VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN): a list's,
+    /// its draws' vertices made a list's indices (WebGPU has no fans).
+    /// The Vulkan bindings it writes (storage buffers and images), as bits:
+    /// set × 16 + binding (all of them: a set past 3 or a binding past 15).
+    pub written: u64,
+    fan: bool,
+    variants: Mutex<HashMap<(Vec<wgpu::TextureFormat>, Dynamic), wgpu::RenderPipeline>>,
+}
+
+/// State set by commands that WebGPU makes part of a pipeline: depth bias
+/// (constant, slope, clamp: f32s' bits) and stencil compare and write
+/// masks, as last set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Dynamic {
+    pub bias: Option<[u32; 3]>,
+    pub compare_mask: Option<u32>,
+    pub write_mask: Option<u32>,
 }
 
 /// What a graphics pipeline is made of (owned, to make it again).
@@ -72,12 +91,25 @@ struct Recipe {
 }
 
 impl Recipe {
-    /// The pipeline, its color targets of `formats` where given.
-    fn make(&self, gpu: &Gpu, formats: Option<&[wgpu::TextureFormat]>) -> Res<wgpu::RenderPipeline> {
+    /// The pipeline, its color targets of `formats` where given, and its
+    /// dynamic state as `d` has it.
+    fn make(&self, gpu: &Gpu, formats: Option<&[wgpu::TextureFormat]>, d: Dynamic) -> Res<wgpu::RenderPipeline> {
         let targets: Vec<Option<wgpu::ColorTargetState>> = match formats {
             Some(f) => self.targets.iter().zip(f).map(|(t, &format)| t.clone().map(|t| wgpu::ColorTargetState { format, ..t })).collect(),
             None => self.targets.clone(),
         };
+        let depth_stencil = self.depth_stencil.clone().map(|mut s| {
+            if let Some([constant, slope, clamp]) = d.bias {
+                s.bias = wgpu::DepthBiasState { constant: f32::from_bits(constant) as i32, slope_scale: f32::from_bits(slope), clamp: f32::from_bits(clamp) };
+            }
+            if let Some(m) = d.compare_mask {
+                s.stencil.read_mask = m;
+            }
+            if let Some(m) = d.write_mask {
+                s.stencil.write_mask = m;
+            }
+            s
+        });
         let buffers: Vec<Option<wgpu::VertexBufferLayout>> = self.buffers.iter().map(|(array_stride, step_mode, attributes)| Some(wgpu::VertexBufferLayout { array_stride: *array_stride, step_mode: *step_mode, attributes })).collect();
         fn constants(c: &[(String, f64)]) -> Vec<(&str, f64)> {
             c.iter().map(|(k, v)| (k.as_str(), *v)).collect()
@@ -89,7 +121,7 @@ impl Recipe {
             layout: Some(&self.layout),
             vertex: wgpu::VertexState { module: &self.vs.0, entry_point: Some(&self.vs.1), compilation_options: options(&vc), buffers: &buffers },
             primitive: self.primitive,
-            depth_stencil: self.depth_stencil.clone(),
+            depth_stencil,
             multisample: self.multisample,
             fragment: self.fs.as_ref().map(|fs| wgpu::FragmentState { module: &fs.0, entry_point: Some(&fs.1), compilation_options: options(&fc), targets: &targets }),
             multiview_mask: None,
@@ -115,23 +147,58 @@ impl Pipeline {
         }
     }
 
-    /// A graphics pipeline for a render pass of these color formats: itself,
-    /// or a variant made for them.
-    fn render_for(&self, gpu: &Gpu, formats: &[wgpu::TextureFormat]) -> Res<wgpu::RenderPipeline> {
+    /// A graphics pipeline for a render pass of these color formats, with
+    /// the dynamic state commands set: itself, or a variant made for them.
+    fn render_for(&self, gpu: &Gpu, formats: &[wgpu::TextureFormat], d: Dynamic) -> Res<wgpu::RenderPipeline> {
         let Kind::Render(rp) = &self.kind else { return Err("a compute pipeline in a render pass".into()) };
         let Some(recipe) = &self.recipe else { return Ok(rp.clone()) };
         let own: Vec<wgpu::TextureFormat> = recipe.targets.iter().flatten().map(|t| t.format).collect();
-        if own == formats || own.len() != formats.len() || recipe.targets.iter().any(Option::is_none) {
+        let formats = if own.len() != formats.len() || recipe.targets.iter().any(Option::is_none) { own.clone() } else { formats.to_vec() };
+        // (Only what it leaves to commands counts.)
+        let d = Dynamic {
+            bias: d.bias.filter(|_| self.dynamic & 1 != 0),
+            compare_mask: d.compare_mask.filter(|_| self.dynamic & 2 != 0),
+            write_mask: d.write_mask.filter(|_| self.dynamic & 4 != 0),
+        };
+        if formats == own && d == Dynamic::default() {
             return Ok(rp.clone());
         }
         let mut variants = self.variants.lock().unwrap();
-        if let Some(v) = variants.get(formats) {
+        let key = (formats, d);
+        if let Some(v) = variants.get(&key) {
             return Ok(v.clone());
         }
-        let v = recipe.make(gpu, Some(formats))?;
-        variants.insert(formats.to_vec(), v.clone());
+        let v = recipe.make(gpu, Some(&key.0), d)?;
+        variants.insert(key, v.clone());
         Ok(v)
     }
+}
+
+/// The Vulkan bindings a pipeline's entry points write, as bits (see
+/// `Pipeline::written`).
+fn written_of(shaders: &[(&Shader, &BTreeSet<(u32, u32)>)]) -> u64 {
+    let mut bits = 0u64;
+    for (s, used) in shaders {
+        for &(g, w) in used.iter() {
+            if Some(g) == s.push_group {
+                continue;
+            }
+            let writes = match s.types.get(&(g, w)) {
+                Some(Ok((wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, .. }, _))) => !read_only,
+                Some(Ok((wgpu::BindingType::StorageTexture { access, .. }, _))) => *access != wgpu::StorageTextureAccess::ReadOnly,
+                Some(Ok(_)) => false,
+                _ => true,
+            };
+            if writes {
+                let (b, _) = crate::spirv::vulkan_binding(w);
+                if g >= 4 || b >= 16 {
+                    return u64::MAX;
+                }
+                bits |= 1 << (g * 16 + b);
+            }
+        }
+    }
+    bits
 }
 
 /// The bindings a pipeline's entry points use, by set (the push
@@ -460,7 +527,8 @@ pub fn compute_pipeline(gpu: &Gpu, shader: &Shader, entry: &str, spec: &[Spec]) 
         return Err(format!("pipeline: {}", describe(&e)));
     }
     let (uses, push_group) = uses_of(&[(shader, bindings)]);
-    Ok(Pipeline { kind: Kind::Compute(pipeline), uses, push_group, vertex_bindings: Vec::new(), arrays: shader.arrays.clone(), recipe: None, variants: Default::default() })
+    let written = written_of(&[(shader, bindings)]);
+    Ok(Pipeline { kind: Kind::Compute(pipeline), uses, push_group, vertex_bindings: Vec::new(), arrays: shader.arrays.clone(), recipe: None, dynamic: 0, fan: false, written, variants: Default::default() })
 }
 
 /// A graphics pipeline's state, from the words the driver sends (u32s,
@@ -494,6 +562,10 @@ pub struct GraphicsState {
     /// The vertex and fragment shaders' specialization constants.
     pub vertex_spec: Vec<Spec>,
     pub fragment_spec: Vec<Spec>,
+    /// What it leaves to commands (VkDynamicState's that WebGPU makes
+    /// part of a pipeline): 1 depth bias, 2 stencil compare mask, 4
+    /// stencil write mask.
+    pub dynamic: u32,
 }
 
 impl GraphicsState {
@@ -505,6 +577,7 @@ impl GraphicsState {
     /// vertex buffers and attributes, and each (9, 3 and 4 words); then
     /// the entry points' names, each padded to 4 bytes; then each shader's
     /// specialization constants: their number, and each (`Spec`'s 4 words).
+    /// Last, what it leaves to commands (`dynamic`).
     pub fn decode(b: &[u8]) -> Res<GraphicsState> {
         let mut r = Reader { b, at: 0 };
         let mut s = GraphicsState::default();
@@ -547,6 +620,7 @@ impl GraphicsState {
                 spec.push([r.u32()?, r.u32()?, r.u32()?, r.u32()?]);
             }
         }
+        s.dynamic = r.u32()?;
         Ok(s)
     }
 }
@@ -684,7 +758,9 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
         2 => T::LineStrip,
         3 => T::TriangleList,
         4 => T::TriangleStrip,
-        t => return Err(format!("topology {t} (WebGPU has no fans, nor adjacency or patches)")),
+        // (A fan's draws are a list's: see `Pipeline::fan`.)
+        5 => T::TriangleList,
+        t => return Err(format!("topology {t} (WebGPU has no adjacency or patches)")),
     };
     let cull_mode = match s.cull {
         1 => Some(wgpu::Face::Front),
@@ -750,12 +826,13 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
         multisample: wgpu::MultisampleState { count: s.samples.max(1), mask: !0, alpha_to_coverage_enabled: false },
         targets,
     };
-    let pipeline = recipe.make(gpu, None)?;
+    let pipeline = recipe.make(gpu, None, Dynamic::default())?;
     let mut stages = vec![(vs, vs_bindings)];
     if let (Some(fs), Some(b)) = (fs, fs_bindings) {
         stages.push((fs, b));
     }
     let (uses, push_group) = uses_of(&stages);
+    let written = written_of(&stages);
     let arrays = vs.arrays.iter().chain(fs.iter().flat_map(|f| f.arrays.iter())).map(|(k, v)| (*k, *v)).collect();
     Ok(Pipeline {
         kind: Kind::Render(pipeline),
@@ -764,6 +841,9 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
         vertex_bindings: s.buffers.iter().map(|b| b[0]).collect(),
         arrays,
         recipe: Some(recipe),
+        dynamic: s.dynamic,
+        fan: s.topology == 5,
+        written,
         variants: Default::default(),
     })
 }
@@ -868,6 +948,11 @@ pub enum Command {
     /// Queries' results into a buffer, `stride` apart (`flags`:
     /// VkQueryResultFlags: 1 64-bit, 4 with each its availability).
     CopyQueries { pool: u64, first: u32, count: u32, buffer: u64, offset: u64, stride: u64, flags: u32 },
+    /// Dynamic state WebGPU makes part of a pipeline: depth bias (constant,
+    /// clamp, slope: f32s' bits), stencil compare and write masks.
+    SetDepthBias([u32; 3]),
+    SetStencilCompareMask(u32),
+    SetStencilWriteMask(u32),
 }
 
 /// An attachment cleared inside a render pass: a color attachment (its
@@ -959,6 +1044,9 @@ pub struct DepthAttachment {
 ///  33 TIMESTAMP      pool (u64), index (u32)
 ///  34 COPY_QUERIES   pool (u64), first, count (u32), buffer, offset, stride
 ///                    (u64), VkQueryResultFlags (u32)
+///  35 SET_DEPTH_BIAS constant, clamp, slope (f32)
+///  36 SET_STENCIL_COMPARE_MASK  mask (u32)
+///  37 SET_STENCIL_WRITE_MASK  mask (u32)
 ///
 /// A SUB: mip, layer, layers, aspect (u32), origin (i32 × 3), extent (u32 × 3).
 pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
@@ -1071,6 +1159,9 @@ pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
             32 => Command::ResetQueries { pool: r.u64()?, first: r.u32()?, count: r.u32()? },
             33 => Command::Timestamp { pool: r.u64()?, index: r.u32()? },
             34 => Command::CopyQueries { pool: r.u64()?, first: r.u32()?, count: r.u32()?, buffer: r.u64()?, offset: r.u64()?, stride: r.u64()?, flags: r.u32()? },
+            35 => Command::SetDepthBias([r.u32()?, r.u32()?, r.u32()?]),
+            36 => Command::SetStencilCompareMask(r.u32()?),
+            37 => Command::SetStencilWriteMask(r.u32()?),
             op => return Err(format!("command {op}")),
         });
         at += len;
@@ -1165,6 +1256,22 @@ pub fn format(vk: u32) -> Option<wgpu::TextureFormat> {
         127 => F::Stencil8,
         129 => F::Depth24PlusStencil8,
         130 => F::Depth32FloatStencil8,
+        // Block-compressed (BC1 to BC7), where the device has them; BC1's RGB
+        // forms as its RGBA ones.
+        131 | 133 => F::Bc1RgbaUnorm,
+        132 | 134 => F::Bc1RgbaUnormSrgb,
+        135 => F::Bc2RgbaUnorm,
+        136 => F::Bc2RgbaUnormSrgb,
+        137 => F::Bc3RgbaUnorm,
+        138 => F::Bc3RgbaUnormSrgb,
+        139 => F::Bc4RUnorm,
+        140 => F::Bc4RSnorm,
+        141 => F::Bc5RgUnorm,
+        142 => F::Bc5RgSnorm,
+        143 => F::Bc6hRgbUfloat,
+        144 => F::Bc6hRgbFloat,
+        145 => F::Bc7RgbaUnorm,
+        146 => F::Bc7RgbaUnormSrgb,
         _ => return None,
     })
 }
@@ -1324,8 +1431,16 @@ pub struct QueryPool {
     pub set: wgpu::QuerySet,
     pub count: u32,
     resolved: wgpu::Buffer,
+    /// For occlusion queries begun outside a render pass (WebGPU's are of
+    /// one pass): a set each pass while one is on counts into, summed as
+    /// it ends, and the buffer it's resolved into.
+    spill: Option<(wgpu::QuerySet, wgpu::Buffer)>,
     pub values: Mutex<Vec<Option<u64>>>,
 }
+
+/// Render passes an occlusion query begun outside one may cover, in a
+/// submission.
+const SPILL: u32 = 256;
 
 /// Whether the device takes timestamps anywhere in a submission.
 pub fn timestamps(gpu: &Gpu) -> bool {
@@ -1349,7 +1464,12 @@ pub fn query_pool(gpu: &Gpu, kind: u32, count: u32) -> Res<QueryPool> {
         usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    Ok(QueryPool { set, count, resolved, values: Mutex::new(vec![None; count as usize]) })
+    let spill = matches!(ty, wgpu::QueryType::Occlusion).then(|| {
+        let set = gpu.device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty, count: SPILL });
+        let resolved = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: SPILL as u64 * 8, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        (set, resolved)
+    });
+    Ok(QueryPool { set, count, resolved, spill, values: Mutex::new(vec![None; count as usize]) })
 }
 
 /// A texel buffer's view (VkBufferView): a 1D texture of its format (WGSL
@@ -1382,7 +1502,11 @@ pub fn texel_view(gpu: &Gpu, buffer: u64, offset: u64, range: u64, vk_format: u3
         sample_count: 1,
         dimension: wgpu::TextureDimension::D1,
         format: f,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        // (A storage texel buffer too, where its format can be one: written,
+        // it's copied back, `write_back`.)
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | (wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC) & f.guaranteed_format_features(gpu.device.features()).allowed_usages,
         view_formats: &[],
     });
     if let Some(e) = pollster::block_on(scope.pop()) {
@@ -1399,6 +1523,18 @@ fn refresh(enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, t: &TexelView)
         t.texture.as_image_copy(),
         wgpu::Extent3d { width: t.texels, height: 1, depth_or_array_layers: 1 },
     );
+}
+
+/// A storage texel view's texture written back to its buffer (after a
+/// dispatch or a pass that may have written it).
+fn write_back(enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, t: &TexelView) {
+    if t.texture.usage().contains(wgpu::TextureUsages::STORAGE_BINDING) {
+        enc.copy_texture_to_buffer(
+            t.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo { buffer, layout: wgpu::TexelCopyBufferLayout { offset: t.offset, bytes_per_row: None, rows_per_image: None } },
+            wgpu::Extent3d { width: t.texels, height: 1, depth_or_array_layers: 1 },
+        );
+    }
 }
 
 /// The texel views among descriptors.
@@ -1466,14 +1602,17 @@ fn on_texture<'t>(t: &'t wgpu::Texture, s: &Sub) -> (wgpu::TexelCopyTextureInfo<
 fn buffer_image(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, t: &wgpu::Texture, r: &Region, to_image: bool) -> Res<()> {
     let (place, extent) = on_texture(t, &r.sub);
     let block = t.format().block_copy_size(Some(place.aspect)).ok_or("an image whose texels can't be copied")?;
+    // (Rows and their lengths in blocks: a compressed format's are of
+    // several texels.)
+    let (bw, bh) = t.format().block_dimensions();
     let row_length = if r.row_length == 0 { extent.width } else { r.row_length };
-    let rows = if r.image_height == 0 { extent.height } else { r.image_height };
-    let row_bytes = row_length * block;
+    let rows = (if r.image_height == 0 { extent.height } else { r.image_height }).div_ceil(bh);
+    let row_bytes = row_length.div_ceil(bw) * block;
     let mut copy = |offset: u64, place: wgpu::TexelCopyTextureInfo, extent: wgpu::Extent3d, bytes_per_row: Option<u32>| {
         let b = wgpu::TexelCopyBufferInfo { buffer, layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row, rows_per_image: bytes_per_row.map(|_| rows) } };
         if to_image { enc.copy_buffer_to_texture(b, place, extent) } else { enc.copy_texture_to_buffer(place, b, extent) }
     };
-    if extent.height <= 1 && extent.depth_or_array_layers <= 1 {
+    if extent.height <= bh && extent.depth_or_array_layers <= 1 {
         // (One row: no pitch, which needn't then be WebGPU's 256 bytes.)
         copy(r.offset, place, extent, None);
     } else if row_bytes.is_multiple_of(256) {
@@ -1504,12 +1643,13 @@ fn buffer_image(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer
         }
     } else {
         for z in 0..extent.depth_or_array_layers {
-            for y in 0..extent.height {
+            for y in 0..extent.height.div_ceil(bh) {
                 let offset = r.offset + (z as u64 * rows as u64 + y as u64) * row_bytes as u64;
                 let mut p = place;
-                p.origin.y += y;
+                p.origin.y += y * bh;
                 p.origin.z += z;
-                copy(offset, p, wgpu::Extent3d { width: extent.width, height: 1, depth_or_array_layers: 1 }, None);
+                let height = (extent.height - y * bh).min(bh);
+                copy(offset, p, wgpu::Extent3d { width: extent.width, height, depth_or_array_layers: 1 }, None);
             }
         }
     }
@@ -1611,6 +1751,69 @@ fn bind_groups<'a>(
         }
     }
     Ok(groups)
+}
+
+/// A triangle fan's `count` indices from `first` of an index buffer (at
+/// `offset`, 16 or 32 bits each) as a list's: each triangle's first, k-th
+/// and (k + 1)-th, 32 bits each, in a new buffer, by a compute shader in
+/// the encoder (the indices are the device's).
+fn fan_list(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, offset: u64, format: wgpu::IndexFormat, first: u32, count: u32) -> Res<wgpu::Buffer> {
+    const FAN: &str = "
+struct P { first: u32, count: u32, wide: u32 }
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<uniform> p: P;
+fn index(k: u32) -> u32 {
+    if p.wide == 1u { return src[k]; }
+    let w = src[k / 2u];
+    return select(w & 0xffffu, w >> 16u, (k & 1u) == 1u);
+}
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = g.x;
+    if i + 2u >= p.count { return; }
+    dst[3u * i] = index(p.first);
+    dst[3u * i + 1u] = index(p.first + i + 1u);
+    dst[3u * i + 2u] = index(p.first + i + 2u);
+}
+";
+    let pipeline = gpu
+        .fans
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| {
+            let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(FAN.into()) });
+            gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None })
+        })
+        .clone();
+    // (The source bound from an aligned offset, the indices counted from it.)
+    let size = if format == wgpu::IndexFormat::Uint32 { 4 } else { 2 };
+    let align = gpu.device.limits().min_storage_buffer_offset_alignment as u64;
+    let at = offset / align * align;
+    let first = first + ((offset - at) / size) as u32;
+    let bound = ((first as u64 + count as u64) * size).next_multiple_of(4).min(buffer.size() - at);
+    let out = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 3 * (count as u64 - 2) * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDEX,
+        mapped_at_creation: false,
+    });
+    let params: Vec<u8> = [first, count, (size == 4) as u32, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let uniform = wgpu::util::DeviceExt::create_buffer_init(&gpu.device, &wgpu::util::BufferInitDescriptor { label: None, contents: &params, usage: wgpu::BufferUsages::UNIFORM });
+    let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: at, size: wgpu::BufferSize::new(bound) }) },
+            wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() },
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline);
+    pass.set_bind_group(0, &group, &[]);
+    pass.dispatch_workgroups((count - 2).div_ceil(64), 1, 1);
+    drop(pass);
+    Ok(out)
 }
 
 /// A render pass's targets: its color attachments' formats, its depth and
@@ -1940,6 +2143,14 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
         Some(Object::Queries(q)) => Ok(q),
         _ => Err(format!("no query pool {h}")),
     };
+    // (Depth bias and stencil masks as commands set them, for the draws.)
+    let mut dynamic = Dynamic::default();
+    // (An occlusion query begun outside render passes, its pool and index and
+    // the overflow slots the passes since counted into; those ended; and the
+    // slots used, by pool.)
+    let mut spanning: Option<(u64, u32, Vec<u32>)> = None;
+    let mut spans: Vec<(u64, u32, Vec<u32>)> = Vec::new();
+    let mut spill_next: BTreeMap<u64, u32> = BTreeMap::new();
     // (Queries ended in it, or reset since, by pool: read back after.)
     let mut ended: BTreeMap<u64, BTreeMap<u32, bool>> = BTreeMap::new();
     let mut enc = gpu.device.create_command_encoder(&Default::default());
@@ -2002,6 +2213,11 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     Command::Dispatch([x, y, z]) => pass.dispatch_workgroups(*x, *y, *z),
                     Command::DispatchIndirect { buffer, offset } => pass.dispatch_workgroups_indirect(buf(*buffer)?, *offset),
                     _ => unreachable!(),
+                }
+                drop(pass);
+                for t in texels_of(sets.values().flatten()) {
+                    let t = texel(t)?;
+                    write_back(&mut enc, buf(t.buffer)?, t);
                 }
             }
             // (Within one buffer, two of Vulkan's in one memory: through
@@ -2118,23 +2334,56 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                         None => 1,
                     },
                 };
+                // (Its indexed draws of triangle fans: their indices made
+                // lists', before it begins, as compute can't run inside it.)
+                let mut fans: HashMap<usize, wgpu::Buffer> = HashMap::new();
+                {
+                    let (mut p, mut ix) = (graphics.clone(), index);
+                    for (j, c) in commands.iter().enumerate().skip(i + 1) {
+                        match c {
+                            Command::EndPass => break,
+                            Command::BindPipeline(h) => p = Some(pipeline(*h)?),
+                            Command::BindIndex { buffer, offset, wide } => ix = Some((*buffer, *offset, if *wide { wgpu::IndexFormat::Uint32 } else { wgpu::IndexFormat::Uint16 })),
+                            Command::DrawIndexed { indices, first, .. } if *indices >= 3 && p.as_ref().is_some_and(|p| p.fan) => {
+                                let (h, offset, f) = ix.ok_or("an indexed draw with no index buffer")?;
+                                fans.insert(j, fan_list(gpu, &mut enc, buf(h)?, offset, f, *first, *indices)?);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 // (The pool of the occlusion queries it has, named as it begins.)
                 let occlusion = commands[i + 1..].iter().take_while(|c| **c != Command::EndPass).find_map(|c| match c {
                     Command::BeginQuery { pool, .. } => Some(*pool),
                     _ => None,
                 });
-                let occlusion_query_set = match occlusion {
-                    Some(h) => Some(&queries(h)?.set),
-                    None => None,
+                // (Or, while a query begun outside passes is on, the pool's
+                // overflow set: the pass counts into a slot of it.)
+                if occlusion.is_some() && spanning.is_some() {
+                    return Err("occlusion queries begun inside a render pass and around it".into());
+                }
+                let occlusion_query_set = match (occlusion, &spanning) {
+                    (Some(h), _) => Some(&queries(h)?.set),
+                    (None, Some((h, _, _))) => Some(&queries(*h)?.spill.as_ref().ok_or("an occlusion query of a pool of timestamps")?.0),
+                    (None, None) => None,
                 };
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &color_attachments, depth_stencil_attachment, occlusion_query_set, ..Default::default() });
+                if let Some((h, _, slots)) = &mut spanning {
+                    let next = spill_next.entry(*h).or_insert(0);
+                    if *next >= SPILL {
+                        return Err(format!("an occlusion query over more than {SPILL} render passes"));
+                    }
+                    pass.begin_occlusion_query(*next);
+                    slots.push(*next);
+                    *next += 1;
+                }
                 // The pass's commands, to its end.
                 i += 1;
                 while i < commands.len() && commands[i] != Command::EndPass {
                     match &commands[i] {
                         Command::BindPipeline(h) => {
                             let p = pipeline(*h)?;
-                            pass.set_pipeline(&p.render_for(gpu, &targets.colors)?);
+                            pass.set_pipeline(&p.render_for(gpu, &targets.colors, dynamic)?);
                             graphics = Some(p);
                         }
                         Command::BindGraphicsSet { set, bindings } => {
@@ -2158,6 +2407,10 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                         }
                         Command::SetBlendConstants([r, g, b, a]) => pass.set_blend_constant(wgpu::Color { r: *r as f64, g: *g as f64, b: *b as f64, a: *a as f64 }),
                         Command::SetStencilReference(r) => pass.set_stencil_reference(*r),
+                        // (Kept for the draws: a pipeline variant's.)
+                        Command::SetDepthBias([constant, clamp, slope]) => dynamic.bias = Some([*constant, *slope, *clamp]),
+                        Command::SetStencilCompareMask(m) => dynamic.compare_mask = Some(*m),
+                        Command::SetStencilWriteMask(m) => dynamic.write_mask = Some(*m),
                         Command::ClearAttachments { attachments, rects } => clear_attachments(gpu, &mut pass, &targets, size, attachments, rects)?,
                         Command::BeginQuery { pool, index } => {
                             if Some(*pool) != occlusion {
@@ -2182,13 +2435,35 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                         c @ (Command::Draw(_) | Command::DrawIndexed { .. } | Command::DrawIndirect { .. }) => {
                             let p = graphics.as_ref().ok_or("a draw with no pipeline bound")?;
                             // (Its pipeline again: one bound before the pass.)
-                            pass.set_pipeline(&p.render_for(gpu, &targets.colors)?);
+                            pass.set_pipeline(&p.render_for(gpu, &targets.colors, dynamic)?);
                             for (g, group) in bind_groups(gpu, p, &graphics_sets, &push, &object, &staged)? {
                                 pass.set_bind_group(g, &group, &[]);
                             }
                             for (slot, b) in p.vertex_bindings.iter().enumerate() {
                                 let &(h, offset) = vertex.get(b).ok_or_else(|| format!("no vertex buffer bound to binding {b}"))?;
                                 pass.set_vertex_buffer(slot as u32, buf(h)?.slice(offset..));
+                            }
+                            // (A triangle fan's: a list of its triangles' indices.)
+                            if p.fan {
+                                match c {
+                                    Command::Draw([n, instances, first, first_instance]) => {
+                                        let list: Vec<u8> = (1..n.saturating_sub(1)).flat_map(|k| [*first, first + k, first + k + 1]).flat_map(u32::to_le_bytes).collect();
+                                        if !list.is_empty() {
+                                            let b = wgpu::util::DeviceExt::create_buffer_init(&gpu.device, &wgpu::util::BufferInitDescriptor { label: None, contents: &list, usage: wgpu::BufferUsages::INDEX });
+                                            pass.set_index_buffer(b.slice(..), wgpu::IndexFormat::Uint32);
+                                            pass.draw_indexed(0..(list.len() / 4) as u32, 0, *first_instance..first_instance + instances);
+                                        }
+                                    }
+                                    Command::DrawIndexed { indices, instances, vertex_offset, first_instance, .. } => {
+                                        if let Some(b) = fans.get(&i) {
+                                            pass.set_index_buffer(b.slice(..), wgpu::IndexFormat::Uint32);
+                                            pass.draw_indexed(0..3 * (indices - 2), *vertex_offset, *first_instance..first_instance + instances);
+                                        }
+                                    }
+                                    _ => return Err("an indirect draw of a triangle fan".into()),
+                                }
+                                i += 1;
+                                continue;
                             }
                             let indexed = matches!(c, Command::DrawIndexed { .. } | Command::DrawIndirect { indexed: true, .. });
                             if indexed {
@@ -2213,8 +2488,25 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     }
                     i += 1;
                 }
+                if spanning.is_some() {
+                    pass.end_occlusion_query();
+                }
+                drop(pass);
+                // (Storage texel buffers it may have written, back to their
+                // buffers.)
+                for t in texels_of(graphics_sets.values().flatten()) {
+                    let t = texel(t)?;
+                    write_back(&mut enc, buf(t.buffer)?, t);
+                }
             }
-            c @ (Command::EndPass | Command::SetViewport(_) | Command::SetScissor(_) | Command::SetBlendConstants(_) | Command::SetStencilReference(_)) => {
+            c @ (Command::EndPass
+            | Command::SetViewport(_)
+            | Command::SetScissor(_)
+            | Command::SetBlendConstants(_)
+            | Command::SetStencilReference(_)
+            | Command::SetDepthBias(_)
+            | Command::SetStencilCompareMask(_)
+            | Command::SetStencilWriteMask(_)) => {
                 // (Dynamic state set outside a pass: Vulkan keeps it for the
                 // next; the driver sets it again in each pass.)
                 if *c == Command::EndPass {
@@ -2286,7 +2578,17 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
             }
             Command::ClearAttachments { .. } => return Err("attachments cleared outside a render pass".into()),
             // (Occlusion queries over more than one render pass: not yet.)
-            Command::BeginQuery { .. } | Command::EndQuery { .. } => return Err("an occlusion query outside a render pass".into()),
+            // (An occlusion query around render passes: each counts into a
+            // slot of the pool's overflow set; summed as it's read back.)
+            Command::BeginQuery { pool, index } => spanning = Some((*pool, *index, Vec::new())),
+            Command::EndQuery { pool, index } => {
+                if let Some((p, k, slots)) = spanning.take()
+                    && (p, k) == (*pool, *index)
+                {
+                    ended.entry(p).or_default().insert(k, true);
+                    spans.push((p, k, slots));
+                }
+            }
             Command::Timestamp { pool, index } => {
                 enc.write_timestamp(&queries(*pool)?.set, *index);
                 ended.entry(*pool).or_default().insert(*index, true);
@@ -2340,9 +2642,23 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
             read_back.push((q, e, 0));
         }
     }
+    for (&h, &n) in &spill_next {
+        if let Some((set, resolved)) = &queries(h)?.spill {
+            enc.resolve_query_set(set, 0..n, resolved, 0);
+        }
+    }
     gpu.queue.submit([enc.finish()]);
     if let Some(e) = pollster::block_on(scope.pop()) {
         return Err(describe(&e));
+    }
+    // (Queries around render passes: their passes' counts summed.)
+    let mut sums: Vec<(&QueryPool, u32, u64)> = Vec::new();
+    for (h, k, slots) in &spans {
+        let q = queries(*h)?;
+        let Some((_, resolved)) = &q.spill else { continue };
+        let bytes = gpu.read(resolved, 0, spill_next[h] as u64 * 8)?;
+        let sum = slots.iter().map(|&s| u64::from_le_bytes(bytes[s as usize * 8..][..8].try_into().unwrap())).sum();
+        sums.push((q, *k, sum));
     }
     for (q, e, n) in read_back {
         let bytes = gpu.read(&q.resolved, 0, n as u64 * 8)?;
@@ -2350,6 +2666,9 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
         for (&k, &on) in e {
             values[k as usize] = on.then(|| u64::from_le_bytes(bytes[k as usize * 8..][..8].try_into().unwrap()));
         }
+    }
+    for (q, k, sum) in sums {
+        q.values.lock().unwrap()[k as usize] = Some(sum);
     }
     Ok(())
 }
@@ -2499,11 +2818,13 @@ var<immediate> p: P;
         w.extend([0, 0, 106, 0, 1, 0, 106, 12]);
         w.extend([u32::from_le_bytes(*b"main"), u32::from_le_bytes(*b"fs\0\0")]);
         w.extend([1, 7, 4, 1f32.to_bits(), 0, 0]); // specialization: the vertex shader's one, the fragment's none
+        w.push(1 | 4); // dynamic: depth bias, stencil write mask
         let bytes: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
         let s = GraphicsState::decode(&bytes).unwrap();
         assert_eq!((s.vertex, s.fragment), ((5, "main".into()), (6, "fs".into())));
         assert_eq!((s.topology, s.cull, s.front_face, s.bias), (3, 2, 1, (true, 2., 0.5, 0.)));
         assert_eq!((s.depth, s.depth_format, s.samples), ((true, true, 1), 126, 1));
+        assert_eq!(s.dynamic, 5);
         assert_eq!((s.colors.len(), s.buffers, s.attributes), (1, vec![[0, 24, 0]], vec![[0, 0, 106, 0], [1, 0, 106, 12]]));
         assert_eq!((s.vertex_spec, s.fragment_spec), (vec![[7, 4, 1f32.to_bits(), 0]], vec![]));
         assert!(GraphicsState::decode(&bytes[..bytes.len() - 4]).is_err());

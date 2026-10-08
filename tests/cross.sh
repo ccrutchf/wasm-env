@@ -64,6 +64,9 @@ if [ "${1:-}" = --build ]; then
 #!/usr/bin/env bash
 # The Windows build of wasm-env, under Wine (tests: WASM_ENV_RUNTIME=\$0).
 export WINEPREFIX=$root/build/wineprefix WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
+# (lavapipe's settings, which the GPU service sets on Linux, from outside:
+# a Windows process's environment doesn't reach it.)
+export GALLIUM_OVERRIDE_CPU_CAPS=\${GALLIUM_OVERRIDE_CPU_CAPS:-avx} LP_NATIVE_VECTOR_WIDTH=\${LP_NATIVE_VECTOR_WIDTH:-128}
 exec $wine/bin/wine $CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/wasm-env.exe "\$@"
 EOF
 	chmod +x "$root/build/wine-wasm-env"
@@ -77,6 +80,8 @@ if [ "${1:-}" = --unit ]; then
 	# clang, in build/win-toolchain, if it's there).
 	wine=$(store wineWow64Packages.stable)
 	export WINEPREFIX=$root/build/wineprefix WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
+	# (lavapipe's settings, from outside, as for build/wine-wasm-env.)
+	export GALLIUM_OVERRIDE_CPU_CAPS=${GALLIUM_OVERRIDE_CPU_CAPS:-avx} LP_NATIVE_VECTOR_WIDTH=${LP_NATIVE_VECTOR_WIDTH:-128}
 	[ -d "$WINEPREFIX" ] || "$wine/bin/wineboot" --init >/dev/null 2>&1
 	if [ -e build/win-toolchain/bin/clang.exe ]; then
 		export WASM_CC="Z:$(pwd | tr / '\\')\\build\\win-toolchain\\bin\\clang.exe"

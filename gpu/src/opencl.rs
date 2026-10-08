@@ -34,10 +34,39 @@ pub struct Guest {
 }
 
 impl Guest {
+    /// The program's include options: on Windows, where clang takes no path
+    /// without a drive for absolute (so the overlay's `/opt` matches
+    /// nothing), `-I /abs` made the root's.
+    fn includes(&self, options: Vec<String>) -> Vec<String> {
+        if !cfg!(windows) {
+            return options;
+        }
+        let root = |p: &str| self.root.join(p.trim_start_matches('/')).display().to_string();
+        let mut out = Vec::new();
+        let mut it = options.into_iter();
+        while let Some(o) = it.next() {
+            match o.as_str() {
+                "-I" => {
+                    let v = it.next().unwrap_or_default();
+                    out.extend(["-I".to_string(), if v.starts_with('/') { root(&v) } else { v }]);
+                }
+                _ if o.starts_with("-I/") => out.push(format!("-I{}", root(&o[2..]))),
+                _ => out.push(o),
+            }
+        }
+        out
+    }
+
     /// clang's arguments for it: a filesystem overlay putting the root at
     /// `/` (falling through to the host's, where clang's own headers are),
     /// and the working directory.
     fn args(&self, dir: &Scratch) -> Result<Vec<String>, String> {
+    // (On Windows, the root searched last instead: `#include "/abs/path.h"`
+        // isn't absolute to clang there, so it's looked for in the include
+        // directories, and found as the root's.)
+        if cfg!(windows) {
+            return Ok(vec!["-idirafter".into(), self.root.display().to_string(), "-working-directory".into(), self.cwd.display().to_string()]);
+        }
         let overlay = dir.0.join("root.yaml");
         // (Each of the root's directories: clang can't take / itself remapped.)
         let quote = |s: String| s.replace('\\', "\\\\").replace('"', "\\\"");
@@ -108,7 +137,7 @@ pub fn clang_ir(cc: &Compiler, source: &str, options: &str, guest: Option<&Guest
     // Everything inlined: the WGSL is one function per kernel.
     args.extend(["-mllvm", "-inline-threshold=100000"].map(String::from));
     args.extend(extra_builtins(&dir)?);
-    args.extend(passed(options));
+    args.extend(guest.map_or_else(|| passed(options), |g| g.includes(passed(options))));
     args.extend(cc.builtin_args());
     if let Some(g) = guest {
         args.extend(g.args(&dir)?);
@@ -163,7 +192,7 @@ pub fn compile(cc: &Compiler, source: &str, options: &str, headers: &[(String, V
         .collect();
     args.extend(["-I".to_string(), dir.0.display().to_string()]);
     args.extend(extra_builtins(&dir)?);
-    args.extend(passed(options));
+    args.extend(guest.map_or_else(|| passed(options), |g| g.includes(passed(options))));
     if let Some(g) = guest {
         args.extend(g.args(&dir)?);
     }

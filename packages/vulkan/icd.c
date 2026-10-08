@@ -33,6 +33,7 @@ struct wl_surface;
 
 void *malloc(size_t);
 void *calloc(size_t, size_t);
+void qsort(void *, size_t, size_t, int (*)(const void *, const void *));
 void *realloc(void *, size_t);
 void free(void *);
 void *memcpy(void *, const void *, size_t);
@@ -87,7 +88,10 @@ enum {
     END_QUERY,
     RESET_QUERIES,
     TIMESTAMP,
-    COPY_QUERIES
+    COPY_QUERIES,
+    SET_DEPTH_BIAS,
+    SET_STENCIL_COMPARE_MASK,
+    SET_STENCIL_WRITE_MASK
 };
 
 struct request {
@@ -119,6 +123,7 @@ enum {
     L_DEVICE,
     L_TYPE,
     L_TIMESTAMP,
+    L_FEATURES,
     L_COUNT
 };
 static uint64_t limits[L_COUNT];
@@ -190,17 +195,23 @@ struct VkShaderModule_T {
 };
 // Graphics state a pipeline may leave to commands (Vulkan's dynamic
 // state), kept by command buffers: WebGPU's passes each start without it.
-enum { S_VIEWPORT = 1, S_SCISSOR = 2, S_BLEND = 4, S_REFERENCE = 8 };
+enum { S_VIEWPORT = 1, S_SCISSOR = 2, S_BLEND = 4, S_REFERENCE = 8, S_BIAS = 16, S_COMPARE_MASK = 32, S_WRITE_MASK = 64 };
 struct state {
     uint32_t set;
     float viewport[6];
     uint32_t scissor[4];
     float blend[4];
     uint32_t reference;
+    // Depth bias (constant, clamp, slope), stencil compare and write masks.
+    float bias[3];
+    uint32_t compare_mask, write_mask;
 };
 struct VkPipeline_T {
     uint64_t handle;
     int graphics;
+    // The bindings it writes (storage buffers, texel buffers and images):
+    // bits, set × 16 + binding (gpu.rs's VK_PIPELINE).
+    uint64_t written;
     // A graphics pipeline's own state (its `set` what isn't dynamic).
     struct state fixed;
 };
@@ -220,7 +231,7 @@ struct VkRenderPass_T {
     struct subpass *sub;
 };
 struct VkFramebuffer_T {
-    uint32_t n;
+    uint32_t n, width, height;
     VkImageView *views;
 };
 struct VkPipelineLayout_T {
@@ -248,6 +259,9 @@ struct VkImageView_T {
 };
 struct VkBufferView_T {
     uint64_t handle;
+    // Its buffer and range (a storage texel buffer's writes reach them).
+    VkBuffer buffer;
+    VkDeviceSize offset, range;
 };
 struct VkQueryPool_T {
     uint64_t handle;
@@ -291,12 +305,28 @@ struct VkCommandBuffer_T {
     size_t n, cap;
     struct write *writes;
     size_t nwrites, wcap;
+    // And the ranges its commands may read (sent from mapped memory as it's
+    // submitted).
+    struct write *reads;
+    size_t nreads, rcap;
+    // Per bind point (graphics, compute), the pipeline bound, and each
+    // set's storage descriptors bound: what a draw or dispatch writes, if
+    // its pipeline writes their bindings.
+    VkPipeline bound[2];
+    struct stored {
+        uint32_t binding;
+        VkBuffer buffer;
+        VkDeviceSize offset, range;
+    } *stores[2][8];
+    uint32_t nstores[2][8], scap[2][8];
     int failed;
     // Graphics: the state set, and the render pass begun (or NULL), its
     // framebuffer, subpass and clear values.
     struct state state;
     VkRenderPass pass;
     VkFramebuffer framebuffer;
+    // The render pass's render area.
+    VkRect2D area;
     uint32_t subpass;
     VkClearValue *clears;
     uint32_t nclears;
@@ -442,7 +472,7 @@ static CALL void CC GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalD
     l->sampledImageColorSampleCounts = l->sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     l->sampledImageDepthSampleCounts = l->sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     l->storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-    l->maxSamplerAnisotropy = 1;
+    l->maxSamplerAnisotropy = 16;
     // (Timestamps where the device takes them: their period.)
     uint32_t period = (uint32_t)limits[L_TIMESTAMP];
     l->timestampComputeAndGraphics = period != 0;
@@ -454,8 +484,26 @@ static CALL void CC GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalD
     l->nonCoherentAtomSize = 4;
 }
 
+// The optional features the driver has: those every device has through it,
+// and those the device has (VK_LIMITS's features).
+static VkPhysicalDeviceFeatures supported(void) {
+    uint64_t has = limits[L_FEATURES];
+    VkPhysicalDeviceFeatures f = {0};
+    // (WebGPU checks buffer accesses; 32-bit indices, cube arrays, blends of
+    // their own per attachment, indirect draws' counts looped over, depth
+    // bias clamped, anisotropic filtering, fragment shaders' stores.)
+    f.robustBufferAccess = f.fullDrawIndexUint32 = f.imageCubeArray = f.independentBlend = VK_TRUE;
+    f.multiDrawIndirect = f.depthBiasClamp = f.samplerAnisotropy = f.fragmentStoresAndAtomics = VK_TRUE;
+    f.shaderSampledImageArrayDynamicIndexing = f.shaderStorageBufferArrayDynamicIndexing = !!(has & 1);
+    f.shaderFloat64 = !!(has & 2);
+    f.shaderInt64 = !!(has & 4);
+    f.drawIndirectFirstInstance = !!(has & 8);
+    f.textureCompressionBC = !!(has & 16);
+    return f;
+}
+
 static CALL void CC GetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f) {
-    memset(f, 0, sizeof *f);
+    *f = supported();
 }
 
 // The one queue family (its timestamps 64 bits, if the device takes them).
@@ -588,10 +636,21 @@ static CALL VkResult CC CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateIn
         if (info->pQueueCreateInfos[i].queueFamilyIndex != 0 || info->pQueueCreateInfos[i].queueCount > 1)
             return VK_ERROR_INITIALIZATION_FAILED;
     if (info->pEnabledFeatures) {
-        // (No feature is supported: asking for one fails.)
-        const VkBool32 *f = (const VkBool32 *)info->pEnabledFeatures;
+        // (Asking for a feature it hasn't fails.)
+        VkPhysicalDeviceFeatures have = supported();
+        const VkBool32 *f = (const VkBool32 *)info->pEnabledFeatures, *h = (const VkBool32 *)&have;
         for (size_t k = 0; k < sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32); k++)
-            if (f[k])
+            if (f[k] && !h[k])
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    // (Or asked for in a VkPhysicalDeviceFeatures2.)
+    for (const VkBaseInStructure *s = info->pNext; s; s = s->pNext) {
+        if (s->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
+            continue;
+        VkPhysicalDeviceFeatures have = supported();
+        const VkBool32 *f = (const VkBool32 *)&((const VkPhysicalDeviceFeatures2 *)s)->features, *h = (const VkBool32 *)&have;
+        for (size_t k = 0; k < sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32); k++)
+            if (f[k] && !h[k])
                 return VK_ERROR_FEATURE_NOT_PRESENT;
     }
     struct VkDevice_T *d = zalloc(sizeof *d);
@@ -662,10 +721,22 @@ static int transfer(int op, VkDeviceMemory m, VkDeviceSize offset, VkDeviceSize 
 }
 
 // The device's writes to a mapped memory read into the program's copy.
+static int by_start(const void *a, const void *b) {
+    const VkDeviceSize *x = a, *y = b;
+    return x[0] < y[0] ? -1 : x[0] > y[0];
+}
+
 static int catch_up(VkDeviceMemory m) {
+    // (Each range once: draws note the same ones over and over.)
+    qsort(m->pending, m->npending, 2 * sizeof *m->pending, by_start);
     int failed = 0;
-    for (size_t k = 0; k < m->npending; k++)
-        failed |= transfer(READ, m, m->pending[2 * k], m->pending[2 * k + 1]);
+    for (size_t k = 0; k < m->npending;) {
+        VkDeviceSize start = m->pending[2 * k], end = m->pending[2 * k + 1];
+        for (k++; k < m->npending && m->pending[2 * k] <= end; k++)
+            if (m->pending[2 * k + 1] > end)
+                end = m->pending[2 * k + 1];
+        failed |= transfer(READ, m, start, end);
+    }
     m->npending = 0;
     return failed;
 }
@@ -676,7 +747,9 @@ static CALL VkResult CC MapMemory(VkDevice d, VkDeviceMemory m, VkDeviceSize off
     m->map = malloc(m->size ? m->size : 1);
     if (!m->map)
         return VK_ERROR_OUT_OF_HOST_MEMORY;
-    if (transfer(READ, m, 0, m->size)) {
+    // (Read, then sent whole once: the runtime keeps what it was sent, to
+    // send only what changes, VK_SEND.)
+    if (transfer(READ, m, 0, m->size) || transfer(VK_SEND, m, 0, m->size)) {
         free(m->map);
         m->map = NULL;
         return VK_ERROR_MEMORY_MAP_FAILED;
@@ -693,9 +766,9 @@ static CALL VkResult CC MapMemory(VkDevice d, VkDeviceMemory m, VkDeviceSize off
 static CALL void CC UnmapMemory(VkDevice d, VkDeviceMemory m) {
     if (!m->map)
         return;
-    // (Unmapping makes the program's writes the device's.)
+    // (Unmapping makes the program's writes the device's: what changed.)
     catch_up(m);
-    transfer(WRITE, m, 0, m->size);
+    transfer(VK_SEND, m, 0, m->size);
     unlist(d, m);
     free(m->map);
     m->map = NULL;
@@ -705,7 +778,7 @@ static CALL VkResult CC FlushMappedMemoryRanges(VkDevice d, uint32_t n, const Vk
     for (uint32_t i = 0; i < n; i++) {
         VkDeviceMemory m = r[i].memory;
         VkDeviceSize end = r[i].size == VK_WHOLE_SIZE ? m->size : r[i].offset + r[i].size;
-        if (m->map && transfer(WRITE, m, r[i].offset, end))
+        if (m->map && (catch_up(m) || transfer(VK_SEND, m, r[i].offset, end)))
             return VK_ERROR_DEVICE_LOST;
     }
     return VK_SUCCESS;
@@ -887,6 +960,9 @@ static CALL VkResult CC CreateBufferView(VkDevice d, const VkBufferViewCreateInf
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     v->handle = q.r[0];
+    v->buffer = b;
+    v->offset = info->offset;
+    v->range = range;
     *out = v;
     return VK_SUCCESS;
 }
@@ -958,6 +1034,7 @@ static CALL VkResult CC CreateComputePipelines(VkDevice d, VkPipelineCache cache
             continue;
         }
         p->handle = q.r[0];
+        p->written = q.r[2];
         out[i] = p;
     }
     return result;
@@ -1104,6 +1181,18 @@ static VkResult graphics_pipeline(const VkGraphicsPipelineCreateInfo *info, VkPi
                 word(&b, w[j]);
         }
     }
+    // What it leaves to commands of what WebGPU makes part of a pipeline:
+    // 1 depth bias, 2 stencil compare mask, 4 stencil write mask.
+    uint32_t dynamic = 0;
+    if (info->pDynamicState)
+        for (uint32_t k = 0; k < info->pDynamicState->dynamicStateCount; k++)
+            switch (info->pDynamicState->pDynamicStates[k]) {
+            case VK_DYNAMIC_STATE_DEPTH_BIAS: dynamic |= 1; break;
+            case VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK: dynamic |= 2; break;
+            case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK: dynamic |= 4; break;
+            default: break;
+            }
+    word(&b, dynamic);
     struct VkPipeline_T *p = zalloc(sizeof *p);
     char why[256];
     struct request q = {VK_GRAPHICS, {(uint64_t)(uintptr_t)b.w, b.n * 4, 0, (uint64_t)(uintptr_t)why, sizeof why}};
@@ -1114,6 +1203,7 @@ static VkResult graphics_pipeline(const VkGraphicsPipelineCreateInfo *info, VkPi
     }
     free(b.w);
     p->handle = q.r[0];
+    p->written = q.r[2];
     p->graphics = 1;
     // Its own state: what it doesn't leave to commands.
     struct state *s = &p->fixed;
@@ -1232,6 +1322,8 @@ static CALL VkResult CC CreateFramebuffer(VkDevice d, const VkFramebufferCreateI
     if (info->attachmentCount)
         memcpy(views, info->pAttachments, info->attachmentCount * sizeof *views);
     f->n = info->attachmentCount;
+    f->width = info->width;
+    f->height = info->height;
     f->views = views;
     *out = f;
     return VK_SUCCESS;
@@ -1503,7 +1595,9 @@ static CALL VkResult CC AllocateCommandBuffers(VkDevice d, const VkCommandBuffer
 }
 
 static void reset(VkCommandBuffer c) {
-    c->n = c->nwrites = 0;
+    c->n = c->nwrites = c->nreads = 0;
+    c->bound[0] = c->bound[1] = NULL;
+    memset(c->nstores, 0, sizeof c->nstores);
     c->failed = 0;
     c->state.set = 0;
     c->pass = NULL;
@@ -1514,6 +1608,10 @@ static CALL void CC FreeCommandBuffers(VkDevice d, VkCommandPool p, uint32_t n, 
         if (cs[i]) {
             free(cs[i]->s);
             free(cs[i]->writes);
+            free(cs[i]->reads);
+            for (int p = 0; p < 2; p++)
+                for (int s = 0; s < 8; s++)
+                    free(cs[i]->stores[p][s]);
             free(cs[i]->clears);
             free(cs[i]);
         }
@@ -1582,6 +1680,22 @@ static void writes(VkCommandBuffer c, VkBuffer b, VkDeviceSize offset, VkDeviceS
     c->writes[c->nwrites++] = (struct write){b->memory, b->offset + offset, b->offset + offset + size};
 }
 
+// That a command may read a buffer's range (sent from mapped memory as the
+// command buffer is submitted).
+static void reads(VkCommandBuffer c, VkBuffer b, VkDeviceSize offset, VkDeviceSize size) {
+    if (c->nreads == c->rcap) {
+        size_t cap = c->rcap ? c->rcap * 2 : 16;
+        struct write *w = realloc(c->reads, cap * sizeof *w);
+        if (!w) {
+            c->failed = 1;
+            return;
+        }
+        c->reads = w;
+        c->rcap = cap;
+    }
+    c->reads[c->nreads++] = (struct write){b->memory, b->offset + offset, b->offset + offset + size};
+}
+
 // Graphics state set (the bits `which`), into the render pass begun.
 static void emit_state(VkCommandBuffer c, uint32_t which) {
     struct state *s = &c->state;
@@ -1597,10 +1711,17 @@ static void emit_state(VkCommandBuffer c, uint32_t which) {
         command(c, SET_BLEND_CONSTANTS, s->blend, sizeof s->blend, NULL, 0);
     if (which & S_REFERENCE)
         command(c, SET_STENCIL_REFERENCE, &s->reference, 4, NULL, 0);
+    if (which & S_BIAS)
+        command(c, SET_DEPTH_BIAS, s->bias, sizeof s->bias, NULL, 0);
+    if (which & S_COMPARE_MASK)
+        command(c, SET_STENCIL_COMPARE_MASK, &s->compare_mask, 4, NULL, 0);
+    if (which & S_WRITE_MASK)
+        command(c, SET_STENCIL_WRITE_MASK, &s->write_mask, 4, NULL, 0);
 }
 
 static CALL void CC CmdBindPipeline(VkCommandBuffer c, VkPipelineBindPoint point, VkPipeline p) {
     command(c, BIND_PIPELINE, &p->handle, 8, NULL, 0);
+    c->bound[point == VK_PIPELINE_BIND_POINT_COMPUTE] = p;
     if (!p->graphics)
         return;
     // Its own state, as if set by commands.
@@ -1617,6 +1738,38 @@ static CALL void CC CmdBindPipeline(VkCommandBuffer c, VkPipelineBindPoint point
     emit_state(c, f->set);
 }
 
+// A storage descriptor bound (bind point p, set), for `wrote`.
+static void store(VkCommandBuffer c, uint32_t p, uint32_t set, uint32_t binding, VkBuffer b, VkDeviceSize offset, VkDeviceSize range) {
+    if (set >= 8)
+        return;
+    if (c->nstores[p][set] == c->scap[p][set]) {
+        uint32_t cap = c->scap[p][set] ? 2 * c->scap[p][set] : 8;
+        struct stored *s = realloc(c->stores[p][set], cap * sizeof *s);
+        if (!s) {
+            c->failed = 1;
+            return;
+        }
+        c->stores[p][set] = s;
+        c->scap[p][set] = cap;
+    }
+    c->stores[p][set][c->nstores[p][set]++] = (struct stored){binding, b, offset, range};
+}
+
+// A draw or dispatch (bind point p): what its pipeline writes of the
+// storage descriptors bound, read back after a wait.
+static void wrote(VkCommandBuffer c, uint32_t p) {
+    VkPipeline pl = c->bound[p];
+    if (!pl || !pl->written)
+        return;
+    for (uint32_t set = 0; set < 8; set++)
+        for (uint32_t k = 0; k < c->nstores[p][set]; k++) {
+            struct stored *s = &c->stores[p][set][k];
+            uint32_t bit = set * 16 + s->binding;
+            if (pl->written == UINT64_MAX || (bit < 64 && (pl->written >> bit & 1)))
+                writes(c, s->buffer, s->offset, s->range);
+        }
+}
+
 static CALL void CC CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t first, uint32_t n, const VkDescriptorSet *sets, uint32_t ndyn, const uint32_t *dyn) {
     uint32_t used = 0;
     for (uint32_t i = 0; i < n; i++) {
@@ -1631,6 +1784,10 @@ static CALL void CC CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint
             count += s->d[k].buffer || s->d[k].view || s->d[k].sampler || s->d[k].texel;
         uint32_t head[2] = {first + i, count};
         uint32_t h[2] = {point == VK_PIPELINE_BIND_POINT_GRAPHICS ? BIND_GRAPHICS_SET : BIND_SET, 8 + 8 + count * 32};
+        // (Its storage descriptors, kept for the draws and dispatches.)
+        uint32_t p = point == VK_PIPELINE_BIND_POINT_COMPUTE, set = first + i;
+        if (set < 8)
+            c->nstores[p][set] = 0;
         put(c, h, 8);
         put(c, head, 8);
         for (uint32_t k = 0; k < s->layout->total; k++) {
@@ -1644,8 +1801,9 @@ static CALL void CC CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint
                 r[0] = e->buffer->memory->handle;
                 r[1] = e->buffer->offset + offset;
                 r[2] = e->range;
+                reads(c, e->buffer, offset, e->range);
                 if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
-                    writes(c, e->buffer, offset, e->range);
+                    store(c, p, set, e->binding, e->buffer, offset, e->range);
             } else if (e->view && e->sampler) {
                 b[1] = 3;
                 r[0] = e->view->handle;
@@ -1659,6 +1817,9 @@ static CALL void CC CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint
             } else if (e->texel) {
                 b[1] = 4;
                 r[0] = e->texel->handle;
+                reads(c, e->texel->buffer, e->texel->offset, e->texel->range);
+                if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)
+                    store(c, p, set, e->binding, e->texel->buffer, e->texel->offset, e->texel->range);
             } else
                 continue;
             // (An array's element above the kind's byte.)
@@ -1675,18 +1836,22 @@ static CALL void CC CmdPushConstants(VkCommandBuffer c, VkPipelineLayout l, VkSh
 }
 
 static CALL void CC CmdDispatch(VkCommandBuffer c, uint32_t x, uint32_t y, uint32_t z) {
+    wrote(c, 1);
     uint32_t g[3] = {x, y, z};
     command(c, DISPATCH, g, 12, NULL, 0);
 }
 
 static CALL void CC CmdDispatchIndirect(VkCommandBuffer c, VkBuffer b, VkDeviceSize offset) {
+    wrote(c, 1);
     uint64_t o[2] = {b->memory->handle, b->offset + offset};
+    reads(c, b, offset, 12);
     command(c, DISPATCH_INDIRECT, o, 16, NULL, 0);
 }
 
 static CALL void CC CmdCopyBuffer(VkCommandBuffer c, VkBuffer src, VkBuffer dst, uint32_t n, const VkBufferCopy *r) {
     for (uint32_t i = 0; i < n; i++) {
         uint64_t o[5] = {src->memory->handle, src->offset + r[i].srcOffset, dst->memory->handle, dst->offset + r[i].dstOffset, r[i].size};
+        reads(c, src, r[i].srcOffset, r[i].size);
         command(c, COPY, o, 40, NULL, 0);
         writes(c, dst, r[i].dstOffset, r[i].size);
     }
@@ -1724,13 +1889,20 @@ static void buffer_image(VkCommandBuffer c, uint32_t op, VkBuffer b, VkImage im,
         put(c, o, 24);
         put(c, rows, 8);
         sub(c, &r[i].imageSubresource, r[i].imageOffset, r[i].imageExtent);
-        if (op == IMAGE_TO_BUFFER) {
-            // (The bytes the copy reaches in the buffer.)
+        {
+            // (The bytes the copy reaches in the buffer: written, or read.)
+            // (A texel of the aspect copied: stencil's a byte; a depth and
+            // stencil format's own size is none, so at most 4.)
             VkExtent3D e = r[i].imageExtent;
-            VkDeviceSize row = (VkDeviceSize)(r[i].bufferRowLength ? r[i].bufferRowLength : e.width) * im->texel;
+            VkDeviceSize texel = r[i].imageSubresource.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT ? 1 : im->texel ? im->texel : 4;
+            VkDeviceSize row = (VkDeviceSize)(r[i].bufferRowLength ? r[i].bufferRowLength : e.width) * texel;
             VkDeviceSize height = r[i].bufferImageHeight ? r[i].bufferImageHeight : e.height;
             VkDeviceSize slices = im->type == VK_IMAGE_TYPE_3D ? e.depth : r[i].imageSubresource.layerCount;
-            writes(c, b, r[i].bufferOffset, (slices - 1) * height * row + (e.height - 1) * row + (VkDeviceSize)e.width * im->texel);
+            VkDeviceSize size = (slices - 1) * height * row + (e.height - 1) * row + (VkDeviceSize)e.width * texel;
+            if (op == IMAGE_TO_BUFFER)
+                writes(c, b, r[i].bufferOffset, size);
+            else
+                reads(c, b, r[i].bufferOffset, size);
         }
     }
 }
@@ -1925,6 +2097,11 @@ static void begin_subpass(VkCommandBuffer c) {
     put(c, h, 8);
     put(c, head, 8);
     VkClearValue zero = {0};
+    // (A render area smaller than the framebuffer: what clears as the pass
+    // begins loads instead, and is cleared within the area after.)
+    int partial = c->area.offset.x > 0 || c->area.offset.y > 0 || c->area.extent.width < f->width || c->area.extent.height < f->height;
+    VkClearAttachment within[9];
+    uint32_t nwithin = 0;
     for (uint32_t k = 0; k <= sp->ncolors; k++) {
         uint32_t at = k < sp->ncolors ? sp->colors[k] : sp->depth;
         if (at == VK_ATTACHMENT_UNUSED)
@@ -1933,11 +2110,22 @@ static void begin_subpass(VkCommandBuffer c) {
         const VkClearValue *clear = at < c->nclears ? &c->clears[at] : &zero;
         uint32_t load = p->first[at] == s ? (uint32_t)d->loadOp : 0, store = p->last[at] == s ? (uint32_t)d->storeOp : 0;
         uint32_t w[6];
+        if (partial && k < sp->ncolors && load == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+            within[nwithin++] = (VkClearAttachment){VK_IMAGE_ASPECT_COLOR_BIT, k, *clear};
+            load = VK_ATTACHMENT_LOAD_OP_LOAD;
+        }
         if (k < sp->ncolors) {
             w[0] = load, w[1] = store;
             memcpy(w + 2, clear->color.uint32, 16);
         } else {
             uint32_t sload = p->first[at] == s ? (uint32_t)d->stencilLoadOp : 0, sstore = p->last[at] == s ? (uint32_t)d->stencilStoreOp : 0;
+            VkImageAspectFlags aspects = 0;
+            if (partial && load == VK_ATTACHMENT_LOAD_OP_CLEAR)
+                aspects |= VK_IMAGE_ASPECT_DEPTH_BIT, load = VK_ATTACHMENT_LOAD_OP_LOAD;
+            if (partial && sload == VK_ATTACHMENT_LOAD_OP_CLEAR)
+                aspects |= VK_IMAGE_ASPECT_STENCIL_BIT, sload = VK_ATTACHMENT_LOAD_OP_LOAD;
+            if (aspects)
+                within[nwithin++] = (VkClearAttachment){aspects, 0, *clear};
             w[0] = load, w[1] = store, w[2] = sload, w[3] = sstore;
             w[4] = bits(clear->depthStencil.depth), w[5] = clear->depthStencil.stencil;
         }
@@ -1949,6 +2137,11 @@ static void begin_subpass(VkCommandBuffer c) {
             uint32_t r = sp->resolves[k];
             put(c, r != VK_ATTACHMENT_UNUSED ? &f->views[r]->handle : &none, 8);
         }
+    }
+    if (nwithin) {
+        VkClearRect area = {c->area, 0, 1};
+        CmdClearAttachments(c, nwithin, within, 1, &area);
+        return;
     }
     // (State set before: each WebGPU pass starts without it.)
     emit_state(c, ~0u);
@@ -1968,6 +2161,7 @@ static CALL void CC CmdBeginRenderPass(VkCommandBuffer c, const VkRenderPassBegi
         memcpy(c->clears, info->pClearValues, c->nclears * sizeof *c->clears);
     c->pass = info->renderPass;
     c->framebuffer = info->framebuffer;
+    c->area = info->renderArea;
     c->subpass = 0;
     begin_subpass(c);
 }
@@ -2016,10 +2210,26 @@ static CALL void CC CmdSetStencilReference(VkCommandBuffer c, VkStencilFaceFlags
 // State WebGPU's pipelines fix (their own, then): lines one pixel wide,
 // no depth bounds test.
 static CALL void CC CmdSetLineWidth(VkCommandBuffer c, float width) {}
-static CALL void CC CmdSetDepthBias(VkCommandBuffer c, float constant, float clamp, float slope) {}
+// (Kept, and sent into the pass: the draws' pipelines are made with them,
+// where they leave them to commands.)
+static CALL void CC CmdSetDepthBias(VkCommandBuffer c, float constant, float clamp, float slope) {
+    struct state *s = &c->state;
+    s->bias[0] = constant, s->bias[1] = clamp, s->bias[2] = slope;
+    s->set |= S_BIAS;
+    emit_state(c, S_BIAS);
+}
 static CALL void CC CmdSetDepthBounds(VkCommandBuffer c, float lo, float hi) {}
-static CALL void CC CmdSetStencilCompareMask(VkCommandBuffer c, VkStencilFaceFlags faces, uint32_t mask) {}
-static CALL void CC CmdSetStencilWriteMask(VkCommandBuffer c, VkStencilFaceFlags faces, uint32_t mask) {}
+// (WebGPU has one mask for both faces: the last set.)
+static CALL void CC CmdSetStencilCompareMask(VkCommandBuffer c, VkStencilFaceFlags faces, uint32_t mask) {
+    c->state.compare_mask = mask;
+    c->state.set |= S_COMPARE_MASK;
+    emit_state(c, S_COMPARE_MASK);
+}
+static CALL void CC CmdSetStencilWriteMask(VkCommandBuffer c, VkStencilFaceFlags faces, uint32_t mask) {
+    c->state.write_mask = mask;
+    c->state.set |= S_WRITE_MASK;
+    emit_state(c, S_WRITE_MASK);
+}
 
 static CALL void CC CmdBindVertexBuffers(VkCommandBuffer c, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *offsets) {
     uint32_t head[2] = {first, n};
@@ -2029,26 +2239,32 @@ static CALL void CC CmdBindVertexBuffers(VkCommandBuffer c, uint32_t first, uint
     for (uint32_t k = 0; k < n; k++) {
         uint64_t r[2] = {b[k]->memory->handle, b[k]->offset + offsets[k]};
         put(c, r, 16);
+        reads(c, b[k], offsets[k], b[k]->size - offsets[k]);
     }
 }
 
 static CALL void CC CmdBindIndexBuffer(VkCommandBuffer c, VkBuffer b, VkDeviceSize offset, VkIndexType type) {
+    reads(c, b, offset, b->size - offset);
     uint64_t r[2] = {b->memory->handle, b->offset + offset};
     uint32_t t = (uint32_t)type;
     command(c, BIND_INDEX, r, 16, &t, 4);
 }
 
 static CALL void CC CmdDraw(VkCommandBuffer c, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t first_instance) {
+    wrote(c, 0);
     uint32_t w[4] = {vertices, instances, first, first_instance};
     command(c, DRAW, w, sizeof w, NULL, 0);
 }
 
 static CALL void CC CmdDrawIndexed(VkCommandBuffer c, uint32_t indices, uint32_t instances, uint32_t first, int32_t vertex_offset, uint32_t first_instance) {
+    wrote(c, 0);
     uint32_t w[5] = {indices, instances, first, (uint32_t)vertex_offset, first_instance};
     command(c, DRAW_INDEXED, w, sizeof w, NULL, 0);
 }
 
 static void draw_indirect(VkCommandBuffer c, uint32_t op, VkBuffer b, VkDeviceSize offset, uint32_t count, uint32_t stride) {
+    wrote(c, 0);
+    reads(c, b, offset, count ? (VkDeviceSize)(count - 1) * stride + 20 : 0);
     uint64_t r[2] = {b->memory->handle, b->offset + offset};
     uint32_t w[2] = {count, stride};
     command(c, op, r, 16, w, 8);
@@ -2077,18 +2293,62 @@ static CALL void CC CmdExecuteCommands(VkCommandBuffer c, uint32_t n, const VkCo
             struct VkBuffer_T b = {w.end - w.offset, 0, w.memory, w.offset};
             writes(c, &b, 0, w.end - w.offset);
         }
+        for (size_t k = 0; k < cs[i]->nreads; k++) {
+            struct write w = cs[i]->reads[k];
+            struct VkBuffer_T b = {w.end - w.offset, 0, w.memory, w.offset};
+            reads(c, &b, 0, w.end - w.offset);
+        }
     }
 }
 
 // ---- Submission and synchronization ----
 
 // Before a submission: the device's writes to mapped memory read back,
-// then the program's copies sent.
-static int send_mapped(VkDevice d) {
+// then what the submission's command buffers may read of the program's
+// copies sent (the runtime sends what changed: VK_SEND). The rest waits for
+// a submission that reads it.
+static int by_range(const void *a, const void *b) {
+    const struct write *x = a, *y = b;
+    if (x->memory != y->memory)
+        return (uintptr_t)x->memory < (uintptr_t)y->memory ? -1 : 1;
+    return x->offset < y->offset ? -1 : x->offset > y->offset;
+}
+
+static int send_mapped(VkDevice d, uint32_t n, const VkSubmitInfo *info) {
     for (VkDeviceMemory m = d->mapped; m; m = m->next)
-        if (catch_up(m) || transfer(VK_SEND, m, 0, m->size))
+        if (catch_up(m))
             return -1;
-    return 0;
+    size_t total = 0;
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t k = 0; k < info[i].commandBufferCount; k++)
+            total += info[i].pCommandBuffers[k]->nreads;
+    struct write *all = malloc((total ? total : 1) * sizeof *all);
+    if (!all)
+        return -1;
+    size_t used = 0;
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t k = 0; k < info[i].commandBufferCount; k++) {
+            VkCommandBuffer c = info[i].pCommandBuffers[k];
+            for (size_t j = 0; j < c->nreads; j++)
+                if (c->reads[j].memory->map)
+                    all[used++] = c->reads[j];
+        }
+    // (Each memory's ranges merged, within it.)
+    qsort(all, used, sizeof *all, by_range);
+    int failed = 0;
+    for (size_t j = 0; j < used;) {
+        struct write r = all[j++];
+        while (j < used && all[j].memory == r.memory && all[j].offset <= r.end) {
+            if (all[j].end > r.end)
+                r.end = all[j].end;
+            j++;
+        }
+        if (r.end > r.memory->size)
+            r.end = r.memory->size;
+        failed |= transfer(VK_SEND, r.memory, r.offset, r.end);
+    }
+    free(all);
+    return failed ? -1 : 0;
 }
 
 static void note_writes(VkCommandBuffer c) {
@@ -2115,7 +2375,7 @@ static VkDevice the_device(VkQueue q) {
 
 static CALL VkResult CC QueueSubmit(VkQueue queue, uint32_t n, const VkSubmitInfo *info, VkFence fence) {
     VkDevice d = the_device(queue);
-    if (send_mapped(d))
+    if (send_mapped(d, n, info))
         return VK_ERROR_DEVICE_LOST;
     for (uint32_t i = 0; i < n; i++)
         for (uint32_t k = 0; k < info[i].commandBufferCount; k++) {

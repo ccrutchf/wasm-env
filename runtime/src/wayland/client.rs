@@ -832,10 +832,35 @@ fn keymap() -> Option<Passed> {
 fn read_buffer(b: &Buffer) -> (u32, u32, Vec<u32>) {
     let (w, h) = (b.width.max(0) as usize, b.height.max(0) as usize);
     let stride = (b.stride.max(0) as usize).max(w * 4);
+    let opaque = if b.format == 1 { 0xff00_0000 } else { 0 };
+    // (Rows without padding, as they mostly are: read straight into the
+    // pixels.)
+    if stride == w * 4 {
+        let mut pixels = vec![0u32; w * h];
+        // SAFETY: u32s are 4 bytes each, aligned, with no invalid values.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u8, pixels.len() * 4) };
+        read_pool(b, bytes);
+        if opaque != 0 {
+            for p in &mut pixels {
+                *p |= opaque;
+            }
+        }
+        return (w as u32, h as u32, pixels);
+    }
     let mut bytes = vec![0u8; stride * h];
+    read_pool(b, &mut bytes);
+    let mut pixels = Vec::with_capacity(w * h);
+    for row in bytes.chunks_exact(stride).take(h) {
+        pixels.extend(row[..w * 4].chunks_exact(4).map(|p| u32::from_le_bytes(p.try_into().unwrap()) | opaque));
+    }
+    (w as u32, h as u32, pixels)
+}
+
+/// A buffer's bytes from its pool, from its offset.
+fn read_pool(b: &Buffer, bytes: &mut [u8]) {
     // Where shared mappings are copies (shared::host_mappings), the client
     // drew into its copy: read from there.
-    if crate::shared::read_copy(&b.pool.open, b.offset as u64, &mut bytes) {
+    if crate::shared::read_copy(&b.pool.open, b.offset as u64, bytes) {
     } else if let Open::File { file, .. } = &*b.pool.open.lock().unwrap() {
         let mut done = 0;
         while done < bytes.len() {
@@ -849,12 +874,6 @@ fn read_buffer(b: &Buffer) -> (u32, u32, Vec<u32>) {
             }
         }
     }
-    let opaque = if b.format == 1 { 0xff00_0000 } else { 0 };
-    let mut pixels = Vec::with_capacity(w * h);
-    for row in bytes.chunks_exact(stride).take(h) {
-        pixels.extend(row[..w * 4].chunks_exact(4).map(|p| u32::from_le_bytes(p.try_into().unwrap()) | opaque));
-    }
-    (w as u32, h as u32, pixels)
 }
 
 /// Draws a surface and its subsurfaces (above it, in order) onto the
@@ -879,6 +898,29 @@ fn blit(s: &Surface, origin: (i32, i32), scale: u32, canvas: &mut [u32], cw: u32
     let ss = s.scale.max(1);
     let (x0, y0) = (origin.0 * scale as i32, origin.1 * scale as i32);
     let (w, h) = (lw * scale as i32, lh * scale as i32);
+    // (Unscaled, as a surface mostly is: a row at a time, copied where it's
+    // all opaque.)
+    if ss == scale {
+        let (xa, xb) = (x0.max(0), (x0 + w).min(cw as i32));
+        if xa >= xb {
+            return;
+        }
+        for y in y0.max(0)..(y0 + h).min(ch as i32) {
+            let sy = (y - y0) as usize;
+            let from = sy * s.width as usize + (xa - x0) as usize;
+            let Some(src) = s.pixels.get(from..from + (xb - xa) as usize) else { continue };
+            let at = (y as u32 * cw + xa as u32) as usize;
+            let dst = &mut canvas[at..at + src.len()];
+            if src.iter().all(|p| p >> 24 == 0xff) {
+                dst.copy_from_slice(src);
+            } else {
+                for (d, &p) in dst.iter_mut().zip(src) {
+                    *d = over(p, *d);
+                }
+            }
+        }
+        return;
+    }
     for y in 0..h {
         let cy = y0 + y;
         if cy < 0 || cy >= ch as i32 {
@@ -893,20 +935,25 @@ fn blit(s: &Surface, origin: (i32, i32), scale: u32, canvas: &mut [u32], cw: u32
             let sx = (x as u32 * ss / scale) as usize;
             let Some(&src) = s.pixels.get(sy * s.width as usize + sx) else { continue };
             let dst = &mut canvas[(cy as u32 * cw + cx as u32) as usize];
-            let a = src >> 24;
-            *dst = if a == 0xff {
-                src
-            } else if a == 0 && src & 0xffffff == 0 {
-                *dst
-            } else {
-                // Premultiplied: src + dst * (1 - a), per channel.
-                let blend = |shift: u32| {
-                    let (sc, dc) = ((src >> shift) & 0xff, (*dst >> shift) & 0xff);
-                    (sc + dc * (255 - a) / 255).min(255) << shift
-                };
-                0xff00_0000 | blend(16) | blend(8) | blend(0)
-            };
+            *dst = over(src, *dst);
         }
+    }
+}
+
+/// A pixel (premultiplied alpha) over another.
+fn over(src: u32, dst: u32) -> u32 {
+    let a = src >> 24;
+    if a == 0xff {
+        src
+    } else if a == 0 && src & 0xffffff == 0 {
+        dst
+    } else {
+        // Premultiplied: src + dst * (1 - a), per channel.
+        let blend = |shift: u32| {
+            let (sc, dc) = ((src >> shift) & 0xff, (dst >> shift) & 0xff);
+            (sc + dc * (255 - a) / 255).min(255) << shift
+        };
+        0xff00_0000 | blend(16) | blend(8) | blend(0)
     }
 }
 

@@ -15,6 +15,9 @@
 #include "vulkan_subpass_vert.h"
 #include "vulkan_texel_spv.h"
 #include "vulkan_array_spv.h"
+#include "vulkan_fan_vert.h"
+#include "vulkan_fan_frag.h"
+#include "vulkan_texel_write_spv.h"
 
 #define N 1000
 #define CHECK(x)                                                    \
@@ -711,6 +714,283 @@ static int clears(VkDevice dev, VkPhysicalDevice pd, VkQueue queue) {
     return 0;
 }
 
+// What WebGPU lacks that the driver makes up for, read back:
+// - a render pass that clears only its render area (the left half of an
+//   8 × 8 image cleared green before: red there, green right);
+// - triangle fans (vulkan_fan.vert, .frag: a quad), drawn and drawn
+//   indexed, each into an image of its own: all blue;
+// - a stencil write mask left to commands: stencil REPLACEd with 0xff
+//   through a mask of 0x0f, read back 0x0f;
+// - an occlusion query begun before the first fan's render pass and ended
+//   after it: 64 samples;
+// - a storage texel buffer written (vulkan_texel_write.comp): 256 words;
+// - BC1 blocks copied into an image and out again, where the device has
+//   them;
+// - a device made with a feature it has and refused one it hasn't.
+static int gaps(VkPhysicalDevice pd, VkDevice dev, VkQueue queue) {
+    enum { W = 8 };
+    VkFormat rgba = VK_FORMAT_R8G8B8A8_UNORM, ds = VK_FORMAT_D24_UNORM_S8_UINT;
+    VkPhysicalDeviceFeatures have;
+    vkGetPhysicalDeviceFeatures(pd, &have);
+    VkPhysicalDeviceFeatures want = {.samplerAnisotropy = VK_TRUE}, not = {.geometryShader = VK_TRUE};
+    float prio = 1;
+    VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0, .queueCount = 1, .pQueuePriorities = &prio};
+    VkDeviceCreateInfo di = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi, .pEnabledFeatures = &want};
+    VkDevice other;
+    int features = have.samplerAnisotropy && vkCreateDevice(pd, &di, NULL, &other) == VK_SUCCESS;
+    if (features)
+        vkDestroyDevice(other, NULL);
+    di.pEnabledFeatures = &not;
+    features &= vkCreateDevice(pd, &di, NULL, &other) == VK_ERROR_FEATURE_NOT_PRESENT;
+
+    // Images: one for the render area, two for fans (with a depth and
+    // stencil image each), and their views.
+    VkImage im[5];
+    VkImageView view[5];
+    for (int k = 0; k < 5; k++) {
+        int depth = k >= 3;
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = depth ? ds : rgba, .extent = {W, W, 1}, .mipLevels = 1,
+                                .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        CHECK(vkCreateImage(dev, &ii, NULL, &im[k]));
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im[k], .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = depth ? ds : rgba,
+                                    .subresourceRange = {depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        CHECK(vkCreateImageView(dev, &vi, NULL, &view[k]));
+    }
+    // One buffer for everything read back: three images' pixels, stencil,
+    // texels, BC blocks; and one for the fans' indices.
+    enum { PIXELS = 0, STENCIL = 3 * W * W * 4, TEXELS = STENCIL + W * W, BC = TEXELS + 1024, BC_BACK = BC + 32, SIZE = BC_BACK + 32 };
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = SIZE,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
+    VkBuffer buf, ibuf;
+    CHECK(vkCreateBuffer(dev, &bi, NULL, &buf));
+    VkBufferCreateInfo ibi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256, .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
+    CHECK(vkCreateBuffer(dev, &ibi, NULL, &ibuf));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev, buf, &req);
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size + 4096, .memoryTypeIndex = 0};
+    VkDeviceMemory mem;
+    CHECK(vkAllocateMemory(dev, &mi, NULL, &mem));
+    CHECK(vkBindBufferMemory(dev, buf, mem, 0));
+    CHECK(vkBindBufferMemory(dev, ibuf, mem, (req.size + 255) / 256 * 256));
+    uint8_t *px;
+    CHECK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, (void **)&px));
+    memset(px, 0, SIZE);
+    uint16_t *indices = (uint16_t *)(px + (req.size + 255) / 256 * 256);
+    for (int k = 0; k < 4; k++)
+        indices[k] = (uint16_t)k;
+    // (BC1: four 8-byte blocks, made up.)
+    for (int k = 0; k < 32; k++)
+        px[BC + k] = (uint8_t)(k * 37 + 11);
+
+    // A render pass of a color and a depth and stencil attachment (both
+    // cleared), and one of a color alone (the render area's).
+    VkAttachmentDescription att[2] = {
+        {0, rgba, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+        {0, ds, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE,
+         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+    };
+    VkAttachmentReference color = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, depth = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &color, .pDepthStencilAttachment = &depth};
+    VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 2, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub};
+    VkRenderPass pass, plain;
+    CHECK(vkCreateRenderPass(dev, &rpi, NULL, &pass));
+    sub.pDepthStencilAttachment = NULL;
+    rpi.attachmentCount = 1;
+    CHECK(vkCreateRenderPass(dev, &rpi, NULL, &plain));
+    VkFramebuffer fb[3];
+    for (int k = 0; k < 3; k++) {
+        VkImageView v[2] = {view[k], view[k ? 2 + k : 0]};
+        VkFramebufferCreateInfo fbi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = k ? pass : plain, .attachmentCount = k ? 2 : 1, .pAttachments = v,
+                                       .width = W, .height = W, .layers = 1};
+        CHECK(vkCreateFramebuffer(dev, &fbi, NULL, &fb[k]));
+    }
+
+    // The fan pipeline: stencil always REPLACEd, its write mask dynamic.
+    VkShaderModule shaders[3];
+    VkShaderModuleCreateInfo si[3] = {{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof fan_vert_spv, .pCode = fan_vert_spv},
+                                      {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof fan_frag_spv, .pCode = fan_frag_spv},
+                                      {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof texel_write_spv, .pCode = texel_write_spv}};
+    for (int k = 0; k < 3; k++)
+        CHECK(vkCreateShaderModule(dev, &si[k], NULL, &shaders[k]));
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout layout;
+    CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &layout));
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = shaders[0], .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = shaders[1], .pName = "main"},
+    };
+    VkPipelineVertexInputStateCreateInfo vis = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ias = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN};
+    VkViewport viewport = {0, 0, W, W, 0, 1};
+    VkRect2D scissor = {{0, 0}, {W, W}};
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .pViewports = &viewport, .scissorCount = 1, .pScissors = &scissor};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkStencilOpState replace = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xff, 0xff, 0xff};
+    VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE,
+                                                 .depthCompareOp = VK_COMPARE_OP_ALWAYS, .stencilTestEnable = VK_TRUE, .front = replace, .back = replace};
+    VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xf};
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba};
+    VkDynamicState dyn = VK_DYNAMIC_STATE_STENCIL_WRITE_MASK;
+    VkPipelineDynamicStateCreateInfo ds_info = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 1, .pDynamicStates = &dyn};
+    VkGraphicsPipelineCreateInfo gpi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = stages, .pVertexInputState = &vis,
+                                        .pInputAssemblyState = &ias, .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms,
+                                        .pDepthStencilState = &dss, .pColorBlendState = &cbs, .pDynamicState = &ds_info, .layout = layout, .renderPass = pass};
+    VkPipeline fan;
+    CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &fan));
+
+    // The storage texel buffer: a view of the readback buffer's texels.
+    VkBufferViewCreateInfo bvi = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = buf, .format = VK_FORMAT_R32_UINT, .offset = TEXELS, .range = 1024};
+    VkBufferView texels;
+    CHECK(vkCreateBufferView(dev, &bvi, NULL, &texels));
+    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
+    VkDescriptorSetLayout sl;
+    CHECK(vkCreateDescriptorSetLayout(dev, &li, NULL, &sl));
+    VkPipelineLayoutCreateInfo cpli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl};
+    VkPipelineLayout clayout;
+    CHECK(vkCreatePipelineLayout(dev, &cpli, NULL, &clayout));
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shaders[2], .pName = "main"},
+                                      .layout = clayout};
+    VkPipeline writer;
+    CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, NULL, &writer));
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+    VkDescriptorPool dpool;
+    CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &dpool));
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &sl};
+    VkDescriptorSet set;
+    CHECK(vkAllocateDescriptorSets(dev, &dai, &set));
+    VkWriteDescriptorSet wd = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
+                               .pTexelBufferView = &texels};
+    vkUpdateDescriptorSets(dev, 1, &wd, 0, NULL);
+
+    // BC1, where the device has it.
+    VkImage bc = VK_NULL_HANDLE;
+    if (have.textureCompressionBC) {
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK, .extent = {8, 8, 1},
+                                .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+        CHECK(vkCreateImage(dev, &ii, NULL, &bc));
+    }
+    VkQueryPoolCreateInfo qpi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = 1};
+    VkQueryPool qp;
+    CHECK(vkCreateQueryPool(dev, &qpi, NULL, &qp));
+
+    VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0};
+    VkCommandPool cpool;
+    CHECK(vkCreateCommandPool(dev, &cpi, NULL, &cpool));
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkCommandBuffer cmd;
+    CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    // The render area: green everywhere, then red in the left half.
+    VkClearColorValue green = {.float32 = {0, 1, 0, 1}};
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd, im[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &green, 1, &all);
+    VkClearValue clears[2] = {{.color = {.float32 = {1, 0, 0, 1}}}, {.depthStencil = {1, 0}}};
+    VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = plain, .framebuffer = fb[0], .renderArea = {{0, 0}, {W / 2, W}},
+                                 .clearValueCount = 1, .pClearValues = clears};
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdEndRenderPass(cmd);
+    // The fans, black cleared, the first in an occlusion query begun outside
+    // its pass, with a stencil write mask of 0x0f.
+    clears[0].color = (VkClearColorValue){.float32 = {0, 0, 0, 1}};
+    vkCmdResetQueryPool(cmd, qp, 0, 1);
+    vkCmdBeginQuery(cmd, qp, 0, 0);
+    for (int k = 1; k <= 2; k++) {
+        VkRenderPassBeginInfo fbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = pass, .framebuffer = fb[k], .renderArea = {{0, 0}, {W, W}},
+                                     .clearValueCount = 2, .pClearValues = clears};
+        vkCmdBeginRenderPass(cmd, &fbi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fan);
+        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0x0f);
+        if (k == 1) {
+            vkCmdDraw(cmd, 4, 1, 0, 0);
+        } else {
+            vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexed(cmd, 4, 1, 0, 0, 0);
+        }
+        vkCmdEndRenderPass(cmd);
+        if (k == 1)
+            vkCmdEndQuery(cmd, qp, 0);
+    }
+    for (int k = 0; k < 3; k++) {
+        VkBufferImageCopy copy = {PIXELS + k * W * W * 4, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W, W, 1}};
+        vkCmdCopyImageToBuffer(cmd, im[k], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &copy);
+    }
+    VkBufferImageCopy stencil = {STENCIL, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {W, W, 1}};
+    vkCmdCopyImageToBuffer(cmd, im[3], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &stencil);
+    // The storage texel buffer, written.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, writer);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, clayout, 0, 1, &set, 0, NULL);
+    vkCmdDispatch(cmd, 4, 1, 1);
+    // BC1 in and out (rows of two blocks: 16 bytes, not WebGPU's 256).
+    if (bc) {
+        VkBufferImageCopy in = {BC, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {8, 8, 1}}, out = in;
+        out.bufferOffset = BC_BACK;
+        vkCmdCopyBufferToImage(cmd, buf, bc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &in);
+        vkCmdCopyImageToBuffer(cmd, bc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &out);
+    }
+    CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+    CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+    CHECK(vkQueueWaitIdle(queue));
+
+    int area = 0, fans = 0, masked = 0, written = 0;
+    for (int y = 0; y < W; y++)
+        for (int x = 0; x < W; x++) {
+            const uint8_t *p = px + PIXELS + (y * W + x) * 4;
+            area += x < W / 2 ? p[0] == 255 && p[1] == 0 : p[0] == 0 && p[1] == 255;
+            for (int k = 1; k <= 2; k++) {
+                const uint8_t *f = px + PIXELS + k * W * W * 4 + (y * W + x) * 4;
+                fans += f[0] == 0 && f[1] == 0 && f[2] == 255;
+            }
+            masked += px[STENCIL + y * W + x] == 0x0f;
+        }
+    for (uint32_t k = 0; k < 256; k++) {
+        uint32_t v;
+        memcpy(&v, px + TEXELS + 4 * k, 4);
+        written += v == 3 * k;
+    }
+    uint64_t samples = 0;
+    CHECK(vkGetQueryPoolResults(dev, qp, 0, 1, sizeof samples, &samples, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+    int blocks = !bc || memcmp(px + BC, px + BC_BACK, 32) == 0;
+    printf("render area %d of %d right, fans %d of %d, stencil masked %d of %d, query %s, texels written %d of 256, BC %s, features %s\n", area, W * W, fans,
+           2 * W * W, masked, W * W, samples >= W * W ? "right" : "wrong", written, blocks ? "right" : "wrong", features ? "right" : "wrong");
+
+    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
+    vkDestroyCommandPool(dev, cpool, NULL);
+    vkDestroyQueryPool(dev, qp, NULL);
+    if (bc)
+        vkDestroyImage(dev, bc, NULL);
+    vkDestroyDescriptorPool(dev, dpool, NULL);
+    vkDestroyPipeline(dev, writer, NULL);
+    vkDestroyPipelineLayout(dev, clayout, NULL);
+    vkDestroyDescriptorSetLayout(dev, sl, NULL);
+    vkDestroyBufferView(dev, texels, NULL);
+    vkDestroyPipeline(dev, fan, NULL);
+    vkDestroyPipelineLayout(dev, layout, NULL);
+    for (int k = 0; k < 3; k++) {
+        vkDestroyShaderModule(dev, shaders[k], NULL);
+        vkDestroyFramebuffer(dev, fb[k], NULL);
+    }
+    vkDestroyRenderPass(dev, pass, NULL);
+    vkDestroyRenderPass(dev, plain, NULL);
+    for (int k = 0; k < 5; k++) {
+        vkDestroyImageView(dev, view[k], NULL);
+        vkDestroyImage(dev, im[k], NULL);
+    }
+    vkDestroyBuffer(dev, buf, NULL);
+    vkDestroyBuffer(dev, ibuf, NULL);
+    vkUnmapMemory(dev, mem);
+    vkFreeMemory(dev, mem, NULL);
+    return 0;
+}
+
 // Drawing into a 64 × 64 RGBA8 image with a depth buffer, read back: a
 // green square over everything (indexed), then three triangles in its
 // corners: a red one in front of it, a blue one behind it, and a yellow one
@@ -1082,7 +1362,7 @@ int main(void) {
     printf("compute: %d of %d wrong\n", wrong, N);
     printf("fill and update: %s\n", filled[0] == 0x5a5a5a5a && filled[2] == 0xc0ffee && filled[3] == 0xbeef && filled[15] == 0x5a5a5a5a ? "right" : "wrong");
     printf("the program's own write kept: %s\n", unused[0] == 12345 ? "yes" : "no");
-    if (images(dev, queue) || blits(dev, queue) || clears(dev, pd, queue) || draw(dev, queue) || subpasses(dev, queue) || texels(dev, queue) || arrays(dev, queue))
+    if (images(dev, queue) || blits(dev, queue) || clears(dev, pd, queue) || draw(dev, queue) || subpasses(dev, queue) || texels(dev, queue) || arrays(dev, queue) || gaps(pd, dev, queue))
         return 1;
 
     vkDestroyFence(dev, fence, NULL);

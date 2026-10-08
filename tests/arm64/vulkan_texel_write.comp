@@ -1,0 +1,11 @@
+// tests/arm64/vulkan.c's storage texel buffer: each of 256 texels written
+// three times its index.
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, r32ui) uniform writeonly uimageBuffer out_texels;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < 256)
+        imageStore(out_texels, int(i), uvec4(3 * i));
+}

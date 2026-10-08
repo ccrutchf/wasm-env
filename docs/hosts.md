@@ -86,11 +86,15 @@ deleted on close; libasound uses one), and a JIT's code written through
 one mapping of a file and run through another brought over, shared
 mappings being copies there (`WASM_ENV_NO_SHARED_MAPPINGS=1` tests that
 on Linux). Under Wine, lavapipe needs the settings the GPU service gives
-it on Linux (`GALLIUM_OVERRIDE_CPU_CAPS=avx LP_NATIVE_VECTOR_WIDTH=128`,
-set outside: a Windows process's environment doesn't reach it), else its
-textures are wrong. Under Wine, two of the GPU service's unit tests fail:
-an OpenCL program's absolute `#include` within its environment (clang's
-overlay on Windows), and OpenCL's doubles in one kernel test.
+it on Linux (`GALLIUM_OVERRIDE_CPU_CAPS=avx LP_NATIVE_VECTOR_WIDTH=128`),
+set from outside, as `build/wine-wasm-env` and `tests/cross.sh --unit`
+do: a Windows process's environment doesn't reach it, and at its default
+width its textures are wrong and the large shaders software doubles make
+are miscompiled. With them, the GPU service's unit tests all pass under
+Wine (57), OpenCL programs' absolute `#include`s included: clang on
+Windows takes no path without a drive for absolute, so there the
+environment's root is the last include directory and a program's
+`-I /abs` is made the root's, rather than an overlay at `/`.
 
 **Symlinks** in an environment are link files on Windows (making real ones
 needs privileges): a small file with the System attribute holding a marker
