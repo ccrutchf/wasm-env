@@ -809,9 +809,7 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                 | Op::IMul
                 | Op::BitwiseOr
                 | Op::BitwiseXor
-                | Op::BitwiseAnd
-                | Op::SDiv
-                | Op::SRem => {
+                | Op::BitwiseAnd => {
                     inst.expect(5)?;
                     let operator = map_binary_operator(inst.op)?;
                     self.parse_expr_binary_op_sign_adjusted(
@@ -849,19 +847,33 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                     inst.expect(5)?;
                     parse_expr_op!(crate::BinaryOperator::Multiply, BINARY)?;
                 }
-                Op::UDiv | Op::FDiv => {
+                // wasm-env: integer divisions and remainders read their
+                // operands as the opcode says.
+                Op::SDiv | Op::SRem | Op::UDiv | Op::UMod => {
+                    inst.expect(5)?;
+                    let (op, kind) = match inst.op {
+                        Op::SDiv => (crate::BinaryOperator::Divide, crate::ScalarKind::Sint),
+                        Op::SRem => (crate::BinaryOperator::Modulo, crate::ScalarKind::Sint),
+                        Op::UDiv => (crate::BinaryOperator::Divide, crate::ScalarKind::Uint),
+                        _ => (crate::BinaryOperator::Modulo, crate::ScalarKind::Uint),
+                    };
+                    self.parse_expr_binary_op_as(ctx, &mut emitter, &mut block, block_id, body_idx, op, kind)?;
+                }
+                Op::FDiv => {
                     inst.expect(5)?;
                     parse_expr_op!(crate::BinaryOperator::Divide, BINARY)?;
                 }
-                Op::UMod | Op::FRem => {
+                Op::FRem => {
                     inst.expect(5)?;
                     parse_expr_op!(crate::BinaryOperator::Modulo, BINARY)?;
                 }
                 Op::SMod => {
                     inst.expect(5)?;
 
-                    // x - y * int(floor(float(x) / float(y)))
-
+                    // wasm-env: the remainder, signed, taking the divisor's
+                    // sign: r = x % y, and r + y where r isn't 0 and its sign
+                    // isn't y's (naga's had gone through floats, which hold
+                    // too few bits).
                     let start = self.data_offset;
                     let result_type_id = self.next()?;
                     let result_id = self.next()?;
@@ -870,91 +882,97 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                     let span = self.span_from_with_op(start);
 
                     let p1_lexp = self.lookup_expression.lookup(p1_id)?;
-                    let left = self.get_expr_handle(
-                        p1_id,
-                        p1_lexp,
-                        ctx,
-                        &mut emitter,
-                        &mut block,
-                        body_idx,
-                    );
+                    let left = self.get_expr_handle(p1_id, p1_lexp, ctx, &mut emitter, &mut block, body_idx);
                     let p2_lexp = self.lookup_expression.lookup(p2_id)?;
-                    let right = self.get_expr_handle(
-                        p2_id,
-                        p2_lexp,
-                        ctx,
-                        &mut emitter,
-                        &mut block,
-                        body_idx,
-                    );
+                    let right = self.get_expr_handle(p2_id, p2_lexp, ctx, &mut emitter, &mut block, body_idx);
 
                     let result_ty = self.lookup_type.lookup(result_type_id)?;
-                    let inner = &ctx.module.types[result_ty.handle].inner;
+                    let inner = ctx.module.types[result_ty.handle].inner.clone();
                     let kind = inner.scalar_kind().unwrap();
-                    let size = inner.size(ctx.gctx()) as u8;
-
-                    let left_cast = ctx.expressions.append(
-                        crate::Expression::As {
-                            expr: left,
-                            kind: crate::ScalarKind::Float,
-                            convert: Some(size),
-                        },
-                        span,
-                    );
-                    let right_cast = ctx.expressions.append(
-                        crate::Expression::As {
-                            expr: right,
-                            kind: crate::ScalarKind::Float,
-                            convert: Some(size),
-                        },
-                        span,
-                    );
-                    let div = ctx.expressions.append(
-                        crate::Expression::Binary {
-                            op: crate::BinaryOperator::Divide,
-                            left: left_cast,
-                            right: right_cast,
-                        },
-                        span,
-                    );
-                    let floor = ctx.expressions.append(
-                        crate::Expression::Math {
-                            fun: crate::MathFunction::Floor,
-                            arg: div,
-                            arg1: None,
-                            arg2: None,
-                            arg3: None,
-                        },
-                        span,
-                    );
-                    let cast = ctx.expressions.append(
-                        crate::Expression::As {
-                            expr: floor,
-                            kind,
-                            convert: Some(size),
-                        },
-                        span,
-                    );
-                    let mult = ctx.expressions.append(
-                        crate::Expression::Binary {
-                            op: crate::BinaryOperator::Multiply,
-                            left: cast,
-                            right,
-                        },
-                        span,
-                    );
-                    let sub = ctx.expressions.append(
-                        crate::Expression::Binary {
-                            op: crate::BinaryOperator::Subtract,
-                            left,
-                            right: mult,
-                        },
-                        span,
-                    );
+                    let wide = inner.scalar_width() == Some(8);
+                    // (0, a constant: outside the emitted expressions.)
+                    block.extend(emitter.finish(ctx.expressions));
+                    let mut zero = ctx.expressions.append(crate::Expression::Literal(if wide { crate::Literal::I64(0) } else { crate::Literal::I32(0) }), span);
+                    if let crate::TypeInner::Vector { size, .. } = inner {
+                        zero = ctx.expressions.append(crate::Expression::Splat { size, value: zero }, span);
+                    }
+                    emitter.start(ctx.expressions);
+                    let mut add = |e: crate::Expression| ctx.expressions.append(e, span);
+                    let signed = |add: &mut dyn FnMut(crate::Expression) -> Handle<crate::Expression>, expr| {
+                        add(crate::Expression::As { expr, kind: crate::ScalarKind::Sint, convert: None })
+                    };
+                    let (x, y) = (signed(&mut add, left), signed(&mut add, right));
+                    let binary = |add: &mut dyn FnMut(crate::Expression) -> Handle<crate::Expression>, op, left, right| add(crate::Expression::Binary { op, left, right });
+                    use crate::BinaryOperator as B;
+                    let r = binary(&mut add, B::Modulo, x, y);
+                    let nonzero = binary(&mut add, B::NotEqual, r, zero);
+                    let r_negative = binary(&mut add, B::Less, r, zero);
+                    let y_negative = binary(&mut add, B::Less, y, zero);
+                    let differ = binary(&mut add, B::NotEqual, r_negative, y_negative);
+                    let adjust = binary(&mut add, B::And, nonzero, differ);
+                    let sum = binary(&mut add, B::Add, r, y);
+                    let mut result = add(crate::Expression::Select { condition: adjust, accept: sum, reject: r });
+                    if kind != crate::ScalarKind::Sint {
+                        result = add(crate::Expression::As { expr: result, kind, convert: None });
+                    }
                     self.lookup_expression.insert(
                         result_id,
                         LookupExpression {
-                            handle: sub,
+                            handle: result,
+                            type_id: result_type_id,
+                            block_id,
+                        },
+                    );
+                }
+                // wasm-env: a float's nearest half and back, a component
+                // at a time (packed as a half, and unpacked).
+                Op::QuantizeToF16 => {
+                    inst.expect(4)?;
+                    let start = self.data_offset;
+                    let result_type_id = self.next()?;
+                    let result_id = self.next()?;
+                    let x_id = self.next()?;
+                    let span = self.span_from_with_op(start);
+                    let x_lexp = self.lookup_expression.lookup(x_id)?;
+                    let x = self.get_expr_handle(x_id, x_lexp, ctx, &mut emitter, &mut block, body_idx);
+                    let result_ty = self.lookup_type.lookup(result_type_id)?.handle;
+                    let size = match ctx.module.types[result_ty].inner {
+                        crate::TypeInner::Vector { size, .. } => Some(size),
+                        _ => None,
+                    };
+                    // (0, a constant: outside the emitted expressions; and
+                    // a vec2<f32>'s type.)
+                    block.extend(emitter.finish(ctx.expressions));
+                    let zero = ctx.expressions.append(crate::Expression::Literal(crate::Literal::F32(0.0)), span);
+                    emitter.start(ctx.expressions);
+                    let vec2 = ctx.module.types.insert(
+                        crate::Type { name: None, inner: crate::TypeInner::Vector { size: crate::VectorSize::Bi, scalar: crate::Scalar::F32 } },
+                        crate::Span::UNDEFINED,
+                    );
+                    let mut add = |e: crate::Expression| ctx.expressions.append(e, span);
+                    let quantized = |add: &mut dyn FnMut(crate::Expression) -> Handle<crate::Expression>, c| {
+                        let pair = add(crate::Expression::Compose { ty: vec2, components: vec![c, zero] });
+                        let math = |fun, arg| crate::Expression::Math { fun, arg, arg1: None, arg2: None, arg3: None };
+                        let packed = add(math(crate::MathFunction::Pack2x16float, pair));
+                        let unpacked = add(math(crate::MathFunction::Unpack2x16float, packed));
+                        add(crate::Expression::AccessIndex { base: unpacked, index: 0 })
+                    };
+                    let handle = match size {
+                        None => quantized(&mut add, x),
+                        Some(size) => {
+                            let components = (0..size as u32)
+                                .map(|index| {
+                                    let c = add(crate::Expression::AccessIndex { base: x, index });
+                                    quantized(&mut add, c)
+                                })
+                                .collect();
+                            add(crate::Expression::Compose { ty: result_ty, components })
+                        }
+                    };
+                    self.lookup_expression.insert(
+                        result_id,
+                        LookupExpression {
+                            handle,
                             type_id: result_type_id,
                             block_id,
                         },
@@ -1255,10 +1273,18 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                         arg2: None,
                         arg3: None,
                     };
+                    // wasm-env: a count of a uint's bits is an int where
+                    // its type says (GLSL's `bitCount`).
+                    let base_kind = ctx.module.types[self.lookup_type.lookup(base_lexp.type_id)?.handle].inner.scalar_kind();
+                    let result_kind = ctx.module.types[self.lookup_type.lookup(result_type_id)?.handle].inner.scalar_kind();
+                    let mut handle = ctx.expressions.append(expr, span);
+                    if let (Some(kind), true) = (result_kind, result_kind != base_kind) {
+                        handle = ctx.expressions.append(crate::Expression::As { expr: handle, kind, convert: None }, span);
+                    }
                     self.lookup_expression.insert(
                         result_id,
                         LookupExpression {
-                            handle: ctx.expressions.append(expr, span),
+                            handle,
                             type_id: result_type_id,
                             block_id,
                         },
@@ -1275,13 +1301,29 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                     let left_handle = get_expr_handle!(left_id, left_lexp);
                     let right_lexp = self.lookup_expression.lookup(right_id)?;
                     let right_handle = get_expr_handle!(right_id, right_lexp);
-                    let expr = crate::Expression::Math {
-                        fun: crate::MathFunction::Outer,
-                        arg: left_handle,
-                        arg1: Some(right_handle),
-                        arg2: None,
-                        arg3: None,
+                    // wasm-env: column j the left vector times the right's
+                    // jth component (SPIR-V's matrix has the right's
+                    // columns; naga's `Outer` the left's, which its SPIR-V
+                    // writer gets wrong where they differ).
+                    let result_ty = self.lookup_type.lookup(result_type_id)?.handle;
+                    let columns = match ctx.module.types[result_ty].inner {
+                        crate::TypeInner::Matrix { columns, .. } => columns as u32,
+                        _ => return Err(Error::InvalidOperand),
                     };
+                    let components = (0..columns)
+                        .map(|index| {
+                            let c = ctx.expressions.append(crate::Expression::AccessIndex { base: right_handle, index }, span);
+                            ctx.expressions.append(
+                                crate::Expression::Binary {
+                                    op: crate::BinaryOperator::Multiply,
+                                    left: left_handle,
+                                    right: c,
+                                },
+                                span,
+                            )
+                        })
+                        .collect();
+                    let expr = crate::Expression::Compose { ty: result_ty, components };
                     self.lookup_expression.insert(
                         result_id,
                         LookupExpression {
@@ -1808,13 +1850,65 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                         None
                     };
 
-                    let expr = crate::Expression::Math {
+                    // wasm-env: GLSL.std.450's signed and unsigned
+                    // operations read their operands as their names say,
+                    // whatever the operands' types (`SSign` of a uint):
+                    // operands taken as that, and the result as its type.
+                    let result_kind = ctx.module.types
+                        [self.lookup_type.lookup(result_type_id)?.handle]
+                        .inner
+                        .scalar_kind();
+                    let operands = match gl_op {
+                        Glo::SSign
+                        | Glo::SAbs
+                        | Glo::SMin
+                        | Glo::SMax
+                        | Glo::SClamp
+                        | Glo::FindSMsb => Some(crate::ScalarKind::Sint),
+                        Glo::UMin | Glo::UMax | Glo::UClamp | Glo::FindUMsb => {
+                            Some(crate::ScalarKind::Uint)
+                        }
+                        // (Its lowest bit, whichever: the result's type.)
+                        Glo::FindILsb => result_kind,
+                        _ => None,
+                    };
+                    let (arg, arg1, arg2, arg3) = match operands {
+                        Some(kind) => {
+                            let mut cast = |e: Handle<crate::Expression>| {
+                                ctx.expressions.append(
+                                    crate::Expression::As {
+                                        expr: e,
+                                        kind,
+                                        convert: None,
+                                    },
+                                    span,
+                                )
+                            };
+                            (
+                                cast(arg),
+                                arg1.map(&mut cast),
+                                arg2.map(&mut cast),
+                                arg3.map(&mut cast),
+                            )
+                        }
+                        None => (arg, arg1, arg2, arg3),
+                    };
+                    let mut expr = crate::Expression::Math {
                         fun,
                         arg,
                         arg1,
                         arg2,
                         arg3,
                     };
+                    if let (Some(kind), Some(result)) = (operands, result_kind) {
+                        if kind != result {
+                            expr = crate::Expression::As {
+                                expr: ctx.expressions.append(expr, span),
+                                kind: result,
+                                convert: None,
+                            };
+                        }
+                    }
                     self.lookup_expression.insert(
                         result_id,
                         LookupExpression {

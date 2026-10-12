@@ -1081,6 +1081,33 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
             .scalar_kind()
             .unwrap();
 
+        // wasm-env: a uint negated (`OpSNegate`) as an int, then the
+        // result as a uint again.
+        if op == crate::UnaryOperator::Negate && kind == crate::ScalarKind::Uint {
+            let signed = ctx.expressions.append(
+                crate::Expression::As {
+                    expr: left,
+                    kind: crate::ScalarKind::Sint,
+                    convert: None,
+                },
+                span,
+            );
+            let negated = ctx.expressions.append(crate::Expression::Unary { op, expr: signed }, span);
+            let expr = crate::Expression::As {
+                expr: negated,
+                kind,
+                convert: None,
+            };
+            self.lookup_expression.insert(
+                result_id,
+                LookupExpression {
+                    handle: ctx.expressions.append(expr, span),
+                    type_id: result_type_id,
+                    block_id,
+                },
+            );
+            return Ok(());
+        }
         let expr = crate::Expression::Unary {
             op,
             expr: if p1_lexp.type_id == result_type_id {
@@ -1112,6 +1139,69 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
     /// where we force the operand to have the same type as the result.
     /// This is mostly needed for "i++" and "i--" coming from GLSL.
     #[allow(clippy::too_many_arguments)]
+    /// wasm-env: a division or remainder whose operands are read as signed
+    /// or unsigned, as the opcode says, whatever their types (`OpSDiv` of
+    /// uints); the result as its type.
+    fn parse_expr_binary_op_as(
+        &mut self,
+        ctx: &mut BlockContext,
+        emitter: &mut crate::proc::Emitter,
+        block: &mut crate::Block,
+        block_id: spirv::Word,
+        body_idx: usize,
+        op: crate::BinaryOperator,
+        kind: crate::ScalarKind,
+    ) -> Result<(), Error> {
+        let start = self.data_offset;
+        let result_type_id = self.next()?;
+        let result_id = self.next()?;
+        let p1_id = self.next()?;
+        let p2_id = self.next()?;
+        let span = self.span_from_with_op(start);
+
+        let p1_lexp = self.lookup_expression.lookup(p1_id)?;
+        let left = self.get_expr_handle(p1_id, p1_lexp, ctx, emitter, block, body_idx);
+        let p2_lexp = self.lookup_expression.lookup(p2_id)?;
+        let right = self.get_expr_handle(p2_id, p2_lexp, ctx, emitter, block, body_idx);
+        let mut cast = |expr, kind| {
+            ctx.expressions.append(
+                crate::Expression::As {
+                    expr,
+                    kind,
+                    convert: None,
+                },
+                span,
+            )
+        };
+        let (left, right) = (cast(left, kind), cast(right, kind));
+        let result = ctx.expressions.append(crate::Expression::Binary { op, left, right }, span);
+        let result_kind = ctx.module.types[self.lookup_type.lookup(result_type_id)?.handle]
+            .inner
+            .scalar_kind()
+            .unwrap_or(kind);
+        let handle = if result_kind == kind {
+            result
+        } else {
+            ctx.expressions.append(
+                crate::Expression::As {
+                    expr: result,
+                    kind: result_kind,
+                    convert: None,
+                },
+                span,
+            )
+        };
+        self.lookup_expression.insert(
+            result_id,
+            LookupExpression {
+                handle,
+                type_id: result_type_id,
+                block_id,
+            },
+        );
+        Ok(())
+    }
+
     fn parse_expr_binary_op_sign_adjusted(
         &mut self,
         ctx: &mut BlockContext,

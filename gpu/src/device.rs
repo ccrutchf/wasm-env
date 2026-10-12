@@ -35,6 +35,8 @@ pub struct Gpu {
     pub(crate) depth24: Mutex<Option<wgpu::ComputePipeline>>,
     /// And written from one: a render pipeline per depth format.
     pub(crate) depth24_up: Mutex<HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
+    /// And vertex bindings repacked (vulkan.rs, `Repack`): a compute pipeline.
+    pub(crate) repack: Mutex<Option<wgpu::ComputePipeline>>,
     lost: std::sync::atomic::AtomicBool,
 }
 
@@ -150,7 +152,7 @@ impl Gpu {
         .map_err(|e| format!("can't open {}: {e}", info.name))?;
         // Errors are reported to the caller (error scopes), not panics.
         device.on_uncaptured_error(Arc::new(|e| eprintln!("wasm-env: GPU: {}", chain(&e))));
-        let mut g = Gpu { adapter, device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), byte_copy: Default::default(), clears: Default::default(), fans: Default::default(), depth24: Default::default(), depth24_up: Default::default(), lost: Default::default() };
+        let mut g = Gpu { adapter, device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), byte_copy: Default::default(), clears: Default::default(), fans: Default::default(), depth24: Default::default(), depth24_up: Default::default(), repack: Default::default(), lost: Default::default() };
         g.quirks = Quirks { native_f64: native_f64 && g.native_doubles_conform()?, ..g.probe_quirks()? };
         if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
             eprintln!("wasm-env: GPU {}: {:?}", g.info.name, g.quirks);

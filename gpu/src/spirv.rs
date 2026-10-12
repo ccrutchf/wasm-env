@@ -19,6 +19,7 @@ mod images1d;
 mod interface;
 mod matrices;
 mod subgroups;
+mod tidy;
 
 pub use interface::VIEW_SET;
 
@@ -403,6 +404,9 @@ fn texel_buffers(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Inst>
 
 const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u32 = 87;
 const OP_IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88;
+const OP_IMAGE_SAMPLE_PROJ_IMPLICIT_LOD: u32 = 91;
+const OP_IMAGE_SAMPLE_PROJ_EXPLICIT_LOD: u32 = 92;
+const OP_IMAGE_QUERY_LEVELS: u32 = 106;
 const OP_IMAGE_QUERY_SIZE_LOD: u32 = 103;
 const OP_CONVERT_S_TO_F: u32 = 111;
 const OP_F_ADD: u32 = 129;
@@ -411,6 +415,138 @@ const OP_SELECT: u32 = 169;
 const OP_S_GREATER_THAN: u32 = 173;
 const OP_S_LESS_THAN: u32 = 177;
 const OP_F_MUL: u32 = 133;
+
+const OP_F_NEGATE: u32 = 127;
+const OP_F_DIV: u32 = 136;
+const OP_LOGICAL_AND: u32 = 167;
+const OP_F_ORD_GREATER_THAN_EQUAL: u32 = 190;
+
+/// Samples of integer cube images and cube arrays (a `usamplerCube`'s
+/// `texture`), which WGSL can't fetch from: the images 2D arrays of their
+/// faces (the runtime binds a cube's view as one: vulkan.rs,
+/// `View::layered`), each sample's direction its face (the major axis, as
+/// Vulkan's cube maps choose it) and the coordinates on it, a cube array's
+/// cube six layers on; then fetched as a 2D array's are
+/// (`integer_samples`).
+fn integer_cubes(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Inst> {
+    let ints: std::collections::HashSet<u32> = insts.iter().filter(|i| i.op == OP_TYPE_INT).map(|i| i.words[0]).collect();
+    let cubes: HashMap<u32, bool> =
+        insts.iter().filter(|i| i.op == OP_TYPE_IMAGE && ints.contains(&i.words[1]) && i.words[2] == DIM_CUBE && i.words[6] == 1).map(|i| (i.words[0], i.words[4] == 1)).collect();
+    let sampled: HashMap<u32, bool> = insts.iter().filter(|i| i.op == OP_TYPE_SAMPLED_IMAGE && cubes.contains_key(&i.words[1])).map(|i| (i.words[0], cubes[&i.words[1]])).collect();
+    // (A sampled image of one: whether it's an array, and its image.)
+    let values: HashMap<u32, (bool, u32)> = insts.iter().filter(|i| i.op == OP_SAMPLED_IMAGE && sampled.contains_key(&i.words[0])).map(|i| (i.words[1], (sampled[&i.words[0]], i.words[2]))).collect();
+    if !insts.iter().any(|i| matches!(i.op, OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD) && values.contains_key(&i.words[2])) {
+        return insts;
+    }
+    let mut made = Vec::new();
+    let float = insts.iter().find(|i| i.op == OP_TYPE_FLOAT && i.words[1] == 32).map(|i| i.words[0]).unwrap_or_else(|| {
+        let f = fresh();
+        made.push(inst(OP_TYPE_FLOAT, &[f, 32]));
+        f
+    });
+    let bool_type = insts.iter().find(|i| i.op == OP_TYPE_BOOL).map(|i| i.words[0]).unwrap_or_else(|| {
+        let b = fresh();
+        made.push(inst(OP_TYPE_BOOL, &[b]));
+        b
+    });
+    let (int, vec3, ivec3, int_zero, int_one, int_six) = (fresh(), fresh(), fresh(), fresh(), fresh(), fresh());
+    made.push(inst(OP_TYPE_INT, &[int, 32, 1]));
+    made.push(inst(OP_TYPE_VECTOR, &[vec3, float, 3]));
+    made.push(inst(OP_TYPE_VECTOR, &[ivec3, int, 3]));
+    made.push(inst(OP_CONSTANT, &[int, int_zero, 0]));
+    made.push(inst(OP_CONSTANT, &[int, int_one, 1]));
+    made.push(inst(OP_CONSTANT, &[int, int_six, 6]));
+    let mut constant = |made: &mut Vec<Inst>, v: f32| {
+        let c = fresh();
+        made.push(inst(OP_CONSTANT, &[float, c, v.to_bits()]));
+        c
+    };
+    let (zero, half, one, six) = (constant(&mut made, 0.0), constant(&mut made, 0.5), constant(&mut made, 1.0), constant(&mut made, 6.0));
+    let faces: Vec<u32> = (0..6).map(|f| constant(&mut made, f as f32)).collect();
+    let mut out = Vec::with_capacity(insts.len() + made.len());
+    for i in insts {
+        if i.op == OP_FUNCTION && !made.is_empty() {
+            out.append(&mut made);
+        }
+        match i.op {
+            OP_TYPE_IMAGE if cubes.contains_key(&i.words[0]) => {
+                let mut words = i.words.clone();
+                words[2] = DIM_2D;
+                words[4] = 1;
+                out.push(Inst { op: i.op, words });
+            }
+            OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD if values.contains_key(&i.words[2]) => {
+                let (arrayed, image) = values[&i.words[2]];
+                let mut op = |out: &mut Vec<Inst>, code: u32, ty: u32, operands: &[u32]| {
+                    let r = fresh();
+                    out.push(Inst { op: code, words: [&[ty, r][..], operands].concat() });
+                    r
+                };
+                let c = i.words[3];
+                let [x, y, z] = [0, 1, 2].map(|k| op(&mut out, OP_COMPOSITE_EXTRACT, float, &[c, k]));
+                let [nx, ny, nz] = [x, y, z].map(|v| op(&mut out, OP_F_NEGATE, float, &[v]));
+                let [px, py, pz] = [x, y, z].map(|v| op(&mut out, OP_F_ORD_GREATER_THAN_EQUAL, bool_type, &[v, zero]));
+                let ax = op(&mut out, OP_SELECT, float, &[px, x, nx]);
+                let ay = op(&mut out, OP_SELECT, float, &[py, y, ny]);
+                let az = op(&mut out, OP_SELECT, float, &[pz, z, nz]);
+                // (The major axis: x where |x| is the largest, else y where
+                // |y| is at least |z|, else z.)
+                let xy = op(&mut out, OP_F_ORD_GREATER_THAN_EQUAL, bool_type, &[ax, ay]);
+                let xz = op(&mut out, OP_F_ORD_GREATER_THAN_EQUAL, bool_type, &[ax, az]);
+                let on_x = op(&mut out, OP_LOGICAL_AND, bool_type, &[xy, xz]);
+                let on_y = op(&mut out, OP_F_ORD_GREATER_THAN_EQUAL, bool_type, &[ay, az]);
+                // Per axis: the face, s and t, and the magnitude (Vulkan's
+                // table: +x (-z, -y), -x (z, -y), +y (x, z), -y (x, -z),
+                // +z (x, -y), -z (-x, -y)).
+                let face_x = op(&mut out, OP_SELECT, float, &[px, faces[0], faces[1]]);
+                let s_x = op(&mut out, OP_SELECT, float, &[px, nz, z]);
+                let face_y = op(&mut out, OP_SELECT, float, &[py, faces[2], faces[3]]);
+                let t_y = op(&mut out, OP_SELECT, float, &[py, z, nz]);
+                let face_z = op(&mut out, OP_SELECT, float, &[pz, faces[4], faces[5]]);
+                let s_z = op(&mut out, OP_SELECT, float, &[pz, x, nx]);
+                let pick = |out: &mut Vec<Inst>, op: &mut dyn FnMut(&mut Vec<Inst>, u32, u32, &[u32]) -> u32, [vx, vy, vz]: [u32; 3]| {
+                    let yz = op(out, OP_SELECT, float, &[on_y, vy, vz]);
+                    op(out, OP_SELECT, float, &[on_x, vx, yz])
+                };
+                let face = pick(&mut out, &mut op, [face_x, face_y, face_z]);
+                let s = pick(&mut out, &mut op, [s_x, x, s_z]);
+                let t = pick(&mut out, &mut op, [ny, t_y, ny]);
+                let m = pick(&mut out, &mut op, [ax, ay, az]);
+                let [u, v] = [s, t].map(|w| {
+                    let q = op(&mut out, OP_F_DIV, float, &[w, m]);
+                    let r = op(&mut out, OP_F_ADD, float, &[q, one]);
+                    op(&mut out, OP_F_MUL, float, &[r, half])
+                });
+                // (A cube array's cube, rounded and kept within the array,
+                // six layers each.)
+                let layer = if arrayed {
+                    let w = op(&mut out, OP_COMPOSITE_EXTRACT, float, &[c, 3]);
+                    let r = op(&mut out, OP_F_ADD, float, &[w, half]);
+                    let n = op(&mut out, OP_CONVERT_F_TO_S, int, &[r]);
+                    let size = op(&mut out, OP_IMAGE_QUERY_SIZE_LOD, ivec3, &[image, int_zero]);
+                    let layers = op(&mut out, OP_COMPOSITE_EXTRACT, int, &[size, 2]);
+                    let cubes = op(&mut out, OP_S_DIV, int, &[layers, int_six]);
+                    let last = op(&mut out, OP_I_SUB, int, &[cubes, int_one]);
+                    let below = op(&mut out, OP_S_LESS_THAN, bool_type, &[n, int_zero]);
+                    let low = op(&mut out, OP_SELECT, int, &[below, int_zero, n]);
+                    let above = op(&mut out, OP_S_GREATER_THAN, bool_type, &[low, last]);
+                    let n = op(&mut out, OP_SELECT, int, &[above, last, low]);
+                    let f = op(&mut out, OP_CONVERT_S_TO_F, float, &[n]);
+                    let base = op(&mut out, OP_F_MUL, float, &[f, six]);
+                    op(&mut out, OP_F_ADD, float, &[base, face])
+                } else {
+                    face
+                };
+                let at = op(&mut out, OP_COMPOSITE_CONSTRUCT, vec3, &[u, v, layer]);
+                let mut words = i.words.clone();
+                words[3] = at;
+                out.push(Inst { op: i.op, words });
+            }
+            _ => out.push(i),
+        }
+    }
+    out
+}
 
 /// Samples of integer 2D images, 2D arrays and 3D images (a
 /// `usampler2D`'s, `usampler2DArray`'s or `usampler3D`'s `texture`),
@@ -448,7 +584,7 @@ fn integer_samples(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Ins
     if !insts.iter().any(|i| {
         matches!(
             i.op,
-            OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD
+            OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD | OP_IMAGE_SAMPLE_PROJ_IMPLICIT_LOD | OP_IMAGE_SAMPLE_PROJ_EXPLICIT_LOD
         ) && of.contains_key(&i.words[2])
     }) {
         return insts;
@@ -476,6 +612,10 @@ fn integer_samples(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Ins
         made.push(inst(OP_TYPE_BOOL, &[b]));
         b
     });
+    // (Values' widths: a projected coordinate's last component divides.)
+    let vector_types: HashMap<u32, u32> = insts.iter().filter(|i| i.op == OP_TYPE_VECTOR).map(|i| (i.words[0], i.words[2])).collect();
+    let widths: HashMap<u32, u32> =
+        insts.iter().filter(|i| i.op >= 41 && !(71..=75).contains(&i.op) && i.words.len() >= 2).filter_map(|i| vector_types.get(&i.words[0]).map(|&n| (i.words[1], n))).collect();
     let mut out = Vec::with_capacity(insts.len() + made.len());
     for i in insts {
         if i.op == OP_FUNCTION && !made.is_empty() {
@@ -484,16 +624,66 @@ fn integer_samples(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Ins
         match i.op {
             // (Each coordinate scaled by the size, an array's layer
             // rounded instead, and kept within the image: the edge's texel,
-            // as clamping to the edge takes, rather than none.)
-            OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD if of.contains_key(&i.words[2]) => {
+            // as clamping to the edge takes, rather than none. At the level
+            // an explicit LOD rounds to, else the first; the offset added;
+            // a projected one's coordinates divided by its last.)
+            OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD | OP_IMAGE_SAMPLE_PROJ_IMPLICIT_LOD | OP_IMAGE_SAMPLE_PROJ_EXPLICIT_LOD
+                if of.contains_key(&i.words[2]) =>
+            {
                 let (ty, result, (image, kind), coordinate) = (i.words[0], i.words[1], of[&i.words[2]], i.words[3]);
                 let n = if kind == 0 { 2 } else { 3 };
+                let (mut lod, mut offset) = (None, None);
+                if let Some(&mask) = i.words.get(4) {
+                    let mut ids = i.words[5..].iter().copied();
+                    for bit in [0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80] {
+                        if mask & bit == 0 {
+                            continue;
+                        }
+                        match bit {
+                            0x2 => lod = ids.next(),
+                            0x4 => {
+                                ids.next();
+                                ids.next();
+                            }
+                            0x8 | 0x10 => offset = ids.next(),
+                            _ => {
+                                ids.next();
+                            }
+                        }
+                    }
+                }
+                let level = match lod {
+                    Some(l) => {
+                        // (Rounded, and within the image's levels.)
+                        let (r, v, levels, last, below, low, above, clamped) = (fresh(), fresh(), fresh(), fresh(), fresh(), fresh(), fresh(), fresh());
+                        out.push(inst(OP_F_ADD, &[float, r, l, half]));
+                        out.push(inst(OP_CONVERT_F_TO_S, &[int, v, r]));
+                        out.push(inst(OP_IMAGE_QUERY_LEVELS, &[int, levels, image]));
+                        out.push(inst(OP_I_SUB, &[int, last, levels, one]));
+                        out.push(inst(OP_S_LESS_THAN, &[bool_type, below, v, zero]));
+                        out.push(inst(OP_SELECT, &[int, low, below, zero, v]));
+                        out.push(inst(OP_S_GREATER_THAN, &[bool_type, above, low, last]));
+                        out.push(inst(OP_SELECT, &[int, clamped, above, last, low]));
+                        clamped
+                    }
+                    None => zero,
+                };
+                let q = matches!(i.op, OP_IMAGE_SAMPLE_PROJ_IMPLICIT_LOD | OP_IMAGE_SAMPLE_PROJ_EXPLICIT_LOD).then(|| {
+                    let q = fresh();
+                    out.push(inst(OP_COMPOSITE_EXTRACT, &[float, q, coordinate, widths.get(&coordinate).map_or(n, |w| w - 1)]));
+                    q
+                });
                 let size = fresh();
-                out.push(inst(OP_IMAGE_QUERY_SIZE_LOD, &[if n == 2 { ivec2 } else { ivec3 }, size, image, zero]));
+                out.push(inst(OP_IMAGE_QUERY_SIZE_LOD, &[if n == 2 { ivec2 } else { ivec3 }, size, image, level]));
                 let mut texel = Vec::new();
                 for k in 0..n {
-                    let (c, at, t, extent, last) = (fresh(), fresh(), fresh(), fresh(), fresh());
+                    let (mut c, at, mut t, extent, last) = (fresh(), fresh(), fresh(), fresh(), fresh());
                     out.push(inst(OP_COMPOSITE_EXTRACT, &[float, c, coordinate, k]));
+                    if let Some(q) = q {
+                        let d = fresh();
+                        out.push(inst(OP_F_DIV, &[float, d, c, q]));
+                        c = d;
+                    }
                     out.push(inst(OP_COMPOSITE_EXTRACT, &[int, extent, size, k]));
                     if kind == 1 && k == 2 {
                         out.push(inst(OP_F_ADD, &[float, at, c, half]));
@@ -503,6 +693,12 @@ fn integer_samples(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Ins
                         out.push(inst(OP_F_MUL, &[float, at, c, scale]));
                     }
                     out.push(inst(OP_CONVERT_F_TO_S, &[int, t, at]));
+                    if let Some(o) = offset.filter(|_| !(kind == 1 && k == 2)) {
+                        let (ok, moved) = (fresh(), fresh());
+                        out.push(inst(OP_COMPOSITE_EXTRACT, &[int, ok, o, k]));
+                        out.push(inst(OP_I_ADD, &[int, moved, t, ok]));
+                        t = moved;
+                    }
                     out.push(inst(OP_I_SUB, &[int, last, extent, one]));
                     let (below, low, above, clamped) = (fresh(), fresh(), fresh(), fresh());
                     out.push(inst(OP_S_LESS_THAN, &[bool_type, below, t, zero]));
@@ -513,7 +709,7 @@ fn integer_samples(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Ins
                 }
                 let at = fresh();
                 out.push(Inst { op: OP_COMPOSITE_CONSTRUCT, words: [&[if n == 2 { ivec2 } else { ivec3 }, at][..], &texel].concat() });
-                out.push(inst(OP_IMAGE_FETCH, &[ty, result, image, at, IMAGE_OPERANDS_LOD, zero]));
+                out.push(inst(OP_IMAGE_FETCH, &[ty, result, image, at, IMAGE_OPERANDS_LOD, level]));
             }
             _ => out.push(i),
         }
@@ -753,6 +949,7 @@ pub fn specialize(spirv: &[u8], values: &[(u32, u64)]) -> Res<Vec<u8>> {
                     168 => (a == 0) as u64,
                     113 => ua,                // UConvert
                     114 => sa as u64,         // SConvert
+                    116 => quantized(f32::from_bits(a as u32)).to_bits() as u64, // QuantizeToF16
                     _ => {
                         let (b, _) = b()?;
                         let sb = signed(at, b);
@@ -835,6 +1032,19 @@ pub fn specialize(spirv: &[u8], values: &[(u32, u64)]) -> Res<Vec<u8>> {
     Ok(emit(header, &out))
 }
 
+/// A float's nearest half, as a float (`OpQuantizeToF16`; one too small
+/// for a normal half 0, as the CTS takes it).
+fn quantized(x: f32) -> f32 {
+    let h = crate::vulkan::half_bits(x);
+    let (sign, exponent, fraction) = (if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }, (h >> 10) & 0x1f, (h & 0x3ff) as f32);
+    sign * match exponent {
+        0 => 0.0,
+        0x1f if fraction == 0.0 => f32::INFINITY,
+        0x1f => f32::NAN,
+        e => (1.0 + fraction / 1024.0) * 2f32.powi(e as i32 - 15),
+    }
+}
+
 /// The module, rewritten (see the module's doc).
 pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
     let (mut header, insts) = parse(spirv)?;
@@ -843,6 +1053,7 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
         next += 1;
         next - 1
     };
+    let insts = tidy::tidy(insts, &mut fresh);
     let insts = subgroups::single(insts, &mut fresh);
     let insts = images1d::as_2d(insts, &mut fresh);
     let insts = cube_storage(insts, &mut fresh);
@@ -999,6 +1210,7 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
             _ => out.push(i),
         }
     }
+    let out = integer_cubes(out, &mut fresh);
     let out = integer_samples(out, &mut fresh);
     header[3] = next;
     Ok(emit(header, &out))

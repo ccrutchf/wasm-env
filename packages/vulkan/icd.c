@@ -1404,13 +1404,18 @@ static VkResult graphics_pipeline(const VkGraphicsPipelineCreateInfo *info, VkPi
     const VkPipelineRasterizationStateCreateInfo *rs = info->pRasterizationState;
     if (!vs || !rs)
         return VK_ERROR_INITIALIZATION_FAILED;
-    if (rs->rasterizerDiscardEnable)
+    // (State Vulkan says is ignored isn't read: its pointers may be
+    // anything. Without rasterization, the viewport, multisample, depth and
+    // stencil, and blend state; without attachments of a kind, its state.)
+    int discard = rs->rasterizerDiscardEnable;
+    if (discard)
         fs = NULL;
     const struct subpass *sp = &info->renderPass->sub[info->subpass];
     const VkAttachmentDescription *att = info->renderPass->attachments;
     int has_depth = sp->depth != VK_ATTACHMENT_UNUSED;
-    const VkPipelineDepthStencilStateCreateInfo *ds = has_depth ? info->pDepthStencilState : NULL;
-    const VkPipelineColorBlendStateCreateInfo *cb = fs ? info->pColorBlendState : NULL;
+    const VkPipelineDepthStencilStateCreateInfo *ds = has_depth && !discard ? info->pDepthStencilState : NULL;
+    const VkPipelineColorBlendStateCreateInfo *cb = fs && sp->ncolors ? info->pColorBlendState : NULL;
+    const VkPipelineMultisampleStateCreateInfo *ms = discard ? NULL : info->pMultisampleState;
     const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
     struct words b = {0};
     uint64_t shaders[2] = {vs->module->handle, fs ? fs->module->handle : 0};
@@ -1421,7 +1426,8 @@ static VkResult graphics_pipeline(const VkGraphicsPipelineCreateInfo *info, VkPi
     word(&b, strlen(vs->pName));
     word(&b, fs ? strlen(fs->pName) : 0);
     word(&b, (uint32_t)info->pInputAssemblyState->topology);
-    word(&b, rs->cullMode);
+    // (Rasterizer discard: 4, its draws not drawn.)
+    word(&b, discard ? 4u : rs->cullMode);
     word(&b, (uint32_t)rs->frontFace);
     word(&b, rs->depthBiasEnable);
     word(&b, bits(rs->depthBiasConstantFactor));
@@ -1435,14 +1441,14 @@ static VkResult graphics_pipeline(const VkGraphicsPipelineCreateInfo *info, VkPi
     stencil_face(&b, ds ? &ds->front : &none);
     stencil_face(&b, ds ? &ds->back : &none);
     word(&b, has_depth ? (uint32_t)att[sp->depth].format : 0);
-    word(&b, info->pMultisampleState ? (uint32_t)info->pMultisampleState->rasterizationSamples : 1);
-    uint32_t nc = fs ? sp->ncolors : 0, nb = vi ? vi->vertexBindingDescriptionCount : 0, na = vi ? vi->vertexAttributeDescriptionCount : 0;
+    word(&b, ms ? (uint32_t)ms->rasterizationSamples : 1);
+    uint32_t nc = fs || discard ? sp->ncolors : 0, nb = vi ? vi->vertexBindingDescriptionCount : 0, na = vi ? vi->vertexAttributeDescriptionCount : 0;
     word(&b, nc);
     word(&b, nb);
     word(&b, na);
     for (uint32_t k = 0; k < nc; k++) {
         word(&b, (uint32_t)att[sp->colors[k]].format);
-        VkPipelineColorBlendAttachmentState blend = {.colorWriteMask = 0xf};
+        VkPipelineColorBlendAttachmentState blend = {.colorWriteMask = discard ? 0 : 0xf};
         if (cb && k < cb->attachmentCount)
             blend = cb->pAttachments[k];
         word(&b, blend.blendEnable);
@@ -1520,16 +1526,16 @@ static VkResult graphics_pipeline(const VkGraphicsPipelineCreateInfo *info, VkPi
             case VK_DYNAMIC_STATE_STENCIL_REFERENCE: s->set &= ~S_REFERENCE; break;
             default: break;
             }
-    const VkPipelineViewportStateCreateInfo *vp = info->pViewportState;
-    if (vp && vp->pViewports && vp->viewportCount)
+    const VkPipelineViewportStateCreateInfo *vp = discard ? NULL : info->pViewportState;
+    if ((s->set & S_VIEWPORT) && vp && vp->pViewports && vp->viewportCount)
         memcpy(s->viewport, vp->pViewports, sizeof s->viewport);
     else
         s->set &= ~S_VIEWPORT;
-    if (vp && vp->pScissors && vp->scissorCount)
+    if ((s->set & S_SCISSOR) && vp && vp->pScissors && vp->scissorCount)
         memcpy(s->scissor, vp->pScissors, sizeof s->scissor);
     else
         s->set &= ~S_SCISSOR;
-    if (cb)
+    if ((s->set & S_BLEND) && cb)
         memcpy(s->blend, cb->blendConstants, sizeof s->blend);
     else
         s->set &= ~S_BLEND;

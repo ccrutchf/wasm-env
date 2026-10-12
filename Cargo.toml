@@ -27,6 +27,12 @@ bad64 = { path = "vendor/bad64" }
 # it hadn't made: image.rs again; and kept an array of storage images'
 # variable's access off its images, and took an array of storage blocks
 # for uniform ones: mod.rs again; and left an array's layers out of its size:
-# image.rs
+# image.rs; and took GLSL.std.450's signed and unsigned operations' operands
+# for their types (`SSign` of a uint, which its SPIR-V writer panicked at):
+# next_block.rs, and its integer divisions', remainders' and negations' likewise
+# (mod.rs; `OpSMod` in integers, not floats); and `OpQuantizeToF16`, which it
+# hadn't, an outer product's matrix (its columns the right vector's, made a
+# column at a time), and bit counts' and lowest bits' result types
+# (next_block.rs)
 # (search "wasm-env").
 naga = { path = "vendor/naga" }

@@ -47,6 +47,18 @@ pub struct Shader {
     source: Arc<[u8]>,
 }
 
+/// A vertex binding whose stride, or an attribute's offset, isn't
+/// aligned as WebGPU's must be (to 4 bytes, or the attribute's size):
+/// copied before its draws into a buffer of its own, each attribute 4-byte
+/// aligned after the last. Its stride, the new one, and each attribute's
+/// offset in a vertex, size, and new offset.
+#[derive(Clone)]
+struct Repack {
+    stride: u64,
+    new_stride: u64,
+    attributes: Vec<[u32; 3]>,
+}
+
 /// A compute or graphics pipeline.
 pub struct Pipeline {
     kind: Kind,
@@ -61,6 +73,8 @@ pub struct Pipeline {
     /// starts (attributes past their binding's stride have slots of their
     /// own, where they're within it).
     vertex_bindings: Vec<(u32, u64)>,
+    /// Per slot, where its binding is repacked for WebGPU (`Repack`).
+    repacks: Vec<Option<Repack>>,
     /// Its binding arrays (Vulkan's descriptor arrays): WebGPU's set and
     /// binding, and how many.
     arrays: BTreeMap<(u32, u32), u32>,
@@ -72,7 +86,7 @@ pub struct Pipeline {
     /// Its bindings of 2D images (not arrays): where a view of an array's
     /// one layer is bound, its 2D view (`View::single`).
     flat: BTreeSet<(u32, u32)>,
-    /// Its bindings of 2D arrays of storage images: where a cube's view is
+    /// Its bindings of 2D arrays (storage, or sampled): where a cube's view is
     /// bound, its 2D array view (`View::layered`).
     layered: BTreeSet<(u32, u32)>,
     /// A graphics pipeline's making, and the variants made of it: for
@@ -91,6 +105,11 @@ pub struct Pipeline {
     /// One culling both faces of triangles (which WebGPU can't): its draws
     /// draw nothing.
     culls_all: bool,
+    /// One whose colors blend by the constant's alpha (Vulkan's
+    /// CONSTANT_ALPHA factors) and never by its color: its draws' blend
+    /// constant is the alpha in every channel (WebGPU's factor is the
+    /// constant's color).
+    constant_alpha: bool,
     variants: Mutex<HashMap<(Vec<wgpu::TextureFormat>, Dynamic), wgpu::RenderPipeline>>,
 }
 
@@ -392,6 +411,31 @@ fn build_flipped(gpu: &Gpu, spirv: &[u8], flip: bool) -> Res<Shader> {
     if arrays_of_blocks {
         naga::compact::compact(&mut module, naga::compact::KeepUnused::Yes);
     }
+    // (A storage image neither read nor written, its size all that's
+    // asked, as one read: wgpu takes one of no access for none.)
+    for (_, g) in module.global_variables.iter_mut() {
+        let (base, array) = match module.types[g.ty].inner {
+            naga::TypeInner::BindingArray { base, size } => (base, Some(size)),
+            _ => (g.ty, None),
+        };
+        if let naga::TypeInner::Image { dim, arrayed, class: naga::ImageClass::Storage { format, access } } = module.types[base].inner
+            && access.is_empty()
+        {
+            let class = naga::ImageClass::Storage { format, access: naga::StorageAccess::LOAD };
+            let image = module.types.insert(naga::Type { name: None, inner: naga::TypeInner::Image { dim, arrayed, class } }, naga::Span::UNDEFINED);
+            g.ty = match array {
+                Some(size) => module.types.insert(naga::Type { name: None, inner: naga::TypeInner::BindingArray { base: image, size } }, naga::Span::UNDEFINED),
+                None => image,
+            };
+        }
+    }
+    // (A buffer only written, `NonReadable`, as one read too: WGSL's
+    // storage is readable.)
+    for (_, g) in module.global_variables.iter_mut() {
+        if let naga::AddressSpace::Storage { access } = &mut g.space {
+            *access |= naga::StorageAccess::LOAD;
+        }
+    }
     let graphics = module.entry_points.iter().any(|e| e.stage != naga::ShaderStage::Compute);
     let written: BTreeSet<naga::Handle<naga::GlobalVariable>> = if graphics {
         let info = validate(&module)?;
@@ -499,9 +543,19 @@ fn flat_of(shaders: &[&Shader]) -> BTreeSet<(u32, u32)> {
     shaders.iter().flat_map(|s| s.types.iter().filter(|(_, t)| d2(t)).map(|(&k, _)| k)).collect()
 }
 
-/// The bindings of shaders that take 2D arrays of storage images.
+/// The bindings of shaders that take 2D arrays (of storage images, or
+/// integer ones sampled: cubes, in the SPIR-V).
 fn layered_of(shaders: &[&Shader]) -> BTreeSet<(u32, u32)> {
-    let arrays = |t: &Res<(wgpu::BindingType, Option<std::num::NonZeroU32>)>| matches!(t, Ok((wgpu::BindingType::StorageTexture { view_dimension: wgpu::TextureViewDimension::D2Array, .. }, _)));
+    let arrays = |t: &Res<(wgpu::BindingType, Option<std::num::NonZeroU32>)>| {
+        matches!(
+            t,
+            Ok((
+                wgpu::BindingType::StorageTexture { view_dimension: wgpu::TextureViewDimension::D2Array, .. }
+                    | wgpu::BindingType::Texture { view_dimension: wgpu::TextureViewDimension::D2Array, .. },
+                _
+            ))
+        )
+    };
     shaders.iter().flat_map(|s| s.types.iter().filter(|(_, t)| arrays(t)).map(|(&k, _)| k)).collect()
 }
 
@@ -727,6 +781,10 @@ fn options<'a>(constants: &'a [(&'a str, f64)]) -> wgpu::PipelineCompilationOpti
 
 /// A compute pipeline of a shader's entry point, specialized.
 pub fn compute_pipeline(gpu: &Gpu, shader: &Shader, entry: &str, spec: &[Spec]) -> Res<Pipeline> {
+    unpanicked("making a pipeline", || made_compute_pipeline(gpu, shader, entry, spec))
+}
+
+fn made_compute_pipeline(gpu: &Gpu, shader: &Shader, entry: &str, spec: &[Spec]) -> Res<Pipeline> {
     // (One computing with specialization constants: made for these.)
     let variant = shader.variant(gpu, spec)?;
     let shader = variant.as_deref().unwrap_or(shader);
@@ -756,6 +814,7 @@ pub fn compute_pipeline(gpu: &Gpu, shader: &Shader, entry: &str, spec: &[Spec]) 
         push_group,
         push_bindings,
         vertex_bindings: Vec::new(),
+        repacks: Vec::new(),
         arrays: shader.arrays.clone(),
         sizes: shader.sizes.clone(),
         flat: flat_of(&[shader]),
@@ -764,6 +823,7 @@ pub fn compute_pipeline(gpu: &Gpu, shader: &Shader, entry: &str, spec: &[Spec]) 
         dynamic: 0,
         fan: false,
         culls_all: false,
+        constant_alpha: false,
         written,
         variants: Default::default(),
     })
@@ -966,6 +1026,19 @@ fn stencil_face(s: &[u32; 6]) -> wgpu::StencilFaceState {
 
 /// A graphics pipeline: `shader` finds a handle's shader.
 pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) -> Option<&'a Shader>) -> Res<Pipeline> {
+    // (A panic making it fails it, rather than leaving the program waiting.)
+    unpanicked("making a pipeline", || made_graphics_pipeline(gpu, s, shader))
+}
+
+/// `make`, or the panic it ended in as an error.
+fn unpanicked<T>(what: &str, make: impl FnOnce() -> Res<T>) -> Res<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(make)).unwrap_or_else(|p| {
+        let why = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+        Err(format!("{what} panicked: {why}"))
+    })
+}
+
+fn made_graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) -> Option<&'a Shader>) -> Res<Pipeline> {
     let vs = shader(s.vertex.0).ok_or("no vertex shader")?;
     let vs_variant = vs.variant(gpu, &s.vertex_spec)?;
     let vs = vs_variant.as_deref().unwrap_or(vs);
@@ -992,10 +1065,50 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
     // Vertex buffers, in WebGPU's slots: one a binding, and one more for
     // each place past its stride an attribute is at (WebGPU's attributes
     // are within it; Vulkan's needn't be): the binding's buffer from there.
-    let mut slots: Vec<(u32, u64, [u32; 3])> = s.buffers.iter().map(|b| (b[0], 0, *b)).collect();
-    let mut attributes: Vec<Vec<wgpu::VertexAttribute>> = vec![Vec::new(); s.buffers.len()];
+    // A binding misaligned for WebGPU is repacked (`Repack`): a slot of
+    // its own, its attributes one after another. So is one with an
+    // attribute wider than its stride (which no slot of its own fits in),
+    // and one with attributes past its stride where their slots would be
+    // more than the device has.
+    let past = |a: &[u32; 4], stride: u64| vertex_format(a[2]).is_some_and(|f| stride != 0 && a[3] as u64 + f.size() > stride);
+    let extra: BTreeSet<(u32, u32)> =
+        s.attributes.iter().filter(|a| s.buffers.iter().any(|b| b[0] == a[1] && past(a, b[1] as u64))).map(|a| (a[1], a[3] & !3)).collect();
+    let crowded = s.buffers.len() + extra.len() > gpu.device.limits().max_vertex_buffers as usize;
+    let misaligned = |b: &[u32; 3]| {
+        let stride = b[1] as u64;
+        b[1] % 4 != 0
+            || s.attributes.iter().filter(|a| a[1] == b[0]).any(|a| {
+                (crowded && past(a, stride))
+                    || vertex_format(a[2]).is_some_and(|f| a[3] as u64 % f.size().min(4) != 0 || (stride != 0 && a[3] as u64 % 4 + f.size() > stride))
+            })
+    };
+    let mut slots: Vec<(u32, u64, [u32; 3])> = Vec::new();
+    let mut attributes: Vec<Vec<wgpu::VertexAttribute>> = Vec::new();
+    let mut repacks: Vec<Option<Repack>> = Vec::new();
+    for b in &s.buffers {
+        if !misaligned(b) {
+            slots.push((b[0], 0, *b));
+            attributes.push(Vec::new());
+            repacks.push(None);
+            continue;
+        }
+        let (mut at, mut placed, mut moved) = (0u32, Vec::new(), Vec::new());
+        for a in s.attributes.iter().filter(|a| a[1] == b[0]) {
+            let format = vertex_format(a[2]).ok_or_else(|| format!("vertex format {}", a[2]))?;
+            placed.push(wgpu::VertexAttribute { format, offset: at as u64, shader_location: a[0] });
+            moved.push([a[3], format.size() as u32, at]);
+            at += (format.size() as u32).next_multiple_of(4);
+        }
+        let new_stride = if b[1] == 0 { 0 } else { at.max(4) };
+        slots.push((b[0], 0, [b[0], new_stride, b[2]]));
+        attributes.push(placed);
+        repacks.push(Some(Repack { stride: b[1] as u64, new_stride: new_stride as u64, attributes: moved }));
+    }
     for a in &s.attributes {
         let b = *s.buffers.iter().find(|b| b[0] == a[1]).ok_or_else(|| format!("an attribute of vertex binding {}, which there isn't", a[1]))?;
+        if misaligned(&b) {
+            continue;
+        }
         let format = vertex_format(a[2]).ok_or_else(|| format!("vertex format {}", a[2]))?;
         let (offset, stride) = (a[3] as u64, b[1] as u64);
         let from = if stride != 0 && offset + format.size() > stride { offset & !3 } else { 0 };
@@ -1004,10 +1117,16 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
             None => {
                 slots.push((a[1], from, b));
                 attributes.push(Vec::new());
+                repacks.push(None);
                 slots.len() - 1
-    }
+            }
         };
         attributes[slot].push(wgpu::VertexAttribute { format, offset: offset - from, shader_location: a[0] });
+    }
+    // (Slots of attributes past their strides may be more than the device
+    // has: refused, as wgpu would panic at them.)
+    if slots.len() > gpu.device.limits().max_vertex_buffers as usize {
+        return Err(format!("{} vertex buffer slots, of {}", slots.len(), gpu.device.limits().max_vertex_buffers));
     }
     let buffers: Vec<Option<wgpu::VertexBufferLayout>> = slots
         .iter()
@@ -1087,7 +1206,17 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
         vs: (vs.module.clone(), s.vertex.1.clone(), vs.constants(&s.vertex_spec).into_iter().collect()),
         vs_source: vs.source.clone(),
         vs_unflipped: Default::default(),
-        fs: fs.map(|fs| (fs.module.clone(), s.fragment.1.clone(), fs.constants(&s.fragment_spec).into_iter().collect())),
+        // (No fragment shader with color targets (rasterizer discard, the
+        // targets written to by nothing): one that writes nothing, as
+        // WebGPU's pipelines with targets have one.)
+        fs: match fs {
+            Some(fs) => Some((fs.module.clone(), s.fragment.1.clone(), fs.constants(&s.fragment_spec).into_iter().collect())),
+            None if !targets.is_empty() => {
+                let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl("@fragment fn main() { discard; }".into()) });
+                Some((module, "main".into(), Vec::new()))
+            }
+            None => None,
+        },
         buffers: buffers.iter().flatten().map(|b| (b.array_stride, b.step_mode, b.attributes.to_vec())).collect(),
         primitive: wgpu::PrimitiveState {
             topology,
@@ -1122,6 +1251,7 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
         push_group,
         push_bindings,
         vertex_bindings: slots.iter().map(|s| (s.0, s.1)).collect(),
+        repacks,
         arrays,
         sizes,
         flat: flat_of(&[Some(vs), fs].into_iter().flatten().collect::<Vec<_>>()),
@@ -1129,7 +1259,11 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
         recipe: Some(recipe),
         dynamic: s.dynamic,
         fan: s.topology == 5,
-        culls_all: s.cull == 3 && (3..=5).contains(&s.topology),
+        culls_all: (s.cull == 3 && (3..=5).contains(&s.topology)) || s.cull == 4,
+        constant_alpha: {
+            let factors: Vec<u32> = s.colors.iter().filter(|c| c[1] != 0).flat_map(|c| [c[2], c[3]]).collect();
+            factors.iter().any(|f| matches!(f, 12 | 13)) && !factors.iter().any(|f| matches!(f, 10 | 11))
+        },
         written,
         variants: Default::default(),
     })
@@ -1710,8 +1844,9 @@ pub struct View {
     pub layers: u32,
     pub single: Option<wgpu::TextureView>,
     /// A cube's (or cube array's) view as a 2D array of its layers: bound
-    /// where a shader takes a storage image (WGSL has no cube ones; the
-    /// SPIR-V's are 2D arrays, spirv.rs `cube_storage`).
+    /// where a shader takes a storage image or samples an integer one
+    /// (WGSL has no cube storage images, nor fetches from cubes; the
+    /// SPIR-V's are 2D arrays, spirv.rs `cube_storage`, `integer_cubes`).
     pub layered: Option<wgpu::TextureView>,
 }
 
@@ -2375,6 +2510,77 @@ fn bind_groups<'a>(
 /// `offset`, 16 or 32 bits each) as a list's: each triangle's first, k-th
 /// and (k + 1)-th, 32 bits each, in a new buffer, by a compute shader in
 /// the encoder (the indices are the device's).
+/// A vertex binding's vertices, `count` of them from `base` in `buffer`,
+/// repacked as `r` says into a buffer of their own (a compute shader:
+/// each word of each vertex the bytes of the attributes there, or 0).
+fn repack_vertices(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, base: u64, count: u64, r: &Repack) -> Res<wgpu::Buffer> {
+    const REPACK: &str = "
+struct P { base: u32, stride: u32, words: u32, count: u32, n: u32, size: u32 }
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<storage, read> p: P;
+@group(0) @binding(3) var<storage, read> attributes: array<vec4<u32>>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let k = id.y * 4194240u + id.x;
+    if k >= p.count * p.words { return; }
+    let v = k / p.words;
+    var out = 0u;
+    for (var b = 0u; b < 4u; b++) {
+        let d = (k % p.words) * 4u + b;
+        for (var a = 0u; a < p.n; a++) {
+            let at = attributes[a];
+            if d >= at.z && d < at.z + at.y {
+                let s = p.base + v * p.stride + at.x + d - at.z;
+                if s < p.size { out |= ((src[s / 4u] >> ((s % 4u) * 8u)) & 0xffu) << (b * 8u); }
+            }
+        }
+    }
+    dst[k] = out;
+}
+";
+    let pipeline = gpu
+        .repack
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| {
+            let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(REPACK.into()) });
+            gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None })
+        })
+        .clone();
+    // (A stride of 0: the one vertex. The source bound from an offset
+    // storage allows, as much of it as a binding may be.)
+    let count = if r.stride == 0 { 1 } else { count.max(1) };
+    let words = (r.new_stride.max(4) / 4) as u32;
+    let out = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: count * words as u64 * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX, mapped_at_creation: false });
+    let align = gpu.device.limits().min_storage_buffer_offset_alignment as u64;
+    let from = (base / align * align).min(buffer.size());
+    let size = (buffer.size() - from).min(gpu.device.limits().max_storage_buffer_binding_size as u64) & !3;
+    if size == 0 {
+        return Ok(out);
+    }
+    let p: Vec<u8> = [(base - from) as u32, r.stride as u32, words, count as u32, r.attributes.len() as u32, size as u32, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let a: Vec<u8> = r.attributes.iter().flat_map(|a| [a[0], a[1], a[2], 0]).flat_map(u32::to_le_bytes).collect();
+    let init = |contents: &[u8]| wgpu::util::DeviceExt::create_buffer_init(&gpu.device, &wgpu::util::BufferInitDescriptor { label: None, contents, usage: wgpu::BufferUsages::STORAGE });
+    let (p, a) = (init(&p), init(&a));
+    let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: from, size: wgpu::BufferSize::new(size) }) },
+            wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: p.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: a.as_entire_binding() },
+        ],
+    });
+    let invocations = count as u32 * words;
+    let mut pass = enc.begin_compute_pass(&Default::default());
+    pass.set_pipeline(&pipeline);
+    pass.set_bind_group(0, &group, &[]);
+    pass.dispatch_workgroups(invocations.min(4194240).div_ceil(64), invocations.div_ceil(4194240), 1);
+    drop(pass);
+    Ok(out)
+}
+
 fn fan_list(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, offset: u64, format: wgpu::IndexFormat, first: u32, count: u32) -> Res<wgpu::Buffer> {
     const FAN: &str = "
 struct P { first: u32, count: u32, wide: u32 }
@@ -2843,7 +3049,7 @@ fn rgb9e5(c: [f32; 3]) -> u32 {
 }
 
 /// A float's half-precision bits, rounded to nearest even.
-fn half_bits(x: f32) -> u16 {
+pub(crate) fn half_bits(x: f32) -> u16 {
     let b = x.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let exp = ((b >> 23) & 0xff) as i32;
@@ -2877,10 +3083,7 @@ fn half_bits(x: f32) -> u16 {
 /// handles name. (A panic in the replay fails it, as the device lost,
 /// rather than leaving the program waiting.)
 pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Object<'a>>) -> Res<()> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay(gpu, commands, object))).unwrap_or_else(|p| {
-        let why = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
-        Err(format!("the replay panicked: {why}"))
-    })
+    unpanicked("the replay", || replay(gpu, commands, object))
 }
 
 fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Object<'a>>) -> Res<()> {
@@ -2912,6 +3115,8 @@ fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Ob
     let mut dynamic = Dynamic::default();
     // (And the stencil reference, each face's.)
     let mut reference = [0u32; 2];
+    // (And the blend constant.)
+    let mut blend_constant = [0f32; 4];
     // (An occlusion query begun outside render passes, its pool and index and
     // the overflow slots the passes since counted into; those ended; and the
     // slots used, by pool.)
@@ -3025,7 +3230,33 @@ fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Ob
                 let (a, extent) = on_texture(tex(*src)?, from);
                 let (b, _) = on_texture(tex(*dst)?, to);
                 let (sf, df) = (a.texture.format(), b.texture.format());
-                if sf.remove_srgb_suffix() == df.remove_srgb_suffix() {
+                // (Depth and stencil, which WebGPU copies only whole and an
+                // aspect of a combined image only from both: a part, or
+                // an aspect, through a buffer, an aspect at a time, as
+                // copies to and from buffers go: `buffer_image`.)
+                let whole = from.origin == [0; 3]
+                    && to.origin == [0; 3]
+                    && a.texture.size().mip_level_size(from.mip, a.texture.dimension()).width == extent.width
+                    && a.texture.size().mip_level_size(from.mip, a.texture.dimension()).height == extent.height
+                    && b.texture.size().mip_level_size(to.mip, b.texture.dimension()).width == extent.width
+                    && b.texture.size().mip_level_size(to.mip, b.texture.dimension()).height == extent.height;
+                let combined = sf.is_combined_depth_stencil_format();
+                if sf.is_depth_stencil_format() && (!whole || (combined && from.aspect != 6) || sf != df) {
+                    let (src_t, dst_t) = (tex(*src)?, tex(*dst)?);
+                    let aspects: Vec<u32> = [2, 4].into_iter().filter(|&k| from.aspect & k != 0).collect();
+                    for k in aspects {
+                        let texels = extent.width as u64 * extent.height as u64 * extent.depth_or_array_layers as u64;
+                        let staged = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: None,
+                            size: (texels * 4).next_multiple_of(4).max(4),
+                            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                            mapped_at_creation: false,
+                        });
+                        let region = |sub: &Sub| Region { buffer: 0, offset: 0, image: 0, row_length: 0, image_height: 0, sub: Sub { aspect: k, ..sub.clone() } };
+                        buffer_image(gpu, &mut enc, &staged, src_t, &region(from), false)?;
+                        buffer_image(gpu, &mut enc, &staged, dst_t, &region(to), true)?;
+                    }
+                } else if sf.remove_srgb_suffix() == df.remove_srgb_suffix() {
                     enc.copy_texture_to_texture(a, b, extent);
                 } else {
                     // (Formats of texels the same size, which Vulkan copies
@@ -3280,12 +3511,37 @@ fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Ob
                         // (Its indexed draws of triangle fans: their indices made
                         // lists', before it begins, as compute can't run inside it.)
                         let mut fans: HashMap<usize, wgpu::Buffer> = HashMap::new();
+                        // (And its draws' vertex bindings that are repacked,
+                        // likewise: by draw and slot.)
+                        let mut repacked: HashMap<(usize, usize), wgpu::Buffer> = HashMap::new();
                         {
-                            let (mut p, mut ix) = (graphics.clone(), index);
+                            let (mut p, mut ix, mut vx) = (graphics.clone(), index, vertex.clone());
                             for (j, c) in commands.iter().enumerate().skip(i + 1) {
+                                if let (Some(p), Command::Draw(_) | Command::DrawIndexed { .. } | Command::DrawIndirect { .. }) = (&p, c) {
+                                    for (slot, r) in p.repacks.iter().enumerate() {
+                                        let Some(r) = r else { continue };
+                                        let (b, from) = p.vertex_bindings[slot];
+                                        let &(h, offset) = vx.get(&b).ok_or_else(|| format!("no vertex buffer bound to binding {b}"))?;
+                                        let (buffer, base) = (buf(h)?, offset + from);
+                                        // (As many vertices as the draw reads: all
+                                        // the buffer has, for one indexed or indirect.)
+                                        let instanced = p.recipe.as_ref().is_some_and(|rc| rc.buffers.get(slot).is_some_and(|b| b.1 == wgpu::VertexStepMode::Instance));
+                                        let count = match c {
+                                            Command::Draw([n, instances, first, first_instance]) => (if instanced { first_instance + instances } else { first + n }) as u64,
+                                            Command::DrawIndexed { instances, first_instance, .. } if instanced => (first_instance + instances) as u64,
+                                            _ => buffer.size().saturating_sub(base).div_ceil(r.stride.max(1)),
+                                        };
+                                        repacked.insert((j, slot), repack_vertices(gpu, &mut enc, buffer, base, count, r)?);
+                                    }
+                                }
                                 match c {
                                     Command::EndPass => break,
                                     Command::BindPipeline(h) => p = Some(pipeline(*h)?),
+                                    Command::BindVertex { first, buffers } => {
+                                        for (k, &b) in buffers.iter().enumerate() {
+                                            vx.insert(first + k as u32, b);
+                                        }
+                                    }
                                     Command::BindIndex { buffer, offset, wide } => ix = Some((*buffer, *offset, if *wide { wgpu::IndexFormat::Uint32 } else { wgpu::IndexFormat::Uint16 })),
                                     Command::DrawIndexed { indices, first, .. } if *indices >= 3 && p.as_ref().is_some_and(|p| p.fan) => {
                                         let (h, offset, f) = ix.ok_or("an indexed draw with no index buffer")?;
@@ -3419,7 +3675,10 @@ fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Ob
                                     let ((x, w), (y, h)) = (clip(*x, *w, size[0]), clip(*y, *h, size[1]));
                                     pass.set_scissor_rect(x, y, w, h)
                                 }
-                                Command::SetBlendConstants([r, g, b, a]) => pass.set_blend_constant(wgpu::Color { r: *r as f64, g: *g as f64, b: *b as f64, a: *a as f64 }),
+                                Command::SetBlendConstants(c) => {
+                                    blend_constant = *c;
+                                    pass.set_blend_constant(wgpu::Color { r: c[0] as f64, g: c[1] as f64, b: c[2] as f64, a: c[3] as f64 });
+                                }
                                 Command::SetStencilReference(r) => {
                                     reference = *r;
                                     pass.set_stencil_reference(r[0]);
@@ -3472,10 +3731,16 @@ fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Ob
                                     let indexed = matches!(c, Command::DrawIndexed { .. } | Command::DrawIndirect { indexed: true, .. });
                                     let d = Dynamic { strip_index: index.filter(|_| indexed).map(|(_, _, f)| f), ..dynamic };
                                     pass.set_pipeline(&p.render_for(gpu, &targets.colors, d)?);
+                                    let [r, g, b, a] = if p.constant_alpha { [blend_constant[3]; 4] } else { blend_constant };
+                                    pass.set_blend_constant(wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: a as f64 });
                                     for (g, group) in bind_groups(gpu, p, &graphics_sets, &push, view_index, &object, &staged)? {
                                         pass.set_bind_group(g, &group, &[]);
                                     }
                                     for (slot, (b, from)) in p.vertex_bindings.iter().enumerate() {
+                                        if let Some(r) = repacked.get(&(i, slot)) {
+                                            pass.set_vertex_buffer(slot as u32, r.slice(..));
+                                            continue;
+                                        }
                                         let &(h, offset) = vertex.get(b).ok_or_else(|| format!("no vertex buffer bound to binding {b}"))?;
                                         let b = buf(h)?;
                                         pass.set_vertex_buffer(slot as u32, b.slice((offset + from).min(b.size())..));
