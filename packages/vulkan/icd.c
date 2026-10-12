@@ -704,9 +704,10 @@ static CALL VkResult CC GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice 
 
 static VkResult image_format_properties(VkFormat f, VkImageType t, VkImageTiling tl, VkImageUsageFlags u, VkImageCreateFlags c, VkImageFormatProperties *p) {
     if (tl == VK_IMAGE_TILING_LINEAR) {
-        // (Linear: one level and layer, copied to and from.)
+        // (Linear: one level and layer, copied to and from; mutable formats
+        // and extended usage change nothing there.)
         VkImageUsageFlags copies = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (!linear_features(f) || (u & ~copies) || c)
+        if (!linear_features(f) || (u & ~copies) || (c & ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)))
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         memset(p, 0, sizeof *p);
         uint32_t d2 = AT_LEAST(limits[L_DIM_2D], 4096), d3 = AT_LEAST(limits[L_DIM_3D], 256);

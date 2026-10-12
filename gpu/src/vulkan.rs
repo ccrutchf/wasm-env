@@ -89,6 +89,9 @@ pub struct Pipeline {
     /// Its bindings of 2D arrays (storage, or sampled): where a cube's view is
     /// bound, its 2D array view (`View::layered`).
     layered: BTreeSet<(u32, u32)>,
+    /// Its bindings of unsigned integer images: where a depth and stencil
+    /// image's view is bound, its stencil's (`View::stencil`).
+    uints: BTreeSet<(u32, u32)>,
     /// A graphics pipeline's making, and the variants made of it: for
     /// render passes whose color formats aren't its own (Vulkan's drivers
     /// draw with a pipeline made for RGBA into BGRA; WebGPU's won't), and
@@ -543,6 +546,12 @@ fn flat_of(shaders: &[&Shader]) -> BTreeSet<(u32, u32)> {
     shaders.iter().flat_map(|s| s.types.iter().filter(|(_, t)| d2(t)).map(|(&k, _)| k)).collect()
 }
 
+/// The bindings of shaders that take unsigned integer images.
+fn uints_of(shaders: &[&Shader]) -> BTreeSet<(u32, u32)> {
+    let uint = |t: &Res<(wgpu::BindingType, Option<std::num::NonZeroU32>)>| matches!(t, Ok((wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, .. }, _)));
+    shaders.iter().flat_map(|s| s.types.iter().filter(|(_, t)| uint(t)).map(|(&k, _)| k)).collect()
+}
+
 /// The bindings of shaders that take 2D arrays (of storage images, or
 /// integer ones sampled: cubes, in the SPIR-V).
 fn layered_of(shaders: &[&Shader]) -> BTreeSet<(u32, u32)> {
@@ -819,6 +828,7 @@ fn made_compute_pipeline(gpu: &Gpu, shader: &Shader, entry: &str, spec: &[Spec])
         sizes: shader.sizes.clone(),
         flat: flat_of(&[shader]),
         layered: layered_of(&[shader]),
+        uints: uints_of(&[shader]),
         recipe: None,
         dynamic: 0,
         fan: false,
@@ -1256,6 +1266,7 @@ fn made_graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64)
         sizes,
         flat: flat_of(&[Some(vs), fs].into_iter().flatten().collect::<Vec<_>>()),
         layered: layered_of(&[Some(vs), fs].into_iter().flatten().collect::<Vec<_>>()),
+        uints: uints_of(&[Some(vs), fs].into_iter().flatten().collect::<Vec<_>>()),
         recipe: Some(recipe),
         dynamic: s.dynamic,
         fan: s.topology == 5,
@@ -1848,6 +1859,10 @@ pub struct View {
     /// (WGSL has no cube storage images, nor fetches from cubes; the
     /// SPIR-V's are 2D arrays, spirv.rs `cube_storage`, `integer_cubes`).
     pub layered: Option<wgpu::TextureView>,
+    /// A depth and stencil image's view as its stencil alone: bound where
+    /// a shader takes unsigned integers (an input attachment's stencil,
+    /// `usubpassInput`), WebGPU's view of both being depth's.
+    pub stencil: Option<wgpu::TextureView>,
 }
 
 /// A view of an image: Vulkan's view type (VkImageViewType), its format
@@ -1922,7 +1937,18 @@ pub fn view(t: &wgpu::Texture, kind: u32, vk_format: u32, aspect_bits: u32, mip:
             ..Default::default()
         })
     });
-    Ok(View { view, format: format.unwrap_or(t.format()), size, attachment, samples: t.sample_count(), base: [mip, layer], array: dimension == D::D2Array, layers: if dimension == D::D3 { 1 } else { layers }, single, layered })
+    let stencil = (t.format().is_combined_depth_stencil_format() && aspect(aspect_bits) != wgpu::TextureAspect::DepthOnly).then(|| {
+        t.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(dimension),
+            aspect: wgpu::TextureAspect::StencilOnly,
+            base_mip_level: mip,
+            mip_level_count: Some(mips),
+            base_array_layer: layer,
+            array_layer_count: if dimension == D::D3 { None } else { Some(layers) },
+            ..Default::default()
+        })
+    });
+    Ok(View { view, format: format.unwrap_or(t.format()), size, attachment, samples: t.sample_count(), base: [mip, layer], array: dimension == D::D2Array, layers: if dimension == D::D3 { 1 } else { layers }, single, layered, stencil })
 }
 
 /// A query pool (VkQueryPool): WebGPU's query set, occlusion or timestamps,
@@ -2016,7 +2042,7 @@ pub fn texel_view(gpu: &Gpu, buffer: u64, offset: u64, range: u64, vk_format: u3
     if let Some(e) = pollster::block_on(scope.pop()) {
         return Err(format!("texel buffer view: {}", describe(&e)));
     }
-    let view = View { view: texture.create_view(&Default::default()), format: f, size: [width, height], attachment: None, samples: 1, base: [0, 0], array: false, layers: 1, single: None, layered: None };
+    let view = View { view: texture.create_view(&Default::default()), format: f, size: [width, height], attachment: None, samples: 1, base: [0, 0], array: false, layers: 1, single: None, layered: None, stencil: None };
     Ok(TexelView { buffer, offset, texels: texels as u32, texture, view })
 }
 
@@ -2431,7 +2457,12 @@ fn bind_groups<'a>(
             },
             (Resource::View(v), false) | (Resource::Combined { view: v, .. }, false) => match object(*v) {
                 Some(Object::View(v)) => One::View(
-                    v.single.as_ref().filter(|_| p.flat.contains(&(g, w))).or(v.layered.as_ref().filter(|_| p.layered.contains(&(g, w)))).unwrap_or(&v.view),
+                    v.single
+                        .as_ref()
+                        .filter(|_| p.flat.contains(&(g, w)))
+                        .or(v.layered.as_ref().filter(|_| p.layered.contains(&(g, w))))
+                        .or(v.stencil.as_ref().filter(|_| p.uints.contains(&(g, w))))
+                        .unwrap_or(&v.view),
                 ),
                 _ => return Err(format!("no image view {v}")),
             },
@@ -3598,7 +3629,7 @@ fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Ob
                                     array_layer_count: Some(1),
                                     ..Default::default()
                                 });
-                                snapshots.insert(h, View { view: layer_view, format: v.format, size: v.size, attachment: None, samples: v.samples, base: [v.base[0], layer], array: false, layers: 1, single: None, layered: None });
+                                snapshots.insert(h, View { view: layer_view, format: v.format, size: v.size, attachment: None, samples: v.samples, base: [v.base[0], layer], array: false, layers: 1, single: None, layered: None, stencil: None });
                                 continue;
                             }
                             if !attached.contains(&t) || v.samples > 1 {
@@ -3621,7 +3652,9 @@ fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Ob
                             let aspect =
                                 if v.format.has_depth_aspect() && t.format().is_combined_depth_stencil_format() { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
                             let snapshot = copy.create_view(&wgpu::TextureViewDescriptor { format: (aspect == wgpu::TextureAspect::All).then_some(v.format), aspect, ..Default::default() });
-                            snapshots.insert(h, View { view: snapshot, format: v.format, size: v.size, attachment: None, samples: 1, base: [0, 0], array: false, layers: 1, single: None, layered: None });
+                            let stencil = (aspect == wgpu::TextureAspect::DepthOnly)
+                                .then(|| copy.create_view(&wgpu::TextureViewDescriptor { aspect: wgpu::TextureAspect::StencilOnly, ..Default::default() }));
+                            snapshots.insert(h, View { view: snapshot, format: v.format, size: v.size, attachment: None, samples: 1, base: [0, 0], array: false, layers: 1, single: None, layered: None, stencil });
                         }
                         let object = |h: u64| match snapshots.get(&h) {
                             Some(v) => Some(Object::View(v)),
