@@ -15,8 +15,12 @@ use std::collections::HashMap;
 
 use crate::ir::Res;
 
+mod images1d;
 mod interface;
 mod matrices;
+mod subgroups;
+
+pub use interface::VIEW_SET;
 
 const OP_ENTRY_POINT: u32 = 15;
 const OP_TYPE_SAMPLER: u32 = 26;
@@ -530,8 +534,10 @@ pub fn specialize(spirv: &[u8], values: &[(u32, u64)]) -> Res<Vec<u8>> {
     // Scalar types: bool, or an integer's width and signedness.
     let bools: std::collections::HashSet<u32> = insts.iter().filter(|i| i.op == OP_TYPE_BOOL).map(|i| i.words[0]).collect();
     let ints: HashMap<u32, (u32, bool)> = insts.iter().filter(|i| i.op == OP_TYPE_INT).map(|i| (i.words[0], (i.words[1], i.words[2] == 1))).collect();
-    // Each scalar constant's value and type, as they're found.
+    // Each scalar constant's value and type, and each composite's parts,
+    // as they're found.
     let mut known: HashMap<u32, (u64, u32)> = HashMap::new();
+    let mut composites: HashMap<u32, Vec<u32>> = HashMap::new();
     let value_of = |id: u32| values.iter().rev().find(|(s, _)| spec_ids.get(&id) == Some(s)).map(|(_, v)| *v);
     let mask = |ty: u32, v: u64| match ints.get(&ty) {
         Some(&(w, _)) if w < 64 => v & ((1u64 << w) - 1),
@@ -583,7 +589,18 @@ pub fn specialize(spirv: &[u8], values: &[(u32, u64)]) -> Res<Vec<u8>> {
                 known.insert(id, (words[2] as u64 | words.get(3).map_or(0, |&h| (h as u64) << 32), ty));
                 out.push(Inst { op: OP_CONSTANT, words });
             }
-            OP_SPEC_CONSTANT_COMPOSITE => out.push(Inst { op: OP_CONSTANT_COMPOSITE, words: i.words }),
+            OP_SPEC_CONSTANT_COMPOSITE | OP_CONSTANT_COMPOSITE => {
+                composites.insert(i.words[1], i.words[2..].to_vec());
+                out.push(Inst { op: OP_CONSTANT_COMPOSITE, words: i.words });
+            }
+            // (A composite's component: gl_WorkGroupSize.x.)
+            OP_SPEC_CONSTANT_OP if i.words[2] == 81 => {
+                let (ty, id) = (i.words[0], i.words[1]);
+                let part = composites.get(&i.words[3]).and_then(|c| c.get(*i.words.get(4)? as usize)).ok_or("SPIR-V: OpSpecConstantOp extracting from what isn't a composite")?;
+                let (v, _) = *known.get(part).ok_or("SPIR-V: OpSpecConstantOp extracting what isn't a scalar")?;
+                known.insert(id, (v, ty));
+                out.push(constant(ty, id, v));
+            }
             OP_SPEC_CONSTANT_OP => {
                 let (ty, id, op) = (i.words[0], i.words[1], i.words[2]);
                 let arg = |k: usize| -> Res<(u64, u32)> {
@@ -697,6 +714,8 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
         next += 1;
         next - 1
     };
+    let insts = subgroups::single(insts, &mut fresh);
+    let insts = images1d::as_2d(insts, &mut fresh);
     let insts = texel_buffers(insts, &mut fresh);
     let insts = subpass_inputs(insts, &mut fresh);
     let insts = nan_tests(insts, &mut fresh);
@@ -704,6 +723,7 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
     let insts = interface::flatten(insts, &mut fresh);
     let insts = interface::widen_outputs(insts, &mut fresh);
     let insts = interface::sample_mask(insts, &mut fresh);
+    let insts = interface::view_index(insts, &mut fresh);
 
     // Combined image sampler types (to their image type), pointers to them
     // (to the type), and variables of those (to the image type).

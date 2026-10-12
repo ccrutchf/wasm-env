@@ -1,13 +1,14 @@
 # The driver's entry points (packages/vulkan/icd.c), generated from the
 # Vulkan registry (vk.xml) by build.sh:
 #
-#   awk -v extensions="VK_KHR_surface ..." -v commands="vkEnumerateInstanceVersion" \
+#   awk -v versions="1.0 1.1" -v extensions="VK_KHR_surface ..." -v commands="..." \
 #       -v omit="vkCreateWaylandSurfaceKHR ..." -v implemented="CreateInstance ..." \
 #       -f entries.awk vk.xml >entries.h
 #
-# Every command of Vulkan 1.0, of the extensions named, and the commands
-# named goes in one of three tables (global, instance, device: by its
-# first parameter's type), but those omitted (the loader's own).
+# Every command of the Vulkan versions named, of the extensions named,
+# and the commands named goes in one of three tables (global, instance,
+# device: by its first parameter's type), but those omitted (the
+# loader's own).
 # A command the driver implements (a function named as the command without
 # its "vk", or as the command it's an alias of) is checked against
 # Vulkan's PFN_ type for it; any other is a stub with the command's own
@@ -34,6 +35,9 @@ function untag(s) {
 }
 
 BEGIN {
+    n = split(versions, list, " ")
+    for (k = 1; k <= n; k++)
+        wanted_version[list[k]] = 1
     n = split(extensions, list, " ")
     for (k = 1; k <= n; k++)
         wanted_ext[list[k]] = 1
@@ -87,10 +91,10 @@ in_cmd && /<param[ >]/ {
     next
 }
 
-# Vulkan 1.0's commands, and those of the extensions wanted (not those
+# The versions' commands, and those of the extensions wanted (not those
 # that also need a later version or another extension).
 /<feature / {
-    in_set = for_vulkan(attr($0, "api")) && attr($0, "number") == "1.0"
+    in_set = for_vulkan(attr($0, "api")) && attr($0, "number") in wanted_version
     next
 }
 /<\/feature>/ {
@@ -99,14 +103,41 @@ in_cmd && /<param[ >]/ {
 }
 /<extension / {
     in_set = attr($0, "name") in wanted_ext
+    current_ext = in_set ? attr($0, "name") : ""
     next
 }
 /<\/extension>/ {
     in_set = 0
+    current_ext = ""
     next
 }
+# (A requirement's dependencies, as vk.xml writes them: versions and
+# extensions, "," for or and "+" for and; met by those wanted.)
+function met(deps,    alts, n, k, terms, m, j, ok, t) {
+    if (deps == "")
+        return 1
+    gsub(/[()]/, "", deps)
+    n = split(deps, alts, ",")
+    for (k = 1; k <= n; k++) {
+        m = split(alts[k], terms, "+")
+        ok = 1
+        for (j = 1; j <= m; j++) {
+            t = terms[j]
+            if (t ~ /^VK_VERSION_/) {
+                sub(/^VK_VERSION_/, "", t)
+                sub(/_/, ".", t)
+                if (!(t in wanted_version))
+                    ok = 0
+            } else if (!(t in wanted_ext))
+                ok = 0
+        }
+        if (ok)
+            return 1
+    }
+    return 0
+}
 /<require/ {
-    in_require = in_set && attr($0, "depends") == "" && for_vulkan(attr($0, "api"))
+    in_require = in_set && met(attr($0, "depends")) && for_vulkan(attr($0, "api"))
     next
 }
 /<\/require>/ {
@@ -122,6 +153,9 @@ in_require && /<command name=/ {
     if (!(name in listed) && !(name in omitted)) {
         listed[name] = 1
         order[++ncmds] = name
+        # (An extension's own command: offered where it's enabled.)
+        if (current_ext != "")
+            from_ext[name] = current_ext
     }
     next
 }
@@ -184,7 +218,7 @@ END {
         print "static const struct entry " levels[l] "[] = {"
         for (k = 1; k <= ncmds; k++)
             if (table[order[k]] == levels[l])
-                print "    {\"" order[k] "\", (PFN_vkVoidFunction)" fn[order[k]] "},"
+                print "    {\"" order[k] "\", (PFN_vkVoidFunction)" fn[order[k]] ", " (order[k] in from_ext ? "\"" from_ext[order[k]] "\"" : "NULL") "},"
         print "};"
     }
 }

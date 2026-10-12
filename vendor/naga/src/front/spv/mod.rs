@@ -3185,10 +3185,12 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
             crate::Expression::Access { base, index } => {
                 log::debug!("\t\t  access {handle:?} {index:?}");
                 let ty = self.record_atomic_access(ctx, base)?;
-                let crate::TypeInner::Array { base, .. } = ctx.module.types[ty].inner else {
-                    unreachable!("Atomic operations on Access expressions only work for arrays");
-                };
-                Ok(base)
+                // (wasm-env: arrays and binding arrays; anything else an
+                // error, not a panic.)
+                match ctx.module.types[ty].inner {
+                    crate::TypeInner::Array { base, .. } | crate::TypeInner::BindingArray { base, .. } => Ok(base),
+                    _ => Err(Error::AtomicUpgradeError(crate::front::atomic_upgrade::Error::GlobalVariableMissing)),
+                }
             }
             crate::Expression::AccessIndex { base, index } => {
                 log::debug!("\t\t  access index {handle:?} {index:?}");
@@ -3199,10 +3201,10 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                         self.upgrade_atomics.insert_field(ty, index);
                         Ok(members[index].ty)
                     }
-                    crate::TypeInner::Array { base, .. } => {
+                    crate::TypeInner::Array { base, .. } | crate::TypeInner::BindingArray { base, .. } => {
                         Ok(base)
                     }
-                    _ => unreachable!("Atomic operations on AccessIndex expressions only work for structs and arrays"),
+                    _ => Err(Error::AtomicUpgradeError(crate::front::atomic_upgrade::Error::GlobalVariableMissing))?,
                 }
             }
             crate::Expression::GlobalVariable(h) => {

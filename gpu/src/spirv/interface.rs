@@ -420,3 +420,71 @@ pub fn sample_mask(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst
     }
     out
 }
+
+const BUILTIN_VIEW_INDEX: u32 = 4440;
+const STORAGE_STORAGE_BUFFER: u32 = 12;
+const DECORATION_BLOCK: u32 = 2;
+const DECORATION_OFFSET: u32 = 35;
+const DECORATION_BINDING: u32 = 33;
+const DECORATION_DESCRIPTOR_SET: u32 = 34;
+
+/// The descriptor set `gl_ViewIndex`'s block is put in, for the runtime to
+/// move (vulkan.rs: beside the push constants, binding 1).
+pub const VIEW_SET: u32 = 0xffff;
+
+/// `gl_ViewIndex` (multiview), which WGSL hasn't: a word in a block of its
+/// own the runtime binds for each view as it draws the subpass again for
+/// it (vulkan.rs). Its loads load the word.
+pub fn view_index(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst> {
+    let views: HashSet<u32> = insts.iter().filter(|i| i.op == OP_DECORATE && i.words[1..] == [DECORATION_BUILTIN, BUILTIN_VIEW_INDEX]).map(|i| i.words[0]).collect();
+    if views.is_empty() {
+        return insts;
+    }
+    // (Its block: a u32 in a struct, a variable of it, pointers, and 0 to
+    // reach the word with.)
+    let (uint, block, block_pointer, word_pointer, var, int, zero) = (fresh(), fresh(), fresh(), fresh(), fresh(), fresh(), fresh());
+    let made = vec![
+        inst(OP_TYPE_INT, &[uint, 32, 0]),
+        inst(OP_TYPE_STRUCT, &[block, uint]),
+        inst(OP_TYPE_POINTER, &[block_pointer, STORAGE_STORAGE_BUFFER, block]),
+        inst(OP_TYPE_POINTER, &[word_pointer, STORAGE_STORAGE_BUFFER, uint]),
+        inst(OP_VARIABLE, &[block_pointer, var, STORAGE_STORAGE_BUFFER]),
+        inst(OP_TYPE_INT, &[int, 32, 1]),
+        inst(OP_CONSTANT, &[int, zero, 0]),
+    ];
+    let mut annotations = vec![
+        inst(OP_DECORATE, &[block, DECORATION_BLOCK]),
+        inst(OP_MEMBER_DECORATE, &[block, 0, DECORATION_OFFSET, 0]),
+        inst(OP_DECORATE, &[var, DECORATION_DESCRIPTOR_SET, VIEW_SET]),
+        inst(OP_DECORATE, &[var, DECORATION_BINDING, 0]),
+    ];
+    let last_annotation = insts.iter().rposition(|i| i.op == OP_DECORATE || i.op == OP_MEMBER_DECORATE).unwrap_or(0);
+    let mut out = Vec::with_capacity(insts.len() + made.len() + 8);
+    let mut made = Some(made);
+    for (n, i) in insts.into_iter().enumerate() {
+        match i.op {
+            OP_FUNCTION => {
+                out.extend(made.take().unwrap_or_default());
+                out.push(i);
+            }
+            OP_VARIABLE if views.contains(&i.words[1]) => {}
+            OP_DECORATE if views.contains(&i.words[0]) => {}
+            OP_ENTRY_POINT => {
+                let name_end = 2 + i.words[2..].iter().position(|w| w.to_le_bytes().contains(&0)).map_or(i.words.len() - 2, |k| k + 1);
+                let words = i.words[..name_end].iter().chain(i.words[name_end..].iter().filter(|w| !views.contains(w))).copied().collect();
+                out.push(Inst { op: OP_ENTRY_POINT, words });
+            }
+            OP_LOAD if views.contains(&i.words[2]) => {
+                let (at, word) = (fresh(), fresh());
+                out.push(inst(OP_ACCESS_CHAIN, &[word_pointer, at, var, zero]));
+                out.push(inst(OP_LOAD, &[uint, word, at]));
+                out.push(inst(OP_BITCAST, &[i.words[0], i.words[1], word]));
+            }
+            _ => out.push(i),
+        }
+        if n == last_annotation {
+            out.append(&mut annotations);
+        }
+    }
+    out
+}

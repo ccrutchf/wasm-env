@@ -13,6 +13,7 @@ use crate::ir::{Module, Res};
 use crate::wgsl::{self, ArgKind, HEADER_WORDS, KernelInfo, Launch, Quirks};
 
 pub struct Gpu {
+    pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
@@ -20,7 +21,7 @@ pub struct Gpu {
     pub quirks: Quirks,
     pipelines: Mutex<HashMap<(usize, String, Launch), Arc<Pipeline>>>,
     /// Vulkan's blits: a render pipeline per destination format.
-    pub(crate) blits: Mutex<HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
+    pub(crate) blits: Mutex<HashMap<(wgpu::TextureFormat, &'static str), wgpu::RenderPipeline>>,
     /// Vulkan's copies of buffers at any size and offset (WebGPU's are of
     /// whole words): a compute pipeline copying bytes.
     pub(crate) byte_copy: Mutex<Option<wgpu::ComputePipeline>>,
@@ -54,6 +55,16 @@ pub enum Api {
 }
 
 impl Gpu {
+    /// A texture format's features: the device's own, where it has them
+    /// (TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES), else WebGPU's guarantees.
+    pub fn format_features(&self, f: wgpu::TextureFormat) -> wgpu::TextureFormatFeatures {
+        if self.device.features().contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
+            self.adapter.get_texture_format_features(f)
+        } else {
+            f.guaranteed_format_features(self.device.features())
+        }
+    }
+
     /// The GPU, for OpenCL.
     pub fn open() -> Res<Gpu> {
         Gpu::open_for(Api::OpenCl)
@@ -121,7 +132,10 @@ impl Gpu {
             // (and draws' first instance in indirect ones, and block-compressed
             // textures)
             | wgpu::Features::INDIRECT_FIRST_INSTANCE
-            | wgpu::Features::TEXTURE_COMPRESSION_BC;
+            | wgpu::Features::TEXTURE_COMPRESSION_BC
+            // (and the formats' features the device has, beyond WebGPU's
+            // guarantees: multisampled 32-bit integers, for one)
+            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         let arrays = if api == Api::Vulkan { adapter.features() & arrays } else { wgpu::Features::empty() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("wasm-env"),
@@ -132,7 +146,7 @@ impl Gpu {
         .map_err(|e| format!("can't open {}: {e}", info.name))?;
         // Errors are reported to the caller (error scopes), not panics.
         device.on_uncaptured_error(Arc::new(|e| eprintln!("wasm-env: GPU: {}", chain(&e))));
-        let mut g = Gpu { device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), byte_copy: Default::default(), clears: Default::default(), fans: Default::default(), depth24: Default::default(), lost: Default::default() };
+        let mut g = Gpu { adapter, device, queue, info, limits, quirks: Quirks::default(), pipelines: Mutex::new(HashMap::new()), blits: Default::default(), byte_copy: Default::default(), clears: Default::default(), fans: Default::default(), depth24: Default::default(), lost: Default::default() };
         g.quirks = Quirks { native_f64: native_f64 && g.native_doubles_conform()?, ..g.probe_quirks()? };
         if std::env::var_os("WASM_ENV_DEBUG_GPU").is_some() {
             eprintln!("wasm-env: GPU {}: {:?}", g.info.name, g.quirks);

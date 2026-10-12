@@ -1,0 +1,15 @@
+// tests/arm64/vulkan.c's Vulkan 1.1 check: subgroups (of one invocation,
+// as the driver has them) as a compute shader sees them.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+layout(local_size_x = 4) in;
+layout(set = 0, binding = 0, std430) buffer O { uint o[]; };
+
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    o[4 * i] = gl_SubgroupSize;
+    o[4 * i + 1] = subgroupElect() ? 1u : 0u;
+    o[4 * i + 2] = gl_NumSubgroups;
+    o[4 * i + 3] = subgroupAll(i < 4u) ? gl_SubgroupID : 99u;
+}

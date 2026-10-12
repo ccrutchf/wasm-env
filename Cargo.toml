@@ -21,5 +21,7 @@ cranelift-codegen = { path = "vendor/cranelift-codegen" }
 bad64 = { path = "vendor/bad64" }
 # naga (wgpu's shader translator) took a fetch from an element of a binding
 # array (Vulkan's descriptor arrays) for one from the array:
-# vendor/naga/src/front/spv/image.rs (search "wasm-env").
+# vendor/naga/src/front/spv/image.rs; and panicked at atomics through
+# anything but an array or a struct: vendor/naga/src/front/spv/mod.rs
+# (search "wasm-env").
 naga = { path = "vendor/naga" }

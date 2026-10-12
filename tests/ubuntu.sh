@@ -297,6 +297,9 @@ if tests/ubuntu-fetch.sh libvulkan-dev vulkan-tools >/dev/null 2>&1 && packages/
 		&& glslangValidator -V --quiet --vn fan_frag_spv -o build/vulkan-test/vulkan_fan_frag.h tests/arm64/vulkan_fan.frag \
 		&& glslangValidator -V --quiet --vn texel_write_spv -o build/vulkan-test/vulkan_texel_write_spv.h tests/arm64/vulkan_texel_write.comp \
 		&& glslangValidator -V --quiet --vn layout_spv -o build/vulkan-test/vulkan_layout_spv.h tests/arm64/vulkan_layout.comp \
+		&& glslangValidator -V --quiet --target-env vulkan1.1 --vn subgroup_spv -o build/vulkan-test/vulkan_subgroup_spv.h tests/arm64/vulkan_subgroup.comp \
+		&& glslangValidator -V --quiet --target-env vulkan1.1 --vn multiview_vert_spv -o build/vulkan-test/vulkan_multiview_vert.h tests/arm64/vulkan_multiview.vert \
+		&& glslangValidator -V --quiet --target-env vulkan1.1 --vn multiview_frag_spv -o build/vulkan-test/vulkan_multiview_frag.h tests/arm64/vulkan_multiview.frag \
 		&& "${cc[@]}" -O2 -Ibuild/vulkan-test -o "$R/opt/tests/vulkan" tests/arm64/vulkan.c -lvulkan; then
 		only=(--env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/wasm-env_icd.aarch64.json)
 		for gpu in host software; do
@@ -316,6 +319,7 @@ texel buffer: 0 of 256 wrong
 descriptor array: 0 of 12 wrong
 render area 64 of 64 right, fans 128 of 128, stencil masked 64 of 64, query right, texels written 256 of 256, BC right, features right
 layouts: 0 of 29 wrong
+Vulkan 1.1 right, subgroups right, views 128 of 128 right, 1D image 8 of 8 right
 done" "$(WASM_ENV_GPU=$gpu timeout 600 "$wasm_env" run --root "$R" "${only[@]}" /opt/tests/vulkan 2>&1)"
 				# vkcube, presenting to the runtime's compositor: its 60th
 				# frame a textured cube (many colors) on a gray background.

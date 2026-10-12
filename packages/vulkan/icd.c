@@ -195,6 +195,8 @@ struct VkDevice_T {
     struct VkQueue_T queue;
     // Memory mapped now (a list).
     struct VkDeviceMemory_T *mapped;
+    // The extensions enabled (bits: device_extensions's order).
+    uint32_t extensions;
 };
 struct VkBuffer_T {
     VkDeviceSize size;
@@ -233,6 +235,8 @@ struct subpass {
     // Each color attachment's resolve attachment (VK_ATTACHMENT_UNUSED: none).
     uint32_t resolves[8];
     uint32_t depth; // VK_ATTACHMENT_UNUSED: none
+    // Its views (multiview's view mask; 0: none): drawn once for each.
+    uint32_t views;
 };
 struct VkRenderPass_T {
     uint32_t n;
@@ -346,6 +350,13 @@ struct VkCommandBuffer_T {
     uint32_t subpass;
     VkClearValue *clears;
     uint32_t nclears;
+    // The events it sets and resets, in order: set (or reset) as it's
+    // submitted, the host seeing them after a wait.
+    struct signal {
+        VkEvent event;
+        int set;
+    } *signals;
+    size_t nsignals, sigcap;
 };
 struct VkFence_T {
     int signaled;
@@ -366,13 +377,28 @@ static void *zalloc(size_t n) {
 
 // ---- Instance and physical device ----
 
+// (Besides Vulkan 1.1's own: those of its extensions it has whole, for
+// programs written for 1.0.)
 static const VkExtensionProperties instance_extensions[] = {
     {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_SPEC_VERSION},
+    {VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_SPEC_VERSION},
+    {VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_SPEC_VERSION},
+    {VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME, VK_KHR_EXTERNAL_FENCE_CAPABILITIES_SPEC_VERSION},
     {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},
     {VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, VK_KHR_WAYLAND_SURFACE_SPEC_VERSION},
 };
 static const VkExtensionProperties device_extensions[] = {
     {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SWAPCHAIN_SPEC_VERSION},
+    {VK_KHR_MAINTENANCE_1_EXTENSION_NAME, VK_KHR_MAINTENANCE_1_SPEC_VERSION},
+    {VK_KHR_MAINTENANCE_2_EXTENSION_NAME, VK_KHR_MAINTENANCE_2_SPEC_VERSION},
+    {VK_KHR_MAINTENANCE_3_EXTENSION_NAME, VK_KHR_MAINTENANCE_3_SPEC_VERSION},
+    {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_GET_MEMORY_REQUIREMENTS_2_SPEC_VERSION},
+    {VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_SPEC_VERSION},
+    {VK_KHR_BIND_MEMORY_2_EXTENSION_NAME, VK_KHR_BIND_MEMORY_2_SPEC_VERSION},
+    {VK_KHR_DESCRIPTOR_UPDATE_TEMPLATE_EXTENSION_NAME, VK_KHR_DESCRIPTOR_UPDATE_TEMPLATE_SPEC_VERSION},
+    {VK_KHR_MULTIVIEW_EXTENSION_NAME, VK_KHR_MULTIVIEW_SPEC_VERSION},
+    {VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_EXTENSION_NAME, VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_SPEC_VERSION},
+    {VK_KHR_RELAXED_BLOCK_LAYOUT_EXTENSION_NAME, VK_KHR_RELAXED_BLOCK_LAYOUT_SPEC_VERSION},
 };
 
 // Whether every extension named is one of `have`.
@@ -422,7 +448,7 @@ static CALL VkResult CC EnumerateInstanceExtensionProperties(const char *layer, 
 }
 
 static CALL VkResult CC EnumerateInstanceVersion(uint32_t *version) {
-    *version = VK_API_VERSION_1_0;
+    *version = VK_API_VERSION_1_1;
     return VK_SUCCESS;
 }
 
@@ -437,7 +463,7 @@ static CALL VkResult CC EnumeratePhysicalDevices(VkInstance i, uint32_t *count, 
 
 static CALL void CC GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalDeviceProperties *p) {
     memset(p, 0, sizeof *p);
-    p->apiVersion = VK_API_VERSION_1_0;
+    p->apiVersion = VK_API_VERSION_1_1;
     p->driverVersion = VK_MAKE_VERSION(0, 1, 0);
     p->vendorID = (uint32_t)limits[L_VENDOR];
     p->deviceID = (uint32_t)limits[L_DEVICE];
@@ -448,7 +474,8 @@ static CALL void CC GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalD
     // The device's limits (WebGPU's), each at least Vulkan's minimum.
 #define AT_LEAST(v, min) ((uint32_t)((v) > (min) ? (v) : (min)))
     uint32_t dim2 = AT_LEAST(limits[L_DIM_2D], 4096);
-    l->maxImageDimension1D = AT_LEAST(limits[L_DIM_1D], 4096);
+    // (A 1D image is a 2D one's row.)
+    l->maxImageDimension1D = AT_LEAST(limits[L_DIM_2D], 4096);
     l->maxImageDimension2D = l->maxImageDimensionCube = dim2;
     l->maxImageDimension3D = AT_LEAST(limits[L_DIM_3D], 256);
     l->maxImageArrayLayers = AT_LEAST(limits[L_LAYERS], 256);
@@ -662,7 +689,17 @@ static VkFormatFeatureFlags needs(VkImageUsageFlags u) {
     return n;
 }
 
+static VkResult image_format_properties(VkFormat f, VkImageType t, VkImageTiling tl, VkImageUsageFlags u, VkImageCreateFlags c, VkImageFormatProperties *p);
+
+// (Not supported: the properties all zeros, as Vulkan says.)
 static CALL VkResult CC GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice pd, VkFormat f, VkImageType t, VkImageTiling tl, VkImageUsageFlags u, VkImageCreateFlags c, VkImageFormatProperties *p) {
+    VkResult r = image_format_properties(f, t, tl, u, c, p);
+    if (r != VK_SUCCESS)
+        memset(p, 0, sizeof *p);
+    return r;
+}
+
+static VkResult image_format_properties(VkFormat f, VkImageType t, VkImageTiling tl, VkImageUsageFlags u, VkImageCreateFlags c, VkImageFormatProperties *p) {
     if (tl == VK_IMAGE_TILING_LINEAR) {
         // (Linear: one level and layer, copied to and from.)
         VkImageUsageFlags copies = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -678,25 +715,25 @@ static CALL VkResult CC GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice 
     }
     VkSampleCountFlags samples;
     VkFormatFeatureFlags have = format_samples(f, NULL, &samples);
-    if (tl != VK_IMAGE_TILING_OPTIMAL || !have || (have & needs(u)) != needs(u) || (c & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT))
+    // (An input attachment is an attachment's, color or depth.)
+    if ((u & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) && !(have & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)))
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (tl != VK_IMAGE_TILING_OPTIMAL || !have || (have & needs(u)) != needs(u) || (c & ~(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)))
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     memset(p, 0, sizeof *p);
-    uint32_t d1 = AT_LEAST(limits[L_DIM_1D], 4096), d2 = AT_LEAST(limits[L_DIM_2D], 4096), d3 = AT_LEAST(limits[L_DIM_3D], 256);
+    uint32_t d1 = AT_LEAST(limits[L_DIM_2D], 4096), d2 = AT_LEAST(limits[L_DIM_2D], 4096), d3 = AT_LEAST(limits[L_DIM_3D], 256);
     p->maxExtent = t == VK_IMAGE_TYPE_3D ? (VkExtent3D){d3, d3, d3} : t == VK_IMAGE_TYPE_1D ? (VkExtent3D){d1, 1, 1} : (VkExtent3D){d2, d2, 1};
     uint32_t largest = t == VK_IMAGE_TYPE_3D ? d3 : t == VK_IMAGE_TYPE_1D ? d1 : d2;
     p->maxMipLevels = 1;
     while (largest >>= 1)
         p->maxMipLevels++;
     p->maxArrayLayers = t == VK_IMAGE_TYPE_3D ? 1 : AT_LEAST(limits[L_LAYERS], 256);
-    // (WebGPU's 1D images are of one level and layer, and of neither depth
-    // nor blocks; its 3D ones of neither either.)
+    // (A 1D image is 2D, a row high: of no blocks, which a row isn't of.
+    // WebGPU's 3D images are of neither depth nor blocks.)
     int depth = have & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
     int blocks = f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
-    if (t == VK_IMAGE_TYPE_1D) {
-        if (depth || blocks)
-            return VK_ERROR_FORMAT_NOT_SUPPORTED;
-        p->maxMipLevels = p->maxArrayLayers = 1;
-    }
+    if (t == VK_IMAGE_TYPE_1D && blocks)
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
     if (t == VK_IMAGE_TYPE_3D && (depth || blocks))
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     p->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
@@ -713,13 +750,89 @@ static CALL void CC GetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevic
     *count = 0;
 }
 
-// The ...2 forms (VK_KHR_get_physical_device_properties2): the 1.0 ones,
-// and nothing in their chains.
+// The ...2 forms (VK_KHR_get_physical_device_properties2, core in 1.1):
+// the 1.0 ones, and Vulkan 1.1's structures in their chains.
 static CALL void CC GetPhysicalDeviceProperties2(VkPhysicalDevice pd, VkPhysicalDeviceProperties2 *p) {
     GetPhysicalDeviceProperties(pd, &p->properties);
+    for (VkBaseOutStructure *s = p->pNext; s; s = s->pNext)
+        switch (s->sType) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES: {
+            VkPhysicalDeviceIDProperties *id = (VkPhysicalDeviceIDProperties *)s;
+            memset(id->deviceUUID, 0, VK_UUID_SIZE);
+            memcpy(id->deviceUUID, "wasm-env", 8);
+            memcpy(id->deviceUUID + 8, &limits[L_VENDOR], 4);
+            memcpy(id->deviceUUID + 12, &limits[L_DEVICE], 4);
+            memcpy(id->driverUUID, "wasm-env-vulkan", 16);
+            memset(id->deviceLUID, 0, VK_LUID_SIZE);
+            id->deviceNodeMask = 0;
+            id->deviceLUIDValid = VK_FALSE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES: {
+            VkPhysicalDeviceMaintenance3Properties *m = (VkPhysicalDeviceMaintenance3Properties *)s;
+            m->maxPerSetDescriptors = 1024;
+            m->maxMemoryAllocationSize = limits[L_ALLOCATION];
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES: {
+            // (Each view a pass of its own, of its layer: as many as a
+            // view mask has bits.)
+            VkPhysicalDeviceMultiviewProperties *m = (VkPhysicalDeviceMultiviewProperties *)s;
+            m->maxMultiviewViewCount = 32;
+            m->maxMultiviewInstanceIndex = (1u << 27) - 1;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_POINT_CLIPPING_PROPERTIES:
+            ((VkPhysicalDevicePointClippingProperties *)s)->pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_PROPERTIES:
+            ((VkPhysicalDeviceProtectedMemoryProperties *)s)->protectedNoFault = VK_FALSE;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES: {
+            // (Subgroups of one invocation, as the SPIR-V is made to have
+            // them on any device: gpu/src/spirv.rs.)
+            VkPhysicalDeviceSubgroupProperties *g = (VkPhysicalDeviceSubgroupProperties *)s;
+            g->subgroupSize = 1;
+            g->supportedStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+            g->supportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT;
+            g->quadOperationsInAllStages = VK_FALSE;
+            break;
+        }
+        default:
+            break;
+        }
 }
 static CALL void CC GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
     GetPhysicalDeviceFeatures(pd, &f->features);
+    // (Of 1.1's optional features, multiview, its only required one.)
+    for (VkBaseOutStructure *s = f->pNext; s; s = s->pNext)
+        switch (s->sType) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES:
+            memset((char *)s + sizeof(VkBaseOutStructure), 0, sizeof(VkPhysicalDevice16BitStorageFeatures) - sizeof(VkBaseOutStructure));
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES: {
+            VkPhysicalDeviceMultiviewFeatures *m = (VkPhysicalDeviceMultiviewFeatures *)s;
+            m->multiview = VK_TRUE;
+            m->multiviewGeometryShader = m->multiviewTessellationShader = VK_FALSE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES:
+            ((VkPhysicalDeviceProtectedMemoryFeatures *)s)->protectedMemory = VK_FALSE;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES:
+            ((VkPhysicalDeviceSamplerYcbcrConversionFeatures *)s)->samplerYcbcrConversion = VK_FALSE;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
+            ((VkPhysicalDeviceShaderDrawParametersFeatures *)s)->shaderDrawParameters = VK_FALSE;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES: {
+            VkPhysicalDeviceVariablePointersFeatures *v = (VkPhysicalDeviceVariablePointersFeatures *)s;
+            v->variablePointersStorageBuffer = v->variablePointers = VK_FALSE;
+            break;
+        }
+        default:
+            break;
+        }
 }
 static CALL void CC GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties2 *m) {
     GetPhysicalDeviceMemoryProperties(pd, &m->memoryProperties);
@@ -737,6 +850,16 @@ static CALL void CC GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice pd,
     *count = *count < 1 ? *count : 1;
 }
 static CALL VkResult CC GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *i, VkImageFormatProperties2 *p) {
+    // (No memory shared with other APIs or processes.)
+    for (const VkBaseInStructure *s = i->pNext; s; s = s->pNext)
+        if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO && ((const VkPhysicalDeviceExternalImageFormatInfo *)s)->handleType)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    for (VkBaseOutStructure *s = p->pNext; s; s = s->pNext) {
+        if (s->sType == VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES)
+            memset(&((VkExternalImageFormatProperties *)s)->externalMemoryProperties, 0, sizeof(VkExternalMemoryProperties));
+        if (s->sType == VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES)
+            ((VkSamplerYcbcrConversionImageFormatProperties *)s)->combinedImageSamplerDescriptorCount = 1;
+    }
     return GetPhysicalDeviceImageFormatProperties(pd, i->format, i->type, i->tiling, i->usage, i->flags, &p->imageFormatProperties);
 }
 static CALL void CC GetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice pd, const VkPhysicalDeviceSparseImageFormatInfo2 *i, uint32_t *count, VkSparseImageFormatProperties2 *p) {
@@ -770,8 +893,25 @@ static CALL VkResult CC CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateIn
             if (f[k] && !h[k])
                 return VK_ERROR_FEATURE_NOT_PRESENT;
     }
-    // (Or asked for in a VkPhysicalDeviceFeatures2.)
+    // (Or asked for in a VkPhysicalDeviceFeatures2, or 1.1's structures:
+    // of those, only multiview, without geometry or tessellation.)
     for (const VkBaseInStructure *s = info->pNext; s; s = s->pNext) {
+        if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES) {
+            const VkPhysicalDeviceMultiviewFeatures *m = (const VkPhysicalDeviceMultiviewFeatures *)s;
+            if (m->multiviewGeometryShader || m->multiviewTessellationShader)
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES) {
+            const VkPhysicalDevice16BitStorageFeatures *b = (const VkPhysicalDevice16BitStorageFeatures *)s;
+            if (b->storageBuffer16BitAccess || b->uniformAndStorageBuffer16BitAccess || b->storagePushConstant16 || b->storageInputOutput16)
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        if ((s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES && ((const VkPhysicalDeviceProtectedMemoryFeatures *)s)->protectedMemory) ||
+            (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES && ((const VkPhysicalDeviceSamplerYcbcrConversionFeatures *)s)->samplerYcbcrConversion) ||
+            (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES && ((const VkPhysicalDeviceShaderDrawParametersFeatures *)s)->shaderDrawParameters) ||
+            (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES && ((const VkPhysicalDeviceVariablePointersFeatures *)s)->variablePointers) ||
+            (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES && ((const VkPhysicalDeviceVariablePointersFeatures *)s)->variablePointersStorageBuffer))
+            return VK_ERROR_FEATURE_NOT_PRESENT;
         if (s->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
             continue;
         VkPhysicalDeviceFeatures have = supported();
@@ -785,6 +925,10 @@ static CALL VkResult CC CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateIn
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     set_loader_magic_value(d);
     set_loader_magic_value(&d->queue);
+    for (uint32_t i = 0; i < info->enabledExtensionCount; i++)
+        for (size_t k = 0; k < sizeof device_extensions / sizeof *device_extensions; k++)
+            if (!strcmp(info->ppEnabledExtensionNames[i], device_extensions[k].extensionName))
+                d->extensions |= 1u << k;
     d->queue.device = d;
     *out = d;
     return VK_SUCCESS;
@@ -1421,9 +1565,14 @@ static CALL VkResult CC CreateRenderPass(VkDevice d, const VkRenderPassCreateInf
         memcpy(p->attachments, info->pAttachments, p->n * sizeof *p->attachments);
     for (uint32_t k = 0; k < p->n; k++)
         p->first[k] = VK_ATTACHMENT_UNUSED, p->last[k] = 0;
+    const VkRenderPassMultiviewCreateInfo *multiview = NULL;
+    for (const VkBaseInStructure *x = info->pNext; x; x = x->pNext)
+        if (x->sType == VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO)
+            multiview = (const VkRenderPassMultiviewCreateInfo *)x;
     for (uint32_t s = 0; s < p->nsub; s++) {
         const VkSubpassDescription *sd = &info->pSubpasses[s];
         struct subpass *sub = &p->sub[s];
+        sub->views = multiview && s < multiview->subpassCount ? multiview->pViewMasks[s] : 0;
         // (Each color attachment with the one it's resolved into, if any.)
         for (uint32_t k = 0; k < sd->colorAttachmentCount && sub->ncolors < 8; k++)
             if (sd->pColorAttachments[k].attachment != VK_ATTACHMENT_UNUSED) {
@@ -1747,7 +1896,7 @@ static CALL VkResult CC AllocateCommandBuffers(VkDevice d, const VkCommandBuffer
 }
 
 static void reset(VkCommandBuffer c) {
-    c->n = c->nwrites = c->nreads = 0;
+    c->n = c->nwrites = c->nreads = c->nsignals = 0;
     c->bound[0] = c->bound[1] = NULL;
     memset(c->nstores, 0, sizeof c->nstores);
     c->failed = 0;
@@ -1765,6 +1914,7 @@ static CALL void CC FreeCommandBuffers(VkDevice d, VkCommandPool p, uint32_t n, 
                 for (int s = 0; s < 8; s++)
                     free(cs[i]->stores[p][s]);
             free(cs[i]->clears);
+            free(cs[i]->signals);
             free(cs[i]);
         }
 }
@@ -2279,13 +2429,28 @@ static CALL void CC CmdCopyQueryPoolResults(VkCommandBuffer c, VkQueryPool p, ui
 // A subpass begun: a WebGPU render pass of its attachments, which load as
 // the render pass says where it first uses them (else what's there), and
 // store unless where it last does the render pass says not to.
+// The views of subpass `s` that use attachment `at` first (multiview: a
+// load op is each view's, where it first uses it).
+static uint32_t first_views(VkRenderPass p, uint32_t s, uint32_t at) {
+    uint32_t before = 0;
+    for (uint32_t t = 0; t < s; t++) {
+        const struct subpass *u = &p->sub[t];
+        int uses = u->depth == at;
+        for (uint32_t k = 0; k < u->ncolors; k++)
+            uses |= u->colors[k] == at || u->resolves[k] == at;
+        if (uses)
+            before |= u->views;
+    }
+    return p->sub[s].views & ~before;
+}
+
 static void begin_subpass(VkCommandBuffer c) {
     VkRenderPass p = c->pass;
     VkFramebuffer f = c->framebuffer;
     uint32_t s = c->subpass;
     const struct subpass *sp = &p->sub[s];
     uint32_t head[2] = {sp->ncolors, sp->depth != VK_ATTACHMENT_UNUSED};
-    uint32_t h[2] = {BEGIN_PASS, 8 + 8 + sp->ncolors * 40 + (head[1] ? 32 : 0)};
+    uint32_t h[2] = {BEGIN_PASS, 8 + 8 + sp->ncolors * 44 + (head[1] ? 36 : 0) + 4};
     put(c, h, 8);
     put(c, head, 8);
     VkClearValue zero = {0};
@@ -2301,6 +2466,9 @@ static void begin_subpass(VkCommandBuffer c) {
         const VkAttachmentDescription *d = &p->attachments[at];
         const VkClearValue *clear = at < c->nclears ? &c->clears[at] : &zero;
         uint32_t load = p->first[at] == s ? (uint32_t)d->loadOp : 0, store = p->last[at] == s ? (uint32_t)d->storeOp : 0;
+        uint32_t firsts = sp->views ? first_views(p, s, at) : 0;
+        if (sp->views && firsts)
+            load = (uint32_t)d->loadOp;
         uint32_t w[6];
         if (partial && k < sp->ncolors && load == VK_ATTACHMENT_LOAD_OP_CLEAR) {
             within[nwithin++] = (VkClearAttachment){VK_IMAGE_ASPECT_COLOR_BIT, k, *clear};
@@ -2310,7 +2478,7 @@ static void begin_subpass(VkCommandBuffer c) {
             w[0] = load, w[1] = store;
             memcpy(w + 2, clear->color.uint32, 16);
         } else {
-            uint32_t sload = p->first[at] == s ? (uint32_t)d->stencilLoadOp : 0, sstore = p->last[at] == s ? (uint32_t)d->stencilStoreOp : 0;
+            uint32_t sload = p->first[at] == s || (sp->views && firsts) ? (uint32_t)d->stencilLoadOp : 0, sstore = p->last[at] == s ? (uint32_t)d->stencilStoreOp : 0;
             VkImageAspectFlags aspects = 0;
             if (partial && load == VK_ATTACHMENT_LOAD_OP_CLEAR)
                 aspects |= VK_IMAGE_ASPECT_DEPTH_BIT, load = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -2329,7 +2497,10 @@ static void begin_subpass(VkCommandBuffer c) {
             uint32_t r = sp->resolves[k];
             put(c, r != VK_ATTACHMENT_UNUSED ? &f->views[r]->handle : &none, 8);
         }
+        // (The views its load ops are for.)
+        put(c, &firsts, 4);
     }
+    put(c, &sp->views, 4);
     if (nwithin) {
         VkClearRect area = {c->area, 0, 1};
         CmdClearAttachments(c, nwithin, within, 1, &area);
@@ -2473,13 +2644,33 @@ static CALL void CC CmdDrawIndexedIndirect(VkCommandBuffer c, VkBuffer b, VkDevi
 // Barriers and events: the commands run in order (wgpu orders a
 // submission's work), so there's nothing to wait for.
 static CALL void CC CmdPipelineBarrier(VkCommandBuffer c, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags f, uint32_t nm, const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {}
-static CALL void CC CmdSetEvent(VkCommandBuffer c, VkEvent e, VkPipelineStageFlags s) {}
-static CALL void CC CmdResetEvent(VkCommandBuffer c, VkEvent e, VkPipelineStageFlags s) {}
+// (Events set and reset by a command buffer: as it's submitted.)
+static void event_op(VkCommandBuffer c, VkEvent e, int set) {
+    if (c->nsignals == c->sigcap) {
+        size_t cap = c->sigcap ? c->sigcap * 2 : 8;
+        struct signal *g = realloc(c->signals, cap * sizeof *g);
+        if (!g) {
+            c->failed = 1;
+            return;
+        }
+        c->signals = g;
+        c->sigcap = cap;
+    }
+    c->signals[c->nsignals++] = (struct signal){e, set};
+}
+static CALL void CC CmdSetEvent(VkCommandBuffer c, VkEvent e, VkPipelineStageFlags s) {
+    event_op(c, e, 1);
+}
+static CALL void CC CmdResetEvent(VkCommandBuffer c, VkEvent e, VkPipelineStageFlags s) {
+    event_op(c, e, 0);
+}
 static CALL void CC CmdWaitEvents(VkCommandBuffer c, uint32_t n, const VkEvent *e, VkPipelineStageFlags src, VkPipelineStageFlags dst, uint32_t nm, const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {}
 
 static CALL void CC CmdExecuteCommands(VkCommandBuffer c, uint32_t n, const VkCommandBuffer *cs) {
     for (uint32_t i = 0; i < n; i++) {
         put(c, cs[i]->s, cs[i]->n);
+        for (size_t k = 0; k < cs[i]->nsignals; k++)
+            event_op(c, cs[i]->signals[k].event, cs[i]->signals[k].set);
         for (size_t k = 0; k < cs[i]->nwrites; k++) {
             struct write w = cs[i]->writes[k];
             struct VkBuffer_T b = {w.end - w.offset, 0, w.memory, w.offset};
@@ -2572,6 +2763,8 @@ static CALL VkResult CC QueueSubmit(VkQueue queue, uint32_t n, const VkSubmitInf
     for (uint32_t i = 0; i < n; i++)
         for (uint32_t k = 0; k < info[i].commandBufferCount; k++) {
             VkCommandBuffer c = info[i].pCommandBuffers[k];
+            for (size_t g = 0; g < c->nsignals; g++)
+                c->signals[g].event->set = c->signals[g].set;
             if (!c->n)
                 continue;
             struct request q = {VK_SUBMIT, {(uint64_t)(uintptr_t)c->s, c->n}};
@@ -2978,6 +3171,32 @@ static CALL VkResult CC AcquireNextImageKHR(VkDevice d, VkSwapchainKHR s, uint64
     return timeout ? VK_TIMEOUT : VK_NOT_READY;
 }
 
+// Device groups' presenting (core 1.1 with VK_KHR_swapchain): the one
+// device's, presenting locally.
+static CALL VkResult CC AcquireNextImage2KHR(VkDevice d, const VkAcquireNextImageInfoKHR *i, uint32_t *index) {
+    return AcquireNextImageKHR(d, i->swapchain, i->timeout, i->semaphore, i->fence, index);
+}
+
+static CALL VkResult CC GetDeviceGroupPresentCapabilitiesKHR(VkDevice d, VkDeviceGroupPresentCapabilitiesKHR *c) {
+    memset(c->presentMask, 0, sizeof c->presentMask);
+    c->presentMask[0] = 1;
+    c->modes = VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR;
+    return VK_SUCCESS;
+}
+
+static CALL VkResult CC GetDeviceGroupSurfacePresentModesKHR(VkDevice d, VkSurfaceKHR surface, VkDeviceGroupPresentModeFlagsKHR *modes) {
+    *modes = VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR;
+    return VK_SUCCESS;
+}
+
+// (The surface whole.)
+static CALL VkResult CC GetPhysicalDevicePresentRectanglesKHR(VkPhysicalDevice pd, VkSurfaceKHR surface, uint32_t *count, VkRect2D *rects) {
+    VkSurfaceCapabilitiesKHR c;
+    GetPhysicalDeviceSurfaceCapabilitiesKHR(pd, surface, &c);
+    VkRect2D r = {{0, 0}, c.currentExtent};
+    return enumerate(count, rects, &r, 1, sizeof r);
+}
+
 // Presenting: once the compositor has shown the last frame (FIFO) and is
 // done with this image's buffer, the image copied into it and committed.
 static VkResult present(VkSwapchainKHR s, uint32_t i) {
@@ -3036,6 +3255,152 @@ static CALL VkResult CC QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *i
     return result;
 }
 
+// ---- Vulkan 1.1 ----
+
+static void unimplemented(const char *command);
+
+// One group, of the one device.
+static CALL VkResult CC EnumeratePhysicalDeviceGroups(VkInstance i, uint32_t *count, VkPhysicalDeviceGroupProperties *out) {
+    if (open_device()) {
+        *count = 0;
+        return VK_SUCCESS;
+    }
+    if (!out) {
+        *count = 1;
+        return VK_SUCCESS;
+    }
+    if (*count < 1)
+        return VK_INCOMPLETE;
+    out[0].physicalDeviceCount = 1;
+    memset(out[0].physicalDevices, 0, sizeof out[0].physicalDevices);
+    out[0].physicalDevices[0] = &physical;
+    out[0].subsetAllocation = VK_FALSE;
+    *count = 1;
+    return VK_SUCCESS;
+}
+
+static CALL void CC GetDeviceGroupPeerMemoryFeatures(VkDevice d, uint32_t heap, uint32_t local, uint32_t remote, VkPeerMemoryFeatureFlags *f) {
+    *f = VK_PEER_MEMORY_FEATURE_COPY_SRC_BIT | VK_PEER_MEMORY_FEATURE_COPY_DST_BIT | VK_PEER_MEMORY_FEATURE_GENERIC_SRC_BIT | VK_PEER_MEMORY_FEATURE_GENERIC_DST_BIT;
+}
+
+static CALL void CC CmdSetDeviceMask(VkCommandBuffer c, uint32_t mask) {
+}
+
+// (From work group 0 only, as yet: a base would be the shaders' to add.)
+static CALL void CC CmdDispatchBase(VkCommandBuffer c, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y, uint32_t z) {
+    if (bx || by || bz) {
+        unimplemented("vkCmdDispatchBase from a work group other than 0");
+        c->failed = 1;
+        return;
+    }
+    CmdDispatch(c, x, y, z);
+}
+
+// (Memory a buffer or image needs: never its own allocation.)
+static void dedicated(void *chain) {
+    for (VkBaseOutStructure *s = chain; s; s = s->pNext)
+        if (s->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+            VkMemoryDedicatedRequirements *r = (VkMemoryDedicatedRequirements *)s;
+            r->prefersDedicatedAllocation = r->requiresDedicatedAllocation = VK_FALSE;
+        }
+}
+
+static CALL void CC GetBufferMemoryRequirements2(VkDevice d, const VkBufferMemoryRequirementsInfo2 *i, VkMemoryRequirements2 *r) {
+    GetBufferMemoryRequirements(d, i->buffer, &r->memoryRequirements);
+    dedicated(r->pNext);
+}
+
+static CALL void CC GetImageMemoryRequirements2(VkDevice d, const VkImageMemoryRequirementsInfo2 *i, VkMemoryRequirements2 *r) {
+    GetImageMemoryRequirements(d, i->image, &r->memoryRequirements);
+    dedicated(r->pNext);
+}
+
+static CALL void CC GetImageSparseMemoryRequirements2(VkDevice d, const VkImageSparseMemoryRequirementsInfo2 *i, uint32_t *count, VkSparseImageMemoryRequirements2 *r) {
+    *count = 0;
+}
+
+static CALL VkResult CC BindBufferMemory2(VkDevice d, uint32_t n, const VkBindBufferMemoryInfo *b) {
+    for (uint32_t i = 0; i < n; i++)
+        BindBufferMemory(d, b[i].buffer, b[i].memory, b[i].memoryOffset);
+    return VK_SUCCESS;
+}
+
+static CALL VkResult CC BindImageMemory2(VkDevice d, uint32_t n, const VkBindImageMemoryInfo *b) {
+    for (uint32_t i = 0; i < n; i++)
+        BindImageMemory(d, b[i].image, b[i].memory, b[i].memoryOffset);
+    return VK_SUCCESS;
+}
+
+static CALL void CC TrimCommandPool(VkDevice d, VkCommandPool pool, VkCommandPoolTrimFlags flags) {
+}
+
+// (Unprotected queues only: the one.)
+static CALL void CC GetDeviceQueue2(VkDevice d, const VkDeviceQueueInfo2 *i, VkQueue *q) {
+    *q = i->flags ? VK_NULL_HANDLE : &d->queue;
+}
+
+// A descriptor update template: its entries, each a run of descriptors
+// read from the program's data at an offset and stride, written as
+// vkUpdateDescriptorSets would.
+struct VkDescriptorUpdateTemplate_T {
+    uint32_t n;
+    VkDescriptorUpdateTemplateEntry *entries;
+};
+
+static CALL VkResult CC CreateDescriptorUpdateTemplate(VkDevice d, const VkDescriptorUpdateTemplateCreateInfo *info, const VkAllocationCallbacks *a, VkDescriptorUpdateTemplate *out) {
+    struct VkDescriptorUpdateTemplate_T *t = zalloc(sizeof *t);
+    if (!t || !(t->entries = zalloc(info->descriptorUpdateEntryCount * sizeof *t->entries))) {
+        free(t);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    t->n = info->descriptorUpdateEntryCount;
+    memcpy(t->entries, info->pDescriptorUpdateEntries, t->n * sizeof *t->entries);
+    *out = t;
+    return VK_SUCCESS;
+}
+
+static CALL void CC DestroyDescriptorUpdateTemplate(VkDevice d, VkDescriptorUpdateTemplate t, const VkAllocationCallbacks *a) {
+    if (!t)
+        return;
+    free(t->entries);
+    free(t);
+}
+
+static CALL void CC UpdateDescriptorSetWithTemplate(VkDevice d, VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void *data) {
+    for (uint32_t i = 0; i < t->n; i++) {
+        const VkDescriptorUpdateTemplateEntry *e = &t->entries[i];
+        for (uint32_t k = 0; k < e->descriptorCount; k++) {
+            const char *at = (const char *)data + e->offset + (size_t)k * e->stride;
+            VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, e->dstBinding, e->dstArrayElement + k, 1, e->descriptorType,
+                                      (const VkDescriptorImageInfo *)at, (const VkDescriptorBufferInfo *)at, (const VkBufferView *)at};
+            UpdateDescriptorSets(d, 1, &w, 0, NULL);
+        }
+    }
+}
+
+// (A set layout is supported if its descriptors are within a set's.)
+static CALL void CC GetDescriptorSetLayoutSupport(VkDevice d, const VkDescriptorSetLayoutCreateInfo *info, VkDescriptorSetLayoutSupport *s) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < info->bindingCount; i++)
+        total += info->pBindings[i].descriptorCount;
+    s->supported = total <= 1024;
+}
+
+// (No buffers, fences or semaphores shared with other APIs or processes.)
+static CALL void CC GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice pd, const VkPhysicalDeviceExternalBufferInfo *i, VkExternalBufferProperties *p) {
+    memset(&p->externalMemoryProperties, 0, sizeof p->externalMemoryProperties);
+}
+
+static CALL void CC GetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice pd, const VkPhysicalDeviceExternalFenceInfo *i, VkExternalFenceProperties *p) {
+    p->exportFromImportedHandleTypes = p->compatibleHandleTypes = 0;
+    p->externalFenceFeatures = 0;
+}
+
+static CALL void CC GetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice pd, const VkPhysicalDeviceExternalSemaphoreInfo *i, VkExternalSemaphoreProperties *p) {
+    p->exportFromImportedHandleTypes = p->compatibleHandleTypes = 0;
+    p->externalSemaphoreFeatures = 0;
+}
+
 // ---- Entry points ----
 
 long write(int, const void *, size_t);
@@ -3073,20 +3438,34 @@ static CALL VkResult CC EnumerateInstanceLayerProperties(uint32_t *count, VkLaye
 struct entry {
     const char *name;
     PFN_vkVoidFunction f;
+    // The extension it's of (NULL: Vulkan's own).
+    const char *extension;
 };
 // The tables, global, instance and device, from vk.xml (entries.awk).
 #include "entries.h"
 
-static PFN_vkVoidFunction find(const struct entry *t, size_t n, const char *name) {
+static const struct entry *lookup(const struct entry *t, size_t n, const char *name) {
     for (size_t k = 0; k < n; k++)
         if (!strcmp(t[k].name, name))
-            return t[k].f;
+            return &t[k];
     return NULL;
 }
-#define FIND(t, name) find(t, sizeof t / sizeof *t, name)
+#define LOOKUP(t, name) lookup(t, sizeof t / sizeof *t, name)
+#define FIND(t, name) (LOOKUP(t, name) ? LOOKUP(t, name)->f : NULL)
 
+// (An extension's commands only where the device has it enabled.)
 static CALL PFN_vkVoidFunction CC GetDeviceProcAddr(VkDevice d, const char *name) {
-    return FIND(device, name);
+    const struct entry *e = LOOKUP(device, name);
+    if (!e)
+        return NULL;
+    if (e->extension) {
+        size_t k = 0, n = sizeof device_extensions / sizeof *device_extensions;
+        while (k < n && strcmp(device_extensions[k].extensionName, e->extension))
+            k++;
+        if (k == n || !(d->extensions >> k & 1))
+            return NULL;
+    }
+    return e->f;
 }
 
 API CALL PFN_vkVoidFunction CC vk_icdGetInstanceProcAddr(VkInstance i, const char *name) {
