@@ -21,7 +21,7 @@ pub struct Gpu {
     pub quirks: Quirks,
     pipelines: Mutex<HashMap<(usize, String, Launch), Arc<Pipeline>>>,
     /// Vulkan's blits: a render pipeline per destination format.
-    pub(crate) blits: Mutex<HashMap<(wgpu::TextureFormat, &'static str), wgpu::RenderPipeline>>,
+    pub(crate) blits: Mutex<HashMap<(wgpu::TextureFormat, &'static str, bool), wgpu::RenderPipeline>>,
     /// Vulkan's copies of buffers at any size and offset (WebGPU's are of
     /// whole words): a compute pipeline copying bytes.
     pub(crate) byte_copy: Mutex<Option<wgpu::ComputePipeline>>,

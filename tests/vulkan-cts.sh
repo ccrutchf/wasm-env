@@ -11,7 +11,8 @@
 # lavapipe (GPU software, the default) or the Intel GPU (intel), a pattern
 # at a time, and counts the results in build/vk-cts-run/PATTERN.log
 # (deqp-vk's own log is PATTERN.qpa). Needs network the first time (the
-# CTS's sources and theirs). WASM_ENV names another wasm-env to run it with.
+# CTS's sources and theirs). WASM_ENV names another wasm-env to run it with,
+# ICD_JSON another driver manifest in the environment's icd.d.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 R=$root/build/ubuntu
@@ -72,7 +73,7 @@ run)
 	cts() { # deqp-vk ARGS... in the environment, from /opt/vk-cts
 		VK_ICD_FILENAMES=$root/build/mesa/share/vulkan/icd.d/${icd}_icd.x86_64.json WGPU_BACKEND=vulkan WASM_ENV_GPU=$gpu \
 			timeout "${CTS_TIMEOUT:-7200}" "${WASM_ENV:-$root/target/release/wasm-env}" run --root "$R" \
-			--env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/wasm-env_icd.aarch64.json --env HOME=/root \
+			--env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/${ICD_JSON:-wasm-env_icd.aarch64.json} --env HOME=/root \
 			/bin/sh -c "cd /opt/vk-cts && ./deqp-vk $*"
 	}
 	for pattern in "$@"; do

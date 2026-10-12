@@ -965,7 +965,7 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
             bias: if s.bias.0 { wgpu::DepthBiasState { constant: s.bias.1 as i32, slope_scale: s.bias.2, clamp: s.bias.3 } } else { Default::default() },
         })
     };
-    let targets: Vec<Option<wgpu::ColorTargetState>> = s
+    let mut targets: Vec<Option<wgpu::ColorTargetState>> = s
         .colors
         .iter()
         .map(|c| {
@@ -977,6 +977,11 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
             Ok(Some(wgpu::ColorTargetState { format: f, blend, write_mask: wgpu::ColorWrites::from_bits_truncate(c[8]) }))
         })
         .collect::<Res<_>>()?;
+    // (No attachments, which WebGPU's pipelines can't be: a dummy target
+    // nothing's written to, as its passes have, `submit`.)
+    if targets.is_empty() && s.depth_format == 0 {
+        targets.push(Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R8Unorm, blend: None, write_mask: wgpu::ColorWrites::empty() }));
+    }
     // A layout of its own, made from both stages: wgpu's derived layouts
     // refuse a binding the stages declare differently (a block of which each
     // declares the members it uses: their minimum sizes differ).
@@ -1102,7 +1107,7 @@ pub enum Command {
     ClearColor { image: u64, mip: u32, mips: u32, layer: u32, layers: u32, color: [u32; 4] },
     /// A render pass: its color attachments and depth/stencil attachment;
     /// the commands up to EndPass are its.
-    BeginPass { colors: Vec<Attachment>, depth: Option<DepthAttachment>, views: u32 },
+    BeginPass { colors: Vec<Attachment>, depth: Option<DepthAttachment>, views: u32, frame: [u32; 2] },
     EndPass,
     /// x, y, width, height, minimum and maximum depth.
     SetViewport([f32; 6]),
@@ -1122,13 +1127,13 @@ pub enum Command {
     BindGraphicsSet { set: u32, bindings: Vec<Binding> },
     /// A region of one image's mip level and layer scaled into another's
     /// (corners: x0, y0, x1, y1), linearly filtered or not.
-    Blit { src: u64, src_level: [u32; 2], from: [i32; 4], dst: u64, dst_level: [u32; 2], to: [i32; 4], linear: bool },
+    Blit { src: u64, src_level: [u32; 2], from: [i32; 4], dst: u64, dst_level: [u32; 2], to: [i32; 4], zs: [i32; 4], linear: bool },
     /// An image's depth and stencil (`aspect`: VkImageAspectFlags) cleared.
     ClearDepth { image: u64, mip: u32, mips: u32, layer: u32, layers: u32, aspect: u32, depth: f32, stencil: u32 },
     /// A multisampled image's mip level and layers resolved into another's.
     Resolve { src: u64, src_level: [u32; 2], dst: u64, dst_level: [u32; 2], layers: u32 },
     /// Inside a render pass: attachments cleared within rectangles.
-    ClearAttachments { attachments: Vec<Clear>, rects: Vec<[u32; 4]> },
+    ClearAttachments { attachments: Vec<Clear>, rects: Vec<[u32; 6]> },
     /// An occlusion query begun and ended in a render pass.
     BeginQuery { pool: u64, index: u32 },
     EndQuery { pool: u64, index: u32 },
@@ -1142,6 +1147,9 @@ pub enum Command {
     SetDepthBias([u32; 3]),
     SetStencilCompareMask(u32),
     SetStencilWriteMask(u32),
+    /// A buffer's range filled with a texel of a format (VkFormat), a
+    /// color packed: a linear image cleared.
+    FillTexels { dst: u64, offset: u64, size: u64, format: u32, color: [u32; 4] },
 }
 
 /// An attachment cleared inside a render pass: a color attachment (its
@@ -1209,7 +1217,8 @@ pub struct DepthAttachment {
 ///                    first), and the depth's view (u64), depth's and
 ///                    stencil's load and store ops, clear depth (f32) and
 ///                    stencil (u32), and the views its load ops are for;
-///                    then the views (multiview's view mask, 0: none)
+///                    then the views (multiview's view mask, 0: none), and
+///                    the framebuffer's width and height
 ///  14 END_PASS
 ///  15 SET_VIEWPORT   x, y, width, height, minimum and maximum depth (f32)
 ///  16 SET_SCISSOR    x, y, width, height (u32)
@@ -1225,7 +1234,9 @@ pub struct DepthAttachment {
 ///  25 BIND_GRAPHICS_SET  as BIND_SET, for graphics
 ///  26 BLIT           source, destination (u64), then u32s: the source's mip
 ///                    level, layer, corners (i32 × 4: x0, y0, x1, y1); the
-///                    destination's likewise; VkFilter
+///                    destination's likewise; VkFilter; and 3D images' z
+///                    ranges (i32 × 4: the source's z0, z1, the
+///                    destination's; 0, 1 for 2D)
 ///  27 CLEAR_DEPTH    image (u64), mip, mips, layer, layers, aspect (u32),
 ///                    depth (f32), stencil (u32)
 ///  28 RESOLVE        source, destination (u64), the source's mip level and
@@ -1243,6 +1254,8 @@ pub struct DepthAttachment {
 ///  35 SET_DEPTH_BIAS constant, clamp, slope (f32)
 ///  36 SET_STENCIL_COMPARE_MASK  mask (u32)
 ///  37 SET_STENCIL_WRITE_MASK  mask (u32)
+///  38 FILL_TEXELS    buffer, offset, size (u64), format (VkFormat), color
+///                    (u32 × 4: a clear value's)
 ///
 /// A SUB: mip, layer, layers, aspect (u32), origin (i32 × 3), extent (u32 × 3).
 pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
@@ -1307,7 +1320,7 @@ pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
                 } else {
                     None
                 };
-                Command::BeginPass { colors, depth, views: r.u32()? }
+                Command::BeginPass { colors, depth, views: r.u32()?, frame: [r.u32()?, r.u32()?] }
             }
             14 => Command::EndPass,
             15 => Command::SetViewport([r.f32()?, r.f32()?, r.f32()?, r.f32()?, r.f32()?, r.f32()?]),
@@ -1324,12 +1337,12 @@ pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
             24 => Command::SetStencilReference(r.u32()?),
             26 => {
                 let (src, dst) = (r.u64()?, r.u64()?);
-                let mut w = [0u32; 13];
+                let mut w = [0u32; 17];
                 for v in &mut w {
                     *v = r.u32()?;
                 }
                 let corners = |k: usize| [w[k] as i32, w[k + 1] as i32, w[k + 2] as i32, w[k + 3] as i32];
-                Command::Blit { src, src_level: [w[0], w[1]], from: corners(2), dst, dst_level: [w[6], w[7]], to: corners(8), linear: w[12] == 1 }
+                Command::Blit { src, src_level: [w[0], w[1]], from: corners(2), dst, dst_level: [w[6], w[7]], to: corners(8), zs: corners(13), linear: w[12] == 1 }
             }
             27 => Command::ClearDepth { image: r.u64()?, mip: r.u32()?, mips: r.u32()?, layer: r.u32()?, layers: r.u32()?, aspect: r.u32()?, depth: r.f32()?, stencil: r.u32()? },
             28 => {
@@ -1339,14 +1352,7 @@ pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
             29 => {
                 let (n, rects) = (r.u32()?, r.u32()?);
                 let attachments = (0..n).map(|_| Ok(Clear { aspect: r.u32()?, index: r.u32()?, value: [r.u32()?, r.u32()?, r.u32()?, r.u32()?] })).collect::<Res<_>>()?;
-                // (Layers aside: a pass's attachments are views of one.)
-                let rects = (0..rects)
-                    .map(|_| {
-                        let rect = [r.u32()?, r.u32()?, r.u32()?, r.u32()?];
-                        let (_, _) = (r.u32()?, r.u32()?);
-                        Ok(rect)
-                    })
-                    .collect::<Res<_>>()?;
+                let rects = (0..rects).map(|_| Ok([r.u32()?, r.u32()?, r.u32()?, r.u32()?, r.u32()?, r.u32()?])).collect::<Res<_>>()?;
                 Command::ClearAttachments { attachments, rects }
             }
             30 => {
@@ -1360,6 +1366,7 @@ pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
             35 => Command::SetDepthBias([r.u32()?, r.u32()?, r.u32()?]),
             36 => Command::SetStencilCompareMask(r.u32()?),
             37 => Command::SetStencilWriteMask(r.u32()?),
+            38 => Command::FillTexels { dst: r.u64()?, offset: r.u64()?, size: r.u64()?, format: r.u32()?, color: [r.u32()?, r.u32()?, r.u32()?, r.u32()?] },
             op => return Err(format!("command {op}")),
         });
         at += len;
@@ -1600,8 +1607,9 @@ pub struct View {
     pub samples: u32,
     /// Its first mip level and layer.
     pub base: [u32; 2],
-    /// Whether it's of a 2D array's layers.
+    /// Whether it's of a 2D array's layers, and how many.
     pub array: bool,
+    pub layers: u32,
 }
 
 /// A view of an image: Vulkan's view type (VkImageViewType), its format
@@ -1639,7 +1647,7 @@ pub fn view(t: &wgpu::Texture, kind: u32, vk_format: u32, aspect_bits: u32, mip:
             ..Default::default()
         })
     });
-    Ok(View { view, format: format.unwrap_or(t.format()), size, attachment, samples: t.sample_count(), base: [mip, layer], array: dimension == D::D2Array })
+    Ok(View { view, format: format.unwrap_or(t.format()), size, attachment, samples: t.sample_count(), base: [mip, layer], array: dimension == D::D2Array, layers: if dimension == D::D3 { 1 } else { layers } })
 }
 
 /// A query pool (VkQueryPool): WebGPU's query set, occlusion or timestamps,
@@ -1733,7 +1741,7 @@ pub fn texel_view(gpu: &Gpu, buffer: u64, offset: u64, range: u64, vk_format: u3
     if let Some(e) = pollster::block_on(scope.pop()) {
         return Err(format!("texel buffer view: {}", describe(&e)));
     }
-    let view = View { view: texture.create_view(&Default::default()), format: f, size: [width, height], attachment: None, samples: 1, base: [0, 0], array: false };
+    let view = View { view: texture.create_view(&Default::default()), format: f, size: [width, height], attachment: None, samples: 1, base: [0, 0], array: false, layers: 1 };
     Ok(TexelView { buffer, offset, texels: texels as u32, texture, view })
 }
 
@@ -1840,9 +1848,12 @@ fn on_texture<'t>(t: &'t wgpu::Texture, s: &Sub) -> (wgpu::TexelCopyTextureInfo<
     let d3 = t.dimension() == wgpu::TextureDimension::D3;
     let z = if d3 { s.origin[2] as u32 } else { s.layer };
     let depth = if d3 { s.extent[2] } else { s.layers };
+    // (Whole blocks: Vulkan's extent stops at a small level's edge, inside
+    // its last block; WebGPU's covers the block.)
+    let (bw, bh) = t.format().block_dimensions();
     (
         wgpu::TexelCopyTextureInfo { texture: t, mip_level: s.mip, origin: wgpu::Origin3d { x: s.origin[0] as u32, y: s.origin[1] as u32, z }, aspect: aspect(s.aspect) },
-        wgpu::Extent3d { width: s.extent[0], height: s.extent[1], depth_or_array_layers: depth },
+        wgpu::Extent3d { width: s.extent[0].next_multiple_of(bw), height: s.extent[1].next_multiple_of(bh), depth_or_array_layers: depth },
     )
 }
 
@@ -2286,43 +2297,34 @@ fn clear_attachments(gpu: &Gpu, pass: &mut wgpu::RenderPass<'_>, t: &Targets, si
     Ok(())
 }
 
+/// A blit's shader: a quad over the destination, T the source's sample
+/// type, DIM its dimension (2d, or 3d: the slice at the uniform's w), and
+/// each texel sampled (`textureSampleLevel`) or, where the source isn't
+/// filtered (integers, floats the device won't filter), the nearest one
+/// fetched.
 const BLIT: &str = "
-@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(0) var t: texture_DIM<T>;
 @group(0) @binding(1) var s: sampler;
-// The source's coordinates at the destination's corners: u0, v0, u1, v1.
-@group(0) @binding(2) var<uniform> r: vec4<f32>;
+// The source's coordinates at the destination's corners: u0, v0, u1, v1;
+// and a 3D source's slice: w (0 to 1), and its index.
+@group(0) @binding(2) var<uniform> r: array<vec4<f32>, 2>;
 struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> }
 @vertex fn vs(@builtin(vertex_index) i: u32) -> V {
     let c = vec2<f32>(f32(i & 1u), f32(i >> 1u));
-    return V(vec4<f32>(c.x * 2.0 - 1.0, 1.0 - c.y * 2.0, 0.0, 1.0), mix(r.xy, r.zw, c));
+    return V(vec4<f32>(c.x * 2.0 - 1.0, 1.0 - c.y * 2.0, 0.0, 1.0), mix(r[0].xy, r[0].zw, c));
 }
-@fragment fn fs(v: V) -> @location(0) vec4<f32> { return textureSampleLevel(t, s, v.uv, 0.0); }
+@fragment fn fs(v: V) -> @location(0) vec4<T> { return TEXEL; }
 ";
 
-/// A blit from a format that isn't filtered (integers', or floats' the
-/// device won't filter): the nearest texel fetched, T the source's (and
-/// destination's) sample type.
-const BLIT_NEAREST: &str = "
-@group(0) @binding(0) var t: texture_2d<T>;
-@group(0) @binding(2) var<uniform> r: vec4<f32>;
-struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> }
-@vertex fn vs(@builtin(vertex_index) i: u32) -> V {
-    let c = vec2<f32>(f32(i & 1u), f32(i >> 1u));
-    return V(vec4<f32>(c.x * 2.0 - 1.0, 1.0 - c.y * 2.0, 0.0, 1.0), mix(r.xy, r.zw, c));
-}
-@fragment fn fs(v: V) -> @location(0) vec4<T> {
-    let size = vec2<f32>(textureDimensions(t, 0));
-    return textureLoad(t, vec2<i32>(clamp(floor(v.uv * size), vec2<f32>(0.0), size - 1.0)), 0);
-}
-";
-
-/// A blit: one mip level and layer's region (corners `from`) scaled into
+/// A blit: one mip level and layer's region (corners `from`, and for 3D
+/// images `zs`: the source's z range and the destination's) scaled into
 /// another's (`to`), mirrored where the corners are; a copy where nothing
-/// is scaled, else drawn (a quad sampling the source, or fetching its
-/// nearest texels where it isn't filtered).
+/// is scaled, else drawn, a 3D destination a slice at a time (a quad
+/// sampling the source, or fetching its nearest texels where it isn't
+/// filtered).
 #[allow(clippy::too_many_arguments)]
-fn blit(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, src: &wgpu::Texture, [sm, sl]: [u32; 2], from: [i32; 4], dst: &wgpu::Texture, [dm, dl]: [u32; 2], to: [i32; 4], linear: bool) -> Res<()> {
-    let (mut from, mut to) = (from, to);
+fn blit(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, src: &wgpu::Texture, [sm, sl]: [u32; 2], from: [i32; 4], dst: &wgpu::Texture, [dm, dl]: [u32; 2], to: [i32; 4], zs: [i32; 4], linear: bool) -> Res<()> {
+    let (mut from, mut to, mut zs) = (from, to, zs);
     // (The destination's corners in order; the source's swapped with them.)
     for k in 0..2 {
         if to[k] > to[k + 2] {
@@ -2330,13 +2332,19 @@ fn blit(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, src: &wgpu::Texture, [sm, sl]
             from.swap(k, k + 2);
         }
     }
-    let (w, h) = ((to[2] - to[0]) as u32, (to[3] - to[1]) as u32);
-    if w == 0 || h == 0 {
+    if zs[2] > zs[3] {
+        zs.swap(2, 3);
+        zs.swap(0, 1);
+    }
+    let (w, h, d) = ((to[2] - to[0]) as u32, (to[3] - to[1]) as u32, (zs[3] - zs[2]) as u32);
+    if w == 0 || h == 0 || d == 0 {
         return Ok(());
     }
-    if from[2] - from[0] == w as i32 && from[3] - from[1] == h as i32 && src.format() == dst.format() {
-        let at = |t, mip, layer, x: i32, y: i32| wgpu::TexelCopyTextureInfo { texture: t, mip_level: mip, origin: wgpu::Origin3d { x: x as u32, y: y as u32, z: layer }, aspect: wgpu::TextureAspect::All };
-        enc.copy_texture_to_texture(at(src, sm, sl, from[0], from[1]), at(dst, dm, dl, to[0], to[1]), wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+    let (src3, dst3) = (src.dimension() == wgpu::TextureDimension::D3, dst.dimension() == wgpu::TextureDimension::D3);
+    if from[2] - from[0] == w as i32 && from[3] - from[1] == h as i32 && zs[1] - zs[0] == d as i32 && src.format() == dst.format() {
+        let at = |t, mip, z: u32, x: i32, y: i32| wgpu::TexelCopyTextureInfo { texture: t, mip_level: mip, origin: wgpu::Origin3d { x: x as u32, y: y as u32, z }, aspect: wgpu::TextureAspect::All };
+        let (sz, dz) = (if src3 { zs[0] as u32 } else { sl }, if dst3 { zs[2] as u32 } else { dl });
+        enc.copy_texture_to_texture(at(src, sm, sz, from[0], from[1]), at(dst, dm, dz, to[0], to[1]), wgpu::Extent3d { width: w, height: h, depth_or_array_layers: d });
         return Ok(());
     }
     let format = dst.format();
@@ -2352,8 +2360,17 @@ fn blit(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, src: &wgpu::Texture, [sm, sl]
         _ => "f32",
     };
     let mut blits = gpu.blits.lock().unwrap();
-    let pipeline = blits.entry((format, kind)).or_insert_with(|| {
-        let source = if kind.is_empty() { BLIT.to_string() } else { BLIT_NEAREST.replace("<T>", &format!("<{kind}>")) };
+    let pipeline = blits.entry((format, kind, src3)).or_insert_with(|| {
+        let texel = match (kind.is_empty(), src3) {
+            (true, false) => "textureSampleLevel(t, s, v.uv, 0.0)",
+            (true, true) => "textureSampleLevel(t, s, vec3<f32>(v.uv, r[1].x), 0.0)",
+            (false, false) => "textureLoad(t, vec2<i32>(clamp(floor(v.uv * vec2<f32>(textureDimensions(t, 0))), vec2<f32>(0.0), vec2<f32>(textureDimensions(t, 0)) - 1.0)), 0)",
+            (false, true) => {
+                "textureLoad(t, vec3<i32>(vec2<i32>(clamp(floor(v.uv * vec2<f32>(textureDimensions(t, 0).xy)), vec2<f32>(0.0), vec2<f32>(textureDimensions(t, 0).xy) - 1.0)), i32(r[1].y)), 0)"
+            }
+        };
+        let source = BLIT.replace("DIM", if src3 { "3d" } else { "2d" }).replace("<T>", &format!("<{}>", if kind.is_empty() { "f32" } else { kind })).replace("TEXEL", texel);
+        let source = if kind.is_empty() { source } else { source.replace("@group(0) @binding(1) var s: sampler;\n", "") };
         let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(source.into()) });
         gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
@@ -2367,46 +2384,51 @@ fn blit(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, src: &wgpu::Texture, [sm, sl]
             cache: None,
         })
     });
+    // (A level's view: one layer of a 2D image, or a 3D one's whole.)
     let level = |t: &wgpu::Texture, mip, layer| {
+        let d3 = t.dimension() == wgpu::TextureDimension::D3;
         t.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2),
+            dimension: Some(if d3 { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 }),
             base_mip_level: mip,
             mip_level_count: Some(1),
-            base_array_layer: layer,
+            base_array_layer: if d3 { 0 } else { layer },
             array_layer_count: Some(1),
             ..Default::default()
         })
     };
-    let (sw, sh) = ((src.width() >> sm).max(1) as f32, (src.height() >> sm).max(1) as f32);
-    let r = [from[0] as f32 / sw, from[1] as f32 / sh, from[2] as f32 / sw, from[3] as f32 / sh];
-    let uniform = wgpu::util::DeviceExt::create_buffer_init(&gpu.device, &wgpu::util::BufferInitDescriptor {
-        label: None,
-        contents: &r.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<_>>(),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let (sw, sh, sd) = ((src.width() >> sm).max(1) as f32, (src.height() >> sm).max(1) as f32, (src.depth_or_array_layers() >> sm).max(1) as f32);
     let filter = if linear { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest };
     let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: filter, min_filter: filter, ..Default::default() });
-    let source = level(src, sm, sl);
-    let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&source) }, wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() }];
-    if kind.is_empty() {
-        entries.push(wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) });
+    let (source, target) = (level(src, sm, sl), level(dst, dm, dl));
+    // Each slice of the destination's: the source's at its middle.
+    for k in 0..d {
+        let z = (zs[0] as f32 + (k as f32 + 0.5) * (zs[1] - zs[0]) as f32 / d as f32).clamp(0.0, sd - 0.5);
+        let r = [from[0] as f32 / sw, from[1] as f32 / sh, from[2] as f32 / sw, from[3] as f32 / sh, z / sd, z.floor(), 0.0, 0.0];
+        let uniform = wgpu::util::DeviceExt::create_buffer_init(&gpu.device, &wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: &r.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<_>>(),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&source) }, wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() }];
+        if kind.is_empty() {
+            entries.push(wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) });
+        }
+        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &entries });
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target,
+                depth_slice: dst3.then_some(zs[2] as u32 + k),
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.set_viewport(to[0] as f32, to[1] as f32, w as f32, h as f32, 0.0, 1.0);
+        pass.draw(0..4, 0..1);
     }
-    let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &entries });
-    let target = level(dst, dm, dl);
-    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: None,
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: &target,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-        })],
-        ..Default::default()
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, &group, &[]);
-    pass.set_viewport(to[0] as f32, to[1] as f32, w as f32, h as f32, 0.0, 1.0);
-    pass.draw(0..4, 0..1);
     Ok(())
 }
 
@@ -2528,11 +2550,34 @@ fn packed(format: wgpu::TextureFormat, bits: &[u32; 4]) -> Option<Vec<u8>> {
         F::R16Float => lanes(1, &|k| half(k).to_vec()),
         F::Rg16Float => lanes(2, &|k| half(k).to_vec()),
         F::Rgba16Float => lanes(4, &|k| half(k).to_vec()),
+        F::Rgb9e5Ufloat => rgb9e5([f(0), f(1), f(2)]).to_le_bytes().to_vec(),
+        F::Rgb10a2Unorm => {
+            let c = |k: usize, max: f32| (f(k).clamp(0.0, 1.0) * max).round() as u32;
+            (c(0, 1023.0) | c(1, 1023.0) << 10 | c(2, 1023.0) << 20 | c(3, 3.0) << 30).to_le_bytes().to_vec()
+        }
+        F::Rgb10a2Uint => (bits[0].min(1023) | bits[1].min(1023) << 10 | bits[2].min(1023) << 20 | bits[3].min(3) << 30).to_le_bytes().to_vec(),
         F::R32Uint | F::R32Sint | F::R32Float => lanes(1, &|k| bits[k].to_le_bytes().to_vec()),
         F::Rg32Uint | F::Rg32Sint | F::Rg32Float => lanes(2, &|k| bits[k].to_le_bytes().to_vec()),
         F::Rgba32Uint | F::Rgba32Sint | F::Rgba32Float => lanes(4, &|k| bits[k].to_le_bytes().to_vec()),
         _ => return None,
     })
+}
+
+/// Three floats as RGB9E5's shared-exponent word (as Vulkan's spec gives it).
+fn rgb9e5(c: [f32; 3]) -> u32 {
+    let max = (511.0 / 512.0) * 2f32.powi(16);
+    let c = c.map(|x| if x.is_nan() { 0.0 } else { x.clamp(0.0, max) });
+    let m = c[0].max(c[1]).max(c[2]);
+    let mut e = (m.log2().floor() as i32).max(-16) + 16;
+    if m == 0.0 {
+        e = 0;
+    }
+    let scale = |e: i32| 2f32.powi(e - 15 - 9);
+    if (m / scale(e) + 0.5).floor() as u32 == 512 {
+        e += 1;
+    }
+    let [r, g, b] = c.map(|x| (x / scale(e) + 0.5).floor() as u32);
+    r | g << 9 | b << 18 | (e as u32) << 27
 }
 
 /// A float's half-precision bits, rounded to nearest even.
@@ -2690,6 +2735,15 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                 }
             }
             Command::Update { dst, offset, data } => enc.copy_buffer_to_buffer(&staged(data), 0, buf(*dst)?, *offset, data.len() as u64),
+            Command::FillTexels { dst, offset, size, format: f, color } => {
+                let texel = format(*f).and_then(|f| packed(f, color)).ok_or_else(|| format!("clearing a linear image of format {f}"))?;
+                let pattern: Vec<u8> = texel.iter().copied().cycle().take(*size as usize).collect();
+                if offset.is_multiple_of(4) && size.is_multiple_of(4) {
+                    enc.copy_buffer_to_buffer(&staged(&pattern), 0, buf(*dst)?, *offset, *size);
+                } else {
+                    copy_bytes(gpu, &mut enc, &staged(&pattern), 0, buf(*dst)?, *offset, *size);
+                }
+            }
             Command::BufferToImage(r) => buffer_image(gpu, &mut enc, buf(r.buffer)?, tex(r.image)?, r, true)?,
             Command::ImageToBuffer(r) => buffer_image(gpu, &mut enc, buf(r.buffer)?, tex(r.image)?, r, false)?,
             Command::CopyImage { src, from, dst, to } => {
@@ -2758,16 +2812,18 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     i += 1;
                     continue;
                 }
-                // (A render pass per mip level and layer, cleared.)
+                // (A render pass per mip level and layer, or a 3D level's
+                // slice, cleared.)
                 let clear = color(t.format(), bits);
                 let d3 = t.dimension() == wgpu::TextureDimension::D3;
                 for m in *mip..mip + mips {
-                    for l in *layer..layer + if d3 { 1 } else { *layers } {
+                    let slices = if d3 { (t.depth_or_array_layers() >> m).max(1) } else { *layers };
+                    for l in if d3 { 0 } else { *layer }..if d3 { slices } else { layer + slices } {
                         let v = t.create_view(&wgpu::TextureViewDescriptor {
                             dimension: Some(if d3 { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 }),
                             base_mip_level: m,
                             mip_level_count: Some(1),
-                            base_array_layer: l,
+                            base_array_layer: if d3 { 0 } else { l },
                             array_layer_count: Some(1),
                             ..Default::default()
                         });
@@ -2775,7 +2831,7 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                             label: None,
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                 view: &v,
-                                depth_slice: None,
+                                depth_slice: d3.then_some(l),
                                 resolve_target: None,
                                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
                             })],
@@ -2784,7 +2840,7 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     }
                 }
             }
-            Command::BeginPass { colors, depth, views } => {
+            Command::BeginPass { colors, depth, views, frame } => {
                 // (Multiview: the subpass drawn again for each view, into
                 // its layer of each attachment, its index the shaders'
                 // `gl_ViewIndex`.)
@@ -2799,24 +2855,61 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     // (Whether an attachment's load op is this view's: it
                     // uses the attachment first here, or there are no views.)
                     let first = |firsts: u32| one.is_none_or(|k| firsts >> k & 1 == 1);
+                    // (An attachment's layer k, as one: what WebGPU attaches.)
+                    let layer_of = |v: &View, k: u32| {
+                        let all = v.attachment.is_some() || v.format.is_depth_stencil_format();
+                        v.view.texture().create_view(&wgpu::TextureViewDescriptor {
+                            format: if all { None } else { Some(v.format) },
+                            dimension: Some(wgpu::TextureViewDimension::D2),
+                            base_mip_level: v.base[0],
+                            mip_level_count: Some(1),
+                            base_array_layer: v.base[1] + k,
+                            array_layer_count: Some(1),
+                            ..Default::default()
+                        })
+                    };
                     let mut layered: HashMap<u64, wgpu::TextureView> = HashMap::new();
-                    if let Some(k) = one {
-                        let handles = colors.iter().flat_map(|a| [a.view, a.resolve]).chain(depth.iter().map(|d| d.view)).filter(|&h| h != 0);
-                        for h in handles {
-                            let v = view(h)?;
-                            let all = v.attachment.is_some() || v.format.is_depth_stencil_format();
-                            let layer = v.view.texture().create_view(&wgpu::TextureViewDescriptor {
-                                format: if all { None } else { Some(v.format) },
-                                dimension: Some(wgpu::TextureViewDimension::D2),
-                                base_mip_level: v.base[0],
-                                mip_level_count: Some(1),
-                                base_array_layer: v.base[1] + k,
-                                array_layer_count: Some(1),
-                                ..Default::default()
-                            });
-                            layered.insert(h, layer);
+                    let handles: Vec<u64> = colors.iter().flat_map(|a| [a.view, a.resolve]).chain(depth.iter().map(|d| d.view)).filter(|&h| h != 0).collect();
+                    for &h in &handles {
+                        let v = view(h)?;
+                        match one {
+                            Some(k) => {
+                                layered.insert(h, layer_of(v, k));
+                            }
+                            // (A layered framebuffer, not multiview: its draws
+                            // reach the first layer, and a load op that clears
+                            // clears each, the rest in passes of their own.)
+                            None if v.layers > 1 => {
+                                layered.insert(h, layer_of(v, 0));
+                                for l in 1..v.layers {
+                                    let lv = layer_of(v, l);
+                                    if let Some(a) = colors.iter().find(|a| a.view == h && a.load == 1) {
+                                        let ops = wgpu::Operations { load: wgpu::LoadOp::Clear(color(v.format, &a.clear)), store: wgpu::StoreOp::Store };
+                                        let _p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &lv, depth_slice: None, resolve_target: None, ops })],
+                                            ..Default::default()
+                                        });
+                                    }
+                                    if let Some(d) = depth.as_ref().filter(|d| d.view == h && (d.depth.0 == 1 || d.stencil.0 == 1)) {
+                                        fn ops<T>((load, _): (u32, u32), clear: T) -> wgpu::Operations<T> {
+                                            wgpu::Operations { load: if load == 1 { wgpu::LoadOp::Clear(clear) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store }
+                                        }
+                                        let _p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                                view: &lv,
+                                                depth_ops: v.format.has_depth_aspect().then(|| ops(d.depth, d.clear_depth)),
+                                                stencil_ops: v.format.has_stencil_aspect().then(|| ops(d.stencil, d.clear_stencil)),
+                                            }),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+                            }
+                            None => {}
                         }
                     }
+                    // (Clears of layers past the first, made after the pass.)
+                    let mut later: Vec<(Vec<Clear>, [u32; 6])> = Vec::new();
                     // (Texel buffers the pass may read, brought up to date: those
                     // bound, and those it binds.)
                     let ahead = commands[i + 1..].iter().take_while(|c| **c != Command::EndPass).filter_map(|c| match c {
@@ -2830,7 +2923,29 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     // (Vulkan's load ops: load, clear, don't care; store ops:
                     // store, don't care.)
                     let store = |s: u32| if s == 1 { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store };
-                    let color_attachments = colors
+                    // (No attachments, which WebGPU's passes can't be: one of
+                    // the framebuffer's size, never kept, the pipelines'
+                    // dummy target; as many samples as they draw with.)
+                    let dummy = if colors.is_empty() && depth.is_none() {
+                        let samples = match commands[i + 1..].iter().take_while(|c| **c != Command::EndPass).find_map(|c| if let Command::BindPipeline(h) = c { Some(*h) } else { None }) {
+                            Some(h) => pipeline(h)?.recipe.as_ref().map_or(1, |r| r.multisample.count),
+                            None => graphics.as_ref().and_then(|p| p.recipe.as_ref()).map_or(1, |r| r.multisample.count),
+                        };
+                        let t = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                            label: None,
+                            size: wgpu::Extent3d { width: frame[0].max(1), height: frame[1].max(1), depth_or_array_layers: 1 },
+                            mip_level_count: 1,
+                            sample_count: samples,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::R8Unorm,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            view_formats: &[],
+                        });
+                        Some((t.create_view(&Default::default()), samples))
+                    } else {
+                        None
+                    };
+                    let mut color_attachments = colors
                         .iter()
                         .map(|a| {
                             let v = view(a.view)?;
@@ -2839,6 +2954,14 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                             Ok(Some(wgpu::RenderPassColorAttachment { view: layered.get(&a.view).unwrap_or(&v.view), depth_slice: None, resolve_target, ops: wgpu::Operations { load, store: store(a.store) } }))
                         })
                         .collect::<Res<Vec<_>>>()?;
+                    if let Some((v, _)) = &dummy {
+                        color_attachments.push(Some(wgpu::RenderPassColorAttachment {
+                            view: v,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Discard },
+                        }));
+                    }
                     let depth_stencil_attachment = match depth {
                         Some(d) => {
                             let v = view(d.view)?;
@@ -2858,18 +2981,19 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     let first = colors.first().map(|a| a.view).or(depth.as_ref().map(|d| d.view));
                     let size = match first {
                         Some(h) => view(h)?.size,
-                        None => [0, 0],
+                        None => *frame,
                     };
                     // (Its targets, for clears drawn inside it.)
                     let targets = Targets {
-                        colors: colors.iter().map(|a| Ok(view(a.view)?.format)).collect::<Res<_>>()?,
+                        colors: if dummy.is_some() { vec![wgpu::TextureFormat::R8Unorm] } else { colors.iter().map(|a| Ok(view(a.view)?.format)).collect::<Res<_>>()? },
                         depth: match depth {
                             Some(d) => Some(view(d.view)?.format),
                             None => None,
                         },
-                        samples: match first {
-                            Some(h) => view(h)?.samples,
-                            None => 1,
+                        samples: match (first, &dummy) {
+                            (Some(h), _) => view(h)?.samples,
+                            (None, Some((_, samples))) => *samples,
+                            (None, None) => 1,
                         },
                     };
                     // (Its indexed draws of triangle fans: their indices made
@@ -2937,7 +3061,7 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                                 array_layer_count: Some(1),
                                 ..Default::default()
                             });
-                            snapshots.insert(h, View { view: layer_view, format: v.format, size: v.size, attachment: None, samples: v.samples, base: [v.base[0], layer], array: false });
+                            snapshots.insert(h, View { view: layer_view, format: v.format, size: v.size, attachment: None, samples: v.samples, base: [v.base[0], layer], array: false, layers: 1 });
                             continue;
                         }
                         if !attached.contains(&t) || v.samples > 1 {
@@ -2960,7 +3084,7 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                         let aspect =
                             if v.format.has_depth_aspect() && t.format().is_combined_depth_stencil_format() { wgpu::TextureAspect::DepthOnly } else { wgpu::TextureAspect::All };
                         let snapshot = copy.create_view(&wgpu::TextureViewDescriptor { format: Some(v.format), aspect, ..Default::default() });
-                        snapshots.insert(h, View { view: snapshot, format: v.format, size: v.size, attachment: None, samples: 1, base: [0, 0], array: false });
+                        snapshots.insert(h, View { view: snapshot, format: v.format, size: v.size, attachment: None, samples: 1, base: [0, 0], array: false, layers: 1 });
                     }
                     let object = |h: u64| match snapshots.get(&h) {
                         Some(v) => Some(Object::View(v)),
@@ -3019,7 +3143,13 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                             Command::SetDepthBias([constant, clamp, slope]) => dynamic.bias = Some([*constant, *slope, *clamp]),
                             Command::SetStencilCompareMask(m) => dynamic.compare_mask = Some(*m),
                             Command::SetStencilWriteMask(m) => dynamic.write_mask = Some(*m),
-                            Command::ClearAttachments { attachments, rects } => clear_attachments(gpu, &mut pass, &targets, size, attachments, rects)?,
+                            Command::ClearAttachments { attachments, rects } => {
+                                let here: Vec<[u32; 4]> = rects.iter().filter(|r| r[4] == 0).map(|r| [r[0], r[1], r[2], r[3]]).collect();
+                                if !here.is_empty() {
+                                    clear_attachments(gpu, &mut pass, &targets, size, attachments, &here)?;
+                                }
+                                later.extend(rects.iter().filter(|r| r[4] + r[5] > 1).map(|r| (attachments.clone(), *r)));
+                            }
                             Command::BeginQuery { pool, index } => {
                                 if Some(*pool) != occlusion {
                                     return Err("occlusion queries of two pools in one render pass".into());
@@ -3108,6 +3238,25 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                         pass.end_occlusion_query();
                     }
                     drop(pass);
+                    // (Clears of later layers: a pass of each layer's, loaded.)
+                    for (attachments, r) in &later {
+                        for l in r[4].max(1)..r[4] + r[5] {
+                            let views: Vec<wgpu::TextureView> = colors.iter().map(|a| Ok(layer_of(view(a.view)?, l))).collect::<Res<_>>()?;
+                            let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
+                            let color_attachments: Vec<_> = views.iter().map(|v| Some(wgpu::RenderPassColorAttachment { view: v, depth_slice: None, resolve_target: None, ops: load })).collect();
+                            let depth_view = match depth {
+                                Some(d) => Some((layer_of(view(d.view)?, l), view(d.view)?.format)),
+                                None => None,
+                            };
+                            let depth_stencil_attachment = depth_view.as_ref().map(|(v, f)| wgpu::RenderPassDepthStencilAttachment {
+                                view: v,
+                                depth_ops: f.has_depth_aspect().then_some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                                stencil_ops: f.has_stencil_aspect().then_some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                            });
+                            let mut p = enc.begin_render_pass(&wgpu::RenderPassDescriptor { color_attachments: &color_attachments, depth_stencil_attachment, ..Default::default() });
+                            clear_attachments(gpu, &mut p, &targets, size, attachments, &[[r[0], r[1], r[2], r[3]]])?;
+                        }
+                    }
                     // (Storage texel buffers it may have written, back to their
                     // buffers.)
                     for t in texels_of(graphics_sets.values().flatten()) {
@@ -3130,7 +3279,7 @@ pub fn submit<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Optio
                     return Err("a render pass's end with none begun".into());
                 }
             }
-            Command::Blit { src, src_level, from, dst, dst_level, to, linear } => blit(gpu, &mut enc, tex(*src)?, *src_level, *from, tex(*dst)?, *dst_level, *to, *linear)?,
+            Command::Blit { src, src_level, from, dst, dst_level, to, zs, linear } => blit(gpu, &mut enc, tex(*src)?, *src_level, *from, tex(*dst)?, *dst_level, *to, *zs, *linear)?,
             Command::ClearDepth { image, mip, mips, layer, layers, aspect: bits, depth, stencil } => {
                 let t = tex(*image)?;
                 let f = t.format();
@@ -3396,7 +3545,7 @@ var<immediate> p: P;
         let commands = [
             Command::Update { dst: 1, offset: 0, data: green },
             Command::BindPipeline(9),
-            Command::BeginPass { colors: vec![Attachment { view: 4, load: 1, store: 0, clear: [one, 0, 0, one], resolve: 0, firsts: 0 }], depth: None, views: 0 },
+            Command::BeginPass { colors: vec![Attachment { view: 4, load: 1, store: 0, clear: [one, 0, 0, one], resolve: 0, firsts: 0 }], depth: None, views: 0, frame: [8, 8] },
             Command::BindGraphicsSet { set: 0, bindings: vec![Binding { binding: 0, element: 0, resource: Resource::Buffer { buffer: 1, offset: 0, size: 16 } }] },
             Command::SetScissor([0, 0, 4, 8]),
             Command::Draw([3, 1, 0, 0]),

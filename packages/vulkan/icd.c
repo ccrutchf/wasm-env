@@ -91,7 +91,8 @@ enum {
     COPY_QUERIES,
     SET_DEPTH_BIAS,
     SET_STENCIL_COMPARE_MASK,
-    SET_STENCIL_WRITE_MASK
+    SET_STENCIL_WRITE_MASK,
+    FILL_TEXELS
 };
 
 struct request {
@@ -1071,6 +1072,9 @@ static CALL void CC GetDeviceMemoryCommitment(VkDevice d, VkDeviceMemory m, VkDe
 static CALL VkResult CC CreateBuffer(VkDevice d, const VkBufferCreateInfo *info, const VkAllocationCallbacks *a, VkBuffer *out) {
     if (info->flags)
         return VK_ERROR_FEATURE_NOT_PRESENT;
+    // (Larger than memory can be: no memory would hold it.)
+    if (info->size > limits[L_ALLOCATION])
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     struct VkBuffer_T *b = zalloc(sizeof *b);
     if (!b)
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -2242,15 +2246,16 @@ static CALL void CC CmdCopyImageToBuffer(VkCommandBuffer c, VkImage im, VkImageL
         buffer_image(c, IMAGE_TO_BUFFER, b, im, n, r);
 }
 
-// Each region's layers (2D images; a 3D one's first slice), scaled.
+// Each region's layers (2D images), or its slices (3D: their z ranges),
+// scaled.
 static CALL void CC CmdBlitImage(VkCommandBuffer c, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageBlit *r, VkFilter filter) {
     uint64_t h[2] = {src->handle, dst->handle};
     for (uint32_t i = 0; i < n; i++)
         for (uint32_t l = 0; l < r[i].srcSubresource.layerCount; l++) {
             const VkOffset3D *s = r[i].srcOffsets, *d = r[i].dstOffsets;
-            uint32_t w[13] = {r[i].srcSubresource.mipLevel, r[i].srcSubresource.baseArrayLayer + l, (uint32_t)s[0].x, (uint32_t)s[0].y, (uint32_t)s[1].x, (uint32_t)s[1].y,
+            uint32_t w[17] = {r[i].srcSubresource.mipLevel, r[i].srcSubresource.baseArrayLayer + l, (uint32_t)s[0].x, (uint32_t)s[0].y, (uint32_t)s[1].x, (uint32_t)s[1].y,
                               r[i].dstSubresource.mipLevel, r[i].dstSubresource.baseArrayLayer + l, (uint32_t)d[0].x, (uint32_t)d[0].y, (uint32_t)d[1].x, (uint32_t)d[1].y,
-                              (uint32_t)filter};
+                              (uint32_t)filter, (uint32_t)s[0].z, (uint32_t)s[1].z, (uint32_t)d[0].z, (uint32_t)d[1].z};
             command(c, BLIT, h, sizeof h, w, sizeof w);
         }
 }
@@ -2282,6 +2287,14 @@ static CALL void CC CmdCopyImage(VkCommandBuffer c, VkImage src, VkImageLayout s
 }
 
 static CALL void CC CmdClearColorImage(VkCommandBuffer c, VkImage im, VkImageLayout l, const VkClearColorValue *color, uint32_t n, const VkImageSubresourceRange *r) {
+    // (A linear image: its memory filled with the color, packed.)
+    if (im->linear) {
+        uint64_t o[3] = {im->memory.memory->handle, im->memory.offset, im->memory.size};
+        uint32_t w[5] = {(uint32_t)im->format, color->uint32[0], color->uint32[1], color->uint32[2], color->uint32[3]};
+        command(c, FILL_TEXELS, o, sizeof o, w, sizeof w);
+        writes(c, &im->memory, 0, im->memory.size);
+        return;
+    }
     for (uint32_t i = 0; i < n; i++) {
         uint32_t mips = r[i].levelCount == VK_REMAINING_MIP_LEVELS ? im->mips - r[i].baseMipLevel : r[i].levelCount;
         uint32_t layers = r[i].layerCount == VK_REMAINING_ARRAY_LAYERS ? im->layers - r[i].baseArrayLayer : r[i].layerCount;
@@ -2450,7 +2463,7 @@ static void begin_subpass(VkCommandBuffer c) {
     uint32_t s = c->subpass;
     const struct subpass *sp = &p->sub[s];
     uint32_t head[2] = {sp->ncolors, sp->depth != VK_ATTACHMENT_UNUSED};
-    uint32_t h[2] = {BEGIN_PASS, 8 + 8 + sp->ncolors * 44 + (head[1] ? 36 : 0) + 4};
+    uint32_t h[2] = {BEGIN_PASS, 8 + 8 + sp->ncolors * 44 + (head[1] ? 36 : 0) + 4 + 8};
     put(c, h, 8);
     put(c, head, 8);
     VkClearValue zero = {0};
@@ -2501,6 +2514,9 @@ static void begin_subpass(VkCommandBuffer c) {
         put(c, &firsts, 4);
     }
     put(c, &sp->views, 4);
+    // (The framebuffer's size: a pass of no attachments has its own.)
+    uint32_t frame[2] = {f->width, f->height};
+    put(c, frame, 8);
     if (nwithin) {
         VkClearRect area = {c->area, 0, 1};
         CmdClearAttachments(c, nwithin, within, 1, &area);
