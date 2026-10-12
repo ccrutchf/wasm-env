@@ -25,6 +25,8 @@ bad64 = { path = "vendor/bad64" }
 # anything but an array or a struct: vendor/naga/src/front/spv/mod.rs; and
 # truncated an array layer that SPIR-V rounds, and wanted a coordinate type
 # it hadn't made: image.rs again; and kept an array of storage images'
-# variable's access off its images: mod.rs again
+# variable's access off its images, and took an array of storage blocks
+# for uniform ones: mod.rs again; and left an array's layers out of its size:
+# image.rs
 # (search "wasm-env").
 naga = { path = "vendor/naga" }

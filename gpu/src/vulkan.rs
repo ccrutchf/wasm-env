@@ -100,8 +100,11 @@ pub struct Pipeline {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Dynamic {
     pub bias: Option<[u32; 3]>,
-    pub compare_mask: Option<u32>,
-    pub write_mask: Option<u32>,
+    pub compare_mask: Option<[u32; 2]>,
+    pub write_mask: Option<[u32; 2]>,
+    /// And a face culled, to draw the other's alone with its own stencil
+    /// masks (`Pipeline::faces`).
+    pub face: Option<wgpu::Face>,
     /// And, for an indexed draw of strips, its indices' format (WebGPU's
     /// pipeline names it).
     pub strip_index: Option<wgpu::IndexFormat>,
@@ -122,11 +125,30 @@ struct Recipe {
     buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)>,
     primitive: wgpu::PrimitiveState,
     depth_stencil: Option<wgpu::DepthStencilState>,
+    /// The back faces' stencil compare and write masks (WebGPU's state has
+    /// one pair, the front's).
+    back_masks: [u32; 2],
     multisample: wgpu::MultisampleState,
     targets: Vec<Option<wgpu::ColorTargetState>>,
 }
 
 impl Recipe {
+    /// Each face's stencil compare and write masks: its own, or as
+    /// commands set them.
+    fn masks(&self, d: Dynamic) -> [[u32; 2]; 2] {
+        let s = self.depth_stencil.as_ref().map_or(Default::default(), |s| s.stencil.clone());
+        let mut masks = [[s.read_mask, s.write_mask], self.back_masks];
+        for (k, m) in masks.iter_mut().enumerate() {
+            if let Some(c) = d.compare_mask {
+                m[0] = c[k];
+            }
+            if let Some(w) = d.write_mask {
+                m[1] = w[k];
+            }
+        }
+        masks
+    }
+
     /// The pipeline, its color targets of `formats` where given, and its
     /// dynamic state as `d` has it.
     fn make(&self, gpu: &Gpu, formats: Option<&[wgpu::TextureFormat]>, d: Dynamic) -> Res<wgpu::RenderPipeline> {
@@ -138,12 +160,10 @@ impl Recipe {
             if let Some([constant, slope, clamp]) = d.bias {
                 s.bias = wgpu::DepthBiasState { constant: f32::from_bits(constant) as i32, slope_scale: f32::from_bits(slope), clamp: f32::from_bits(clamp) };
             }
-            if let Some(m) = d.compare_mask {
-                s.stencil.read_mask = m;
-            }
-            if let Some(m) = d.write_mask {
-                s.stencil.write_mask = m;
-            }
+            // (The front's masks, or the back's where it's the back
+            // faces drawn alone.)
+            let [front, back] = self.masks(d);
+            [s.stencil.read_mask, s.stencil.write_mask] = if d.face == Some(wgpu::Face::Front) { back } else { front };
             // (A format without stencil: no stencil test, which Vulkan
             // ignores there and WebGPU refuses.)
             if !s.format.has_stencil_aspect() {
@@ -168,7 +188,7 @@ impl Recipe {
             label: None,
             layout: Some(&self.layout),
             vertex: wgpu::VertexState { module: &vs, entry_point: Some(&self.vs.1), compilation_options: options(&vc), buffers: &buffers },
-                primitive: wgpu::PrimitiveState { strip_index_format: d.strip_index, ..self.primitive },
+                primitive: wgpu::PrimitiveState { strip_index_format: d.strip_index, cull_mode: d.face.or(self.primitive.cull_mode), ..self.primitive },
             depth_stencil,
             multisample: self.multisample,
             fragment: self.fs.as_ref().map(|fs| wgpu::FragmentState { module: &fs.0, entry_point: Some(&fs.1), compilation_options: options(&fc), targets: &targets }),
@@ -192,6 +212,30 @@ impl Pipeline {
         }
     }
 
+    /// The draws a draw is, for each face's stencil state (WebGPU's
+    /// pipelines have one pair of masks, its passes one reference): where
+    /// a triangle's faces differ in them, the front faces drawn alone, then
+    /// the back faces (each a face culled, and its reference); else one.
+    fn faces(&self, d: Dynamic, reference: [u32; 2]) -> Vec<(Option<wgpu::Face>, u32)> {
+        let one = vec![(None, reference[0])];
+        let Some(r) = &self.recipe else { return one };
+        let Some(s) = &r.depth_stencil else { return one };
+        // (Points and lines are front faces.)
+        let triangles = matches!(r.primitive.topology, wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip);
+        if !triangles || !s.format.has_stencil_aspect() || !s.stencil.is_enabled() {
+            return one;
+        }
+        let [front, back] = r.masks(d);
+        if front == back && reference[0] == reference[1] {
+            return one;
+        }
+        match r.primitive.cull_mode {
+            Some(wgpu::Face::Back) => one,
+            Some(wgpu::Face::Front) => vec![(Some(wgpu::Face::Front), reference[1])],
+            None => vec![(Some(wgpu::Face::Back), reference[0]), (Some(wgpu::Face::Front), reference[1])],
+        }
+    }
+
     /// A graphics pipeline for a render pass of these color formats, with
     /// the dynamic state commands set: itself, or a variant made for them.
     fn render_for(&self, gpu: &Gpu, formats: &[wgpu::TextureFormat], d: Dynamic) -> Res<wgpu::RenderPipeline> {
@@ -206,6 +250,7 @@ impl Pipeline {
             write_mask: d.write_mask.filter(|_| self.dynamic & 4 != 0),
             strip_index: d.strip_index.filter(|_| recipe.primitive.topology.is_strip()),
             flip: d.flip,
+            face: d.face,
         };
         if formats == own && d == Dynamic::default() {
             return Ok(rp.clone());
@@ -896,6 +941,16 @@ fn blend_factor(f: u32) -> wgpu::BlendFactor {
     }
 }
 
+/// A blend of factors and an operation; min and max take none (Vulkan's
+/// ignore theirs; WebGPU's must be one).
+fn blend_component(src: u32, dst: u32, op: u32) -> wgpu::BlendComponent {
+    let operation = blend_op(op);
+    if matches!(operation, wgpu::BlendOperation::Min | wgpu::BlendOperation::Max) {
+        return wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation };
+    }
+    wgpu::BlendComponent { src_factor: blend_factor(src), dst_factor: blend_factor(dst), operation }
+}
+
 fn blend_op(op: u32) -> wgpu::BlendOperation {
     use wgpu::BlendOperation as O;
     [O::Add, O::Subtract, O::ReverseSubtract, O::Min, O::Max].get(op as usize).copied().unwrap_or(O::Add)
@@ -1006,8 +1061,8 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
         .map(|c| {
             let f = format(c[0]).ok_or_else(|| format!("format {}", c[0]))?;
             let blend = (c[1] != 0).then(|| wgpu::BlendState {
-                color: wgpu::BlendComponent { src_factor: blend_factor(c[2]), dst_factor: blend_factor(c[3]), operation: blend_op(c[4]) },
-                alpha: wgpu::BlendComponent { src_factor: blend_factor(c[5]), dst_factor: blend_factor(c[6]), operation: blend_op(c[7]) },
+                color: blend_component(c[2], c[3], c[4]),
+                alpha: blend_component(c[5], c[6], c[7]),
             });
             Ok(Some(wgpu::ColorTargetState { format: f, blend, write_mask: wgpu::ColorWrites::from_bits_truncate(c[8]) }))
         })
@@ -1044,6 +1099,7 @@ pub fn graphics_pipeline<'a>(gpu: &Gpu, s: &GraphicsState, shader: impl Fn(u64) 
             conservative: false,
         },
         depth_stencil,
+        back_masks: [s.stencil.2[4], s.stencil.2[5]],
         multisample: wgpu::MultisampleState { count: s.samples.max(1), mask: !0, alpha_to_coverage_enabled: false },
         targets,
     };
@@ -1159,7 +1215,7 @@ pub enum Command {
     DrawIndexed { indices: u32, instances: u32, first: u32, vertex_offset: i32, first_instance: u32 },
     DrawIndirect { buffer: u64, offset: u64, count: u32, stride: u32, indexed: bool },
     SetBlendConstants([f32; 4]),
-    SetStencilReference(u32),
+    SetStencilReference([u32; 2]),
     /// A descriptor set bound for graphics (BindSet's are compute's).
     BindGraphicsSet { set: u32, bindings: Vec<Binding> },
     /// A region of one image's mip level and layer scaled into another's
@@ -1182,8 +1238,8 @@ pub enum Command {
     /// Dynamic state WebGPU makes part of a pipeline: depth bias (constant,
     /// clamp, slope: f32s' bits), stencil compare and write masks.
     SetDepthBias([u32; 3]),
-    SetStencilCompareMask(u32),
-    SetStencilWriteMask(u32),
+    SetStencilCompareMask([u32; 2]),
+    SetStencilWriteMask([u32; 2]),
     /// A barrier inside a render pass (a subpass's self-dependency).
     Barrier,
     /// A buffer's range filled with a texel of a format (VkFormat), a
@@ -1269,7 +1325,7 @@ pub struct DepthAttachment {
 ///  21 DRAW_INDIRECT  buffer, offset (u64), count, stride (u32)
 ///  22 DRAW_INDEXED_INDIRECT  likewise
 ///  23 SET_BLEND_CONSTANTS  (f32 × 4)
-///  24 SET_STENCIL_REFERENCE  (u32)
+///  24 SET_STENCIL_REFERENCE  front's, back's (u32)
 ///  25 BIND_GRAPHICS_SET  as BIND_SET, for graphics
 ///  26 BLIT           source, destination (u64), then u32s: the source's mip
 ///                    level, layer, corners (i32 × 4: x0, y0, x1, y1); the
@@ -1291,8 +1347,8 @@ pub struct DepthAttachment {
 ///  34 COPY_QUERIES   pool (u64), first, count (u32), buffer, offset, stride
 ///                    (u64), VkQueryResultFlags (u32)
 ///  35 SET_DEPTH_BIAS constant, clamp, slope (f32)
-///  36 SET_STENCIL_COMPARE_MASK  mask (u32)
-///  37 SET_STENCIL_WRITE_MASK  mask (u32)
+///  36 SET_STENCIL_COMPARE_MASK  front's, back's (u32)
+///  37 SET_STENCIL_WRITE_MASK  front's, back's (u32)
 ///  38 FILL_TEXELS    buffer, offset, size (u64), format (VkFormat), color
 ///                    (u32 × 4: a clear value's)
 ///  39 BARRIER        (inside a render pass: what it drew read after)
@@ -1375,7 +1431,7 @@ pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
             20 => Command::DrawIndexed { indices: r.u32()?, instances: r.u32()?, first: r.u32()?, vertex_offset: r.u32()? as i32, first_instance: r.u32()? },
             21 | 22 => Command::DrawIndirect { buffer: r.u64()?, offset: r.u64()?, count: r.u32()?, stride: r.u32()?, indexed: op == 22 },
             23 => Command::SetBlendConstants([r.f32()?, r.f32()?, r.f32()?, r.f32()?]),
-            24 => Command::SetStencilReference(r.u32()?),
+            24 => Command::SetStencilReference([r.u32()?, r.u32()?]),
             26 => {
                 let (src, dst) = (r.u64()?, r.u64()?);
                 let mut w = [0u32; 17];
@@ -1405,8 +1461,8 @@ pub fn decode(stream: &[u8]) -> Res<Vec<Command>> {
             33 => Command::Timestamp { pool: r.u64()?, index: r.u32()? },
             34 => Command::CopyQueries { pool: r.u64()?, first: r.u32()?, count: r.u32()?, buffer: r.u64()?, offset: r.u64()?, stride: r.u64()?, flags: r.u32()? },
             35 => Command::SetDepthBias([r.u32()?, r.u32()?, r.u32()?]),
-            36 => Command::SetStencilCompareMask(r.u32()?),
-            37 => Command::SetStencilWriteMask(r.u32()?),
+            36 => Command::SetStencilCompareMask([r.u32()?, r.u32()?]),
+            37 => Command::SetStencilWriteMask([r.u32()?, r.u32()?]),
             38 => Command::FillTexels { dst: r.u64()?, offset: r.u64()?, size: r.u64()?, format: r.u32()?, color: [r.u32()?, r.u32()?, r.u32()?, r.u32()?] },
             op => return Err(format!("command {op}")),
         });
@@ -1955,12 +2011,14 @@ fn on_texture<'t>(t: &'t wgpu::Texture, s: &Sub) -> (wgpu::TexelCopyTextureInfo<
 fn buffer_image(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, t: &wgpu::Texture, r: &Region, to_image: bool) -> Res<()> {
     let (place, extent) = on_texture(t, &r.sub);
     // (24-bit depth, which WebGPU won't copy: read by a compute shader,
-    // written by a draw.)
+    // written by a draw; and 32-bit float depth, which it won't copy to,
+    // written by one too.)
     if !to_image && t.format().block_copy_size(Some(place.aspect)).is_none() && matches!(t.format(), wgpu::TextureFormat::Depth24Plus | wgpu::TextureFormat::Depth24PlusStencil8) {
         return depth24_to_buffer(gpu, enc, buffer, t, r);
     }
-    if to_image && t.format().block_copy_size(Some(place.aspect)).is_none() && matches!(t.format(), wgpu::TextureFormat::Depth24Plus | wgpu::TextureFormat::Depth24PlusStencil8) {
-        return depth24_from_buffer(gpu, enc, buffer, t, r);
+    use wgpu::TextureFormat as F;
+    if to_image && place.aspect != wgpu::TextureAspect::StencilOnly && matches!(t.format(), F::Depth24Plus | F::Depth24PlusStencil8 | F::Depth32Float | F::Depth32FloatStencil8) {
+        return depth_from_buffer(gpu, enc, buffer, t, r);
     }
     let block = t.format().block_copy_size(Some(place.aspect)).ok_or("an image whose texels can't be copied")?;
     // (Rows and their lengths in blocks: a compressed format's are of
@@ -2102,9 +2160,10 @@ struct P { x: u32, y: u32, layer: u32, mip: u32, width: u32, height: u32 }
     Ok(())
 }
 
-/// 24-bit depth written from a buffer, which WebGPU won't copy either: the
-/// buffer's rows gathered, then drawn as each layer's depth.
-fn depth24_from_buffer(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, t: &wgpu::Texture, r: &Region) -> Res<()> {
+/// Depth written from a buffer, which WebGPU won't copy for 24 bits or
+/// 32-bit floats: the buffer's rows gathered, then drawn as each layer's
+/// depth (24-bit unsigned normalized, or a float's bits).
+fn depth_from_buffer(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, t: &wgpu::Texture, r: &Region) -> Res<()> {
     const DEPTH24: &str = "
 struct P { x: u32, y: u32, width: u32, height: u32 }
 @group(0) @binding(0) var<storage, read> texels: array<u32>;
@@ -2116,7 +2175,8 @@ struct V { @builtin(position) at: vec4<f32>, @location(0) @interpolate(flat) lay
 @fragment fn fs(v: V) -> @builtin(frag_depth) f32 {
     let x = u32(v.at.x) - p.x;
     let y = u32(v.at.y) - p.y;
-    return f32(texels[(v.layer * p.height + y) * p.width + x] & 0xffffffu) / 16777215.0;
+    let t = texels[(v.layer * p.height + y) * p.width + x];
+    return DEPTH;
 }
 ";
     let s = &r.sub;
@@ -2130,7 +2190,8 @@ struct V { @builtin(position) at: vec4<f32>, @location(0) @interpolate(flat) lay
         .unwrap()
         .entry(format)
         .or_insert_with(|| {
-            let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(DEPTH24.into()) });
+            let depth = if matches!(format, wgpu::TextureFormat::Depth32Float | wgpu::TextureFormat::Depth32FloatStencil8) { "bitcast<f32>(t)" } else { "f32(t & 0xffffffu) / 16777215.0" };
+            let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(DEPTH24.replace("DEPTH", depth).into()) });
             gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: None,
                 layout: None,
@@ -2849,6 +2910,8 @@ fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Ob
     };
     // (Depth bias and stencil masks as commands set them, for the draws.)
     let mut dynamic = Dynamic::default();
+    // (And the stencil reference, each face's.)
+    let mut reference = [0u32; 2];
     // (An occlusion query begun outside render passes, its pool and index and
     // the overflow slots the passes since counted into; those ended; and the
     // slots used, by pool.)
@@ -3357,7 +3420,10 @@ fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Ob
                                     pass.set_scissor_rect(x, y, w, h)
                                 }
                                 Command::SetBlendConstants([r, g, b, a]) => pass.set_blend_constant(wgpu::Color { r: *r as f64, g: *g as f64, b: *b as f64, a: *a as f64 }),
-                                Command::SetStencilReference(r) => pass.set_stencil_reference(*r),
+                                Command::SetStencilReference(r) => {
+                                    reference = *r;
+                                    pass.set_stencil_reference(r[0]);
+                                }
                                 // (Kept for the draws: a pipeline variant's.)
                                 Command::SetDepthBias([constant, clamp, slope]) => dynamic.bias = Some([*constant, *slope, *clamp]),
                                 Command::SetStencilCompareMask(m) => dynamic.compare_mask = Some(*m),
@@ -3441,18 +3507,30 @@ fn replay<'a>(gpu: &Gpu, commands: &[Command], object: impl Fn(u64) -> Option<Ob
                                         let (h, offset, f) = index.ok_or("an indexed draw with no index buffer")?;
                                         pass.set_index_buffer(buf(h)?.slice(offset..), f);
                                     }
-                                    match c {
-                                        Command::Draw([n, instances, first, first_instance]) => pass.draw(*first..first + n, *first_instance..first_instance + instances),
-                                        Command::DrawIndexed { indices, instances, first, vertex_offset, first_instance } => {
-                                            pass.draw_indexed(*first..first + indices, *vertex_offset, *first_instance..first_instance + instances)
+                                    // (Each face's stencil state apart, where
+                                    // they differ: a draw for each.)
+                                    let faces = p.faces(d, reference);
+                                    for &(face, r) in &faces {
+                                        if face.is_some() {
+                                            pass.set_pipeline(&p.render_for(gpu, &targets.colors, Dynamic { face, ..d })?);
+                                            pass.set_stencil_reference(r);
                                         }
-                                        Command::DrawIndirect { buffer, offset, count, stride, indexed } => {
-                                            for k in 0..*count as u64 {
-                                                let at = offset + k * *stride as u64;
-                                                if *indexed { pass.draw_indexed_indirect(buf(*buffer)?, at) } else { pass.draw_indirect(buf(*buffer)?, at) }
+                                        match c {
+                                            Command::Draw([n, instances, first, first_instance]) => pass.draw(*first..first + n, *first_instance..first_instance + instances),
+                                            Command::DrawIndexed { indices, instances, first, vertex_offset, first_instance } => {
+                                                pass.draw_indexed(*first..first + indices, *vertex_offset, *first_instance..first_instance + instances)
                                             }
+                                            Command::DrawIndirect { buffer, offset, count, stride, indexed } => {
+                                                for k in 0..*count as u64 {
+                                                    let at = offset + k * *stride as u64;
+                                                    if *indexed { pass.draw_indexed_indirect(buf(*buffer)?, at) } else { pass.draw_indirect(buf(*buffer)?, at) }
+                                                }
+                                            }
+                                            _ => unreachable!(),
                                         }
-                                        _ => unreachable!(),
+                                    }
+                                    if faces[0].0.is_some() {
+                                        pass.set_stencil_reference(reference[0]);
                                     }
                                 }
                                 c => return Err(format!("{c:?} in a render pass")),

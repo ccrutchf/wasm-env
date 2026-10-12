@@ -217,10 +217,11 @@ struct state {
     float viewport[6];
     uint32_t scissor[4];
     float blend[4];
-    uint32_t reference;
-    // Depth bias (constant, clamp, slope), stencil compare and write masks.
+    uint32_t reference[2];
+    // Depth bias (constant, clamp, slope), stencil compare and write masks
+    // (the front faces', the back's).
     float bias[3];
-    uint32_t compare_mask, write_mask;
+    uint32_t compare_mask[2], write_mask[2];
 };
 struct VkPipeline_T {
     uint64_t handle;
@@ -1533,7 +1534,7 @@ static VkResult graphics_pipeline(const VkGraphicsPipelineCreateInfo *info, VkPi
     else
         s->set &= ~S_BLEND;
     if (ds && ds->stencilTestEnable)
-        s->reference = ds->front.reference;
+        s->reference[0] = ds->front.reference, s->reference[1] = ds->back.reference;
     else
         s->set &= ~S_REFERENCE;
     *out = p;
@@ -2018,13 +2019,13 @@ static void emit_state(VkCommandBuffer c, uint32_t which) {
     if (which & S_BLEND)
         command(c, SET_BLEND_CONSTANTS, s->blend, sizeof s->blend, NULL, 0);
     if (which & S_REFERENCE)
-        command(c, SET_STENCIL_REFERENCE, &s->reference, 4, NULL, 0);
+        command(c, SET_STENCIL_REFERENCE, s->reference, sizeof s->reference, NULL, 0);
     if (which & S_BIAS)
         command(c, SET_DEPTH_BIAS, s->bias, sizeof s->bias, NULL, 0);
     if (which & S_COMPARE_MASK)
-        command(c, SET_STENCIL_COMPARE_MASK, &s->compare_mask, 4, NULL, 0);
+        command(c, SET_STENCIL_COMPARE_MASK, s->compare_mask, sizeof s->compare_mask, NULL, 0);
     if (which & S_WRITE_MASK)
-        command(c, SET_STENCIL_WRITE_MASK, &s->write_mask, 4, NULL, 0);
+        command(c, SET_STENCIL_WRITE_MASK, s->write_mask, sizeof s->write_mask, NULL, 0);
 }
 
 static CALL void CC CmdBindPipeline(VkCommandBuffer c, VkPipelineBindPoint point, VkPipeline p) {
@@ -2041,7 +2042,7 @@ static CALL void CC CmdBindPipeline(VkCommandBuffer c, VkPipelineBindPoint point
     if (f->set & S_BLEND)
         memcpy(s->blend, f->blend, sizeof s->blend);
     if (f->set & S_REFERENCE)
-        s->reference = f->reference;
+        memcpy(s->reference, f->reference, sizeof s->reference);
     s->set |= f->set;
     emit_state(c, f->set);
 }
@@ -2584,7 +2585,9 @@ static CALL void CC CmdSetBlendConstants(VkCommandBuffer c, const float blend[4]
 }
 
 static CALL void CC CmdSetStencilReference(VkCommandBuffer c, VkStencilFaceFlags faces, uint32_t reference) {
-    c->state.reference = reference;
+    for (int k = 0; k < 2; k++)
+        if (faces & (VK_STENCIL_FACE_FRONT_BIT << k))
+            c->state.reference[k] = reference;
     set_state(c, S_REFERENCE);
 }
 
@@ -2600,14 +2603,18 @@ static CALL void CC CmdSetDepthBias(VkCommandBuffer c, float constant, float cla
     emit_state(c, S_BIAS);
 }
 static CALL void CC CmdSetDepthBounds(VkCommandBuffer c, float lo, float hi) {}
-// (WebGPU has one mask for both faces: the last set.)
+// (Each face's: the runtime draws the faces apart where they differ.)
 static CALL void CC CmdSetStencilCompareMask(VkCommandBuffer c, VkStencilFaceFlags faces, uint32_t mask) {
-    c->state.compare_mask = mask;
+    for (int k = 0; k < 2; k++)
+        if (faces & (VK_STENCIL_FACE_FRONT_BIT << k))
+            c->state.compare_mask[k] = mask;
     c->state.set |= S_COMPARE_MASK;
     emit_state(c, S_COMPARE_MASK);
 }
 static CALL void CC CmdSetStencilWriteMask(VkCommandBuffer c, VkStencilFaceFlags faces, uint32_t mask) {
-    c->state.write_mask = mask;
+    for (int k = 0; k < 2; k++)
+        if (faces & (VK_STENCIL_FACE_FRONT_BIT << k))
+            c->state.write_mask[k] = mask;
     c->state.set |= S_WRITE_MASK;
     emit_state(c, S_WRITE_MASK);
 }

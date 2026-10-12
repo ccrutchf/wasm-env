@@ -3040,7 +3040,13 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
             }
         }
 
-        let ext_class = match self.lookup_storage_buffer_types.get(&ty) {
+        // wasm-env: an array of storage blocks (`BufferBlock`s in the
+        // `Uniform` class) is storage too.
+        let element = match module.types[ty].inner {
+            crate::TypeInner::Array { base, .. } | crate::TypeInner::BindingArray { base, .. } => base,
+            _ => ty,
+        };
+        let ext_class = match self.lookup_storage_buffer_types.get(&ty).or_else(|| self.lookup_storage_buffer_types.get(&element)) {
             Some(&access) => ExtendedClass::Global(crate::AddressSpace::Storage { access }),
             None => map_storage_class(storage_class)?,
         };

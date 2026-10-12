@@ -880,10 +880,54 @@ impl<I: Iterator<Item = u32>> super::Frontend<I> {
         //TODO: handle arrays and cubes
         let image_lexp = self.lookup_expression.lookup(image_id)?;
 
-        let expr = crate::Expression::ImageQuery {
+        let mut expr = crate::Expression::ImageQuery {
             image: image_lexp.handle,
             query: crate::ImageQuery::Size { level },
         };
+
+        // wasm-env: an array's size has its layers after its dimensions (a
+        // cube array's, its cubes), as SPIR-V's does.
+        let image_ty = self.lookup_type.lookup(image_lexp.type_id)?.handle;
+        if let crate::TypeInner::Image {
+            dim, arrayed: true, ..
+        } = ctx.module.types[image_ty].inner
+        {
+            let span = self.span_from_with_op(start);
+            let size = ctx.expressions.append(expr, span);
+            let layers = ctx.expressions.append(
+                crate::Expression::ImageQuery {
+                    image: image_lexp.handle,
+                    query: crate::ImageQuery::NumLayers,
+                },
+                span,
+            );
+            let mut components = match dim {
+                crate::ImageDimension::D1 => alloc::vec![size],
+                _ => (0..2)
+                    .map(|index| {
+                        ctx.expressions
+                            .append(crate::Expression::AccessIndex { base: size, index }, span)
+                    })
+                    .collect(),
+            };
+            components.push(layers);
+            let size = if components.len() == 2 {
+                crate::VectorSize::Bi
+            } else {
+                crate::VectorSize::Tri
+            };
+            let ty = ctx.module.types.insert(
+                crate::Type {
+                    name: None,
+                    inner: crate::TypeInner::Vector {
+                        size,
+                        scalar: Scalar::U32,
+                    },
+                },
+                crate::Span::UNDEFINED,
+            );
+            expr = crate::Expression::Compose { ty, components };
+        }
 
         let result_type_handle = self.lookup_type.lookup(result_type_id)?.handle;
         let maybe_scalar_kind = ctx.module.types[result_type_handle].inner.scalar_kind();

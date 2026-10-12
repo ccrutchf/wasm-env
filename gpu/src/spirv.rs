@@ -45,16 +45,36 @@ const DECORATION_VOLATILE: u32 = 21;
 const DECORATION_COHERENT: u32 = 23;
 const UNIFORM_CONSTANT: u32 = 0;
 
+/// Vulkan bindings from this one on, which doubled would pass WebGPU's
+/// limit (1000 a group), are numbered in the order they're first seen
+/// (`LARGE`), from WebGPU's 800: Vulkan's may be any 32-bit number, though
+/// programs number theirs from 0 (and the CTS uses a few large ones).
+const FIRST_LARGE: u32 = 400;
+static LARGE: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
 /// The WebGPU binding for a Vulkan binding (`sampler`: a combined image
 /// sampler's sampler).
 pub fn binding(vulkan: u32, sampler: bool) -> u32 {
-    2 * vulkan + sampler as u32
+    if vulkan < FIRST_LARGE {
+        return 2 * vulkan + sampler as u32;
+    }
+    let mut large = LARGE.lock().unwrap();
+    let k = large.iter().position(|&b| b == vulkan).unwrap_or_else(|| {
+        large.push(vulkan);
+        large.len() - 1
+    });
+    // (Past 100 of them, WebGPU refuses the binding as the layout's made.)
+    2 * (FIRST_LARGE + k as u32) + sampler as u32
 }
 
 /// The Vulkan binding a WebGPU binding came from, and whether it's a
 /// combined image sampler's sampler.
 pub fn vulkan_binding(wgpu: u32) -> (u32, bool) {
-    (wgpu / 2, wgpu % 2 == 1)
+    let (b, sampler) = (wgpu / 2, wgpu % 2 == 1);
+    if b < FIRST_LARGE {
+        return (b, sampler);
+    }
+    (LARGE.lock().unwrap().get((b - FIRST_LARGE) as usize).copied().unwrap_or(b), sampler)
 }
 
 /// An instruction: its opcode and operands.
@@ -79,6 +99,7 @@ const OP_IMAGE_READ: u32 = 98;
 const OP_CONVERT_F_TO_S: u32 = 110;
 const OP_I_ADD: u32 = 128;
 const DIM_2D: u32 = 1;
+const DIM_3D: u32 = 2;
 const DIM_SUBPASS_DATA: u32 = 6;
 const STORAGE_INPUT: u32 = 1;
 const BUILTIN_FRAG_COORD: u32 = 15;
@@ -384,38 +405,45 @@ const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u32 = 87;
 const OP_IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88;
 const OP_IMAGE_QUERY_SIZE_LOD: u32 = 103;
 const OP_CONVERT_S_TO_F: u32 = 111;
+const OP_F_ADD: u32 = 129;
+const OP_I_SUB: u32 = 130;
+const OP_SELECT: u32 = 169;
+const OP_S_GREATER_THAN: u32 = 173;
+const OP_S_LESS_THAN: u32 = 177;
 const OP_F_MUL: u32 = 133;
 
-/// Samples of integer 2D images (a `usampler2D`'s `texture`), which WGSL
-/// hasn't (Vulkan's take the nearest texel): fetches of the texel at the
-/// coordinates times the image's size, from level 0.
+/// Samples of integer 2D images, 2D arrays and 3D images (a
+/// `usampler2D`'s, `usampler2DArray`'s or `usampler3D`'s `texture`),
+/// which WGSL hasn't (Vulkan's take the nearest texel): fetches of the
+/// texel at the coordinates times the image's size, from level 0, an
+/// array's layer the nearest.
 fn integer_samples(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Inst> {
     let ints: std::collections::HashSet<u32> = insts
         .iter()
         .filter(|i| i.op == OP_TYPE_INT)
         .map(|i| i.words[0])
         .collect();
-    let images: std::collections::HashSet<u32> = insts
+    // (Each such image type, and its kind: 2D, a 2D array, 3D.)
+    let images: HashMap<u32, u8> = insts
         .iter()
         .filter(|i| {
             i.op == OP_TYPE_IMAGE
                 && ints.contains(&i.words[1])
-                && i.words[2] == DIM_2D
-                && i.words[4] == 0
+                && (i.words[2] == DIM_2D || (i.words[2] == DIM_3D && i.words[4] == 0))
                 && i.words[5] == 0
         })
-        .map(|i| i.words[0])
+        .map(|i| (i.words[0], if i.words[2] == DIM_3D { 2 } else { i.words[4] as u8 }))
         .collect();
-    let sampled_types: std::collections::HashSet<u32> = insts
+    let sampled_types: HashMap<u32, u8> = insts
         .iter()
-        .filter(|i| i.op == OP_TYPE_SAMPLED_IMAGE && images.contains(&i.words[1]))
-        .map(|i| i.words[0])
+        .filter(|i| i.op == OP_TYPE_SAMPLED_IMAGE && images.contains_key(&i.words[1]))
+        .map(|i| (i.words[0], images[&i.words[1]]))
         .collect();
-    // (A sampled image of one: its image.)
-    let of: HashMap<u32, u32> = insts
+    // (A sampled image of one: its image, and its kind.)
+    let of: HashMap<u32, (u32, u8)> = insts
         .iter()
-        .filter(|i| i.op == OP_SAMPLED_IMAGE && sampled_types.contains(&i.words[0]))
-        .map(|i| (i.words[1], i.words[2]))
+        .filter(|i| i.op == OP_SAMPLED_IMAGE && sampled_types.contains_key(&i.words[0]))
+        .map(|i| (i.words[1], (i.words[2], sampled_types[&i.words[0]])))
         .collect();
     if !insts.iter().any(|i| {
         matches!(
@@ -429,38 +457,63 @@ fn integer_samples(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Ins
         .iter()
         .find(|i| i.op == OP_TYPE_FLOAT && i.words[1] == 32)
         .map(|i| i.words[0]);
-    let (int, ivec2, vec2, zero) = (fresh(), fresh(), fresh(), fresh());
+    let (int, ivec2, ivec3, zero, one, half) = (fresh(), fresh(), fresh(), fresh(), fresh(), fresh());
     let mut made = vec![
         inst(OP_TYPE_INT, &[int, 32, 1]),
         inst(OP_TYPE_VECTOR, &[ivec2, int, 2]),
+        inst(OP_TYPE_VECTOR, &[ivec3, int, 3]),
         inst(OP_CONSTANT, &[int, zero, 0]),
+        inst(OP_CONSTANT, &[int, one, 1]),
     ];
     let float = float.unwrap_or_else(|| {
         let f = fresh();
         made.push(inst(OP_TYPE_FLOAT, &[f, 32]));
         f
     });
-    made.push(inst(OP_TYPE_VECTOR, &[vec2, float, 2]));
+    made.push(inst(OP_CONSTANT, &[float, half, 0.5f32.to_bits()]));
+    let bool_type = insts.iter().find(|i| i.op == OP_TYPE_BOOL).map(|i| i.words[0]).unwrap_or_else(|| {
+        let b = fresh();
+        made.push(inst(OP_TYPE_BOOL, &[b]));
+        b
+    });
     let mut out = Vec::with_capacity(insts.len() + made.len());
     for i in insts {
         if i.op == OP_FUNCTION && !made.is_empty() {
             out.append(&mut made);
         }
         match i.op {
-            OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD
-                if of.contains_key(&i.words[2]) =>
-            {
-                let (ty, result, image, coordinate) =
-                    (i.words[0], i.words[1], of[&i.words[2]], i.words[3]);
-                let (size, scale, at, texel) = (fresh(), fresh(), fresh(), fresh());
-                out.push(inst(OP_IMAGE_QUERY_SIZE_LOD, &[ivec2, size, image, zero]));
-                out.push(inst(OP_CONVERT_S_TO_F, &[vec2, scale, size]));
-                out.push(inst(OP_F_MUL, &[vec2, at, coordinate, scale]));
-                out.push(inst(OP_CONVERT_F_TO_S, &[ivec2, texel, at]));
-                out.push(inst(
-                    OP_IMAGE_FETCH,
-                    &[ty, result, image, texel, IMAGE_OPERANDS_LOD, zero],
-                ));
+            // (Each coordinate scaled by the size, an array's layer
+            // rounded instead, and kept within the image: the edge's texel,
+            // as clamping to the edge takes, rather than none.)
+            OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD if of.contains_key(&i.words[2]) => {
+                let (ty, result, (image, kind), coordinate) = (i.words[0], i.words[1], of[&i.words[2]], i.words[3]);
+                let n = if kind == 0 { 2 } else { 3 };
+                let size = fresh();
+                out.push(inst(OP_IMAGE_QUERY_SIZE_LOD, &[if n == 2 { ivec2 } else { ivec3 }, size, image, zero]));
+                let mut texel = Vec::new();
+                for k in 0..n {
+                    let (c, at, t, extent, last) = (fresh(), fresh(), fresh(), fresh(), fresh());
+                    out.push(inst(OP_COMPOSITE_EXTRACT, &[float, c, coordinate, k]));
+                    out.push(inst(OP_COMPOSITE_EXTRACT, &[int, extent, size, k]));
+                    if kind == 1 && k == 2 {
+                        out.push(inst(OP_F_ADD, &[float, at, c, half]));
+                    } else {
+                        let scale = fresh();
+                        out.push(inst(OP_CONVERT_S_TO_F, &[float, scale, extent]));
+                        out.push(inst(OP_F_MUL, &[float, at, c, scale]));
+                    }
+                    out.push(inst(OP_CONVERT_F_TO_S, &[int, t, at]));
+                    out.push(inst(OP_I_SUB, &[int, last, extent, one]));
+                    let (below, low, above, clamped) = (fresh(), fresh(), fresh(), fresh());
+                    out.push(inst(OP_S_LESS_THAN, &[bool_type, below, t, zero]));
+                    out.push(inst(OP_SELECT, &[int, low, below, zero, t]));
+                    out.push(inst(OP_S_GREATER_THAN, &[bool_type, above, low, last]));
+                    out.push(inst(OP_SELECT, &[int, clamped, above, last, low]));
+                    texel.push(clamped);
+                }
+                let at = fresh();
+                out.push(Inst { op: OP_COMPOSITE_CONSTRUCT, words: [&[if n == 2 { ivec2 } else { ivec3 }, at][..], &texel].concat() });
+                out.push(inst(OP_IMAGE_FETCH, &[ty, result, image, at, IMAGE_OPERANDS_LOD, zero]));
             }
             _ => out.push(i),
         }
@@ -976,6 +1029,8 @@ mod tests {
         got.sort();
         assert_eq!(got, [(0, 6), (1, 0), (1, 2)]);
         assert_eq!(vulkan_binding(binding(5, true)), (5, true));
+        assert_eq!(vulkan_binding(binding(0xfffe, false)), (0xfffe, false));
+        assert!(binding(0xfffe, true) < 1000);
     }
 
     #[test]
