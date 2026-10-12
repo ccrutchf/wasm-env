@@ -89,7 +89,8 @@
 //!              the image's), aspect, mip level, levels, layer, layers   r0: handle
 //!  26 VK_SAMPLER  a0: u32s: filters (magnification, minification, mipmap),
 //!              address modes (u, v, w), maximum anisotropy, comparison
-//!              (VkCompareOp + 1, or 0), LOD minimum and maximum (f32)   r0: handle
+//!              (VkCompareOp + 1, or 0), LOD minimum and maximum (f32), border
+//!              color (VkBorderColor)   r0: handle
 //!  27 VK_FORMAT   a0: VkFormat   r0: its VkFormatFeatureFlags (optimal
 //!              tiling), r2: a texel's bytes (0: not supported), r3: its
 //!              sample counts (VkSampleCountFlags: 1, or 1 and 4)
@@ -649,8 +650,8 @@ impl Session {
                         }
                     }
                     _ => {
-                        let w = words(a[0], 10)?;
-                        Ok(Vk::Sampler(vulkan::sampler(g, [w[0], w[1], w[2]], [w[3], w[4], w[5]], w[6] as u16, w[7], [f32::from_bits(w[8]), f32::from_bits(w[9])])))
+                        let w = words(a[0], 11)?;
+                        Ok(Vk::Sampler(vulkan::sampler(g, [w[0], w[1], w[2]], [w[3], w[4], w[5]], w[6] as u16, w[7], [f32::from_bits(w[8]), f32::from_bits(w[9])], w[10])))
                     }
                 };
                 match made {

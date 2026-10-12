@@ -12,6 +12,10 @@
 //! array element); into a row-major one, a component's chain has its two
 //! indices swapped, and a column's (not one place in memory) is a column
 //! loaded from the rows, or stored to them, a component at a time.
+//!
+//! And vectors at offsets WGSL wouldn't put them (Vulkan 1.1's relaxed
+//! block layout: a `vec3` 4 bytes in): such a member is an array of its
+//! components, a load of it made a vector, a store an array.
 
 use std::collections::HashMap;
 
@@ -36,6 +40,7 @@ const DECORATION_ROW_MAJOR: u32 = 4;
 const DECORATION_COL_MAJOR: u32 = 5;
 const DECORATION_ARRAY_STRIDE: u32 = 6;
 const DECORATION_MATRIX_STRIDE: u32 = 7;
+const DECORATION_OFFSET: u32 = 35;
 
 /// A matrix member's layout: row-major or not, and its stride.
 type Layout = (bool, u32);
@@ -95,6 +100,12 @@ impl Pass<'_> {
             Some(OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY) => self.has_matrix(self.types[&ty].words[1]),
             _ => false,
         }
+    }
+
+    /// Whether `ty` is what a made member makes arrays of: a matrix (in
+    /// arrays), or a vector.
+    fn holds(&self, ty: u32) -> bool {
+        self.has_matrix(ty) || self.ty(ty).is_some_and(|i| i.op == OP_TYPE_VECTOR)
     }
 
     /// A matrix's column type, its columns, and its rows.
@@ -171,6 +182,13 @@ impl Pass<'_> {
         let i = self.types[&ty].clone();
         let t = (self.fresh)();
         match i.op {
+            // (A vector: its components, `layout`'s stride apart.)
+            OP_TYPE_VECTOR => {
+                let n = self.index(i.words[2], Some(before));
+                self.before.entry(before).or_default().push(inst(OP_TYPE_ARRAY, &[t, i.words[1], n]));
+                self.types.insert(t, inst(OP_TYPE_ARRAY, &[t, i.words[1], n]));
+                self.decorations.push(inst(OP_DECORATE, &[t, DECORATION_ARRAY_STRIDE, layout.1]));
+            }
             OP_TYPE_MATRIX => {
                 let (column, columns, rows) = self.matrix(ty);
                 let (element, n) = if layout.0 { (self.vector(self.types[&column].words[1], columns, before), rows) } else { (column, columns) };
@@ -205,6 +223,7 @@ pub fn arrays(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst> {
     // Member layouts: (struct, member) → row-major, stride.
     let mut row_major: HashMap<(u32, u32), bool> = HashMap::new();
     let mut strides: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut offsets: HashMap<(u32, u32), u32> = HashMap::new();
     for i in &insts {
         if i.op == OP_MEMBER_DECORATE {
             match i.words[2] {
@@ -214,11 +233,14 @@ pub fn arrays(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst> {
                 DECORATION_MATRIX_STRIDE => {
                     strides.insert((i.words[0], i.words[1]), i.words[3]);
                 }
+                DECORATION_OFFSET => {
+                    offsets.insert((i.words[0], i.words[1]), i.words[3]);
+                }
                 _ => {}
             }
         }
     }
-    if strides.is_empty() && row_major.is_empty() {
+    if strides.is_empty() && row_major.is_empty() && offsets.is_empty() {
         return insts;
     }
     let types: HashMap<u32, Inst> = insts.iter().filter(|i| (19..=38).contains(&i.op)).map(|i| (i.words[0], i.clone())).collect();
@@ -249,6 +271,17 @@ pub fn arrays(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst> {
     for i in insts.iter().filter(|i| i.op == OP_TYPE_STRUCT) {
         for (k, &ty) in i.words[1..].iter().enumerate() {
             let key = (i.words[0], k as u32);
+            // (A vector where WGSL wouldn't align it: its components.)
+            if pass.types.get(&ty).is_some_and(|t| t.op == OP_TYPE_VECTOR) {
+                let (scalar, n) = (pass.types[&ty].words[1], pass.types[&ty].words[2]);
+                let width = pass.types.get(&scalar).map_or(4, |s| s.words[1] / 8);
+                let align = if n == 2 { 2 * width } else { 4 * width };
+                if offsets.get(&key).is_some_and(|o| o % align != 0) {
+                    members.insert(key, ((false, width), ty));
+                    order.push(key);
+                }
+                continue;
+            }
             if !pass.has_matrix(ty) {
                 continue;
             }
@@ -272,7 +305,7 @@ pub fn arrays(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst> {
         pass.made(ty, layout, s);
     }
     // (Index constants loads and stores of row-major columns take.)
-    let most = members.values().map(|&(_, ty)| {
+    let most = members.values().filter(|&&(_, ty)| pass.has_matrix(ty)).map(|&(_, ty)| {
         let mut m = ty;
         while pass.types[&m].op != OP_TYPE_MATRIX {
             m = pass.types[&m].words[1];
@@ -345,7 +378,7 @@ pub fn arrays(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst> {
                 out.push(inst(OP_COMPOSITE_CONSTRUCT, &[&[ty, result][..], &parts].concat()));
                 values.insert(result, ty);
             }
-            OP_LOAD if places.get(&i.words[2]).is_some_and(|p| p.layout.is_some() && pass.has_matrix(p.ty)) => {
+            OP_LOAD if places.get(&i.words[2]).is_some_and(|p| p.layout.is_some() && pass.holds(p.ty)) => {
                 let p = places[&i.words[2]];
                 let (ty, result) = (i.words[0], i.words[1]);
                 let made = pass.made[&(p.ty, p.layout.unwrap())];
@@ -372,7 +405,7 @@ pub fn arrays(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst> {
                     out.push(inst(OP_STORE, &[p, x]));
                 }
             }
-            OP_STORE if places.get(&i.words[0]).is_some_and(|p| p.layout.is_some() && pass.has_matrix(p.ty)) => {
+            OP_STORE if places.get(&i.words[0]).is_some_and(|p| p.layout.is_some() && pass.holds(p.ty)) => {
                 let p = places[&i.words[0]];
                 let value = from_matrix(&mut pass, p.ty, p.layout.unwrap(), i.words[1], &mut out);
                 let mut words = i.words.clone();
@@ -483,7 +516,7 @@ fn chain(pass: &mut Pass, members: &HashMap<(u32, u32), (Layout, u32)>, places: 
         }
     }
     let mut words = i.words.clone();
-    if let Some(layout) = place.layout.filter(|_| pass.has_matrix(place.ty)) {
+    if let Some(layout) = place.layout.filter(|_| pass.holds(place.ty)) {
         let made = pass.made[&(place.ty, layout)];
         words[0] = pass.pointer(place.class, made);
     }
@@ -497,7 +530,13 @@ fn to_matrix(pass: &mut Pass, ty: u32, layout: Layout, value: u32, result: Optio
     let result = result.unwrap_or_else(|| (pass.fresh)());
     let t = pass.types[&ty].clone();
     let mut parts = Vec::new();
-    if t.op == OP_TYPE_MATRIX {
+    if t.op == OP_TYPE_VECTOR {
+        for k in 0..t.words[2] {
+            let x = (pass.fresh)();
+            out.push(inst(OP_COMPOSITE_EXTRACT, &[t.words[1], x, value, k]));
+            parts.push(x);
+        }
+    } else if t.op == OP_TYPE_MATRIX {
         let (column, columns, rows) = pass.matrix(ty);
         if layout.0 {
             let row = pass.types[&pass.made[&(ty, layout)]].words[1];
@@ -547,7 +586,13 @@ fn from_matrix(pass: &mut Pass, ty: u32, layout: Layout, value: u32, out: &mut V
     let made = pass.made[&(ty, layout)];
     let t = pass.types[&ty].clone();
     let mut parts = Vec::new();
-    if t.op == OP_TYPE_MATRIX {
+    if t.op == OP_TYPE_VECTOR {
+        for k in 0..t.words[2] {
+            let x = (pass.fresh)();
+            out.push(inst(OP_COMPOSITE_EXTRACT, &[t.words[1], x, value, k]));
+            parts.push(x);
+        }
+    } else if t.op == OP_TYPE_MATRIX {
         let (column, columns, rows) = pass.matrix(ty);
         if layout.0 {
             let row = pass.types[&made].words[1];

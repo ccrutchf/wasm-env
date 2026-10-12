@@ -25,6 +25,8 @@ pub use interface::VIEW_SET;
 const OP_ENTRY_POINT: u32 = 15;
 const OP_TYPE_SAMPLER: u32 = 26;
 const OP_TYPE_SAMPLED_IMAGE: u32 = 27;
+const OP_TYPE_ARRAY: u32 = 28;
+const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
 const OP_TYPE_POINTER: u32 = 32;
 const OP_VARIABLE: u32 = 59;
 const OP_LOAD: u32 = 61;
@@ -183,6 +185,80 @@ const OP_COMPOSITE_EXTRACT: u32 = 81;
 const OP_I_MUL: u32 = 132;
 const OP_SHIFT_RIGHT_LOGICAL: u32 = 194;
 const DIM_BUFFER: u32 = 5;
+
+const DIM_CUBE: u32 = 3;
+const OP_S_DIV: u32 = 135;
+
+/// Cube storage images (`imageCube`, `imageCubeArray`), which WGSL hasn't,
+/// as 2D arrays of their layers (the runtime binds a cube's view as one:
+/// vulkan.rs, `View::layered`). Their coordinates are a 2D array's already
+/// (x, y, and the face, or 6 times the cube plus the face); a size asked
+/// for is the width and height, and a cube array's cubes, the layers / 6.
+fn cube_storage(insts: Vec<Inst>, fresh: &mut impl FnMut() -> u32) -> Vec<Inst> {
+    let cubes: HashMap<u32, bool> = insts.iter().filter(|i| i.op == OP_TYPE_IMAGE && i.words[2] == DIM_CUBE && i.words[6] == 2).map(|i| (i.words[0], i.words[4] == 1)).collect();
+    if cubes.is_empty() {
+        return insts;
+    }
+    let types: std::collections::HashSet<u32> = insts.iter().filter(|i| (19..=39).contains(&i.op)).map(|i| i.words[0]).collect();
+    let values: HashMap<u32, bool> =
+        insts.iter().filter(|i| !(19..=39).contains(&i.op) && i.words.len() >= 2 && cubes.contains_key(&i.words[0]) && !types.contains(&i.words[1])).map(|i| (i.words[1], cubes[&i.words[0]])).collect();
+    // (A size's vector type: its component and count; and an ivec3 of
+    // that component, made where there's none.)
+    let vectors: HashMap<u32, (u32, u32)> = insts.iter().filter(|i| i.op == OP_TYPE_VECTOR).map(|i| (i.words[0], (i.words[1], i.words[2]))).collect();
+    let mut made: Vec<Inst> = Vec::new();
+    let mut three: HashMap<u32, u32> = HashMap::new();
+    let mut six: HashMap<u32, u32> = HashMap::new();
+    for i in insts.iter().filter(|i| i.op == OP_IMAGE_QUERY_SIZE && values.contains_key(&i.words[2])) {
+        let Some(&(int, _)) = vectors.get(&i.words[0]) else { continue };
+        three.entry(int).or_insert_with(|| match vectors.iter().find(|(_, v)| **v == (int, 3)) {
+            Some((&t, _)) => t,
+            None => {
+                let t = fresh();
+                made.push(inst(OP_TYPE_VECTOR, &[t, int, 3]));
+                t
+            }
+        });
+        if values[&i.words[2]] {
+            six.entry(int).or_insert_with(|| {
+                let c = fresh();
+                made.push(inst(OP_CONSTANT, &[int, c, 6]));
+                c
+            });
+        }
+    }
+    let mut out = Vec::with_capacity(insts.len() + made.len());
+    for i in insts {
+        if i.op == OP_FUNCTION && !made.is_empty() {
+            out.append(&mut made);
+        }
+        match i.op {
+            OP_TYPE_IMAGE if cubes.contains_key(&i.words[0]) => {
+                let mut words = i.words.clone();
+                words[2] = DIM_2D;
+                words[4] = 1;
+                out.push(Inst { op: i.op, words });
+            }
+            OP_IMAGE_QUERY_SIZE if values.contains_key(&i.words[2]) && vectors.contains_key(&i.words[0]) => {
+                let (ty, result, image) = (i.words[0], i.words[1], i.words[2]);
+                let int = vectors[&ty].0;
+                let q = fresh();
+                out.push(inst(OP_IMAGE_QUERY_SIZE, &[three[&int], q, image]));
+                if values[&image] {
+                    let (x, y, z, cubes) = (fresh(), fresh(), fresh(), fresh());
+                    out.push(inst(OP_COMPOSITE_EXTRACT, &[int, x, q, 0]));
+                    out.push(inst(OP_COMPOSITE_EXTRACT, &[int, y, q, 1]));
+                    out.push(inst(OP_COMPOSITE_EXTRACT, &[int, z, q, 2]));
+                    out.push(inst(OP_S_DIV, &[int, cubes, z, six[&int]]));
+                    out.push(inst(OP_COMPOSITE_CONSTRUCT, &[ty, result, x, y, cubes]));
+                } else {
+                    out.push(inst(OP_VECTOR_SHUFFLE, &[ty, result, q, q, 0, 1]));
+                }
+            }
+            _ => out.push(i),
+        }
+    }
+    out
+}
 
 /// Texel buffers (GLSL's `samplerBuffer`, `textureBuffer`, `imageBuffer`),
 /// which WGSL hasn't, as 2D images (the runtime binds a texel buffer view
@@ -716,6 +792,7 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
     };
     let insts = subgroups::single(insts, &mut fresh);
     let insts = images1d::as_2d(insts, &mut fresh);
+    let insts = cube_storage(insts, &mut fresh);
     let insts = texel_buffers(insts, &mut fresh);
     let insts = subpass_inputs(insts, &mut fresh);
     let insts = nan_tests(insts, &mut fresh);
@@ -731,6 +808,21 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
     let pointers: HashMap<u32, u32> =
         insts.iter().filter(|i| i.op == OP_TYPE_POINTER && i.words[1] == UNIFORM_CONSTANT && sampled.contains_key(&i.words[2])).map(|i| (i.words[0], i.words[2])).collect();
     let combined: HashMap<u32, u32> = insts.iter().filter(|i| i.op == OP_VARIABLE && pointers.contains_key(&i.words[0])).map(|i| (i.words[1], sampled[&pointers[&i.words[0]]])).collect();
+    // Arrays of them (a descriptor array: their image type and length, or
+    // none for a runtime array), pointers to those, and variables of those;
+    // each split as an array of images and one of samplers (made: their
+    // types, pointers to them, the pointer to an image, and the samplers'
+    // variable), and access chains into one split likewise (to the image's
+    // chain and the sampler's).
+    let arrays: HashMap<u32, (u32, Option<u32>)> = insts
+        .iter()
+        .filter(|i| matches!(i.op, OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY) && sampled.contains_key(&i.words[1]))
+        .map(|i| (i.words[0], (sampled[&i.words[1]], i.words.get(2).copied())))
+        .collect();
+    let array_pointers: HashMap<u32, u32> = insts.iter().filter(|i| i.op == OP_TYPE_POINTER && i.words[1] == UNIFORM_CONSTANT && arrays.contains_key(&i.words[2])).map(|i| (i.words[0], i.words[2])).collect();
+    let combined_arrays: HashMap<u32, (u32, Option<u32>)> = insts.iter().filter(|i| i.op == OP_VARIABLE && array_pointers.contains_key(&i.words[0])).map(|i| (i.words[1], arrays[&array_pointers[&i.words[0]]])).collect();
+    let array_parts: HashMap<u32, [u32; 6]> = combined_arrays.keys().map(|&v| (v, [fresh(), fresh(), fresh(), fresh(), fresh(), fresh()])).collect();
+    let mut chains: HashMap<u32, (u32, u32, u32)> = HashMap::new();
     // The sampler type (made, if the module has none), a pointer to it,
     // and per combined variable its image's pointer type and its sampler.
     let existing_sampler = insts.iter().find(|i| i.op == OP_TYPE_SAMPLER).map(|i| i.words[0]);
@@ -778,9 +870,8 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
                     Some(&(DECORATION_COHERENT | DECORATION_VOLATILE))
                 ) => {}
             // (What it needs declared before the first combined variable.)
-            OP_VARIABLE if combined.contains_key(&i.words[1]) => {
+            OP_VARIABLE if combined.contains_key(&i.words[1]) || combined_arrays.contains_key(&i.words[1]) => {
                 let v = i.words[1];
-                let (image_pointer, sampler) = parts[&v];
                 if !declared {
                     if existing_sampler.is_none() {
                         out.push(inst(OP_TYPE_SAMPLER, &[sampler_type]));
@@ -788,15 +879,48 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
                     out.push(inst(OP_TYPE_POINTER, &[sampler_pointer, UNIFORM_CONSTANT, sampler_type]));
                     declared = true;
                 }
+                if let Some(&(image, length)) = combined_arrays.get(&v) {
+                    let [images, samplers, images_pointer, samplers_pointer, image_pointer, sampler] = array_parts[&v];
+                    let array = |element| match length {
+                        Some(n) => inst(OP_TYPE_ARRAY, &[0, element, n]),
+                        None => inst(OP_TYPE_RUNTIME_ARRAY, &[0, element]),
+                    };
+                    for (id, element) in [(images, image), (samplers, sampler_type)] {
+                        let mut a = array(element);
+                        a.words[0] = id;
+                        out.push(a);
+                    }
+                    out.push(inst(OP_TYPE_POINTER, &[images_pointer, UNIFORM_CONSTANT, images]));
+                    out.push(inst(OP_TYPE_POINTER, &[samplers_pointer, UNIFORM_CONSTANT, samplers]));
+                    out.push(inst(OP_TYPE_POINTER, &[image_pointer, UNIFORM_CONSTANT, image]));
+                    out.push(inst(OP_VARIABLE, &[images_pointer, v, UNIFORM_CONSTANT]));
+                    out.push(inst(OP_VARIABLE, &[samplers_pointer, sampler, UNIFORM_CONSTANT]));
+                    continue;
+                }
+                let (image_pointer, sampler) = parts[&v];
                 out.push(inst(OP_TYPE_POINTER, &[image_pointer, UNIFORM_CONSTANT, combined[&v]]));
                 out.push(inst(OP_VARIABLE, &[image_pointer, v, UNIFORM_CONSTANT]));
                 out.push(inst(OP_VARIABLE, &[sampler_pointer, sampler, UNIFORM_CONSTANT]));
             }
-            OP_LOAD if combined.contains_key(&i.words[2]) => {
+            // (An element of an array of them: the image's element, and
+            // the sampler's.)
+            OP_ACCESS_CHAIN | OP_IN_BOUNDS_ACCESS_CHAIN if combined_arrays.contains_key(&i.words[2]) => {
+                let v = i.words[2];
+                let [_, _, _, _, image_pointer, samplers] = array_parts[&v];
+                let (image, sampler) = (i.words[1], fresh());
+                out.push(Inst { op: i.op, words: [&[image_pointer, image, v][..], &i.words[3..]].concat() });
+                out.push(Inst { op: i.op, words: [&[sampler_pointer, sampler, samplers][..], &i.words[3..]].concat() });
+                chains.insert(image, (combined_arrays[&v].0, image, sampler));
+            }
+            OP_LOAD if combined.contains_key(&i.words[2]) || chains.contains_key(&i.words[2]) => {
                 let (ty, result, v) = (i.words[0], i.words[1], i.words[2]);
+                let (image_type, image_from, sampler_from) = match chains.get(&v) {
+                    Some(&c) => c,
+                    None => (combined[&v], v, parts[&v].1),
+                };
                 let (image, sampler) = (fresh(), fresh());
-                out.push(inst(OP_LOAD, &[combined[&v], image, v]));
-                out.push(inst(OP_LOAD, &[sampler_type, sampler, parts[&v].1]));
+                out.push(inst(OP_LOAD, &[image_type, image, image_from]));
+                out.push(inst(OP_LOAD, &[sampler_type, sampler, sampler_from]));
                 out.push(inst(OP_SAMPLED_IMAGE, &[ty, result, image, sampler]));
             }
             // Bindings doubled; a combined variable's set and binding given
@@ -805,7 +929,7 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
                 let (target, kind, value) = (i.words[0], i.words[1], i.words[2]);
                 let binding_of = |sampler| if kind == DECORATION_BINDING { binding(value, sampler) } else { value };
                 out.push(inst(OP_DECORATE, &[target, kind, binding_of(false)]));
-                if let Some(&(_, sampler)) = parts.get(&target) {
+                if let Some(sampler) = parts.get(&target).map(|p| p.1).or_else(|| array_parts.get(&target).map(|p| p[5])) {
                     out.push(inst(OP_DECORATE, &[sampler, kind, binding_of(true)]));
                 }
             }
@@ -816,7 +940,7 @@ pub fn prepare(spirv: &[u8]) -> Res<Vec<u8>> {
                 // through the word with its NUL), then the interface.)
                 let name_end = 2 + i.words[2..].iter().position(|w| w.to_le_bytes().contains(&0)).map_or(i.words.len() - 2, |k| k + 1);
                 let mut words: Vec<u32> = i.words[..name_end].iter().chain(i.words[name_end..].iter().filter(|w| !point_vars.contains(w))).copied().collect();
-                words.extend(i.words[name_end..].iter().filter_map(|w| parts.get(w).map(|p| p.1)));
+                words.extend(i.words[name_end..].iter().filter_map(|w| parts.get(w).map(|p| p.1).or_else(|| array_parts.get(w).map(|p| p[5]))));
                 out.push(Inst { op: OP_ENTRY_POINT, words });
             }
             _ => out.push(i),

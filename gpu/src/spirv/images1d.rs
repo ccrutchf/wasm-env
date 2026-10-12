@@ -54,6 +54,9 @@ struct Made<'a> {
     half: u32,
     float_zero: u32,
     int_zero: u32,
+    /// Values' components: a vector's (a coordinate may have more than its
+    /// image's, which go unused).
+    widths: HashMap<u32, u32>,
 }
 
 impl Made<'_> {
@@ -67,8 +70,19 @@ impl Made<'_> {
         v
     }
 
+    /// A coordinate's x, where it isn't an array's and has more components.
+    fn first(&mut self, c: u32, scalar: u32, arrayed: bool, out: &mut Vec<Inst>) -> u32 {
+        if arrayed || self.widths.get(&c).is_none_or(|&n| n < 2) {
+            return c;
+        }
+        let x = (self.fresh)();
+        out.push(inst(OP_COMPOSITE_EXTRACT, &[scalar, x, c, 0]));
+        x
+    }
+
     /// A float coordinate made 2D: x, then `y`, then an array's layer.
     fn float_coordinate(&mut self, c: u32, arrayed: bool, y: u32, out: &mut Vec<Inst>) -> u32 {
+        let c = self.first(c, self.float, arrayed, out);
         let v = (self.fresh)();
         if arrayed {
             let (x, l) = ((self.fresh)(), (self.fresh)());
@@ -85,6 +99,7 @@ impl Made<'_> {
 
     /// An integer coordinate made 2D: x, then 0, then an array's layer.
     fn int_coordinate(&mut self, c: u32, arrayed: bool, out: &mut Vec<Inst>) -> u32 {
+        let c = self.first(c, self.int, arrayed, out);
         let (bits, v) = ((self.fresh)(), (self.fresh)());
         if arrayed {
             let ivec2 = self.vector(self.int, 2);
@@ -160,6 +175,12 @@ pub fn as_2d(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst> {
             }
         }
     }
+    let vector_types: HashMap<u32, u32> = insts.iter().filter(|i| i.op == OP_TYPE_VECTOR).map(|i| (i.words[0], i.words[2])).collect();
+    let widths: HashMap<u32, u32> = insts
+        .iter()
+        .filter(|i| i.op >= 41 && !(71..=75).contains(&i.op) && i.words.len() >= 2)
+        .filter_map(|i| vector_types.get(&i.words[0]).map(|&n| (i.words[1], n)))
+        .collect();
     // (A float and an int, vectors of them, and 0.5, 0.0 and 0.)
     let float = insts.iter().find(|i| i.op == OP_TYPE_FLOAT && i.words[1] == 32).map(|i| i.words[0]);
     let mut decls = Vec::new();
@@ -173,7 +194,7 @@ pub fn as_2d(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst> {
     decls.push(inst(OP_CONSTANT, &[float, half, 0.5f32.to_bits()]));
     decls.push(inst(OP_CONSTANT, &[float, float_zero, 0]));
     decls.push(inst(OP_CONSTANT, &[int, int_zero, 0]));
-    let mut m = Made { fresh, decls, float, int, vectors: HashMap::new(), half, float_zero, int_zero };
+    let mut m = Made { fresh, decls, float, int, vectors: HashMap::new(), half, float_zero, int_zero, widths };
 
     let mut out = Vec::with_capacity(insts.len());
     let mut functions_at = None;
@@ -193,10 +214,11 @@ pub fn as_2d(insts: Vec<Inst>, fresh: &mut dyn FnMut() -> u32) -> Vec<Inst> {
                 let fixed = if DREF.contains(&op) { 5 } else { 4 };
                 let coordinate = if PROJ.contains(&op) {
                     // (Projected: (x, q) as (x, q / 2, q), whose division
-                    // is (x / q, 0.5).)
+                    // is (x / q, 0.5); q is the last component.)
                     let (x, q, y, v) = ((m.fresh)(), (m.fresh)(), (m.fresh)(), (m.fresh)());
                     out.push(inst(OP_COMPOSITE_EXTRACT, &[m.float, x, i.words[3], 0]));
-                    out.push(inst(OP_COMPOSITE_EXTRACT, &[m.float, q, i.words[3], 1]));
+                    let last = m.widths.get(&i.words[3]).map_or(1, |n| n - 1);
+                    out.push(inst(OP_COMPOSITE_EXTRACT, &[m.float, q, i.words[3], last]));
                     out.push(inst(OP_F_MUL, &[m.float, y, q, m.half]));
                     let ty = m.vector(m.float, 3);
                     out.push(inst(OP_COMPOSITE_CONSTRUCT, &[ty, v, x, y, q]));

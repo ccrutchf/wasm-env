@@ -92,7 +92,8 @@ enum {
     SET_DEPTH_BIAS,
     SET_STENCIL_COMPARE_MASK,
     SET_STENCIL_WRITE_MASK,
-    FILL_TEXELS
+    FILL_TEXELS,
+    BARRIER
 };
 
 struct request {
@@ -1219,7 +1220,7 @@ static CALL VkResult CC CreateSampler(VkDevice d, const VkSamplerCreateInfo *inf
         float f;
         uint32_t u;
     } lo = {info->minLod}, hi = {info->maxLod};
-    uint32_t w[10] = {(uint32_t)info->magFilter,
+    uint32_t w[11] = {(uint32_t)info->magFilter,
                       (uint32_t)info->minFilter,
                       (uint32_t)info->mipmapMode,
                       (uint32_t)info->addressModeU,
@@ -1228,7 +1229,8 @@ static CALL VkResult CC CreateSampler(VkDevice d, const VkSamplerCreateInfo *inf
                       info->anisotropyEnable ? (uint32_t)info->maxAnisotropy : 1u,
                       info->compareEnable ? (uint32_t)info->compareOp + 1 : 0u,
                       lo.u,
-                      hi.u};
+                      hi.u,
+                      (uint32_t)info->borderColor};
     struct request q = {VK_SAMPLER, {(uint64_t)(uintptr_t)w}};
     struct VkSampler_T *s = zalloc(sizeof *s);
     if (!s || call(&q)) {
@@ -2659,7 +2661,12 @@ static CALL void CC CmdDrawIndexedIndirect(VkCommandBuffer c, VkBuffer b, VkDevi
 
 // Barriers and events: the commands run in order (wgpu orders a
 // submission's work), so there's nothing to wait for.
-static CALL void CC CmdPipelineBarrier(VkCommandBuffer c, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags f, uint32_t nm, const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {}
+// (Barriers are the replay's order, but one inside a render pass: a
+// subpass reading what it drew, which the runtime's pass ends for.)
+static CALL void CC CmdPipelineBarrier(VkCommandBuffer c, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags f, uint32_t nm, const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {
+    if (c->pass)
+        command(c, BARRIER, NULL, 0, NULL, 0);
+}
 // (Events set and reset by a command buffer: as it's submitted.)
 static void event_op(VkCommandBuffer c, VkEvent e, int set) {
     if (c->nsignals == c->sigcap) {

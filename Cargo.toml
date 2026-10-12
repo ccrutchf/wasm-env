@@ -22,6 +22,9 @@ bad64 = { path = "vendor/bad64" }
 # naga (wgpu's shader translator) took a fetch from an element of a binding
 # array (Vulkan's descriptor arrays) for one from the array:
 # vendor/naga/src/front/spv/image.rs; and panicked at atomics through
-# anything but an array or a struct: vendor/naga/src/front/spv/mod.rs
+# anything but an array or a struct: vendor/naga/src/front/spv/mod.rs; and
+# truncated an array layer that SPIR-V rounds, and wanted a coordinate type
+# it hadn't made: image.rs again; and kept an array of storage images'
+# variable's access off its images: mod.rs again
 # (search "wasm-env").
 naga = { path = "vendor/naga" }

@@ -69,12 +69,18 @@ run)
 		[ "$1" = intel ] && icd=intel gpu=intel
 		shift
 	fi
-	mkdir -p "$runs" "$R/tmp/vk-cts"
-	cts() { # deqp-vk ARGS... in the environment, from /opt/vk-cts
+	# (A directory of the run's own, in the environment's /tmp: runs side
+	# by side don't share their lists of cases.)
+	tmp=vk-cts.$$
+	trap 'rm -rf "$R/tmp/$tmp"' EXIT
+	mkdir -p "$runs" "$R/tmp/$tmp"
+	cts() { # deqp-vk ARGS... in the environment, from DIR (its data /opt/vk-cts's)
+		local dir=$1
+		shift
 		VK_ICD_FILENAMES=$root/build/mesa/share/vulkan/icd.d/${icd}_icd.x86_64.json WGPU_BACKEND=vulkan WASM_ENV_GPU=$gpu \
 			timeout "${CTS_TIMEOUT:-7200}" "${WASM_ENV:-$root/target/release/wasm-env}" run --root "$R" \
 			--env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/${ICD_JSON:-wasm-env_icd.aarch64.json} --env HOME=/root \
-			/bin/sh -c "cd /opt/vk-cts && ./deqp-vk $*"
+			/bin/sh -c "cd $dir && /opt/vk-cts/deqp-vk --deqp-archive-dir=/opt/vk-cts $*"
 	}
 	for pattern in "$@"; do
 		name=${pattern//\*/all}
@@ -83,22 +89,22 @@ run)
 		# Its cases, then runs of those not yet run: a crash ends a run, so
 		# the case it was in counts as crashed and the next run goes on
 		# after it.
-		cts "--deqp-runmode=txt-caselist --deqp-case='$pattern' --deqp-log-filename=/dev/null" >/dev/null 2>&1 || true
-		grep '^TEST: ' "$R/opt/vk-cts/dEQP-VK-cases.txt" | cut -d' ' -f2 >"$R/tmp/vk-cts/left.txt" 2>/dev/null || true
-		rm -f "$R/opt/vk-cts/dEQP-VK-cases.txt" "$runs/$name.qpa"
-		while [ -s "$R/tmp/vk-cts/left.txt" ]; do
-			cts "--deqp-caselist-file=/tmp/vk-cts/left.txt --deqp-log-filename=/tmp/vk-cts/part.qpa --deqp-log-images=disable --deqp-log-shader-sources=disable" >>"$log" 2>&1 || true
-			qpa=$R/tmp/vk-cts/part.qpa
+		cts "/tmp/$tmp" "--deqp-runmode=txt-caselist --deqp-case='$pattern' --deqp-log-filename=/dev/null" >/dev/null 2>&1 || true
+		grep '^TEST: ' "$R/tmp/$tmp/dEQP-VK-cases.txt" | cut -d' ' -f2 >"$R/tmp/$tmp/left.txt" 2>/dev/null || true
+		rm -f "$R/tmp/$tmp/dEQP-VK-cases.txt" "$runs/$name.qpa"
+		while [ -s "$R/tmp/$tmp/left.txt" ]; do
+			cts /opt/vk-cts "--deqp-caselist-file=/tmp/$tmp/left.txt --deqp-log-filename=/tmp/$tmp/part.qpa --deqp-log-images=disable --deqp-log-shader-sources=disable" >>"$log" 2>&1 || true
+			qpa=$R/tmp/$tmp/part.qpa
 			cat "$qpa" >>"$runs/$name.qpa" 2>/dev/null || true
 			# (Cases begun: done, or the crash's.)
-			grep -a -o '^#beginTestCaseResult .*' "$qpa" 2>/dev/null | cut -d' ' -f2 >"$R/tmp/vk-cts/begun.txt" || true
-			last=$(tail -1 "$R/tmp/vk-cts/begun.txt")
+			grep -a -o '^#beginTestCaseResult .*' "$qpa" 2>/dev/null | cut -d' ' -f2 >"$R/tmp/$tmp/begun.txt" || true
+			last=$(tail -1 "$R/tmp/$tmp/begun.txt")
 			if [ -n "$last" ] && ! tail -5 "$qpa" | grep -a -q '^#endTestCaseResult\|^#endSession'; then
 				echo "#crash $last" >>"$runs/$name.qpa"
 			fi
-			[ -s "$R/tmp/vk-cts/begun.txt" ] || break
-			grep -v -x -F -f "$R/tmp/vk-cts/begun.txt" "$R/tmp/vk-cts/left.txt" >"$R/tmp/vk-cts/next.txt" || true
-			mv "$R/tmp/vk-cts/next.txt" "$R/tmp/vk-cts/left.txt"
+			[ -s "$R/tmp/$tmp/begun.txt" ] || break
+			grep -v -x -F -f "$R/tmp/$tmp/begun.txt" "$R/tmp/$tmp/left.txt" >"$R/tmp/$tmp/next.txt" || true
+			mv "$R/tmp/$tmp/next.txt" "$R/tmp/$tmp/left.txt"
 		done
 		# The count: each case's status, and the crashes.
 		counts=$(grep -a -o 'StatusCode="[A-Za-z]*"' "$runs/$name.qpa" 2>/dev/null | cut -d'"' -f2 | sort | uniq -c | awk '{printf "%s %s, ", $2, $1}')

@@ -89,17 +89,19 @@ fn extract_image_coordinates(
     };
 
     let required_size = image_dim.required_coordinate_size();
+    // wasm-env: made where it isn't there (`parse_type_image` makes a
+    // float one: an arrayed storage image's integer coordinates have none).
     let required_ty = required_size.map(|size| {
-        ctx.module
-            .types
-            .get(&crate::Type {
+        ctx.module.types.insert(
+            crate::Type {
                 name: None,
                 inner: crate::TypeInner::Vector {
                     size,
                     scalar: Scalar { kind, width: 4 },
                 },
-            })
-            .expect("Required coordinate type should have been set up by `parse_type_image`!")
+            },
+            crate::Span::UNDEFINED,
+        )
     });
     let extra_expr = crate::Expression::AccessIndex {
         base,
@@ -131,7 +133,21 @@ fn extract_image_coordinates(
                     )
                 }
             };
-            let array_index_f32 = ctx.expressions.append(extra_expr, base_span);
+            let mut array_index_f32 = ctx.expressions.append(extra_expr, base_span);
+            // wasm-env: a float layer is rounded (to even, as SPIR-V's
+            // are), not truncated.
+            if kind == crate::ScalarKind::Float {
+                array_index_f32 = ctx.expressions.append(
+                    crate::Expression::Math {
+                        fun: crate::MathFunction::Round,
+                        arg: array_index_f32,
+                        arg1: None,
+                        arg2: None,
+                        arg3: None,
+                    },
+                    base_span,
+                );
+            }
             let array_index = ctx.expressions.append(
                 crate::Expression::As {
                     kind: crate::ScalarKind::Sint,

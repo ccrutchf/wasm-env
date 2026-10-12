@@ -3010,6 +3010,35 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                 Default::default(),
             );
         }
+        // wasm-env: and likewise a binding array of them's.
+        if let crate::TypeInner::BindingArray { base, size } = module.types[ty].inner {
+            if let crate::TypeInner::Image {
+                dim,
+                arrayed,
+                class: crate::ImageClass::Storage { format, access: _ },
+            } = module.types[base].inner
+            {
+                let access = dec.flags.to_storage_access();
+                let base = module.types.insert(
+                    crate::Type {
+                        name: None,
+                        inner: crate::TypeInner::Image {
+                            dim,
+                            arrayed,
+                            class: crate::ImageClass::Storage { format, access },
+                        },
+                    },
+                    Default::default(),
+                );
+                ty = module.types.insert(
+                    crate::Type {
+                        name: None,
+                        inner: crate::TypeInner::BindingArray { base, size },
+                    },
+                    Default::default(),
+                );
+            }
+        }
 
         let ext_class = match self.lookup_storage_buffer_types.get(&ty) {
             Some(&access) => ExtendedClass::Global(crate::AddressSpace::Storage { access }),
