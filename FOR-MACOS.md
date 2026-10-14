@@ -65,15 +65,17 @@ do on Linux.
 ## 2. The Ubuntu environment
 
 The conformance tests, vkQuake and the drivers' tests are built on the Linux
-machine into its `build/ubuntu`. Bring that over as an export, made on Linux
-inside `nix develop`:
+machine into its `build/ubuntu`. Bring that over as an export, made on Linux:
 
 ```
-target/release/wasm-env export build/ubuntu build/ubuntu-oci.tar
+nix develop -c tests/export.sh
 ```
 
-The export includes everything below, without the translation cache (which
-is per host):
+The script first rebuilds the GPU drivers from the tree into the
+environment. It then writes `export/ubuntu-oci.tar` and its `.sha256`
+(ignored by git), and reports anything the checks below need that's
+missing. The export includes everything below, without the translation
+cache (which is per host):
 
 - the Vulkan driver, at `/usr/lib/wasm-env/libwasm-env-vulkan.so` with
   `/usr/share/vulkan/icd.d/wasm-env_icd.aarch64.json`;

@@ -38,22 +38,24 @@ So, in order of importance:
 
 ## 1. On the Linux machine: build what Windows needs
 
-From the repository's root, inside `nix develop`:
+From the repository's root:
 
 ```
-tests/cross.sh --build
-target/release/wasm-env export build/ubuntu build/ubuntu-oci.tar
+nix develop -c tests/export.sh --windows
 ```
 
-That gives you:
+The script first rebuilds the GPU drivers from the tree into the
+environment. It reports anything the checks below need that's missing, and
+leaves everything in `export/` (ignored by git):
 
-- `build/target-cross/x86_64-pc-windows-gnu/release/wasm-env.exe` and
-  `wasm-env-translate.exe`. The second must sit beside the first.
-- `build/win-toolchain/`, the translator's toolchain for Windows:
-  `bin\clang.exe`, `bin\wasm-ld.exe`, `lib\clang\21\include\` and
-  `lib\libclang_rt.builtins.a`.
-- `build/ubuntu-oci.tar`, the Ubuntu 24.04 arm64 environment, without its
-  translation cache. It already has everything below:
+- `export/windows/`, laid out as Windows wants it:
+  - `bin\wasm-env.exe` and `bin\wasm-env-translate.exe`;
+  - `lib\wasm-env\toolchain\`, the translator's toolchain for Windows:
+    `bin\clang.exe`, `bin\wasm-ld.exe`, `lib\clang\21\include\` and
+    `lib\libclang_rt.builtins.a`.
+- `export/ubuntu-oci.tar` (and its `.sha256`), the Ubuntu 24.04 arm64
+  environment, without its translation cache. It already has everything
+  below:
   - the Vulkan driver, at `/usr/lib/wasm-env/libwasm-env-vulkan.so` with
     `/usr/share/vulkan/icd.d/wasm-env_icd.aarch64.json`;
   - the OpenCL driver (`/etc/OpenCL/vendors/wasm-env.icd`);
@@ -62,19 +64,20 @@ That gives you:
   - vkQuake with Quake's shareware data (`/opt/vkquake`);
   - OpenCL's conformance tests (`/opt/cts`) and Vulkan's (`/opt/vk-cts`).
 
-  If you change the drivers or the tests on Linux, export it again.
+  If you change the drivers or the tests on Linux, run the script again.
 
-Copy those three to the Windows machine.
+Copy `export/` to the Windows machine.
 
 ## 2. On Windows: set up
 
-Lay them out so the runtime finds its toolchain without settings: by default
-it looks in `..\lib\wasm-env\toolchain` beside `wasm-env.exe`.
+Put the contents of `export/windows` in `C:\wasm-env`, with the archive
+beside them. That way the runtime finds its toolchain without settings: by
+default it looks in `..\lib\wasm-env\toolchain` beside `wasm-env.exe`.
 
 ```
 C:\wasm-env\bin\wasm-env.exe
 C:\wasm-env\bin\wasm-env-translate.exe
-C:\wasm-env\lib\wasm-env\toolchain\...   (the contents of build/win-toolchain)
+C:\wasm-env\lib\wasm-env\toolchain\...
 C:\wasm-env\ubuntu-oci.tar
 ```
 
